@@ -542,7 +542,7 @@ pub async fn delegation_flows(ctx: &ReadCtx, since: i64) -> Result<Read, ApiErro
         Part::rows(
             "historical",
             NestId::LegacyFlows,
-            sql::delegation_events_since_sql(since),
+            sql::legacy_delegation_events_since_sql(since),
         ),
     ];
     ctx.cached(
@@ -742,5 +742,89 @@ mod tests {
         };
         let merged = older_of(&known, &Provenance::default());
         assert_eq!(merged.as_of, Some(500));
+    }
+}
+
+#[cfg(test)]
+mod wiring_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
+
+    /// Records every statement the service actually sends, so a test can assert on the wiring
+    /// rather than on the query builders in isolation.
+    ///
+    /// This exists because a builder test passed while the route still called the wrong builder:
+    /// a formatting pass had split the call across lines and a search-and-replace missed it. The
+    /// SQL was right, the route was wrong, and nothing failed until production answered 400.
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+
+    impl Respond for Recorder {
+        fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+            // A serving route consults readiness before it asks anything, so the stand-in has to
+            // answer that too or every read is refused before a statement is ever sent.
+            if req.url.path().ends_with("/ready") {
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ready": true, "lag_blocks": 0, "tip": 1, "last_block": 1,
+                    "sealed_through": 1, "stalled": false
+                }));
+            }
+            let q = req
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "q")
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default();
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{} :: {q}", req.url.path()));
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count": 0, "rows": [],
+                "provenance": {"as_of": 1, "sealed_through": 1, "source": "mock"}
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn each_nest_is_asked_a_question_its_own_schema_can_answer() {
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("GET"))
+            .respond_with(Recorder(seen.clone()))
+            .mount(&server)
+            .await;
+
+        let mut cfg = kittiwake_nest::NestConfig::new(server.uri());
+        for n in NestId::ALL {
+            cfg.base_paths.insert(n, format!("/{}", n.as_str()));
+        }
+        let gate = NestGate::new(cfg).unwrap();
+        let ctx = ReadCtx::new(gate, kittiwake_cache::Store::new(64), 1);
+
+        delegation_flows(&ctx, 100)
+            .await
+            .expect("both halves answer");
+
+        let seen = seen.lock().unwrap();
+        let live = seen
+            .iter()
+            .find(|s| s.starts_with("/alloc/sql"))
+            .expect("the live nest was asked");
+        let archive = seen
+            .iter()
+            .find(|s| s.starts_with("/legacy-flows/sql"))
+            .expect("the archive was asked");
+
+        assert!(live.contains("lodestar_delegations"), "live half: {live}");
+        assert!(
+            archive.contains("staking_legacy__stake_delegated"),
+            "the archive has no lodestar_* views: {archive}"
+        );
+        assert!(
+            !archive.contains("lodestar_delegations"),
+            "asking the archive for a view it does not have is a 400: {archive}"
+        );
     }
 }
