@@ -19,6 +19,9 @@ pub const REO_ADDRESS: &str = "0x8ec2767a9d9ba02b4e09e8ff4fac2e14a340f304";
 pub const GRT_ARBITRUM: &str = "0x9623063377ad1b27544c965ccd7342f7ea7e88c7";
 /// GRT on Ethereum mainnet, where the token was minted.
 pub const GRT_MAINNET: &str = "0xc944e90c64b2c07662a292be6244bdf05cda44a7";
+/// The L1 escrow holding GRT that has been bridged to L2. Counting both sides without subtracting
+/// it would double-count every bridged token.
+pub const L1_BRIDGE_ESCROW: &str = "0x36aff7001294dae4c2ed4fdefc478a00de77f090";
 
 sol! {
     #[sol(rpc)]
@@ -220,6 +223,60 @@ impl Chain {
         )))
     }
 
+    /// Supply across both chains. Three reads; a failure in any of them makes the whole breakdown
+    /// absent rather than partial, because a global supply computed from two of three figures is a
+    /// plausible wrong number.
+    pub async fn grt_supply_breakdown(&self) -> Result<SupplyBreakdown, ApiError> {
+        let token_l1 = Address::from_str(GRT_MAINNET).expect("constant");
+        let escrow = Address::from_str(L1_BRIDGE_ESCROW).expect("constant");
+
+        let l2 = self.grt_total_supply(SupplyChain::Arbitrum);
+        let l1_and_escrow = async {
+            let mut last = String::from("none configured");
+            for url in &self.mainnet {
+                let Ok(parsed) = url.parse() else { continue };
+                let provider = ProviderBuilder::new().connect_http(parsed);
+                let erc20 = IERC20::new(token_l1, provider);
+                let c_supply = erc20.totalSupply();
+                let c_balance = erc20.balanceOf(escrow);
+                let both = async { tokio::join!(c_supply.call(), c_balance.call()) };
+                match tokio::time::timeout(Duration::from_secs(12), both).await {
+                    Ok((Ok(supply), Ok(balance))) => return Ok((supply, balance)),
+                    Ok((a, b)) => {
+                        last = a
+                            .err()
+                            .map(|e| e.to_string())
+                            .or_else(|| b.err().map(|e| e.to_string()))
+                            .unwrap_or(last);
+                    }
+                    Err(_) => last = "timed out".into(),
+                }
+            }
+            Err(ApiError::Unavailable(format!(
+                "no mainnet endpoint answered: {last}"
+            )))
+        };
+
+        let (l2, l1_pair) = tokio::join!(l2, l1_and_escrow);
+        let (l1_supply, escrow_balance) = l1_pair?;
+        let to_grt = |v: U256| -> f64 {
+            // Through a string rather than a cast: the supply exceeds what u128 holds comfortably
+            // and the figure is only ever displayed, so a parse to f64 at the end is honest.
+            v.to_string().parse::<f64>().unwrap_or(0.0) / 1e18
+        };
+
+        let l1_total_supply = to_grt(l1_supply);
+        let l2_total_supply = l2?.parse::<f64>().unwrap_or(0.0) / 1e18;
+        let bridge_escrow = to_grt(escrow_balance);
+
+        Ok(SupplyBreakdown {
+            l1_total_supply,
+            l2_total_supply,
+            bridge_escrow,
+            global_supply: l1_total_supply + l2_total_supply - bridge_escrow,
+        })
+    }
+
     /// The current Arbitrum block, used by the health endpoint to say whether the RPC is answering.
     pub async fn block_number(&self) -> Result<u64, ApiError> {
         let provider = self.arb()?;
@@ -228,6 +285,18 @@ impl Chain {
             .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
             .map_err(|e| ApiError::Unavailable(format!("arbitrum rpc: {e}")))
     }
+}
+
+/// GRT in circulation across both chains, in whole GRT.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplyBreakdown {
+    pub l1_total_supply: f64,
+    pub l2_total_supply: f64,
+    pub bridge_escrow: f64,
+    /// L1 plus L2 minus what sits in escrow: the tokens on L2 are the same tokens the escrow
+    /// holds, so adding the two supplies without subtracting it counts them twice.
+    pub global_supply: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,9 +322,17 @@ fn now_secs() -> i64 {
 mod tests {
     use super::*;
 
+    /// Bridged tokens exist on both sides of the bridge; counting them twice would overstate the
+    /// supply by the whole escrow balance.
+    #[test]
+    fn the_global_supply_does_not_count_bridged_tokens_twice() {
+        let (l1, l2, escrow) = (10_800_262_816.0, 3_380_666_513.0, 2_694_465_409.0);
+        assert_eq!(l1 + l2 - escrow, 11_486_463_920.0);
+    }
+
     #[test]
     fn the_contract_addresses_parse() {
-        for a in [REO_ADDRESS, GRT_ARBITRUM, GRT_MAINNET] {
+        for a in [REO_ADDRESS, GRT_ARBITRUM, GRT_MAINNET, L1_BRIDGE_ESCROW] {
             assert!(Address::from_str(a).is_ok(), "{a}");
         }
     }

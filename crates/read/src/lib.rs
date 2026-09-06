@@ -28,6 +28,9 @@ pub struct ReadCtx {
     pub gate: NestGate,
     pub store: Store,
     pub schema_version: u32,
+    /// Absent when no Arbitrum RPC is configured. The routes that need a contract read say so
+    /// rather than quietly omitting the part they could not compute.
+    pub chain: Option<kittiwake_chain::Chain>,
 }
 
 /// A source that is not a nest: it has no provenance of its own, so the age of the cache entry is
@@ -47,7 +50,13 @@ impl ReadCtx {
             gate,
             store,
             schema_version,
+            chain: None,
         }
+    }
+
+    pub fn with_chain(mut self, chain: Option<kittiwake_chain::Chain>) -> Self {
+        self.chain = chain;
+        self
     }
 
     /// Read one route's answer, honouring its freshness policy.

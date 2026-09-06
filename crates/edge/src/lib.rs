@@ -389,7 +389,7 @@ pub fn state(
     pool: Option<kittiwake_db::Pool>,
 ) -> AppState {
     AppState {
-        read: ReadCtx::new(gate, store, schema_version),
+        read: ReadCtx::new(gate, store, schema_version).with_chain(chain.clone()),
         ext: kittiwake_ext::Ext::default(),
         chain,
         pool,

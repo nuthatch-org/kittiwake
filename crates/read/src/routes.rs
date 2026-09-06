@@ -194,26 +194,107 @@ pub async fn epochs(ctx: &ReadCtx, first: i64) -> Result<Read, ApiError> {
     .await
 }
 
-/// `/api/network-stats` and, with the same body, `/api/grt-flow`: the totals and the parameters.
+/// `/api/network-stats`, and `/api/grt-flow` off the same fold.
+///
+/// The shape here is not ours to choose: it is what the dashboard's hooks are written against, so
+/// the nest's snake_case columns are mapped to the camelCase the frontend reads, wei stays a
+/// decimal string, and counts stay integers. `maxAllocationEpochs` and `thawingPeriod` are null
+/// because Horizon has no equivalent - null rather than zero, which would read as "no thawing
+/// period" instead of "the concept does not apply".
 pub async fn network_stats(ctx: &ReadCtx) -> Result<Read, ApiError> {
+    let chain = ctx.chain.clone();
+    let fetch: Fetcher = Arc::new(move |gate: NestGate, lane: Lane| {
+        let chain = chain.clone();
+        Box::pin(async move {
+            let mut net = QuerySpec::read(NestId::Alloc, sql::network_sql());
+            let mut par = QuerySpec::read(NestId::Alloc, sql::network_params_sql());
+            net.lane = lane;
+            par.lane = lane;
+
+            let (net, par) = tokio::join!(
+                gate.query_coalesced("alloc:network", net),
+                gate.query_coalesced("alloc:network-params", par),
+            );
+            let net = net.map_err(ApiError::from)?;
+            let par = par.map_err(ApiError::from)?;
+            let n = net.rows.first().cloned().unwrap_or(serde_json::Value::Null);
+            let p = par.rows.first().cloned().unwrap_or(serde_json::Value::Null);
+
+            // Three contract reads across two chains. Absent rather than partial when any fails:
+            // a global supply computed from two of three figures is a plausible wrong number.
+            let supply = match &chain {
+                Some(c) => c.grt_supply_breakdown().await.ok(),
+                None => None,
+            };
+
+            let graph_network = serde_json::json!({
+                "totalTokensStaked": str_of(&n, "total_tokens_staked"),
+                "totalDelegatedTokens": str_of(&n, "total_delegated_tokens"),
+                "totalTokensSignalled": str_of(&n, "total_tokens_signalled"),
+                "totalTokensAllocated": str_of(&n, "total_tokens_allocated"),
+                "totalIndexingRewards": str_of(&n, "total_indexing_rewards"),
+                "totalQueryFees": str_of(&n, "total_query_fees"),
+                "currentEpoch": int_of(&n, "current_epoch"),
+                "epochLength": int_of(&p, "epoch_length"),
+                "lastLengthUpdateEpoch": int_of(&p, "last_length_update_epoch"),
+                "lastLengthUpdateBlock": int_of(&p, "last_length_update_block"),
+                "indexerCount": int_of(&n, "indexer_count"),
+                "stakedIndexersCount": int_of(&n, "staked_indexers_count"),
+                "delegatorCount": int_of(&n, "delegator_count"),
+                "activeDelegatorCount": int_of(&n, "active_delegator_count"),
+                "curatorCount": int_of(&n, "curator_count"),
+                "activeCuratorCount": int_of(&n, "active_curator_count"),
+                "subgraphCount": int_of(&n, "subgraph_count"),
+                "activeSubgraphCount": int_of(&n, "active_subgraph_count"),
+                "delegationRatio": int_of(&p, "delegation_ratio"),
+                "protocolFeePercentage": int_of(&p, "protocol_payment_cut"),
+                "delegationTaxPercentage": int_of(&p, "curation_tax_percentage"),
+                // No Horizon equivalent. Null, not zero.
+                "maxAllocationEpochs": serde_json::Value::Null,
+                "thawingPeriod": serde_json::Value::Null,
+                "totalSupply": str_of(&n, "total_supply"),
+                "networkGRTIssuancePerBlock": str_of(&n, "issuance_per_block"),
+            });
+
+            let value = serde_json::json!({
+                "graphNetwork": graph_network,
+                // The block the nest answered as of, which is the only honest date for this row.
+                "_meta": { "block": { "number": net.provenance.as_of } },
+                "grtSupply": supply,
+            });
+            Ok((value, older_of(&net.provenance, &par.provenance)))
+        })
+    });
+
     ctx.cached(
         "network-stats",
         NestId::Alloc,
         serde_json::json!({}),
         CachePolicy::from_poll_interval(cadence::LIVE),
-        many(
-            vec![
-                Part::one("network", NestId::Alloc, sql::network_sql().to_string()),
-                Part::one(
-                    "params",
-                    NestId::Alloc,
-                    sql::network_params_sql().to_string(),
-                ),
-            ],
-            T_FOLD,
-        ),
+        fetch,
     )
     .await
+}
+
+/// A nest column as the string the frontend expects. Wei never becomes a number on this path.
+fn str_of(v: &serde_json::Value, key: &str) -> serde_json::Value {
+    match v.get(key) {
+        Some(serde_json::Value::String(s)) => serde_json::Value::String(s.clone()),
+        Some(serde_json::Value::Number(n)) => serde_json::Value::String(n.to_string()),
+        _ => serde_json::Value::Null,
+    }
+}
+
+/// A nest column as an integer, accepting the string form the nest sometimes returns.
+fn int_of(v: &serde_json::Value, key: &str) -> serde_json::Value {
+    match v.get(key) {
+        Some(serde_json::Value::Number(n)) => serde_json::Value::Number(n.clone()),
+        Some(serde_json::Value::String(s)) => s
+            .parse::<i64>()
+            .map(|i| serde_json::Value::Number(i.into()))
+            .unwrap_or(serde_json::Value::Null),
+        _ => serde_json::Value::Null,
+    }
 }
 
 /// `/api/token-metrics`: the epoch series, from which issuance and rewards are derived.
