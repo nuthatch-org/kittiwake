@@ -529,28 +529,90 @@ pub async fn delegation_events(
     .await
 }
 
-/// `/api/delegation-flows`: the Horizon era from the live nest and the pre-Horizon era from the
-/// frozen archive. Two nests, one chart. The archive half is exempt from the readiness check by
-/// construction, since it reports stalled for ever and is right to.
+/// `/api/delegation-flows`: daily inflow and outflow, from two nests.
+///
+/// The pre-Horizon era lives in the frozen archive and the Horizon era in the live nest, split at
+/// a fixed instant so the two windows are disjoint and no day is counted twice.
+///
+/// **Both halves are summed by the nest.** Fetching the events and adding them up here was the
+/// first version and it was wrong: a long window runs to hundreds of thousands of events against a
+/// 50,000-row cap, so the answer came back truncated and the daily totals were short. A chart that
+/// is quietly missing three quarters of its volume looks entirely plausible.
+///
+/// The answer is dated by the **live** half. The archive is frozen by construction rather than
+/// stale, and dating the whole response by an as-of that will never advance would make a current
+/// chart look three-quarters of a million blocks out of date for ever.
 pub async fn delegation_flows(ctx: &ReadCtx, since: i64) -> Result<Read, ApiError> {
-    let parts = vec![
-        Part::rows(
-            "live",
-            NestId::Alloc,
-            sql::delegation_events_since_sql(since),
-        ),
-        Part::rows(
-            "historical",
-            NestId::LegacyFlows,
-            sql::legacy_delegation_events_since_sql(since),
-        ),
-    ];
+    let boundary = sql::LEGACY_HISTORY_END_EXCLUSIVE;
+    let wants_archive = since < boundary;
+
+    let fetch: Fetcher = Arc::new(move |gate: NestGate, lane: Lane| {
+        Box::pin(async move {
+            let mut live = QuerySpec::read(
+                NestId::Alloc,
+                sql::daily_flow_sql(since.max(boundary), i64::MAX, false),
+            )
+            .with_timeout(T_FOLD);
+            live.lane = lane;
+
+            let live_answer = gate
+                .query_coalesced(&format!("alloc:flows:{}", since.max(boundary)), live)
+                .await
+                .map_err(ApiError::from)?;
+
+            let mut days: std::collections::BTreeMap<String, (f64, f64)> = Default::default();
+            let mut absorb = |rows: &[serde_json::Value]| {
+                for r in rows {
+                    let Some(date) = r.get("date").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let f = |k: &str| r.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let e = days.entry(date.to_string()).or_insert((0.0, 0.0));
+                    e.0 += f("inflows");
+                    e.1 += f("outflows");
+                }
+            };
+
+            if wants_archive {
+                let mut hist = QuerySpec::read(
+                    NestId::LegacyFlows,
+                    sql::daily_flow_sql(since, boundary, true),
+                )
+                .with_timeout(T_FOLD);
+                hist.lane = lane;
+                let hist_answer = gate
+                    .query_coalesced(&format!("legacy:flows:{since}"), hist)
+                    .await
+                    .map_err(ApiError::from)?;
+                absorb(&hist_answer.rows);
+            }
+            absorb(&live_answer.rows);
+
+            let points: Vec<serde_json::Value> = days
+                .into_iter()
+                .map(|(date, (inflows, outflows))| {
+                    serde_json::json!({
+                        "date": date,
+                        "inflows": inflows,
+                        "outflows": outflows,
+                        "net": inflows - outflows,
+                    })
+                })
+                .collect();
+
+            Ok((
+                serde_json::Value::Array(points),
+                live_answer.provenance.clone(),
+            ))
+        })
+    });
+
     ctx.cached(
         "delegation-flows",
         NestId::Alloc,
-        serde_json::json!({"since": since}),
+        serde_json::json!({ "since": since }),
         CachePolicy::from_poll_interval(cadence::ARCHIVAL),
-        many(parts, T_FOLD),
+        fetch,
     )
     .await
 }
@@ -803,6 +865,7 @@ mod wiring_tests {
         let gate = NestGate::new(cfg).unwrap();
         let ctx = ReadCtx::new(gate, kittiwake_cache::Store::new(64), 1);
 
+        // A window starting before the boundary, so both halves are asked.
         delegation_flows(&ctx, 100)
             .await
             .expect("both halves answer");
@@ -817,14 +880,62 @@ mod wiring_tests {
             .find(|s| s.starts_with("/legacy-flows/sql"))
             .expect("the archive was asked");
 
-        assert!(live.contains("lodestar_delegations"), "live half: {live}");
+        // The live nest indexes Horizon only; the pre-Horizon tables exist solely in the archive,
+        // and asking for them here is a 400.
+        assert!(live.contains("staking__tokens_delegated"), "live: {live}");
         assert!(
-            archive.contains("staking_legacy__stake_delegated"),
-            "the archive has no lodestar_* views: {archive}"
+            !live.contains("staking_legacy__"),
+            "the live nest has no pre-Horizon tables"
         );
         assert!(
-            !archive.contains("lodestar_delegations"),
-            "asking the archive for a view it does not have is a 400: {archive}"
+            archive.contains("staking_legacy__stake_delegated"),
+            "archive: {archive}"
+        );
+
+        // Both halves must be summed by the nest. A raw scan truncates at 50,000 rows and the
+        // chart silently loses volume.
+        for q in [live, archive] {
+            assert!(
+                q.contains("GROUP BY 1"),
+                "not aggregated at the source: {q}"
+            );
+            assert!(
+                !q.contains("lodestar_delegations"),
+                "the flow reads events, not the fold: {q}"
+            );
+        }
+    }
+
+    /// A window that starts after the boundary has no archive half at all, and must not ask the
+    /// archive a question whose answer would be empty anyway.
+    #[tokio::test]
+    async fn a_recent_window_does_not_trouble_the_archive() {
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("GET"))
+            .respond_with(Recorder(seen.clone()))
+            .mount(&server)
+            .await;
+
+        let mut cfg = kittiwake_nest::NestConfig::new(server.uri());
+        for n in NestId::ALL {
+            cfg.base_paths.insert(n, format!("/{}", n.as_str()));
+        }
+        let ctx = ReadCtx::new(
+            NestGate::new(cfg).unwrap(),
+            kittiwake_cache::Store::new(64),
+            1,
+        );
+
+        delegation_flows(&ctx, sql::LEGACY_HISTORY_END_EXCLUSIVE + 86_400)
+            .await
+            .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().any(|s| s.starts_with("/alloc/sql")));
+        assert!(
+            !seen.iter().any(|s| s.starts_with("/legacy-flows/sql")),
+            "the archive should not have been asked"
         );
     }
 }

@@ -656,22 +656,28 @@ pub fn delegation_events_since_sql(since: i64) -> String {
     )
 }
 
-/// The pre-Horizon half of the delegation flow, from the frozen archive.
+/// The instant the frozen archive's history ends and the live nest's begins.
 ///
-/// The archive is a raw event store, not a nest with the `lodestar_*` views: it carries
-/// `staking_legacy__stake_delegated` and `..._locked` and nothing folded on top. Asking it for
-/// `lodestar_delegations`, as the first version of this did, is a 400 from the nest and a broken
-/// chart. The output shape matches [`delegation_events_since_sql`] so the caller cannot tell the
-/// two halves apart.
+/// The two windows are disjoint by construction, so no event is counted twice and none is missed.
+pub const LEGACY_HISTORY_END_EXCLUSIVE: i64 = 1_787_555_748;
+
+/// Daily delegation inflow and outflow, **aggregated by the nest**.
 ///
-/// `StakeDelegatedLocked` is the pre-Horizon undelegation: tokens leave the pool and are locked
-/// until a thawing period ends.
+/// This must never fetch raw events. There are hundreds of thousands of them and the nest caps a
+/// result at 50,000 rows, so a raw scan comes back truncated and the daily sums are quietly short -
+/// a chart that looks plausible and is wrong. Grouping in SQL returns one row per day, which no
+/// window can overflow, and the sums are computed where the data is.
 ///
-/// The archive holds 346,288 delegations spanning 2023-02-13 to 2025-12-09, so a recent window
-/// legitimately returns nothing from it. That is an empty result, not a failure.
-pub fn legacy_delegation_events_since_sql(since: i64) -> String {
+/// `legacy` picks the schema: the frozen archive carries both the pre-Horizon `staking_legacy__`
+/// tables and the Horizon ones, while the live nest has only the latter.
+pub fn daily_flow_sql(start: i64, end: i64, legacy: bool) -> String {
+    let events = if legacy {
+        "SELECT block_timestamp, CAST(tokens_dec AS DOUBLE) / 1e18 AS tokens, 'inflow' AS direction          FROM staking_legacy__stake_delegated          UNION ALL SELECT block_timestamp, CAST(tokens_dec AS DOUBLE) / 1e18, 'outflow'          FROM staking_legacy__stake_delegated_locked          UNION ALL SELECT block_timestamp, CAST(tokens_dec AS DOUBLE) / 1e18, 'inflow'          FROM staking__tokens_delegated          UNION ALL SELECT block_timestamp, CAST(tokens_dec AS DOUBLE) / 1e18, 'outflow'          FROM staking__tokens_undelegated"
+    } else {
+        "SELECT block_timestamp, CAST(tokens_dec AS DOUBLE) / 1e18 AS tokens, 'inflow' AS direction          FROM staking__tokens_delegated          UNION ALL SELECT block_timestamp, CAST(tokens_dec AS DOUBLE) / 1e18, 'outflow'          FROM staking__tokens_undelegated"
+    };
     format!(
-        "SELECT 'delegation' AS event_type, LOWER(indexer) AS indexer, CAST(tokens AS VARCHAR) AS tokens          FROM staking_legacy__stake_delegated WHERE block_timestamp > {since}          UNION ALL          SELECT 'undelegation', LOWER(indexer), CAST(tokens AS VARCHAR)          FROM staking_legacy__stake_delegated_locked WHERE block_timestamp > {since}"
+        "WITH events AS ({events})          SELECT strftime(to_timestamp(block_timestamp), '%Y-%m-%d') AS date,          SUM(CASE WHEN direction = 'inflow' THEN tokens ELSE 0 END) AS inflows,          SUM(CASE WHEN direction = 'outflow' THEN tokens ELSE 0 END) AS outflows          FROM events WHERE block_timestamp >= {start} AND block_timestamp < {end}          GROUP BY 1 ORDER BY 1"
     )
 }
 
@@ -810,26 +816,43 @@ mod tests {
         assert!(indexer_stake_history_sql(addr, &[]).is_none());
     }
 
-    /// The two halves of the delegation flow come from different schemas and must not be asked
-    /// the same question.
+    /// The flow chart must be summed by the nest, never by scanning events here. A raw scan of a
+    /// long window exceeds the nest's 50,000-row cap and comes back truncated, which makes the
+    /// daily totals short and the chart quietly wrong while looking entirely plausible.
     #[test]
-    fn the_archive_is_queried_by_its_own_tables_not_the_live_views() {
-        let live = delegation_events_since_sql(100);
-        let archive = legacy_delegation_events_since_sql(100);
-        assert!(live.contains("lodestar_delegations"));
+    fn the_flow_chart_is_aggregated_at_the_source() {
+        let sql = daily_flow_sql(0, i64::MAX, false);
+        assert!(sql.contains("GROUP BY 1"), "must aggregate in the nest");
+        assert!(sql.contains("SUM(CASE WHEN direction = 'inflow'"));
         assert!(
-            !archive.contains("lodestar_delegations"),
-            "the archive has no such view"
+            !sql.contains("lodestar_delegations"),
+            "the flow reads raw events, not the fold"
         );
+    }
+
+    /// The archive holds both eras; the live nest holds only Horizon. Asking the live nest for the
+    /// pre-Horizon tables is a 400.
+    #[test]
+    fn each_era_is_read_from_the_nest_that_has_it() {
+        let archive = daily_flow_sql(0, LEGACY_HISTORY_END_EXCLUSIVE, true);
+        let live = daily_flow_sql(LEGACY_HISTORY_END_EXCLUSIVE, i64::MAX, false);
         assert!(archive.contains("staking_legacy__stake_delegated"));
-        assert!(archive.contains("staking_legacy__stake_delegated_locked"));
-        // Same columns out, so the caller cannot tell which half it is reading.
-        for col in ["event_type", "indexer", "tokens"] {
-            assert!(
-                archive.contains(col),
-                "{col} missing from the archive query"
-            );
-        }
+        assert!(
+            !live.contains("staking_legacy__"),
+            "the live nest has no pre-Horizon tables"
+        );
+        assert!(live.contains("staking__tokens_delegated"));
+    }
+
+    /// Disjoint windows, so no day is counted twice and none is dropped.
+    #[test]
+    fn the_two_windows_meet_exactly_once() {
+        let archive = daily_flow_sql(0, LEGACY_HISTORY_END_EXCLUSIVE, true);
+        let live = daily_flow_sql(LEGACY_HISTORY_END_EXCLUSIVE, i64::MAX, false);
+        assert!(archive.contains(&format!("block_timestamp < {LEGACY_HISTORY_END_EXCLUSIVE}")));
+        assert!(live.contains(&format!(
+            "block_timestamp >= {LEGACY_HISTORY_END_EXCLUSIVE}"
+        )));
     }
 
     #[test]
