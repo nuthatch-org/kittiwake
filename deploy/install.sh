@@ -48,10 +48,14 @@ if [ ! -f "$ETC/config.toml" ]; then
 # Written by deploy/install.sh. Edit freely; re-running install will not overwrite it.
 bind = "127.0.0.1:8080"
 
-# Off until this instance has been watched for a while. Turning the scheduler on makes this process
-# the writer for Lodestar's Postgres, which is a decision rather than a default.
+# Both off on a fresh install, and both should be turned on deliberately.
+#
+# The scheduler makes this process the writer for Lodestar's Postgres, which is a decision rather
+# than a default. The warmer issues one fold per dataset per minute against the protocol nest; that
+# is a reduction in load once traffic moves here, but pure addition while nothing points at this
+# service yet, and the nest it would be adding to has been memory-exhausted once.
 scheduler_enabled = false
-warmer_enabled = true
+warmer_enabled = false
 
 # Left unset deliberately: the read routes need no database, and the Postgres password lives in the
 # platform's environment rather than on this box. Add it when the ingest jobs move over.
