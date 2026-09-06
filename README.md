@@ -45,18 +45,19 @@ Scuttlebutt, push, Lodie, signatures, the wasm disassembler). See `docs/migratio
 
 ## Measured
 
-Against a stand-in nest whose fold takes 1.5s, on a laptop:
+Release build, against a stand-in nest whose fold takes the 23,500 ms measured on production:
 
 | | |
 |---|---|
-| Cold read | 1.513 s (the fold itself) |
-| Warm read | 0.99 ms |
-| 20 concurrent cold readers of one uncached key | **1** nest query, 19 coalesced |
-| 200 requests against a 120/min budget | 25 served, 175 refused with `retry-after` |
+| Cold read | 23,506 ms - the fold itself, unchanged and unchangeable from here |
+| Warm p50 / p95 / p99 / max | 0.26 / 0.52 / 0.63 / 1.35 ms |
+| Warm throughput | 108,728 req/s at concurrency 32 |
+| 40 concurrent cold readers of one key | **1** nest query, all 40 answered |
+| Nest queries per warm request | 0.0002 |
 
-The real bar is in `docs/design.md`. The honest part of it: the nest's intrinsic cold fold does not
-get faster, because the nests are the contract and are off limits. The win is that a reader never
-meets one, and that each fold runs at most once per freshness window.
+Reproduce with `cargo run --bin kittiwake-bench`. The full comparison against the migration's
+acceptance bar, including the one number that deliberately does not improve, is in
+[`docs/benchmarks.md`](docs/benchmarks.md).
 
 ## Running it
 
@@ -123,6 +124,12 @@ crates/
 ```
 
 ## Deployment
+
+**Deployed on the Nuremberg primary since 2026-09-06**, on loopback behind Caddy, with the
+scheduler and warmer off until traffic moves. `deploy/install.sh` is idempotent and takes the nest
+credentials from the box rather than asking anyone to paste a secret. `deploy/build-linux.sh`
+builds inside Debian bookworm, because the obvious build host has a newer glibc than the target and
+its binaries will not run there.
 
 Nuremberg, beside Postgres and Redis, not Helsinki beside the nests: that box is 7.7 GB, already
 carries every nest with the protocol nest capped at 2 GB, and has been memory-exhausted once.
