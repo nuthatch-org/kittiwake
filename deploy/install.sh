@@ -98,10 +98,14 @@ fi
 
 install -m 0644 "$UNIT" /etc/systemd/system/kittiwake.service
 systemctl daemon-reload
-systemctl enable --now kittiwake
-sleep 2
+systemctl enable kittiwake
+# Restart rather than `enable --now`, which is a no-op on an already-running unit and would leave
+# the old binary serving after a perfectly successful-looking install. Learned the obvious way.
+systemctl restart kittiwake
+sleep 3
 systemctl --no-pager --lines=0 status kittiwake | head -5
 echo
+echo "running: $(readlink -f /proc/$(systemctl show kittiwake -p MainPID --value)/exe 2>/dev/null || echo unknown)"
 echo "smoke:"
 curl -fsS --max-time 5 http://127.0.0.1:8080/health && echo
 curl -fsS --max-time 20 http://127.0.0.1:8080/ready | head -c 400 && echo
