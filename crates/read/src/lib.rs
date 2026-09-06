@@ -113,8 +113,25 @@ impl ReadCtx {
         poll: Duration,
         fetch: ExternalFetcher,
     ) -> Result<Read, ApiError> {
+        self.cached_external_keyed(route, route, poll, fetch).await
+    }
+
+    /// As [`Self::cached_external`], but with a per-subject key: one entry per indexer rather than
+    /// one for the whole route.
+    pub async fn cached_external_keyed(
+        &self,
+        route: &'static str,
+        subject: &str,
+        poll: Duration,
+        fetch: ExternalFetcher,
+    ) -> Result<Read, ApiError> {
         let policy = CachePolicy::from_poll_interval(poll);
-        let key = kittiwake_cache::key(self.schema_version, "ext", route, &serde_json::json!({}));
+        let key = kittiwake_cache::key(
+            self.schema_version,
+            "ext",
+            route,
+            &serde_json::json!({ "subject": subject }),
+        );
 
         if let Some(entry) = self.store.get(&key).await {
             match classify(entry.age(), &policy) {

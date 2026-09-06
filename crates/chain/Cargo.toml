@@ -1,0 +1,17 @@
+[package]
+name = "kittiwake-chain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+alloy = { version = "2.4.1", features = ["provider-http", "sol-types", "contract", "rpc-types", "signers"] }
+kittiwake-types = { version = "0.1.0", path = "../types" }
+metrics = "0.24.6"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt", "time", "macros"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["full"] }

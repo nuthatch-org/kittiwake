@@ -87,6 +87,9 @@ impl Limits {
 pub struct AppState {
     pub read: ReadCtx,
     pub ext: kittiwake_ext::Ext,
+    /// Absent when no Arbitrum RPC is configured; the routes that need it say so rather than
+    /// silently returning nothing.
+    pub chain: Option<kittiwake_chain::Chain>,
     pub limits: Arc<Limits>,
     pub metrics: Option<kittiwake_obs::PrometheusHandle>,
     pub started: std::time::Instant,
@@ -152,7 +155,7 @@ impl From<ApiError> for ErrorResponse {
 /// Vercel's CDN caches rewritten external origins by upstream `Cache-Control` since April 2026.
 /// Every data route must therefore say `no-store`, or the edge will hold protocol figures past
 /// their freshness budget and our whole staleness model is decided by somebody else's cache.
-fn no_store(headers: &mut HeaderMap) {
+pub(crate) fn no_store(headers: &mut HeaderMap) {
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
 }
 
@@ -356,6 +359,11 @@ pub fn router(state: AppState) -> Router {
         // Direct Indexer Payments
         .route("/api/dips", get(handlers::dips))
         // The public SQL surface
+        .route("/api/reo", get(handlers::reo))
+        .route(
+            "/api/indexer-node-health",
+            get(handlers::indexer_node_health),
+        )
         .route("/api/price", get(handlers::price))
         .route("/api/tvl", get(handlers::tvl))
         // The public SQL surface
@@ -367,16 +375,19 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// Build the state the router needs.
+#[allow(clippy::too_many_arguments)]
 pub fn state(
     gate: NestGate,
     store: Store,
     schema_version: u32,
     limits: Limits,
     metrics: Option<kittiwake_obs::PrometheusHandle>,
+    chain: Option<kittiwake_chain::Chain>,
 ) -> AppState {
     AppState {
         read: ReadCtx::new(gate, store, schema_version),
         ext: kittiwake_ext::Ext::default(),
+        chain,
         limits: Arc::new(limits),
         metrics,
         started: std::time::Instant::now(),

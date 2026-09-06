@@ -18,12 +18,18 @@ service returns the same shape, ignoring the added `provenance` key.
 | 4 | `/gns`, `/dips`, `/dips-sepolia`, `/legacy-flows` reads | other nests, exercises multi-nest gate config | to do |
 | 5 | `/api/sql/*` | needs screening and receipts; independent of ingest | catalog and query done; named tier and receipts to do |
 | 6 | the seventeen ingest jobs | run both writing the same tables in shadow first, compare row deltas, then disable the platform crons | scheduler done, job bodies to do |
-| 7 | `/api/ens`, `price`, `tvl`, `reo`, `manifest`, `service-census`, `operator-preflight`, `delegate/recommend`, `indexer-node-health` | chain and third-party reads; the SSRF guard lands here | to do |
-| 8 | `/api/push/*` | signature verification, APNs, operator keys | to do |
-| 9 | `/api/studio/*` | sessions, deploy keys, IPFS, on-chain lifecycle | to do |
-| 10 | `/api/scuttlebutt/*` | streaming and moderation | to do |
-| 11 | the long tail | some of it droppable | to do |
-| 12 | frontend hooks | only now do the hooks change | to do |
+| 7 | `/api/price`, `tvl`, `reo`, `indexer-node-health` | chain and third-party reads; the SSRF guard lands here | **done**; `ens`, `manifest`, `service-census`, `operator-preflight`, `delegate/recommend` remain |
+| 8 | `/api/studio/*` | sessions, deploy keys, IPFS, on-chain lifecycle | to do |
+| 9 | `/api/scuttlebutt/*` | streaming and moderation | to do |
+| 10 | the long tail | some of it droppable | to do |
+| 11 | frontend hooks | only now do the hooks change | to do |
+
+## Discontinued, so not ported at all
+
+**Push notifications** (`/api/push/*`, APNs, Push Protocol) and **Lodie** (`/api/lodie/*`, the
+Ollama-backed assistant) were discontinued on 2026-09-06. Neither is in this service and neither
+should be added. Their tables can stay in Postgres until someone decides to drop them; nothing here
+reads or writes them.
 
 ## Two that should be rewritten rather than ported
 

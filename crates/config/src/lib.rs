@@ -108,6 +108,13 @@ pub struct Config {
     pub nest: NestSettings,
     /// Absent means the Postgres-backed routes report unavailable rather than pretending.
     pub database_url: Option<String>,
+    /// Arbitrum One JSON-RPC. Required for the oracle and supply reads; the routes that need it
+    /// report unavailable without it rather than reaching for a public endpoint that would
+    /// throttle under the directory's fan-out.
+    pub arbitrum_rpc_url: Option<String>,
+    /// Ethereum mainnet JSON-RPC. Optional: three public endpoints are tried in order when unset,
+    /// which is acceptable here because ENS is not a protocol figure.
+    pub mainnet_rpc_url: Option<String>,
     #[serde(default = "default_db_max_conns")]
     pub database_max_connections: u32,
     #[serde(default)]
@@ -199,6 +206,8 @@ mod tests {
                 cron_queue_timeout_secs: 120,
             },
             database_url: None,
+            arbitrum_rpc_url: None,
+            mainnet_rpc_url: None,
             database_max_connections: 16,
             cache: None,
             limits: None,

@@ -110,12 +110,29 @@ async fn main() -> anyhow::Result<()> {
         exempt,
     );
 
+    let chain = match cfg.arbitrum_rpc_url.as_deref() {
+        Some(url) => {
+            tracing::info!("arbitrum rpc configured");
+            Some(kittiwake_chain::Chain::new(
+                url,
+                cfg.mainnet_rpc_url.clone(),
+            ))
+        }
+        None => {
+            tracing::warn!(
+                "no arbitrum_rpc_url: the oracle and supply routes will report unavailable"
+            );
+            None
+        }
+    };
+
     let state = kittiwake_edge::state(
         gate.clone(),
         store.clone(),
         cache_cfg.schema_version,
         limits,
         metrics,
+        chain,
     );
     let limits_handle = state.limits.clone();
 

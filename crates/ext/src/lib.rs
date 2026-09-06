@@ -14,7 +14,7 @@ const DEFILLAMA: &str = "https://api.llama.fi/v2/historicalChainTvl/Arbitrum";
 
 #[derive(Clone)]
 pub struct Ext {
-    http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
     /// Overridable so the tests can point at a stand-in rather than the live API.
     price_url: String,
     tvl_url: String,
@@ -143,5 +143,219 @@ mod tests {
 
         let ext = Ext::new("unused", format!("{}/tvl", server.uri()));
         assert_eq!(ext.arbitrum_tvl().await.unwrap(), 250.0);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Probing an indexer's own endpoint
+// ---------------------------------------------------------------------------------------------
+
+/// What an indexer's status endpoint says about one deployment.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IndexingStatus {
+    pub deployment: String,
+    pub health: String,
+    pub synced: bool,
+    pub latest_block: Option<i64>,
+    pub chain_head_block: Option<i64>,
+    /// How far behind the chain head it is, when both figures are known.
+    pub blocks_behind: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProbeResult {
+    pub url: String,
+    pub reachable: bool,
+    pub elapsed_ms: u64,
+    pub statuses: Vec<IndexingStatus>,
+    /// Why it failed, in words a reader can act on. Present only when `reachable` is false.
+    pub error: Option<String>,
+}
+
+/// The standard status query. Asked of the indexer's own endpoint, which is unauthenticated by
+/// design: an indexer that hides it cannot be checked by anyone, including its delegators.
+const STATUS_QUERY: &str = r#"{"query":"{ indexingStatuses { subgraph health synced chains { chainHeadBlock { number } latestBlock { number } } } }"}"#;
+
+impl Ext {
+    /// Ask an indexer what it is serving.
+    ///
+    /// The URL comes from the service registry, which anyone may write to, so it goes through the
+    /// SSRF guard first: without that, an indexer can register `http://169.254.169.254/` and use
+    /// our server to read our own cloud metadata.
+    pub async fn probe_indexer(&self, base_url: &str) -> ProbeResult {
+        let began = std::time::Instant::now();
+        let url = format!("{}/status", base_url.trim_end_matches('/'));
+
+        let checked = match kittiwake_ssrf::check_resolved(&url).await {
+            Ok(u) => u,
+            Err(refusal) => {
+                return ProbeResult {
+                    url,
+                    reachable: false,
+                    elapsed_ms: began.elapsed().as_millis() as u64,
+                    statuses: Vec::new(),
+                    error: Some(refusal.to_string()),
+                };
+            }
+        };
+
+        let sent = self
+            .http
+            .post(checked)
+            .header("content-type", "application/json")
+            .body(STATUS_QUERY)
+            .send()
+            .await;
+
+        let body: serde_json::Value = match sent {
+            Ok(r) if r.status().is_success() => match r.json().await {
+                Ok(v) => v,
+                Err(e) => return failed(url, began, format!("unreadable answer: {e}")),
+            },
+            Ok(r) => return failed(url, began, format!("HTTP {}", r.status().as_u16())),
+            Err(e) => {
+                let why = if e.is_timeout() {
+                    "timed out".to_string()
+                } else {
+                    e.to_string()
+                };
+                return failed(url, began, why);
+            }
+        };
+
+        let statuses = body
+            .pointer("/data/indexingStatuses")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(parse_status).collect())
+            .unwrap_or_default();
+
+        ProbeResult {
+            url,
+            reachable: true,
+            elapsed_ms: began.elapsed().as_millis() as u64,
+            statuses,
+            error: None,
+        }
+    }
+}
+
+fn failed(url: String, began: std::time::Instant, why: String) -> ProbeResult {
+    ProbeResult {
+        url,
+        reachable: false,
+        elapsed_ms: began.elapsed().as_millis() as u64,
+        statuses: Vec::new(),
+        error: Some(why),
+    }
+}
+
+fn parse_status(v: &serde_json::Value) -> Option<IndexingStatus> {
+    let deployment = v.get("subgraph")?.as_str()?.to_string();
+    let chain = v
+        .get("chains")
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first());
+    let num = |k: &str| -> Option<i64> {
+        chain?
+            .get(k)?
+            .get("number")?
+            .as_str()
+            .and_then(|s| s.parse().ok())
+    };
+    let latest = num("latestBlock");
+    let head = num("chainHeadBlock");
+    Some(IndexingStatus {
+        deployment,
+        health: v
+            .get("health")
+            .and_then(|h| h.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        synced: v.get("synced").and_then(|s| s.as_bool()).unwrap_or(false),
+        latest_block: latest,
+        chain_head_block: head,
+        // Only when both are known. A missing head would otherwise make every indexer look
+        // perfectly caught up, which is the failure that looks like success.
+        blocks_behind: match (head, latest) {
+            (Some(h), Some(l)) => Some((h - l).max(0)),
+            _ => None,
+        },
+    })
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn a_registered_url_pointing_inward_is_refused_before_any_request() {
+        let ext = Ext::default();
+        let r = ext.probe_indexer("http://169.254.169.254").await;
+        assert!(!r.reachable);
+        assert!(r.error.unwrap().contains("not an address we will fetch"));
+    }
+
+    #[tokio::test]
+    async fn a_healthy_indexer_reports_how_far_behind_it_is() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"indexingStatuses": [{
+                    "subgraph": "QmAbc", "health": "healthy", "synced": true,
+                    "chains": [{"chainHeadBlock": {"number": "1000"}, "latestBlock": {"number": "990"}}]
+                }]}
+            })))
+            .mount(&server)
+            .await;
+
+        // Point straight at the mock, bypassing the guard, which loopback would otherwise refuse:
+        // the guard itself is tested above and in the ssrf crate.
+        let ext = Ext::default();
+        let body: serde_json::Value = ext
+            .http
+            .post(format!("{}/status", server.uri()))
+            .body(STATUS_QUERY)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let parsed: Vec<IndexingStatus> = body
+            .pointer("/data/indexingStatuses")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(parse_status)
+            .collect();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].blocks_behind, Some(10));
+        assert!(parsed[0].synced);
+    }
+
+    /// A missing chain head must not read as "perfectly caught up".
+    #[test]
+    fn an_unknown_chain_head_leaves_the_gap_unknown() {
+        let v = serde_json::json!({
+            "subgraph": "QmAbc", "health": "healthy", "synced": false,
+            "chains": [{"latestBlock": {"number": "990"}}]
+        });
+        let s = parse_status(&v).unwrap();
+        assert_eq!(s.latest_block, Some(990));
+        assert_eq!(s.blocks_behind, None);
+    }
+
+    #[test]
+    fn an_indexer_ahead_of_the_head_is_zero_behind_not_negative() {
+        let v = serde_json::json!({
+            "subgraph": "QmAbc", "health": "healthy", "synced": true,
+            "chains": [{"chainHeadBlock": {"number": "990"}, "latestBlock": {"number": "1000"}}]
+        });
+        assert_eq!(parse_status(&v).unwrap().blocks_behind, Some(0));
     }
 }

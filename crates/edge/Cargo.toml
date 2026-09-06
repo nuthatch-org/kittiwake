@@ -9,12 +9,14 @@ axum = { version = "0.8.9", features = ["macros", "json"] }
 governor = "0.10.4"
 http = "1.5.0"
 kittiwake-cache = { version = "0.1.0", path = "../cache" }
+kittiwake-chain = { version = "0.1.0", path = "../chain" }
 kittiwake-config = { version = "0.1.0", path = "../config" }
 kittiwake-db = { version = "0.1.0", path = "../db" }
 kittiwake-ext = { version = "0.1.0", path = "../ext" }
 kittiwake-nest = { version = "0.1.0", path = "../nest" }
 kittiwake-obs = { version = "0.1.0", path = "../obs" }
 kittiwake-read = { version = "0.1.0", path = "../read" }
+kittiwake-score = { version = "0.1.0", path = "../score" }
 kittiwake-sqlplay = { version = "0.1.0", path = "../sqlplay" }
 kittiwake-types = { version = "0.1.0", path = "../types" }
 metrics = "0.24.6"

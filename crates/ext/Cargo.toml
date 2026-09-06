@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 kittiwake-cache = { version = "0.1.0", path = "../cache" }
+kittiwake-ssrf = { version = "0.1.0", path = "../ssrf" }
 kittiwake-types = { version = "0.1.0", path = "../types" }
 metrics = "0.24.6"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "gzip", "http2", "charset", "query"] }

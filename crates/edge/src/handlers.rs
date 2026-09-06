@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::HeaderMap;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use kittiwake_read::routes;
 use kittiwake_types::ApiError;
 
@@ -486,4 +486,70 @@ pub async fn tvl(
         })
         .await?;
     Ok(envelope(read))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Chain reads and live probes
+// ---------------------------------------------------------------------------------------------
+
+/// `/api/reo`: the Rewards Eligibility Oracle's verdict on one indexer.
+///
+/// Cached for five minutes. This is a contract read, so it is true at one block and says nothing
+/// about any other; the age of the cache entry is the whole of what can honestly be said about how
+/// current it is, and that is what the envelope reports.
+pub async fn reo(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<AddressQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let address = q
+        .address
+        .ok_or_else(|| ApiError::BadRequest("address is required".into()))?;
+    let address = addr(&address);
+    let chain = st
+        .chain
+        .clone()
+        .ok_or_else(|| ApiError::Unavailable("no Arbitrum RPC is configured".into()))?;
+
+    let route_key = format!("reo:{address}");
+    let read = st
+        .read
+        .cached_external_keyed("reo", &route_key, std::time::Duration::from_secs(300), {
+            std::sync::Arc::new(move || {
+                let chain = chain.clone();
+                let address = address.clone();
+                Box::pin(async move {
+                    let e = chain.eligibility(&address).await?;
+                    Ok(serde_json::to_value(e).unwrap_or(serde_json::Value::Null))
+                })
+            })
+        })
+        .await?;
+    Ok(envelope(read))
+}
+
+#[derive(serde::Deserialize)]
+pub struct NodeHealthQuery {
+    pub url: String,
+}
+
+/// `/api/indexer-node-health`: ask an indexer's own status endpoint what it is serving.
+///
+/// The URL is supplied by the caller and, in the ordinary path, comes from the on-chain service
+/// registry, which anyone may write to. It goes through the SSRF guard before any request is made.
+/// Not cached by route: the point of this one is that it is live.
+pub async fn indexer_node_health(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<NodeHealthQuery>,
+) -> Result<Response, ErrorResponse> {
+    st.limits
+        .check(&st.limits.mutation, client_ip(peer, &headers))?;
+    let result = st.ext.probe_indexer(&q.url).await;
+    let mut resp = axum::Json(serde_json::json!({ "data": result })).into_response();
+    crate::no_store(resp.headers_mut());
+    Ok(resp)
 }

@@ -1,0 +1,13 @@
+[package]
+name = "kittiwake-ssrf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { version = "1.53.1", features = ["net", "time", "rt"] }
+tracing = "0.1.44"
+url = "2.5.8"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["full"] }

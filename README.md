@@ -34,14 +34,21 @@ Working, tested, and exercised end to end against a stand-in nest:
 | Scheduler: stagger, jitter, overlap, `cron_runs` | `sched` | done |
 | Warmer | `warmer` | list folds done; per-address hot set pending real traffic |
 | Postgres pool and `cron_runs` writer | `db` | done |
+| Ingest jobs: epochs, delegations, allocations, disputes, network snapshot | `ingest` | done; RAV and the chain-dependent jobs remain |
+| SSRF guard, with the DNS-rebinding check | `ssrf` | done |
+| The eleven-dimension composite score | `score` | done |
+| Chain reads: the eligibility oracle, GRT supply | `chain` | done |
+| Price, TVL, and probing an indexer's own status endpoint | `ext` | done |
 | Config, logging, metrics, health and readiness | `config`, `obs` | done |
 
-Three routes are live as the pattern for the rest: `/api/network-stats`, `/api/indexers`,
-`/api/epochs`, plus `/api/sql/catalog` and `/api/sql/query`.
+**Thirty-four routes are live**: every nest-backed read the dashboard makes, the public SQL
+surface, the price and TVL figures, the eligibility oracle, and a live indexer probe.
 
-Not built yet, in the migration's own order: the remaining `/alloc` reads, the other nests' reads,
-the seventeen ingest jobs, the chain and IPFS clients, then the product layer (the Dock,
-Scuttlebutt, push, Lodie, signatures, the wasm disassembler). See `docs/migration.md`.
+Not built yet, in the migration's own order: the RAV and chain-dependent ingest jobs, ENS, the
+service census and operator preflight, IPFS, then the product layer (the Dock, Scuttlebutt, the
+wasm disassembler, signatures). See `docs/migration.md`.
+
+**Push notifications and Lodie were discontinued on 2026-09-06** and are deliberately absent.
 
 ## Measured
 
@@ -115,6 +122,11 @@ crates/
   nest/     the only code that opens a socket to a nest
   cache/    freshness policy, keys, the in-process store
   db/       Postgres pool, cron_runs
+  ingest/   the nest-to-Postgres jobs
+  ssrf/     what may be fetched, and what may never be
+  score/    the composite indexer score
+  chain/    Arbitrum and mainnet contract reads
+  ext/      price, TVL, and probing an indexer's own endpoint
   read/     the cached read layer and the ported SQL
   sqlplay/  public SQL: allowlist and screening
   sched/    the ingest scheduler
