@@ -656,6 +656,25 @@ pub fn delegation_events_since_sql(since: i64) -> String {
     )
 }
 
+/// The pre-Horizon half of the delegation flow, from the frozen archive.
+///
+/// The archive is a raw event store, not a nest with the `lodestar_*` views: it carries
+/// `staking_legacy__stake_delegated` and `..._locked` and nothing folded on top. Asking it for
+/// `lodestar_delegations`, as the first version of this did, is a 400 from the nest and a broken
+/// chart. The output shape matches [`delegation_events_since_sql`] so the caller cannot tell the
+/// two halves apart.
+///
+/// `StakeDelegatedLocked` is the pre-Horizon undelegation: tokens leave the pool and are locked
+/// until a thawing period ends.
+///
+/// The archive holds 346,288 delegations spanning 2023-02-13 to 2025-12-09, so a recent window
+/// legitimately returns nothing from it. That is an empty result, not a failure.
+pub fn legacy_delegation_events_since_sql(since: i64) -> String {
+    format!(
+        "SELECT 'delegation' AS event_type, LOWER(indexer) AS indexer, CAST(tokens AS VARCHAR) AS tokens          FROM staking_legacy__stake_delegated WHERE block_timestamp > {since}          UNION ALL          SELECT 'undelegation', LOWER(indexer), CAST(tokens AS VARCHAR)          FROM staking_legacy__stake_delegated_locked WHERE block_timestamp > {since}"
+    )
+}
+
 pub fn closed_allocations_since_sql(since: i64) -> String {
     format!(
         "SELECT LOWER(indexer) AS indexer, CAST(indexing_delegator_rewards AS VARCHAR) AS indexing_delegator_rewards, closed_at \
@@ -789,6 +808,28 @@ mod tests {
         );
         assert!(sql.contains("(100), (200), (300)"));
         assert!(indexer_stake_history_sql(addr, &[]).is_none());
+    }
+
+    /// The two halves of the delegation flow come from different schemas and must not be asked
+    /// the same question.
+    #[test]
+    fn the_archive_is_queried_by_its_own_tables_not_the_live_views() {
+        let live = delegation_events_since_sql(100);
+        let archive = legacy_delegation_events_since_sql(100);
+        assert!(live.contains("lodestar_delegations"));
+        assert!(
+            !archive.contains("lodestar_delegations"),
+            "the archive has no such view"
+        );
+        assert!(archive.contains("staking_legacy__stake_delegated"));
+        assert!(archive.contains("staking_legacy__stake_delegated_locked"));
+        // Same columns out, so the caller cannot tell which half it is reading.
+        for col in ["event_type", "indexer", "tokens"] {
+            assert!(
+                archive.contains(col),
+                "{col} missing from the archive query"
+            );
+        }
     }
 
     #[test]
