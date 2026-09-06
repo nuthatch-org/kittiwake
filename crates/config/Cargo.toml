@@ -1,0 +1,11 @@
+[package]
+name = "kittiwake-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+figment = { version = "0.10.19", features = ["toml", "env"] }
+secrecy = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.20"

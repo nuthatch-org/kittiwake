@@ -1,0 +1,14 @@
+[package]
+name = "kittiwake-warmer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kittiwake-cache = { version = "0.1.0", path = "../cache" }
+kittiwake-nest = { version = "0.1.0", path = "../nest" }
+kittiwake-read = { version = "0.1.0", path = "../read" }
+kittiwake-types = { version = "0.1.0", path = "../types" }
+metrics = "0.24.6"
+tokio = { version = "1.53.1", features = ["sync", "time", "rt"] }
+tracing = "0.1.44"

@@ -1,0 +1,28 @@
+[package]
+name = "kittiwake-edge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum = { version = "0.8.9", features = ["macros", "json"] }
+governor = "0.10.4"
+http = "1.5.0"
+kittiwake-cache = { version = "0.1.0", path = "../cache" }
+kittiwake-config = { version = "0.1.0", path = "../config" }
+kittiwake-db = { version = "0.1.0", path = "../db" }
+kittiwake-nest = { version = "0.1.0", path = "../nest" }
+kittiwake-obs = { version = "0.1.0", path = "../obs" }
+kittiwake-read = { version = "0.1.0", path = "../read" }
+kittiwake-sqlplay = { version = "0.1.0", path = "../sqlplay" }
+kittiwake-types = { version = "0.1.0", path = "../types" }
+metrics = "0.24.6"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["sync", "time", "rt"] }
+tower = "0.5.3"
+tower-http = { version = "0.7.1", features = ["trace", "cors", "request-id", "util", "catch-panic", "timeout"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["full"] }

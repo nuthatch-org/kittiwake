@@ -1,0 +1,45 @@
+[Unit]
+Description=kittiwake (Lodestar backend)
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=kittiwake
+Group=kittiwake
+Environment=KITTIWAKE_CONFIG=/etc/kittiwake/config.toml
+ExecStart=/opt/kittiwake/bin/kittiwake
+# 0600 root:kittiwake. Connection strings and the nest password.
+EnvironmentFile=-/etc/kittiwake/env
+Restart=always
+RestartSec=2
+
+# This box also runs Postgres and Redis, which the service depends on. Taking memory from them
+# to cache their own answers would be a poor trade.
+MemoryHigh=768M
+MemoryMax=1G
+TasksMax=512
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/kittiwake
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Note for when the wasm disassembler lands: MemoryDenyWriteExecute=true breaks a JIT. Precompile
+# the module and deserialize it read-only, and this stays on. Do not silently drop it instead.
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,28 @@
+[package]
+name = "kittiwake"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kittiwake"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+chrono = "0.4.45"
+futures = "0.3.34"
+kittiwake-cache = { version = "0.1.0", path = "../cache" }
+kittiwake-config = { version = "0.1.0", path = "../config" }
+kittiwake-db = { version = "0.1.0", path = "../db" }
+kittiwake-edge = { version = "0.1.0", path = "../edge" }
+kittiwake-nest = { version = "0.1.0", path = "../nest" }
+kittiwake-obs = { version = "0.1.0", path = "../obs" }
+kittiwake-read = { version = "0.1.0", path = "../read" }
+kittiwake-sched = { version = "0.1.0", path = "../sched" }
+kittiwake-sqlplay = { version = "0.1.0", path = "../sqlplay" }
+kittiwake-types = { version = "0.1.0", path = "../types" }
+kittiwake-warmer = { version = "0.1.0", path = "../warmer" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tracing = "0.1.44"

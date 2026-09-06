@@ -1,0 +1,213 @@
+//! kittiwake: Lodestar's backend.
+//!
+//! One process, on purpose. The admission gate in front of the nests is only the truth if there is
+//! exactly one of it, and the previous service's per-process gate was meaningless precisely
+//! because the platform ran many copies. Splitting the API from the scheduler would reintroduce
+//! that fault, so both live here.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Context;
+use futures::future::BoxFuture;
+use kittiwake_cache::Store;
+use kittiwake_config::Config;
+use kittiwake_nest::{NestConfig, NestGate};
+use kittiwake_read::ReadCtx;
+use kittiwake_sched::{JobDef, JobOutcome, JobRun, RunRecorder, Scheduler};
+use kittiwake_types::NestId;
+
+/// Writes each run to `cron_runs`, which is where a failure that predates the current deployment
+/// can still be read. Platform logs only ever show the live deployment's window.
+struct PgRecorder(kittiwake_db::Pool);
+
+impl RunRecorder for PgRecorder {
+    fn record(&self, run: JobRun) -> BoxFuture<'static, ()> {
+        let pool = self.0.clone();
+        Box::pin(async move {
+            if let Err(e) = kittiwake_db::record_cron_run(
+                &pool,
+                run.job,
+                run.started_at,
+                run.duration,
+                run.success,
+                run.error.as_deref(),
+            )
+            .await
+            {
+                tracing::warn!(job = run.job, error = %e, "could not record the cron run");
+            }
+        })
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    kittiwake_obs::init_tracing();
+    let metrics = kittiwake_obs::init_metrics().ok();
+
+    let config_path =
+        std::env::var("KITTIWAKE_CONFIG").unwrap_or_else(|_| "/etc/kittiwake/config.toml".into());
+    let cfg = Config::load(&config_path)
+        .with_context(|| format!("loading configuration from {config_path}"))?;
+
+    tracing::info!(config = %config_path, nest = %cfg.nest.origin, bind = %cfg.bind, "starting");
+
+    // The gate. Every read, warm and cron passes through it, and its permits are sized to what
+    // each nest itself admits.
+    let mut nest_cfg = NestConfig::new(cfg.nest.origin.clone())
+        .with_auth(cfg.nest.user.clone(), cfg.nest.password.clone());
+    nest_cfg.read_queue_timeout = cfg.read_queue_timeout();
+    nest_cfg.cron_queue_timeout = cfg.cron_queue_timeout();
+    for nest in NestId::ALL {
+        if let Some(p) = cfg.nest.base_paths.get(nest.as_str()) {
+            nest_cfg.base_paths.insert(nest, p.clone());
+        }
+        if let Some(n) = cfg.nest.permits.get(nest.as_str()) {
+            nest_cfg.permits.insert(nest, *n);
+        }
+    }
+    let gate = NestGate::new(nest_cfg).map_err(|e| anyhow::anyhow!("building nest client: {e}"))?;
+
+    let cache_cfg = cfg.cache();
+    let store = Store::new(cache_cfg.max_entries);
+    let read = ReadCtx::new(gate.clone(), store.clone(), cache_cfg.schema_version);
+
+    let pool = match cfg.database_url.as_deref() {
+        Some(url) => {
+            let pool = kittiwake_db::connect(url, cfg.database_max_connections)
+                .await
+                .context("connecting to Postgres")?;
+            kittiwake_db::ping(&pool)
+                .await
+                .context("first query against Postgres")?;
+            tracing::info!(
+                max_connections = cfg.database_max_connections,
+                "postgres ready"
+            );
+            Some(pool)
+        }
+        None => {
+            tracing::warn!("no database_url: the Postgres-backed routes will report unavailable");
+            None
+        }
+    };
+
+    let limit_cfg = cfg.limits();
+    let exempt = limit_cfg
+        .exempt_ips
+        .iter()
+        .filter_map(|s| s.parse().ok())
+        .collect::<Vec<_>>();
+    let limits = kittiwake_edge::Limits::new(
+        limit_cfg.sql_per_minute,
+        limit_cfg.read_per_minute,
+        limit_cfg.mutation_per_minute,
+        exempt,
+    );
+
+    let state = kittiwake_edge::state(
+        gate.clone(),
+        store.clone(),
+        cache_cfg.schema_version,
+        limits,
+        metrics,
+    );
+    let limits_handle = state.limits.clone();
+
+    // Keyed rate-limit state grows with distinct callers; sweep the idle ones periodically so a
+    // long uptime against a wide address range cannot grow it without bound.
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(300));
+        loop {
+            tick.tick().await;
+            limits_handle.sweep();
+        }
+    });
+
+    let mut handles = Vec::new();
+
+    if cfg.warmer_enabled || cfg.scheduler_enabled {
+        let recorder: Arc<dyn RunRecorder> = match &pool {
+            Some(p) => Arc::new(PgRecorder(p.clone())),
+            None => Arc::new(kittiwake_sched::NoopRecorder),
+        };
+        let mut scheduler = Scheduler::new(gate.clone(), recorder);
+        let mut jobs: Vec<JobDef> = Vec::new();
+
+        if cfg.warmer_enabled {
+            let warm_ctx = read.clone();
+            jobs.push(JobDef::every(
+                "warm",
+                Duration::from_secs(60),
+                Arc::new(move |_ctx| {
+                    let ctx = warm_ctx.clone();
+                    Box::pin(async move {
+                        let report = kittiwake_warmer::warm_all(&ctx).await;
+                        Ok(JobOutcome {
+                            rows_written: report.warmed,
+                        })
+                    })
+                }),
+            ));
+        }
+
+        if cfg.scheduler_enabled {
+            // The seventeen ingest jobs land here as they are ported, each staggered off the
+            // others so no two ever contend for the same permit. See the migration order in
+            // docs/migration.md.
+            tracing::info!("scheduler enabled; ingest jobs are ported incrementally");
+        }
+
+        handles.extend(scheduler.spawn_all(jobs));
+        std::mem::forget(scheduler);
+    }
+
+    let app = kittiwake_edge::router(state);
+    let addr: SocketAddr = cfg
+        .bind
+        .parse()
+        .with_context(|| format!("bind address {}", cfg.bind))?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding {addr}"))?;
+    tracing::info!(%addr, "listening");
+
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown())
+    .await
+    .context("serving")?;
+
+    for h in handles {
+        h.abort();
+    }
+    tracing::info!("stopped");
+    Ok(())
+}
+
+/// SIGTERM as well as ctrl-c: systemd sends the former, and a unit that only handles the latter
+/// gets killed rather than drained.
+async fn shutdown() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            s.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("shutdown signal received, draining");
+}

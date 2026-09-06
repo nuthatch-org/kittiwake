@@ -1,0 +1,44 @@
+# kittiwake configuration. Every value here is overridable by environment, prefixed KITTIWAKE_
+# with __ for nesting: KITTIWAKE_NEST__ORIGIN, KITTIWAKE_DATABASE_URL, and so on.
+
+bind = "127.0.0.1:8080"
+
+# Off by default. Two instances both scheduling against one Postgres is a data problem, so turning
+# these on is a deliberate act on exactly one box.
+scheduler_enabled = false
+warmer_enabled = true
+
+# Absent means the Postgres-backed routes report unavailable rather than pretending.
+# database_url = "postgresql://lodestar:...@127.0.0.1:5433/lodestar?sslmode=require"
+database_max_connections = 16
+
+[nest]
+# Required. There is no second source.
+origin = "https://nuthatch.example.sslip.io"
+user = "lodestar"
+password = ""
+
+# Only needed when a nest is staged somewhere other than its usual path.
+# [nest.base_paths]
+# alloc = "/alloc-next"
+
+# Must not exceed what the nest itself admits. The protocol nest runs with
+# NUTHATCH_SQL_MAX_CONCURRENCY=4 by drop-in; the rest admit two.
+[nest.permits]
+alloc = 4
+gns = 2
+dips = 2
+"dips-sepolia" = 2
+"legacy-flows" = 2
+
+[cache]
+max_entries = 8192
+# Bump to retire every key at once when a response shape changes.
+schema_version = 1
+
+[limits]
+sql_per_minute = 10
+read_per_minute = 120
+mutation_per_minute = 30
+# Foghorn's hourly read. Its reads still go through the cache, so it adds close to zero nest load.
+exempt_ips = []

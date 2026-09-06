@@ -1,0 +1,14 @@
+# The only hop allowed to set X-Forwarded-For. The service honours that header solely from a
+# loopback peer, so a caller cannot choose their own rate-limit bucket by sending one.
+api.lodestar-dashboard.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8080 {
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+	}
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+	}
+}
