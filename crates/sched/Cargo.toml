@@ -9,6 +9,7 @@ chrono = "0.4.45"
 cron = "0.17.0"
 futures = "0.3.34"
 kittiwake-db = { version = "0.1.0", path = "../db" }
+kittiwake-ingest = { version = "0.1.0", path = "../ingest" }
 kittiwake-nest = { version = "0.1.0", path = "../nest" }
 kittiwake-types = { version = "0.1.0", path = "../types" }
 metrics = "0.24.6"

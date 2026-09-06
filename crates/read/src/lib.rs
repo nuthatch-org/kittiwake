@@ -30,6 +30,11 @@ pub struct ReadCtx {
     pub schema_version: u32,
 }
 
+/// A source that is not a nest: it has no provenance of its own, so the age of the cache entry is
+/// the whole of what we can say about how current it is.
+pub type ExternalFetcher =
+    Arc<dyn Fn() -> BoxFuture<'static, Result<serde_json::Value, ApiError>> + Send + Sync>;
+
 /// A cached answer and the record of how it was delivered.
 pub struct Read {
     pub entry: Arc<Entry>,
@@ -94,6 +99,53 @@ impl ReadCtx {
 
         let entry = self.fetch_and_store(&key, nest, fetch, Lane::Read).await?;
         let meta = entry.meta(ServedFrom::Nest, false);
+        Ok(Read { entry, meta })
+    }
+
+    /// Read something that is not a nest: a price, a TVL figure.
+    ///
+    /// No readiness check, because there is nothing to ask; no nest provenance, because there is
+    /// none to carry. The freshness rules are otherwise identical, including that a failure is
+    /// reported rather than papered over with the last known value.
+    pub async fn cached_external(
+        &self,
+        route: &'static str,
+        poll: Duration,
+        fetch: ExternalFetcher,
+    ) -> Result<Read, ApiError> {
+        let policy = CachePolicy::from_poll_interval(poll);
+        let key = kittiwake_cache::key(self.schema_version, "ext", route, &serde_json::json!({}));
+
+        if let Some(entry) = self.store.get(&key).await {
+            match classify(entry.age(), &policy) {
+                Freshness::Fresh => {
+                    let meta = entry.meta(ServedFrom::Chain, false);
+                    return Ok(Read { entry, meta });
+                }
+                Freshness::Stale => {
+                    let ctx = self.clone();
+                    let key2 = key.clone();
+                    let f = fetch.clone();
+                    tokio::spawn(async move {
+                        if let Ok(v) = f().await {
+                            ctx.store
+                                .insert(key2, Entry::new(v, Provenance::default()))
+                                .await;
+                        }
+                    });
+                    let meta = entry.meta(ServedFrom::Chain, true);
+                    return Ok(Read { entry, meta });
+                }
+                Freshness::Expired => {}
+            }
+        }
+
+        let value = fetch().await?;
+        let entry = self
+            .store
+            .insert(key, Entry::new(value, Provenance::default()))
+            .await;
+        let meta = entry.meta(ServedFrom::Chain, false);
         Ok(Read { entry, meta })
     }
 

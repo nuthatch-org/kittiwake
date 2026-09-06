@@ -9,6 +9,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod jobs;
+
 use anyhow::Context;
 use futures::future::BoxFuture;
 use kittiwake_cache::Store;
@@ -32,6 +34,7 @@ impl RunRecorder for PgRecorder {
                 run.started_at,
                 run.duration,
                 run.success,
+                run.rows_written as i64,
                 run.error.as_deref(),
             )
             .await
@@ -154,10 +157,16 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if cfg.scheduler_enabled {
-            // The seventeen ingest jobs land here as they are ported, each staggered off the
-            // others so no two ever contend for the same permit. See the migration order in
-            // docs/migration.md.
-            tracing::info!("scheduler enabled; ingest jobs are ported incrementally");
+            match &pool {
+                Some(p) => {
+                    let ingest = jobs::ingest_jobs(p.clone(), kittiwake_ext::Ext::default());
+                    tracing::info!(count = ingest.len(), "ingest jobs scheduled");
+                    jobs.extend(ingest);
+                }
+                None => tracing::warn!(
+                    "scheduler_enabled with no database_url: the ingest jobs have nowhere to write,                      so none were scheduled"
+                ),
+            }
         }
 
         handles.extend(scheduler.spawn_all(jobs));

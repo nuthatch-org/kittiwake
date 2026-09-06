@@ -86,6 +86,7 @@ impl Limits {
 #[derive(Clone)]
 pub struct AppState {
     pub read: ReadCtx,
+    pub ext: kittiwake_ext::Ext,
     pub limits: Arc<Limits>,
     pub metrics: Option<kittiwake_obs::PrometheusHandle>,
     pub started: std::time::Instant,
@@ -355,6 +356,9 @@ pub fn router(state: AppState) -> Router {
         // Direct Indexer Payments
         .route("/api/dips", get(handlers::dips))
         // The public SQL surface
+        .route("/api/price", get(handlers::price))
+        .route("/api/tvl", get(handlers::tvl))
+        // The public SQL surface
         .route("/api/sql/catalog", get(get_sql_catalog))
         .route("/api/sql/query", post(post_sql_query))
         .layer(tower_http::trace::TraceLayer::new_for_http())
@@ -372,6 +376,7 @@ pub fn state(
 ) -> AppState {
     AppState {
         read: ReadCtx::new(gate, store, schema_version),
+        ext: kittiwake_ext::Ext::default(),
         limits: Arc::new(limits),
         metrics,
         started: std::time::Instant::now(),

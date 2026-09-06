@@ -17,6 +17,8 @@ kittiwake-cache = { version = "0.1.0", path = "../cache" }
 kittiwake-config = { version = "0.1.0", path = "../config" }
 kittiwake-db = { version = "0.1.0", path = "../db" }
 kittiwake-edge = { version = "0.1.0", path = "../edge" }
+kittiwake-ext = { version = "0.1.0", path = "../ext" }
+kittiwake-ingest = { version = "0.1.0", path = "../ingest" }
 kittiwake-nest = { version = "0.1.0", path = "../nest" }
 kittiwake-obs = { version = "0.1.0", path = "../obs" }
 kittiwake-read = { version = "0.1.0", path = "../read" }

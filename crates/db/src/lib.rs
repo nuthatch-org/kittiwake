@@ -42,15 +42,17 @@ pub async fn record_cron_run(
     started_at: chrono::DateTime<chrono::Utc>,
     duration: Duration,
     success: bool,
+    rows_affected: i64,
     error: Option<&str>,
 ) -> Result<(), DbError> {
     sqlx::query(
-        "INSERT INTO cron_runs (step, started_at, duration_ms, success, error_message) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO cron_runs (step, started_at, duration_ms, rows_affected, success, error_message) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(step)
     .bind(started_at)
-    .bind(duration.as_millis() as i64)
+    .bind(duration.as_millis() as i32)
+    .bind(rows_affected as i32)
     .bind(success)
     .bind(error)
     .execute(pool)

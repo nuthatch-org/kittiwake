@@ -435,3 +435,55 @@ pub async fn dips(
     let sepolia = q.network.as_deref() == Some("sepolia");
     Ok(envelope(routes::dips(&st.read, sepolia).await?))
 }
+
+// ---------------------------------------------------------------------------------------------
+// Outside sources
+// ---------------------------------------------------------------------------------------------
+
+/// `/api/price`. Cached hard, because a price API is rate-limited and a page of protocol figures
+/// must never be late because of one. When the source is down this reports the failure rather than
+/// serving an old price as a current one.
+pub async fn price(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let read = st
+        .read
+        .cached_external("price", std::time::Duration::from_secs(60), {
+            let ext = st.ext.clone();
+            std::sync::Arc::new(move || {
+                let ext = ext.clone();
+                Box::pin(async move {
+                    let (usd, change) = ext.grt_price().await?;
+                    Ok(serde_json::json!({ "usd": usd, "change24h": change }))
+                })
+            })
+        })
+        .await?;
+    Ok(envelope(read))
+}
+
+/// `/api/tvl`.
+pub async fn tvl(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let read = st
+        .read
+        .cached_external("tvl", std::time::Duration::from_secs(600), {
+            let ext = st.ext.clone();
+            std::sync::Arc::new(move || {
+                let ext = ext.clone();
+                Box::pin(async move {
+                    let tvl = ext.arbitrum_tvl().await?;
+                    Ok(serde_json::json!({ "chain": "Arbitrum", "tvlUsd": tvl }))
+                })
+            })
+        })
+        .await?;
+    Ok(envelope(read))
+}
