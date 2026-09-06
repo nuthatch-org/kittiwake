@@ -90,6 +90,8 @@ pub struct AppState {
     /// Absent when no Arbitrum RPC is configured; the routes that need it say so rather than
     /// silently returning nothing.
     pub chain: Option<kittiwake_chain::Chain>,
+    /// Absent when no database is configured; the routes that need one say so.
+    pub pool: Option<kittiwake_db::Pool>,
     pub limits: Arc<Limits>,
     pub metrics: Option<kittiwake_obs::PrometheusHandle>,
     pub started: std::time::Instant,
@@ -359,6 +361,7 @@ pub fn router(state: AppState) -> Router {
         // Direct Indexer Payments
         .route("/api/dips", get(handlers::dips))
         // The public SQL surface
+        .route("/api/indexers-enriched", get(handlers::indexers_enriched))
         .route("/api/reo", get(handlers::reo))
         .route(
             "/api/indexer-node-health",
@@ -383,11 +386,13 @@ pub fn state(
     limits: Limits,
     metrics: Option<kittiwake_obs::PrometheusHandle>,
     chain: Option<kittiwake_chain::Chain>,
+    pool: Option<kittiwake_db::Pool>,
 ) -> AppState {
     AppState {
         read: ReadCtx::new(gate, store, schema_version),
         ext: kittiwake_ext::Ext::default(),
         chain,
+        pool,
         limits: Arc::new(limits),
         metrics,
         started: std::time::Instant::now(),

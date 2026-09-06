@@ -6,9 +6,13 @@ license.workspace = true
 
 [dependencies]
 chrono = "0.4.45"
+futures = "0.3.34"
+kittiwake-chain = { version = "0.1.0", path = "../chain" }
 kittiwake-db = { version = "0.1.0", path = "../db" }
 kittiwake-nest = { version = "0.1.0", path = "../nest" }
 kittiwake-read = { version = "0.1.0", path = "../read" }
+kittiwake-rewards = { version = "0.1.0", path = "../rewards" }
+kittiwake-score = { version = "0.1.0", path = "../score" }
 kittiwake-types = { version = "0.1.0", path = "../types" }
 metrics = "0.24.6"
 serde = { version = "1.0.229", features = ["derive"] }

@@ -553,3 +553,38 @@ pub async fn indexer_node_health(
     crate::no_store(resp.headers_mut());
     Ok(resp)
 }
+
+/// `/api/indexers-enriched`: the directory with scores, read from the rows the refresh job wrote.
+///
+/// Postgres rather than the nest, deliberately. The score folds six nest reads and an oracle call
+/// per indexer; recomputing that per page view would spend the nest's whole permit budget on one
+/// table. The freshness of the answer is the freshness of the job, which is what `lastUpdated`
+/// on each row reports.
+pub async fn indexers_enriched(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<ListQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let pool = st
+        .pool
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("no database is configured".into()))?;
+
+    let rows = kittiwake_db::enriched_indexers(pool, q.first.clamp(1, 1000))
+        .await
+        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+
+    let mut resp = axum::Json(serde_json::json!({
+        "data": rows,
+        "provenance": { "served_from": "postgres", "stale": false, "age_seconds": 0 },
+    }))
+    .into_response();
+    resp.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-kittiwake-served-from"),
+        axum::http::HeaderValue::from_static("postgres"),
+    );
+    crate::no_store(resp.headers_mut());
+    Ok(resp)
+}

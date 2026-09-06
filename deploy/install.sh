@@ -62,6 +62,11 @@ warmer_enabled = false
 # database_url = "postgresql://lodestar:...@127.0.0.1:5433/lodestar?sslmode=require"
 database_max_connections = 16
 
+# The eligibility oracle and the GRT supply need this. Use the same value as the platform's
+# ARBITRUM_RPC_URL - a keyed endpoint, not a public one. The refresh job makes one oracle call per
+# indexer, and the free endpoints answer a handful per minute before refusing.
+# arbitrum_rpc_url = "https://arb-mainnet.g.alchemy.com/v2/..."
+
 [nest]
 origin = "$NEST_ORIGIN"
 user = "$NEST_USER"

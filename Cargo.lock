@@ -3123,9 +3123,13 @@ name = "kittiwake-ingest"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures",
+ "kittiwake-chain",
  "kittiwake-db",
  "kittiwake-nest",
  "kittiwake-read",
+ "kittiwake-rewards",
+ "kittiwake-score",
  "kittiwake-types",
  "metrics",
  "serde",
@@ -3182,6 +3186,13 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "kittiwake-rewards"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

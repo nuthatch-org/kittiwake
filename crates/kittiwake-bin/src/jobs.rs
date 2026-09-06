@@ -24,8 +24,39 @@ fn mins(n: u64) -> Duration {
 /// The offsets are the same ones the platform schedules encoded, kept so a comparison between the
 /// two systems is like for like: epochs at :03 past every ten minutes, delegations at :08 past
 /// every fifteen, allocations at :13 past the hour, and so on.
-pub fn ingest_jobs(pool: Pool, ext: Ext) -> Vec<JobDef> {
+pub fn ingest_jobs(pool: Pool, ext: Ext, chain: Option<kittiwake_chain::Chain>) -> Vec<JobDef> {
     let mut jobs = Vec::new();
+
+    {
+        let pool = pool.clone();
+        let chain = chain.clone();
+        jobs.push(JobDef::every(
+            "refresh",
+            mins(5),
+            Arc::new(move |ctx| {
+                let pool = pool.clone();
+                let chain = chain.clone();
+                Box::pin(async move {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    kittiwake_ingest::refresh::refresh(
+                        &pool,
+                        &ctx.gate,
+                        ctx.lane,
+                        chain.as_ref(),
+                        now,
+                    )
+                    .await
+                    .map(|i| JobOutcome {
+                        rows_written: i.rows,
+                    })
+                    .map_err(|e| e.to_string())
+                })
+            }),
+        ));
+    }
 
     {
         let pool = pool.clone();
@@ -161,6 +192,7 @@ mod tests {
             ("ingest-delegations", mins(15), mins(8)),
             ("ingest-allocations", mins(60), mins(13)),
             ("ingest-disputes", mins(360), Duration::ZERO),
+            ("refresh", mins(5), Duration::ZERO),
             ("snapshot-network", mins(5), mins(2)),
             ("warm", mins(1), Duration::ZERO),
         ];

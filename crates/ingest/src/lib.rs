@@ -11,6 +11,7 @@ use kittiwake_db::Pool;
 use kittiwake_nest::{Lane, NestGate, QuerySpec, SqlAnswer};
 use kittiwake_types::NestId;
 
+pub mod refresh;
 pub mod state;
 
 #[derive(Debug, thiserror::Error)]
@@ -24,7 +25,7 @@ pub enum IngestError {
 }
 
 /// One page of rows from a nest, with the truncation check every caller would otherwise forget.
-async fn page(
+pub(crate) async fn page(
     gate: &NestGate,
     nest: NestId,
     sql: String,
@@ -44,7 +45,7 @@ async fn page(
     Ok(answer)
 }
 
-fn s(v: &serde_json::Value, k: &str) -> Option<String> {
+pub(crate) fn s(v: &serde_json::Value, k: &str) -> Option<String> {
     match v.get(k)? {
         serde_json::Value::String(s) => Some(s.clone()),
         serde_json::Value::Number(n) => Some(n.to_string()),
@@ -52,7 +53,7 @@ fn s(v: &serde_json::Value, k: &str) -> Option<String> {
     }
 }
 
-fn i(v: &serde_json::Value, k: &str) -> Option<i64> {
+pub(crate) fn i(v: &serde_json::Value, k: &str) -> Option<i64> {
     match v.get(k)? {
         serde_json::Value::Number(n) => n.as_i64(),
         serde_json::Value::String(s) => s.parse().ok(),

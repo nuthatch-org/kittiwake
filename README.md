@@ -39,9 +39,11 @@ Working, tested, and exercised end to end against a stand-in nest:
 | The eleven-dimension composite score | `score` | done |
 | Chain reads: the eligibility oracle, GRT supply | `chain` | done |
 | Price, TVL, and probing an indexer's own status endpoint | `ext` | done |
+| Delegator APR, realised return, pool exchange rate, capacity | `rewards` | done |
+| The refresh pipeline that writes the scored directory | `ingest` | done |
 | Config, logging, metrics, health and readiness | `config`, `obs` | done |
 
-**Thirty-four routes are live**: every nest-backed read the dashboard makes, the public SQL
+**Thirty-five routes are live**: every nest-backed read the dashboard makes, the public SQL
 surface, the price and TVL figures, the eligibility oracle, and a live indexer probe.
 
 Not built yet, in the migration's own order: the RAV and chain-dependent ingest jobs, ENS, the
@@ -127,6 +129,7 @@ crates/
   score/    the composite indexer score
   chain/    Arbitrum and mainnet contract reads
   ext/      price, TVL, and probing an indexer's own endpoint
+  rewards/  what a delegator actually earns
   read/     the cached read layer and the ported SQL
   sqlplay/  public SQL: allowlist and screening
   sched/    the ingest scheduler

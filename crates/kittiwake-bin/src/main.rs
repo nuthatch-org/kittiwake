@@ -132,7 +132,8 @@ async fn main() -> anyhow::Result<()> {
         cache_cfg.schema_version,
         limits,
         metrics,
-        chain,
+        chain.clone(),
+        pool.clone(),
     );
     let limits_handle = state.limits.clone();
 
@@ -176,7 +177,8 @@ async fn main() -> anyhow::Result<()> {
         if cfg.scheduler_enabled {
             match &pool {
                 Some(p) => {
-                    let ingest = jobs::ingest_jobs(p.clone(), kittiwake_ext::Ext::default());
+                    let ingest =
+                        jobs::ingest_jobs(p.clone(), kittiwake_ext::Ext::default(), chain.clone());
                     tracing::info!(count = ingest.len(), "ingest jobs scheduled");
                     jobs.extend(ingest);
                 }
