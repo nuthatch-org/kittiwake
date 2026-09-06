@@ -10,8 +10,10 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod handlers;
+
 use axum::Router;
-use axum::extract::{ConnectInfo, Query, State};
+use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -20,10 +22,10 @@ use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
 use kittiwake_cache::Store;
 use kittiwake_nest::NestGate;
-use kittiwake_read::{ReadCtx, routes};
+use kittiwake_read::ReadCtx;
 use kittiwake_types::{ApiError, Meta, NestId};
 
-type Limiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
+pub(crate) type Limiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
 
 /// One budget class. Separate limiters rather than one shared: a crawler exhausting the public SQL
 /// budget must not also lock the dashboard's own reads out.
@@ -57,7 +59,7 @@ impl Limits {
         }
     }
 
-    fn check(&self, limiter: &Limiter, ip: IpAddr) -> Result<(), ApiError> {
+    pub(crate) fn check(&self, limiter: &Limiter, ip: IpAddr) -> Result<(), ApiError> {
         if self.exempt.contains(&ip) {
             return Ok(());
         }
@@ -94,7 +96,7 @@ pub struct AppState {
 /// `X-Forwarded-For` is honoured **only** when the immediate peer is loopback, which is the only
 /// case where the header was written by our own Caddy rather than by the caller. Trusting it
 /// unconditionally would let anyone choose their own rate-limit bucket.
-fn client_ip(peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+pub(crate) fn client_ip(peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
     let peer_ip = peer.ip();
     if !peer_ip.is_loopback() {
         return peer_ip;
@@ -175,7 +177,7 @@ fn provenance_headers(headers: &mut HeaderMap, meta: &Meta) {
 }
 
 /// Wrap a cached read as the response every data route returns.
-fn envelope(read: kittiwake_read::Read) -> Response {
+pub(crate) fn envelope(read: kittiwake_read::Read) -> Response {
     let body = serde_json::json!({
         "data": &*read.entry.value,
         "provenance": &read.meta,
@@ -184,79 +186,6 @@ fn envelope(read: kittiwake_read::Read) -> Response {
     provenance_headers(resp.headers_mut(), &read.meta);
     no_store(resp.headers_mut());
     resp
-}
-
-#[derive(serde::Deserialize)]
-pub struct IndexersQuery {
-    #[serde(default = "d_first")]
-    first: i64,
-    #[serde(default)]
-    skip: i64,
-    #[serde(default = "d_order")]
-    order_by: String,
-    #[serde(default = "d_dir")]
-    order_direction: String,
-}
-
-fn d_first() -> i64 {
-    100
-}
-fn d_order() -> String {
-    "stakedTokens".into()
-}
-fn d_dir() -> String {
-    "desc".into()
-}
-
-async fn get_indexers(
-    State(st): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Query(q): Query<IndexersQuery>,
-) -> Result<Response, ErrorResponse> {
-    st.limits
-        .check(&st.limits.read, client_ip(peer, &headers))?;
-    let read = routes::indexers(
-        &st.read,
-        routes::IndexersParams {
-            first: q.first,
-            skip: q.skip,
-            order_by: q.order_by,
-            descending: q.order_direction != "asc",
-        },
-    )
-    .await?;
-    Ok(envelope(read))
-}
-
-#[derive(serde::Deserialize)]
-pub struct EpochsQuery {
-    #[serde(default = "d_epochs")]
-    count: i64,
-}
-fn d_epochs() -> i64 {
-    20
-}
-
-async fn get_epochs(
-    State(st): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Query(q): Query<EpochsQuery>,
-) -> Result<Response, ErrorResponse> {
-    st.limits
-        .check(&st.limits.read, client_ip(peer, &headers))?;
-    Ok(envelope(routes::epochs(&st.read, q.count).await?))
-}
-
-async fn get_network_stats(
-    State(st): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-) -> Result<Response, ErrorResponse> {
-    st.limits
-        .check(&st.limits.read, client_ip(peer, &headers))?;
-    Ok(envelope(routes::network_stats(&st.read).await?))
 }
 
 async fn get_sql_catalog(State(_st): State<AppState>) -> Response {
@@ -369,15 +298,65 @@ async fn get_metrics(State(st): State<AppState>) -> Response {
 }
 
 pub fn router(state: AppState) -> Router {
+    use axum::routing::post;
     Router::new()
         .route("/health", get(get_health))
         .route("/ready", get(get_ready))
         .route("/metrics", get(get_metrics))
-        .route("/api/network-stats", get(get_network_stats))
-        .route("/api/indexers", get(get_indexers))
-        .route("/api/epochs", get(get_epochs))
+        // The directory and the network
+        .route("/api/indexers", get(handlers::indexers))
+        .route("/api/indexer/{address}", get(handlers::indexer))
+        .route(
+            "/api/indexer-status/{address}",
+            get(handlers::indexer_status),
+        )
+        .route(
+            "/api/apr-provenance/{address}",
+            get(handlers::apr_provenance),
+        )
+        .route(
+            "/api/indexer-stake-history/{address}",
+            get(handlers::indexer_stake_history),
+        )
+        .route("/api/curators", get(handlers::curators))
+        .route("/api/epochs", get(handlers::epochs))
+        .route("/api/network-stats", get(handlers::network_stats))
+        // Same fold, different panel: one cache entry serves both.
+        .route("/api/grt-flow", get(handlers::network_stats))
+        .route("/api/token-metrics", get(handlers::token_metrics))
+        // Positions
+        .route("/api/portfolio", get(handlers::portfolio))
+        .route("/api/rewards-history", get(handlers::rewards_history))
+        .route("/api/provisions", get(handlers::provisions))
+        .route("/api/payments", get(handlers::payments))
+        .route("/api/poi", get(handlers::poi))
+        // Activity
+        .route("/api/delegation-events", get(handlers::delegation_events))
+        .route("/api/delegation-flows", get(handlers::delegation_flows))
+        .route("/api/developer-activity", get(handlers::developer_activity))
+        // Subgraphs
+        .route(
+            "/api/subgraph-deployments",
+            get(handlers::subgraph_deployments),
+        )
+        .route("/api/subgraph-fees-30d", get(handlers::subgraph_fees_30d))
+        .route(
+            "/api/subgraph-curation/{hash}",
+            get(handlers::subgraph_curation),
+        )
+        .route(
+            "/api/subgraph-history/{hash}",
+            get(handlers::subgraph_history),
+        )
+        .route(
+            "/api/indexing-status/{hash}",
+            get(handlers::indexing_status),
+        )
+        // Direct Indexer Payments
+        .route("/api/dips", get(handlers::dips))
+        // The public SQL surface
         .route("/api/sql/catalog", get(get_sql_catalog))
-        .route("/api/sql/query", axum::routing::post(post_sql_query))
+        .route("/api/sql/query", post(post_sql_query))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(tower_http::catch_panic::CatchPanicLayer::new())
         .with_state(state)
