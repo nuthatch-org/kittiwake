@@ -43,6 +43,12 @@ Working, tested, and exercised end to end against a stand-in nest:
 | The refresh pipeline that writes the scored directory | `ingest` | done |
 | Config, logging, metrics, health and readiness | `config`, `obs` | done |
 
+**Parity is the gate, and it is not yet met.** The routes serve correct data in the wrong shape:
+the nest's own column names, where the dashboard expects its own contract. `kittiwake-parity`
+measures this and stood at 1 matching, 17 breaking on 2026-09-06; `/api/network-stats` has since
+been shaped and matches exactly. See [`docs/parity.md`](docs/parity.md). No route should be pointed
+at this service until its parity check is clean.
+
 **Thirty-five routes are live**: every nest-backed read the dashboard makes, the public SQL
 surface, the price and TVL figures, the eligibility oracle, and a live indexer probe.
 
@@ -130,6 +136,7 @@ crates/
   chain/    Arbitrum and mainnet contract reads
   ext/      price, TVL, and probing an indexer's own endpoint
   rewards/  what a delegator actually earns
+  parity/   compares our shape against the incumbent's, route by route
   read/     the cached read layer and the ported SQL
   sqlplay/  public SQL: allowlist and screening
   sched/    the ingest scheduler
