@@ -154,6 +154,9 @@ mod tests {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct IndexingStatus {
     pub deployment: String,
+    /// The chain this deployment indexes. graph-node answers one chain per status, so the field is
+    /// singular here where the GraphQL shape is a list.
+    pub network: Option<String>,
     pub health: String,
     pub synced: bool,
     pub latest_block: Option<i64>,
@@ -174,7 +177,7 @@ pub struct ProbeResult {
 
 /// The standard status query. Asked of the indexer's own endpoint, which is unauthenticated by
 /// design: an indexer that hides it cannot be checked by anyone, including its delegators.
-const STATUS_QUERY: &str = r#"{"query":"{ indexingStatuses { subgraph health synced chains { chainHeadBlock { number } latestBlock { number } } } }"}"#;
+const STATUS_QUERY: &str = r#"{"query":"{ indexingStatuses { subgraph health synced chains { network chainHeadBlock { number } latestBlock { number } } } }"}"#;
 
 impl Ext {
     /// Ask an indexer what it is serving.
@@ -266,6 +269,10 @@ fn parse_status(v: &serde_json::Value) -> Option<IndexingStatus> {
     let head = num("chainHeadBlock");
     Some(IndexingStatus {
         deployment,
+        network: chain
+            .and_then(|c| c.get("network"))
+            .and_then(|n| n.as_str())
+            .map(|n| n.to_string()),
         health: v
             .get("health")
             .and_then(|h| h.as_str())

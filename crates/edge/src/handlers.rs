@@ -753,3 +753,67 @@ pub async fn horizon_activity(
     crate::no_store(resp.headers_mut());
     Ok(resp)
 }
+
+/// `/api/chain-lag`: per-chain lag and liveness, as the chain-health job last computed it.
+///
+/// `data` is null before the job's first run rather than an empty set of chains, because "we have
+/// not looked" and "every chain is fine" are different answers and the panel renders them
+/// differently.
+pub async fn chain_lag(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    live_or(
+        &st,
+        kittiwake_read::shape::CHAIN_LAG_KEY,
+        serde_json::Value::Null,
+    )
+    .await
+}
+
+/// `/api/dropped-chains`: indexer address to the chains it has stopped serving since the last run.
+///
+/// Empty here means "nobody dropped anything", which is the ordinary case and is not the same as
+/// the chain-lag null above: an absent map and an empty map say the same thing to the caller.
+pub async fn dropped_chains(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    live_or(
+        &st,
+        kittiwake_read::shape::DROPPED_CHAINS_KEY,
+        serde_json::json!({}),
+    )
+    .await
+}
+
+/// Serve whatever a live job last wrote, or `absent` with `stale: true` if it has not run.
+async fn live_or(
+    st: &AppState,
+    key: &str,
+    absent: serde_json::Value,
+) -> Result<Response, ErrorResponse> {
+    let (data, meta) = match st.read.store.get(key).await {
+        Some(e) => {
+            let meta = e.meta(kittiwake_types::ServedFrom::Cache, false);
+            ((*e.value).clone(), meta)
+        }
+        None => (
+            absent,
+            kittiwake_types::Meta {
+                provenance: Default::default(),
+                served_from: kittiwake_types::ServedFrom::Cache,
+                stale: true,
+                age_seconds: 0,
+            },
+        ),
+    };
+    let mut resp =
+        axum::Json(serde_json::json!({ "data": data, "provenance": &meta })).into_response();
+    crate::no_store(resp.headers_mut());
+    Ok(resp)
+}

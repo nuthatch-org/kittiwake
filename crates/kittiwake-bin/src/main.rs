@@ -154,8 +154,19 @@ async fn main() -> anyhow::Result<()> {
         let mut scheduler = Scheduler::new(gate.clone(), recorder);
         let mut jobs: Vec<JobDef> = Vec::new();
 
-        // Always: these write nowhere but this process's own memory.
-        jobs.extend(jobs::live_jobs(store.clone()));
+        // Always: these write nowhere the platform's own crons also write. Most of them touch
+        // only this process's memory; chain health additionally keeps its history in two tables
+        // of its own, created here because they are the one part of the schema that is ours.
+        if let Some(p) = &pool {
+            kittiwake_db::ensure_chain_health_tables(p)
+                .await
+                .context("creating the chain-health tables")?;
+        }
+        jobs.extend(jobs::live_jobs(
+            store.clone(),
+            pool.clone(),
+            kittiwake_ext::Ext::default(),
+        ));
 
         if cfg.warmer_enabled {
             let warm_ctx = read.clone();

@@ -29,7 +29,7 @@ fn mins(n: u64) -> Duration {
 /// Safe to run whenever the service is up, because nothing outside this process can see what they
 /// write. The distinction that matters is not "is it a cron" but "does it write to a store the
 /// other system also writes to" - and these do not.
-pub fn live_jobs(store: kittiwake_cache::Store) -> Vec<JobDef> {
+pub fn live_jobs(store: kittiwake_cache::Store, pool: Option<Pool>, ext: Ext) -> Vec<JobDef> {
     let mut jobs = Vec::new();
     {
         // Every two minutes, as the platform schedule had it. Writes into the process's own store
@@ -52,6 +52,47 @@ pub fn live_jobs(store: kittiwake_cache::Store) -> Vec<JobDef> {
                 }),
             )
             .staggered(Duration::from_secs(30)),
+        );
+    }
+
+    // Chain health writes its history to two tables of its own, which nothing else reads or
+    // writes, so it is not gated with the shared-Postgres writers below. With no database it
+    // still runs, keeping that history in the process instead - see `live::History` for what that
+    // costs and why it is preferable to not running the job at all.
+    {
+        let store = store.clone();
+        let history = Arc::new(match pool {
+            Some(p) => kittiwake_ingest::live::History::Db(p),
+            None => {
+                tracing::warn!(
+                    "no database_url: chain-head history is kept in memory, so a restart resets \
+                     the stall clock and a halted chain reads live again for up to six hours"
+                );
+                kittiwake_ingest::live::History::Memory(Default::default())
+            }
+        });
+        jobs.push(
+            JobDef::every(
+                "refresh-chain-health",
+                mins(30),
+                Arc::new(move |ctx| {
+                    let store = store.clone();
+                    let history = history.clone();
+                    let ext = ext.clone();
+                    Box::pin(async move {
+                        let now = chrono::Utc::now().timestamp_millis();
+                        kittiwake_ingest::live::chain_health(
+                            &store, &history, &ctx.gate, ctx.lane, &ext, now,
+                        )
+                        .await
+                        .map(|i| JobOutcome {
+                            rows_written: i.rows,
+                        })
+                        .map_err(|e| e.to_string())
+                    })
+                }),
+            )
+            .staggered(mins(4)),
         );
     }
 

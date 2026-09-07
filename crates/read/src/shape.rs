@@ -983,6 +983,10 @@ pub fn ipfs_or_id(hex_id: &str) -> String {
 /// writes into the same store the route reads, and three network round trips per request go away.
 pub const HORIZON_ACTIVITY_KEY: &str = "live:horizon-activity";
 
+/// Where the chain-health job leaves its two answers, for the same reason.
+pub const CHAIN_LAG_KEY: &str = "live:chain-lag";
+pub const DROPPED_CHAINS_KEY: &str = "live:dropped-chains";
+
 fn delegation_activity_type(event_type: &str) -> &'static str {
     match event_type {
         "undelegation" => "undelegated",

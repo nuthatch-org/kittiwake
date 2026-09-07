@@ -386,6 +386,8 @@ pub fn router(state: AppState) -> Router {
         // The public SQL surface
         .route("/api/indexers-enriched", get(handlers::indexers_enriched))
         .route("/api/horizon/activity", get(handlers::horizon_activity))
+        .route("/api/chain-lag", get(handlers::chain_lag))
+        .route("/api/dropped-chains", get(handlers::dropped_chains))
         .route("/api/reo", get(handlers::reo))
         .route(
             "/api/indexer-node-health",

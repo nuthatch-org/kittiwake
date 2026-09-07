@@ -103,3 +103,114 @@ pub async fn enriched_indexers(pool: &Pool, limit: i64) -> Result<Vec<EnrichedIn
     .await?;
     Ok(rows)
 }
+
+// ---------------------------------------------------------------------------------------------
+// Chain health: head history and per-indexer chain sets
+// ---------------------------------------------------------------------------------------------
+
+/// Create the two tables the chain-health job keeps its history in.
+///
+/// The rest of the schema is the platform's, untouched, which is what keeps the migration
+/// reversible. These two are additive and nothing else reads or writes them, so they cost that
+/// property nothing: the old handler does not know they exist and does not care.
+///
+/// They exist as tables rather than as process memory because the history is the signal. A chain
+/// that has been dead for three days must still read as dead after a restart; keeping the stall
+/// clock in memory would reset it on every deploy and hand back a clean bill of health to exactly
+/// the chain that had earned the alarm.
+pub async fn ensure_chain_health_tables(pool: &Pool) -> Result<(), DbError> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS chain_head_records ( \
+           network TEXT PRIMARY KEY, \
+           head BIGINT NOT NULL, \
+           head_first_seen_at TIMESTAMPTZ NOT NULL, \
+           last_checked_at TIMESTAMPTZ NOT NULL )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS indexer_chains ( \
+           address TEXT PRIMARY KEY, \
+           chains TEXT[] NOT NULL, \
+           captured_at TIMESTAMPTZ NOT NULL )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `(network, head, head_first_seen_at_ms, last_checked_at_ms)`.
+pub type ChainHeadRow = (String, i64, i64, i64);
+
+pub async fn chain_head_records(pool: &Pool) -> Result<Vec<ChainHeadRow>, DbError> {
+    let rows: Vec<(
+        String,
+        i64,
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+    )> = sqlx::query_as(
+        "SELECT network, head, head_first_seen_at, last_checked_at FROM chain_head_records",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(n, h, f, l)| (n, h, f.timestamp_millis(), l.timestamp_millis()))
+        .collect())
+}
+
+pub async fn upsert_chain_head_records(pool: &Pool, rows: &[ChainHeadRow]) -> Result<u64, DbError> {
+    let mut written = 0;
+    for (network, head, first_seen_ms, checked_ms) in rows {
+        let first_seen = chrono::DateTime::from_timestamp_millis(*first_seen_ms)
+            .unwrap_or_else(chrono::Utc::now);
+        let checked =
+            chrono::DateTime::from_timestamp_millis(*checked_ms).unwrap_or_else(chrono::Utc::now);
+        written += sqlx::query(
+            "INSERT INTO chain_head_records (network, head, head_first_seen_at, last_checked_at) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (network) DO UPDATE SET head = EXCLUDED.head, \
+               head_first_seen_at = EXCLUDED.head_first_seen_at, \
+               last_checked_at = EXCLUDED.last_checked_at",
+        )
+        .bind(network)
+        .bind(head)
+        .bind(first_seen)
+        .bind(checked)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    }
+    Ok(written)
+}
+
+/// The chain set each indexer was last seen serving.
+pub async fn indexer_chains(pool: &Pool) -> Result<Vec<(String, Vec<String>)>, DbError> {
+    let rows: Vec<(String, Vec<String>)> =
+        sqlx::query_as("SELECT address, chains FROM indexer_chains")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows)
+}
+
+pub async fn upsert_indexer_chains(
+    pool: &Pool,
+    rows: &[(String, Vec<String>)],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<u64, DbError> {
+    let mut written = 0;
+    for (address, chains) in rows {
+        written += sqlx::query(
+            "INSERT INTO indexer_chains (address, chains, captured_at) VALUES ($1, $2, $3) \
+             ON CONFLICT (address) DO UPDATE SET chains = EXCLUDED.chains, \
+               captured_at = EXCLUDED.captured_at",
+        )
+        .bind(address)
+        .bind(chains)
+        .bind(now)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    }
+    Ok(written)
+}
