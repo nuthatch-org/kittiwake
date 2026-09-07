@@ -13,7 +13,7 @@ use kittiwake_cache::CachePolicy;
 use kittiwake_nest::{Lane, NestGate, QuerySpec};
 use kittiwake_types::{ApiError, NestId, Provenance};
 
-use crate::{Fetcher, Read, ReadCtx, sql};
+use crate::{Fetcher, Read, ReadCtx, shape, sql};
 
 /// One query inside a composed answer.
 pub struct Part {
@@ -530,7 +530,13 @@ pub async fn indexer_stake_history(
         NestId::Alloc,
         serde_json::json!({"address": addr, "points": cutoffs.len(), "from": cutoffs.first(), "to": cutoffs.last()}),
         CachePolicy::from_poll_interval(cadence::ARCHIVAL),
-        rows_only(NestId::Alloc, sql, T_FOLD),
+        rows_shaped(
+            NestId::Alloc,
+            sql,
+            T_FOLD,
+            shape::stake_history_point,
+            Some("history"),
+        ),
     )
     .await
 }

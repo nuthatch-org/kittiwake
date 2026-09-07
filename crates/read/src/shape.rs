@@ -1574,3 +1574,67 @@ mod tests {
         assert_eq!(arr[1]["type"], json!("delegated"));
     }
 }
+
+/// One point on an indexer's stake history.
+///
+/// The nest answers a cutoff and two wei balances; the panel plots a date and two GRT figures. The
+/// date is derived from the cutoff rather than sent alongside it, because the cutoff is the thing
+/// the query was built from and a second field would be a second chance to disagree with it.
+pub fn stake_history_point(r: &Value) -> Value {
+    let cutoff = i0(r, "cutoff").as_i64().unwrap_or(0);
+    json!({
+        "date": iso_date(cutoff),
+        "selfStakeGrt": num(grt(r, "staked_tokens")),
+        "delegatedGrt": num(grt(r, "delegated_tokens")),
+    })
+}
+
+/// A unix second to `YYYY-MM-DD`, which is what the chart's axis reads.
+fn iso_date(secs: i64) -> String {
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// A float as JSON, or zero rather than `null` when it is not representable.
+///
+/// A chart with a null in the series draws a gap; a chart with a zero draws a zero. Neither is
+/// ideal for a NaN, and zero is the one that does not break the axis.
+fn num(v: f64) -> Value {
+    serde_json::Number::from_f64(v)
+        .map(Value::Number)
+        .unwrap_or(json!(0))
+}
+
+#[cfg(test)]
+mod stake_history_tests {
+    use super::*;
+
+    #[test]
+    fn a_row_becomes_the_point_the_chart_plots() {
+        let row = json!({
+            "cutoff": 1_757_000_000,
+            "staked_tokens": "136728062185740942355425427",
+            "delegated_tokens": "0",
+        });
+        let p = stake_history_point(&row);
+        assert_eq!(p["date"], json!("2025-09-04"));
+        // 136,728,062.18... GRT, not 1.36e26.
+        let self_stake = p["selfStakeGrt"].as_f64().unwrap();
+        assert!(
+            (self_stake - 136_728_062.185_740_94).abs() < 1.0,
+            "got {self_stake}"
+        );
+        assert_eq!(p["delegatedGrt"].as_f64(), Some(0.0));
+    }
+
+    /// Wei is divided, never truncated to an integer and never left as the raw string: a chart
+    /// plotting 1.3e26 has an axis nobody can read.
+    #[test]
+    fn a_missing_or_unparseable_balance_is_zero_rather_than_absent() {
+        let p = stake_history_point(&json!({"cutoff": 0}));
+        assert_eq!(p["selfStakeGrt"].as_f64(), Some(0.0));
+        assert_eq!(p["delegatedGrt"].as_f64(), Some(0.0));
+        assert_eq!(p["date"], json!("1970-01-01"));
+    }
+}

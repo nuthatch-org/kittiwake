@@ -84,6 +84,19 @@ fn d_days() -> i64 {
     30
 }
 
+/// Twenty-six weeks, which is the window the stake-history panel plots and the number of points the
+/// handler it replaces always returns. The `days` parameter still overrides it; this is only what
+/// the panel gets when it asks for nothing.
+fn d_stake_history_days() -> i64 {
+    182
+}
+
+#[derive(serde::Deserialize)]
+pub struct StakeHistoryQuery {
+    #[serde(default = "d_stake_history_days")]
+    pub days: i64,
+}
+
 /// An address from the path, lower-cased. The SQL layer refuses anything that is not one, but
 /// normalising here means a caller using checksum case is served rather than rejected.
 fn addr(raw: &str) -> String {
@@ -271,7 +284,7 @@ pub async fn indexer_stake_history(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(address): Path<String>,
-    Query(q): Query<DaysQuery>,
+    Query(q): Query<StakeHistoryQuery>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
     let days = q.days.clamp(7, 730);
