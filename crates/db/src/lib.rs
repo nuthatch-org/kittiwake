@@ -34,6 +34,18 @@ pub async fn ping(pool: &Pool) -> Result<(), DbError> {
     Ok(())
 }
 
+/// How this service's runs are labelled in `cron_runs`.
+///
+/// Both systems write that table, and while both are running they write it under job names that are
+/// otherwise identical - `refresh-chain-health` fires here and on the platform. Without a prefix,
+/// "when did refresh-chain-health last succeed" answers with whichever system ran most recently and
+/// gives no way to tell which, which is precisely the question a shadow run is asking.
+///
+/// With it, `refresh` and `kittiwake:refresh` sit side by side in the same table and can be compared
+/// directly. Worth keeping after the platform crons are gone, too: a row that says where it came
+/// from stays true, and a row that does not has to be dated to be understood.
+pub const CRON_RUN_PREFIX: &str = "kittiwake:";
+
 /// Append one run to `cron_runs`. The table already exists and Grafana reads it, so the columns
 /// are taken as given rather than redesigned.
 pub async fn record_cron_run(
@@ -49,7 +61,7 @@ pub async fn record_cron_run(
         "INSERT INTO cron_runs (step, started_at, duration_ms, rows_affected, success, error_message) \
          VALUES ($1, $2, $3, $4, $5, $6)",
     )
-    .bind(step)
+    .bind(format!("{CRON_RUN_PREFIX}{step}"))
     .bind(started_at)
     .bind(duration.as_millis() as i32)
     .bind(rows_affected as i32)
@@ -259,4 +271,20 @@ pub async fn get_live_answer(
             .fetch_optional(pool)
             .await?;
     Ok(row)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The prefix is the only thing telling two systems' rows apart in a shared table, so it is
+    /// pinned rather than left to whoever edits the constant next.
+    #[test]
+    fn a_recorded_run_is_labelled_with_its_system() {
+        assert_eq!(CRON_RUN_PREFIX, "kittiwake:");
+        assert_eq!(
+            format!("{CRON_RUN_PREFIX}refresh-chain-health"),
+            "kittiwake:refresh-chain-health"
+        );
+    }
 }
