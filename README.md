@@ -42,18 +42,34 @@ Working, tested, and exercised end to end against a stand-in nest:
 | Delegator APR, realised return, pool exchange rate, capacity | `rewards` | done |
 | The refresh pipeline that writes the scored directory | `ingest` | done |
 | Config, logging, metrics, health and readiness | `config`, `obs` | done |
+| The Dock's session scheme, held to tokens the incumbent minted | `dock` | done |
 
-**Parity is met.** As of 2026-09-07, `kittiwake-parity` reports **20 matching, 0 breaking**: every
-route returns the shape the dashboard is written against, and the figures agree with the incumbent
-where they have been compared by hand. See [`docs/parity.md`](docs/parity.md), including the three
-defects that passed the shape check and were caught only by comparing values.
+## The written record
 
-**Thirty-five routes are live**: every nest-backed read the dashboard makes, the public SQL
-surface, the price and TVL figures, the eligibility oracle, and a live indexer probe.
+| | |
+|---|---|
+| [`docs/status.md`](docs/status.md) | Per route: parity verdict and timings. **Generated**, never edited. |
+| [`docs/decisions.md`](docs/decisions.md) | Judgement calls, with the reasoning. The file for what would otherwise be re-litigated or quietly undone. |
+| [`docs/migration.md`](docs/migration.md) | What has moved, what has not, and what is a deletion rather than a port. |
+| [`docs/benchmarks.md`](docs/benchmarks.md) | The acceptance bar, including the number that deliberately does not improve. |
+| [`docs/parity.md`](docs/parity.md) | How parity is checked, and why by shape rather than value. |
+| [`docs/design.md`](docs/design.md) | The gate, coalescing and freshness model. |
 
-Not built yet, in the migration's own order: the RAV and chain-dependent ingest jobs, ENS, the
-service census and operator preflight, IPFS, then the product layer (the Dock, Scuttlebutt, the
-wasm disassembler, signatures). See `docs/migration.md`.
+
+**Live in production since 2026-09-07, 11:24 UTC.** The dashboard's `/api/*` is rewritten to this
+service for **31 routes**; the rest are still Next handlers. `kittiwake-parity` reports **31
+matching, 1 breaking** against a frozen pre-rewrite deployment, and writes
+[`docs/status.md`](docs/status.md) on every run - per route, with timings. The one breaking route is
+not in production; see [`docs/migration.md`](docs/migration.md).
+
+The cutover was not clean and the record says so: eight routes shipped with the wrong shape and
+answered `200` for two hours, because the rewrite list and the parity table were two lists nobody
+had connected. Seven were fixed the same day. What that cost and what now prevents it is in
+[`docs/decisions.md`](docs/decisions.md).
+
+Not built yet, in the migration's own order: `indexing-status`, then the product layer - the Dock,
+Scuttlebutt, the wasm disassembler, the SQL named tier and receipts - and a long tail that wants
+triaging rather than porting.
 
 **Push notifications and Lodie were discontinued on 2026-09-06** and are deliberately absent.
 
