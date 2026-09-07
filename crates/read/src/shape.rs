@@ -1999,3 +1999,95 @@ mod grt_flow_tests {
         assert_eq!(f["blockNumber"], json!(0));
     }
 }
+
+/// A deployment's curation: who signalled it, and the deployment's own totals.
+///
+/// The two totals repeat on every row because they belong to the deployment rather than to any
+/// curator, so they are lifted off the first row rather than summed. Summing them would multiply
+/// the deployment's signal by its number of curators, which is a plausible number and completely
+/// wrong - the kind that survives a glance.
+///
+/// Wei stays a string throughout. These are balances a reader may compare or quote, not magnitudes
+/// for a chart, and the moment one becomes an `f64` the last digits stop being true.
+pub fn subgraph_curation(rows: &[Value]) -> Value {
+    let Some(first) = rows.first() else {
+        return json!({ "signals": [], "totalSignalledTokens": "0", "queryFeesAmount": "0" });
+    };
+    let signals: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": t(r, "id"),
+                "curatorAddress": t(r, "curator"),
+                "signalledTokens": s0(r, "signalled_tokens"),
+                "unsignalledTokens": s0(r, "unsignalled_tokens"),
+                "signal": s0(r, "signal"),
+                "lastSignalChange": i0(r, "last_signal_change"),
+                "realizedRewards": s0(r, "realized_rewards"),
+            })
+        })
+        .collect();
+    json!({
+        "signals": signals,
+        "totalSignalledTokens": s0(first, "deployment_signalled_tokens"),
+        "queryFeesAmount": s0(first, "deployment_query_fees_amount"),
+    })
+}
+
+#[cfg(test)]
+mod subgraph_curation_tests {
+    use super::*;
+
+    fn row(curator: &str, signalled: &str) -> Value {
+        json!({
+            "id": format!("sig-{curator}"),
+            "curator": curator,
+            "signalled_tokens": signalled,
+            "unsignalled_tokens": "0",
+            "signal": "1000",
+            "last_signal_change": 1_757_000_000_i64,
+            "realized_rewards": "7",
+            "deployment_signalled_tokens": "4851646996536021200956",
+            "deployment_query_fees_amount": "123456",
+        })
+    }
+
+    /// The totals belong to the deployment, not to the curators, so two curators must not double
+    /// them. The bug this guards is a sum where a lift was wanted.
+    #[test]
+    fn the_deployment_totals_are_lifted_not_summed() {
+        let out = subgraph_curation(&[row("0xaa", "100"), row("0xbb", "200")]);
+        assert_eq!(out["signals"].as_array().unwrap().len(), 2);
+        assert_eq!(out["totalSignalledTokens"], json!("4851646996536021200956"));
+        assert_eq!(out["queryFeesAmount"], json!("123456"));
+    }
+
+    /// Wei never becomes a number here: these are balances, and a curator comparing their own
+    /// position against the total deserves both to be exact.
+    #[test]
+    fn balances_stay_strings() {
+        let out = subgraph_curation(&[row("0xaa", "4851646996536021200956")]);
+        let sig = &out["signals"][0];
+        assert!(sig["signalledTokens"].is_string());
+        assert_eq!(sig["signalledTokens"], json!("4851646996536021200956"));
+        assert!(out["totalSignalledTokens"].is_string());
+    }
+
+    #[test]
+    fn a_deployment_nobody_signalled_is_zeroes_rather_than_absent() {
+        let out = subgraph_curation(&[]);
+        assert_eq!(out["signals"], json!([]));
+        assert_eq!(out["totalSignalledTokens"], json!("0"));
+        assert_eq!(out["queryFeesAmount"], json!("0"));
+    }
+
+    #[test]
+    fn the_curator_is_named_as_the_frontend_reads_it() {
+        let out = subgraph_curation(&[row("0xabc", "1")]);
+        assert_eq!(out["signals"][0]["curatorAddress"], json!("0xabc"));
+        assert_eq!(
+            out["signals"][0]["lastSignalChange"],
+            json!(1_757_000_000_i64)
+        );
+    }
+}

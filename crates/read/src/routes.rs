@@ -1120,12 +1120,21 @@ pub async fn subgraph_fees_30d(ctx: &ReadCtx, since: i64) -> Result<Read, ApiErr
 
 pub async fn subgraph_curation(ctx: &ReadCtx, dep: &str) -> Result<Read, ApiError> {
     let sql = addr_or_400!(sql::deployment_signals_sql(dep, 100), "deployment id");
+    let inner = rows_only(NestId::Alloc, sql, T_FOLD);
+    let fetch: Fetcher = Arc::new(move |gate, lane| {
+        let inner = inner.clone();
+        Box::pin(async move {
+            let (v, p) = inner(gate, lane).await?;
+            let rows = v.as_array().cloned().unwrap_or_default();
+            Ok((shape::subgraph_curation(&rows), p))
+        })
+    });
     ctx.cached(
         "subgraph-curation",
         NestId::Alloc,
         serde_json::json!({"deployment": dep}),
         CachePolicy::from_poll_interval(cadence::LIVE),
-        rows_only(NestId::Alloc, sql, T_FOLD),
+        fetch,
     )
     .await
 }
