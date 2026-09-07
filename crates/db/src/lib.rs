@@ -119,6 +119,22 @@ pub async fn enriched_indexers(pool: &Pool, limit: i64) -> Result<Vec<EnrichedIn
 /// clock in memory would reset it on every deploy and hand back a clean bill of health to exactly
 /// the chain that had earned the alarm.
 pub async fn ensure_chain_health_tables(pool: &Pool) -> Result<(), DbError> {
+    // Where a live job's finished answer is kept, so a restart does not blank a panel.
+    //
+    // The jobs write into this process's memory, which is what makes them fast and what removes
+    // Redis from the request path. The cost is that memory does not survive a deploy, and a job on
+    // a thirty-minute period leaves the route with nothing to say for up to thirty minutes. The
+    // service this replaces did not have that hole, because its Redis outlived its functions. This
+    // table is that durability, without putting a network hop back into the read path: the store
+    // still answers every request, and this is consulted only when the store is empty.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS live_answers ( \
+           key TEXT PRIMARY KEY, \
+           value JSONB NOT NULL, \
+           computed_at TIMESTAMPTZ NOT NULL )",
+    )
+    .execute(pool)
+    .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS chain_head_records ( \
            network TEXT PRIMARY KEY, \
@@ -213,4 +229,34 @@ pub async fn upsert_indexer_chains(
         .rows_affected();
     }
     Ok(written)
+}
+
+/// Keep a live job's answer, so a restart has something to serve until the job runs again.
+pub async fn put_live_answer(
+    pool: &Pool,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "INSERT INTO live_answers (key, value, computed_at) VALUES ($1, $2, NOW()) \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, computed_at = NOW()",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The last answer a live job kept, and when it was computed.
+pub async fn get_live_answer(
+    pool: &Pool,
+    key: &str,
+) -> Result<Option<(serde_json::Value, chrono::DateTime<chrono::Utc>)>, DbError> {
+    let row: Option<(serde_json::Value, chrono::DateTime<chrono::Utc>)> =
+        sqlx::query_as("SELECT value, computed_at FROM live_answers WHERE key = $1")
+            .bind(key)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row)
 }

@@ -42,19 +42,26 @@ pub fn live_jobs(store: kittiwake_cache::Store, pool: Option<Pool>, ext: Ext) ->
         // Every two minutes, as the platform schedule had it. Writes into the process's own store
         // rather than Redis, because the route that reads it is in this process.
         let store = store.clone();
+        let pool = pool.clone();
         jobs.push(
             JobDef::every(
                 "ingest-horizon-activity",
                 Duration::from_secs(120),
                 Arc::new(move |ctx| {
                     let store = store.clone();
+                    let pool = pool.clone();
                     Box::pin(async move {
-                        kittiwake_ingest::live::horizon_activity(&store, &ctx.gate, ctx.lane)
-                            .await
-                            .map(|i| JobOutcome {
-                                rows_written: i.rows,
-                            })
-                            .map_err(|e| e.to_string())
+                        kittiwake_ingest::live::horizon_activity(
+                            &store,
+                            pool.as_ref(),
+                            &ctx.gate,
+                            ctx.lane,
+                        )
+                        .await
+                        .map(|i| JobOutcome {
+                            rows_written: i.rows,
+                        })
+                        .map_err(|e| e.to_string())
                     })
                 }),
             )

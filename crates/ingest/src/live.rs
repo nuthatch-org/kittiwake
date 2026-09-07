@@ -13,9 +13,33 @@ use kittiwake_types::NestId;
 
 use crate::{IngestError, Ingested};
 
+/// Put an answer where the route reads it, and where a restart can find it again.
+///
+/// The store is the one the request path touches; the table is only consulted when the store is
+/// empty, which is the window between a restart and the job's next run. A failure to persist is
+/// logged and not raised: the answer is already served, and losing the durable copy costs a panel
+/// a few minutes after the next deploy rather than costing anyone this one.
+async fn keep(
+    store: &Store,
+    pool: Option<&kittiwake_db::Pool>,
+    key: &str,
+    value: serde_json::Value,
+    provenance: kittiwake_types::Provenance,
+) {
+    if let Some(pool) = pool
+        && let Err(e) = kittiwake_db::put_live_answer(pool, key, &value).await
+    {
+        tracing::warn!(key, err = %e, "could not keep the live answer; a restart will blank it");
+    }
+    store
+        .insert(key.to_string(), Entry::new(value, provenance))
+        .await;
+}
+
 /// Refresh the Horizon activity feed.
 pub async fn horizon_activity(
     store: &Store,
+    pool: Option<&kittiwake_db::Pool>,
     gate: &NestGate,
     lane: Lane,
 ) -> Result<Ingested, IngestError> {
@@ -34,12 +58,14 @@ pub async fn horizon_activity(
 
     let feed = shape::horizon_activity(&d.rows, &p.rows);
     let count = feed.as_array().map(|a| a.len()).unwrap_or(0);
-    store
-        .insert(
-            shape::HORIZON_ACTIVITY_KEY.to_string(),
-            Entry::new(feed, d.provenance.clone()),
-        )
-        .await;
+    keep(
+        store,
+        pool,
+        shape::HORIZON_ACTIVITY_KEY,
+        feed,
+        d.provenance.clone(),
+    )
+    .await;
 
     Ok(Ingested { rows: count as u64 })
 }
@@ -79,6 +105,14 @@ pub struct MemoryHistory {
 }
 
 impl History {
+    /// The database behind this history, when there is one.
+    fn pool(&self) -> Option<&kittiwake_db::Pool> {
+        match self {
+            History::Db(p) => Some(p),
+            History::Memory(_) => None,
+        }
+    }
+
     async fn heads(
         &self,
     ) -> Result<std::collections::BTreeMap<String, crate::liveness::ChainHeadRecord>, IngestError>
@@ -346,24 +380,23 @@ pub async fn chain_health(
         source: Some("indexer status endpoints".into()),
         ..Default::default()
     };
-    store
-        .insert(
-            shape::CHAIN_LAG_KEY.to_string(),
-            Entry::new(
-                serde_json::json!({ "chains": chains, "computedAt": now_ms }),
-                provenance.clone(),
-            ),
-        )
-        .await;
-    store
-        .insert(
-            shape::DROPPED_CHAINS_KEY.to_string(),
-            Entry::new(
-                serde_json::to_value(&dropped).unwrap_or_default(),
-                provenance,
-            ),
-        )
-        .await;
+    let pool = history.pool();
+    keep(
+        store,
+        pool,
+        shape::CHAIN_LAG_KEY,
+        serde_json::json!({ "chains": chains, "computedAt": now_ms }),
+        provenance.clone(),
+    )
+    .await;
+    keep(
+        store,
+        pool,
+        shape::DROPPED_CHAINS_KEY,
+        serde_json::to_value(&dropped).unwrap_or_default(),
+        provenance,
+    )
+    .await;
 
     Ok(Ingested { rows: count })
 }

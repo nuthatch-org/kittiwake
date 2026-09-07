@@ -791,7 +791,13 @@ pub async fn dropped_chains(
     .await
 }
 
-/// Serve whatever a live job last wrote, or `absent` with `stale: true` if it has not run.
+/// Serve whatever a live job last wrote.
+///
+/// Three answers in order of preference: this process's store, which is what serves every request
+/// in the ordinary case; the durable copy in Postgres, which covers the window between a restart
+/// and the job's next run; and `absent` marked stale, which is what an honestly empty answer looks
+/// like. A thirty-minute job would otherwise leave a panel blank for thirty minutes after every
+/// deploy, and a blank panel is indistinguishable from a chain nobody is serving.
 async fn live_or(
     st: &AppState,
     key: &str,
@@ -802,15 +808,18 @@ async fn live_or(
             let meta = e.meta(kittiwake_types::ServedFrom::Cache, false);
             ((*e.value).clone(), meta)
         }
-        None => (
-            absent,
-            kittiwake_types::Meta {
-                provenance: Default::default(),
-                served_from: kittiwake_types::ServedFrom::Cache,
-                stale: true,
-                age_seconds: 0,
-            },
-        ),
+        None => match kept(st, key).await {
+            Some(pair) => pair,
+            None => (
+                absent,
+                kittiwake_types::Meta {
+                    provenance: Default::default(),
+                    served_from: kittiwake_types::ServedFrom::Cache,
+                    stale: true,
+                    age_seconds: 0,
+                },
+            ),
+        },
     };
     let mut resp =
         axum::Json(serde_json::json!({ "data": data, "provenance": &meta })).into_response();
@@ -912,4 +921,27 @@ pub async fn subgraph_names(
         axum::Json(serde_json::json!({ "data": map, "source": "nuthatch" })).into_response();
     crate::no_store(resp.headers_mut());
     Ok(resp)
+}
+
+/// The durable copy of a live answer, with its real age.
+///
+/// Always marked stale, whatever the age: it is by definition older than the job's last intent to
+/// run, and a reader deciding whether to trust a figure should be told so rather than left to infer
+/// it from a timestamp.
+async fn kept(st: &AppState, key: &str) -> Option<(serde_json::Value, kittiwake_types::Meta)> {
+    let pool = st.pool.as_ref()?;
+    let (value, computed_at) = kittiwake_db::get_live_answer(pool, key)
+        .await
+        .map_err(|e| tracing::warn!(key, err = %e, "could not read the kept live answer"))
+        .ok()??;
+    let age = (chrono::Utc::now() - computed_at).num_seconds().max(0) as u64;
+    Some((
+        value,
+        kittiwake_types::Meta {
+            provenance: Default::default(),
+            served_from: kittiwake_types::ServedFrom::Postgres,
+            stale: true,
+            age_seconds: age,
+        },
+    ))
 }

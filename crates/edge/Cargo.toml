@@ -8,6 +8,7 @@ license.workspace = true
 axum = { version = "0.8.9", features = ["macros", "json"] }
 governor = "0.10.4"
 http = "1.5.0"
+chrono = "0.4.45"
 kittiwake-cache = { version = "0.1.0", path = "../cache" }
 kittiwake-chain = { version = "0.1.0", path = "../chain" }
 kittiwake-config = { version = "0.1.0", path = "../config" }

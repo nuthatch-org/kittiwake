@@ -3080,6 +3080,7 @@ name = "kittiwake-edge"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
  "governor",
  "http",
  "kittiwake-cache",
