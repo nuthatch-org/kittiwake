@@ -273,6 +273,34 @@ pub async fn get_live_answer(
     Ok(row)
 }
 
+/// Each indexer's delegation exchange rate, one point per day, newest snapshot per day.
+///
+/// `DISTINCT ON` with that ordering takes the **last** snapshot of each day rather than the first,
+/// which is what a day's closing rate means. Several snapshots a day is the normal case.
+pub async fn delegation_exchange_rates(
+    pool: &Pool,
+    indexers: &[String],
+    since: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<(String, chrono::NaiveDate, f64)>, DbError> {
+    if indexers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<(String, chrono::NaiveDate, f64)> = sqlx::query_as(
+        "SELECT DISTINCT ON (indexer_address, snapshot_at::date) \
+           indexer_address, snapshot_at::date AS snapshot_date, \
+           delegation_exchange_rate::float8 \
+         FROM indexer_snapshots \
+         WHERE indexer_address = ANY($1) AND snapshot_at >= $2 \
+           AND delegation_exchange_rate IS NOT NULL \
+         ORDER BY indexer_address, snapshot_at::date, snapshot_at DESC",
+    )
+    .bind(indexers)
+    .bind(since)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

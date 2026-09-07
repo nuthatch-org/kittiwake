@@ -380,9 +380,54 @@ pub async fn rewards_history(
     let address = q
         .address
         .ok_or_else(|| ApiError::BadRequest("address is required".into()))?;
-    Ok(envelope(
-        routes::rewards_history(&st.read, &addr(&address)).await?,
-    ))
+    let read = routes::rewards_history(&st.read, &addr(&address)).await?;
+
+    // The positions come from the nest; the daily exchange rates that turn them into a value over
+    // time live in Lodestar's own Postgres, written by the snapshot cron. Neither half is the
+    // series on its own, which is why this is composed here rather than in `routes`: `ReadCtx` has
+    // no database, deliberately, and giving it one so this route could reach it would hand every
+    // nest read a dependency only this one needs.
+    let pool = st
+        .pool
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("no database is configured".into()))?;
+
+    let positions: Vec<(String, f64, f64)> = read
+        .entry
+        .value
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| {
+                    let indexer = r.get("indexer")?.as_str()?.to_lowercase();
+                    let wei = |k: &str| {
+                        r.get(k)
+                            .and_then(|v| v.as_str())
+                            .and_then(|x| x.parse::<f64>().ok())
+                            .unwrap_or(0.0)
+                            / 1e18
+                    };
+                    Some((indexer, wei("staked_tokens"), wei("share_amount")))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Ninety days, as the handler this replaces defaults to.
+    let since = chrono::Utc::now() - chrono::Duration::days(90);
+    let indexers: Vec<String> = positions.iter().map(|(i, _, _)| i.clone()).collect();
+    let rates = kittiwake_db::delegation_exchange_rates(pool, &indexers, since)
+        .await
+        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?
+        .into_iter()
+        .map(|(i, d, r)| (i, d.to_string(), r))
+        .collect::<Vec<_>>();
+
+    let body = kittiwake_read::shape::rewards_history(&positions, &rates);
+    // At the root, not under `data`: that is the shape the panel reads.
+    let mut resp = axum::Json(body).into_response();
+    crate::no_store(resp.headers_mut());
+    Ok(resp)
 }
 
 #[derive(serde::Deserialize)]

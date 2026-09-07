@@ -2091,3 +2091,193 @@ mod subgraph_curation_tests {
         );
     }
 }
+
+/// A delegator's portfolio value over time, folded from their positions and each indexer's daily
+/// delegation exchange rate.
+///
+/// The rate is what a share is worth in GRT, so a position's value is shares times rate and the
+/// rewards are whatever that exceeds the principal. Two details carry the whole thing:
+///
+/// **Forward fill.** A rate is only snapshotted when it changes, so most indexers have no row on
+/// most days. Leaving those days out would make the portfolio appear to shrink and grow as
+/// individual indexers dropped in and out of the sum. The last known rate carries forward.
+///
+/// **Before the first snapshot, principal stands in.** An indexer with no rate yet contributes its
+/// principal rather than nothing, so a new position does not read as a loss of its own value on the
+/// day it opens.
+///
+/// Rewards are floored at zero. A rate below one is arithmetically possible after a slashing and it
+/// is not a negative reward, it is a loss, and this series does not claim to measure those.
+pub fn rewards_history(positions: &[(String, f64, f64)], rates: &[(String, String, f64)]) -> Value {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    if positions.is_empty() {
+        return json!({ "history": [] });
+    }
+
+    let mut by_indexer: BTreeMap<&str, BTreeMap<&str, f64>> = BTreeMap::new();
+    let mut dates: BTreeSet<&str> = BTreeSet::new();
+    for (indexer, date, rate) in rates {
+        by_indexer
+            .entry(indexer.as_str())
+            .or_default()
+            .insert(date.as_str(), *rate);
+        dates.insert(date.as_str());
+    }
+    if dates.is_empty() {
+        return json!({ "history": [] });
+    }
+    let dates: Vec<&str> = dates.into_iter().collect();
+
+    // Forward fill, in date order, per indexer.
+    for rates in by_indexer.values_mut() {
+        let mut last: Option<f64> = None;
+        for d in &dates {
+            match rates.get(d) {
+                Some(r) => last = Some(*r),
+                None => {
+                    if let Some(r) = last {
+                        rates.insert(d, r);
+                    }
+                }
+            }
+        }
+    }
+
+    let total_principal: f64 = positions.iter().map(|(_, principal, _)| principal).sum();
+    let history: Vec<Value> = dates
+        .iter()
+        .map(|date| {
+            let total_value: f64 = positions
+                .iter()
+                .map(|(indexer, principal, shares)| {
+                    match by_indexer.get(indexer.as_str()).and_then(|r| r.get(date)) {
+                        Some(rate) => shares * rate,
+                        None => *principal,
+                    }
+                })
+                .sum();
+            json!({
+                "date": short_date(date),
+                "timestamp": date_millis(date),
+                "value": num(round2(total_value)),
+                "rewards": num(round2((total_value - total_principal).max(0.0))),
+                "principal": num(round2(total_principal)),
+            })
+        })
+        .collect();
+    json!({ "history": history })
+}
+
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
+/// `2026-09-07` to `9/7`, which is what the chart's axis carries.
+fn short_date(iso: &str) -> String {
+    let mut parts = iso.split('-');
+    let (_, m, d) = (parts.next(), parts.next(), parts.next());
+    match (m, d) {
+        (Some(m), Some(d)) => format!(
+            "{}/{}",
+            m.trim_start_matches('0'),
+            d.trim_start_matches('0')
+        ),
+        _ => iso.to_string(),
+    }
+}
+
+fn date_millis(iso: &str) -> Value {
+    chrono::NaiveDate::parse_from_str(iso, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| json!(dt.and_utc().timestamp_millis()))
+        .unwrap_or(json!(0))
+}
+
+#[cfg(test)]
+mod rewards_history_tests {
+    use super::*;
+
+    fn pos(indexer: &str, principal: f64, shares: f64) -> (String, f64, f64) {
+        (indexer.to_string(), principal, shares)
+    }
+    fn rate(indexer: &str, date: &str, r: f64) -> (String, String, f64) {
+        (indexer.to_string(), date.to_string(), r)
+    }
+
+    #[test]
+    fn no_positions_is_an_empty_series() {
+        assert_eq!(rewards_history(&[], &[])["history"], json!([]));
+        assert_eq!(
+            rewards_history(&[pos("0xa", 100.0, 100.0)], &[])["history"],
+            json!([])
+        );
+    }
+
+    /// The detail the whole fold hangs on. A rate is snapshotted only when it changes, so an
+    /// indexer missing from a day must keep its last known rate. Without this the portfolio
+    /// visibly shrinks and grows as indexers drop in and out of the sum.
+    #[test]
+    fn a_missing_day_carries_the_last_known_rate_forward() {
+        let out = rewards_history(
+            &[pos("0xa", 100.0, 100.0)],
+            &[
+                rate("0xa", "2026-09-01", 1.10),
+                rate("0xb", "2026-09-02", 1.00),
+                rate("0xa", "2026-09-03", 1.20),
+            ],
+        );
+        let h = out["history"].as_array().unwrap();
+        assert_eq!(h.len(), 3);
+        // Day two has no row for 0xa, so its day-one rate carries.
+        assert_eq!(h[1]["value"].as_f64().unwrap(), 110.0);
+        assert_eq!(h[2]["value"].as_f64().unwrap(), 120.0);
+    }
+
+    /// Before an indexer's first snapshot there is nothing to carry forward, and the position is
+    /// worth its principal rather than nothing.
+    #[test]
+    fn a_position_with_no_rate_yet_is_worth_its_principal() {
+        let out = rewards_history(
+            &[pos("0xa", 500.0, 500.0)],
+            &[rate("0xb", "2026-09-01", 1.0)],
+        );
+        let h = out["history"].as_array().unwrap();
+        assert_eq!(h[0]["value"].as_f64().unwrap(), 500.0);
+        assert_eq!(h[0]["rewards"].as_f64().unwrap(), 0.0);
+    }
+
+    /// A rate below one is a loss, not a negative reward.
+    #[test]
+    fn rewards_never_go_negative() {
+        let out = rewards_history(
+            &[pos("0xa", 100.0, 100.0)],
+            &[rate("0xa", "2026-09-01", 0.80)],
+        );
+        let h = out["history"].as_array().unwrap();
+        assert_eq!(h[0]["value"].as_f64().unwrap(), 80.0);
+        assert_eq!(h[0]["rewards"].as_f64().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn the_axis_label_is_month_slash_day_without_leading_zeroes() {
+        assert_eq!(short_date("2026-09-07"), "9/7");
+        assert_eq!(short_date("2026-12-25"), "12/25");
+    }
+
+    #[test]
+    fn two_positions_are_summed_and_the_principal_is_the_total() {
+        let out = rewards_history(
+            &[pos("0xa", 100.0, 100.0), pos("0xb", 200.0, 200.0)],
+            &[
+                rate("0xa", "2026-09-01", 1.5),
+                rate("0xb", "2026-09-01", 1.0),
+            ],
+        );
+        let h = &out["history"][0];
+        assert_eq!(h["principal"].as_f64().unwrap(), 300.0);
+        assert_eq!(h["value"].as_f64().unwrap(), 350.0);
+        assert_eq!(h["rewards"].as_f64().unwrap(), 50.0);
+    }
+}
