@@ -66,6 +66,25 @@ pub(crate) fn older_of(a: &Provenance, b: &Provenance) -> Provenance {
 /// Each part is coalesced on its own statement, so two routes that happen to want the same fold
 /// cost the nest one query between them rather than one each. They run concurrently; the gate is
 /// what bounds how many actually reach the nest at once.
+/// [`many`], with the combined object folded into its final shape.
+///
+/// The parts are what the nest can answer; the fold is what the panel reads. Keeping them separate
+/// means the SQL stays a description of the data rather than of the chart.
+pub fn many_folded(
+    parts: Vec<Part>,
+    timeout: Duration,
+    fold: fn(&serde_json::Value) -> serde_json::Value,
+) -> Fetcher {
+    let inner = many(parts, timeout);
+    Arc::new(move |gate, lane| {
+        let inner = inner.clone();
+        Box::pin(async move {
+            let (v, p) = inner(gate, lane).await?;
+            Ok((fold(&v), p))
+        })
+    })
+}
+
 pub fn many(parts: Vec<Part>, timeout: Duration) -> Fetcher {
     let parts = Arc::new(parts);
     Arc::new(move |gate: NestGate, lane: Lane| {
@@ -1083,7 +1102,7 @@ pub async fn subgraph_history(ctx: &ReadCtx, dep: &str) -> Result<Read, ApiError
         NestId::Alloc,
         serde_json::json!({"deployment": dep}),
         CachePolicy::from_poll_interval(cadence::ARCHIVAL),
-        many(parts, T_FOLD),
+        many_folded(parts, T_FOLD, shape::subgraph_history),
     )
     .await
 }

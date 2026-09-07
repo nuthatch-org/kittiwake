@@ -1638,3 +1638,171 @@ mod stake_history_tests {
         assert_eq!(p["date"], json!("1970-01-01"));
     }
 }
+
+/// A deployment's weekly signal and stake series, folded from the two event lists.
+///
+/// The nest answers what happened; the chart plots what was true. Signal is the running sum of
+/// `MintSignal` less `BurnSignal` up to each week, and stake is the total allocated by every
+/// allocation that was open at that moment - created before it and either still open or closed
+/// after it. Neither is a column anywhere; both have to be folded.
+///
+/// Three details that are easy to get subtly wrong, all matching the handler this replaces:
+///
+/// - The window starts at the earliest event **or** a year ago, whichever is later. A deployment
+///   from 2021 would otherwise plot three hundred points nobody reads.
+/// - Signal is floored at zero. Burns can exceed mints in the window when the mints happened before
+///   it, and a negative signal is not a thing that exists.
+/// - The leading flat section is trimmed at 2% of peak. A deployment signalled in month nine plots
+///   thirty-five weeks of zero before anything happens, and the interesting part ends up squeezed
+///   into the right-hand tenth of the chart.
+pub fn subgraph_history(combined: &Value) -> Value {
+    const WEEK: i64 = 7 * 86_400;
+    const YEAR: i64 = 365 * 86_400;
+
+    let mut signals: Vec<(i64, f64)> = combined
+        .get("signals")
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .map(|r| {
+                    let ts = i0(r, "timestamp").as_i64().unwrap_or(0);
+                    let tokens = grt(r, "tokens");
+                    let minted = s(r, "type").as_str() == Some("MintSignal");
+                    (ts, if minted { tokens } else { -tokens })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    signals.sort_by_key(|(ts, _)| *ts);
+
+    let allocations: Vec<(i64, Option<i64>, f64)> = combined
+        .get("allocations")
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .map(|r| {
+                    (
+                        i0(r, "created_at").as_i64().unwrap_or(0),
+                        r.get("closed_at").and_then(|v| match v {
+                            Value::Number(n) => n.as_i64(),
+                            Value::String(x) => x.parse().ok(),
+                            _ => None,
+                        }),
+                        grt(r, "allocated_tokens"),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if signals.is_empty() && allocations.is_empty() {
+        return json!({ "history": [] });
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let earliest = signals
+        .iter()
+        .map(|(ts, _)| *ts)
+        .chain(allocations.iter().map(|(c, _, _)| *c))
+        .filter(|t| *t > 0)
+        .min()
+        .unwrap_or(now);
+    let start = earliest.max(now - YEAR);
+
+    let mut history = Vec::new();
+    let mut ts = start;
+    while ts <= now {
+        let signal: f64 = signals
+            .iter()
+            .take_while(|(t, _)| *t <= ts)
+            .map(|(_, v)| v)
+            .sum();
+        let stake: f64 = allocations
+            .iter()
+            .filter(|(created, closed, _)| *created <= ts && closed.is_none_or(|c| c > ts))
+            .map(|(_, _, tokens)| tokens)
+            .sum();
+        history.push(json!({
+            "date": iso_date(ts),
+            "signalGrt": num(signal.max(0.0)),
+            "stakeGrt": num(stake),
+        }));
+        ts += WEEK;
+    }
+
+    let peak = history
+        .iter()
+        .map(|p| p["signalGrt"].as_f64().unwrap_or(0.0) + p["stakeGrt"].as_f64().unwrap_or(0.0))
+        .fold(0.0f64, f64::max);
+    let threshold = peak * 0.02;
+    let first = history
+        .iter()
+        .position(|p| {
+            p["signalGrt"].as_f64().unwrap_or(0.0) + p["stakeGrt"].as_f64().unwrap_or(0.0)
+                >= threshold
+        })
+        .unwrap_or(0);
+    json!({ "history": history.split_off(first) })
+}
+
+#[cfg(test)]
+mod subgraph_history_tests {
+    use super::*;
+
+    fn now() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    #[test]
+    fn nothing_at_all_is_an_empty_series_rather_than_a_year_of_zeroes() {
+        let out = subgraph_history(&json!({"signals": [], "allocations": []}));
+        assert_eq!(out["history"], json!([]));
+    }
+
+    #[test]
+    fn signal_is_mints_less_burns_and_stake_is_what_was_open() {
+        let t = now() - 20 * 86_400;
+        let out = subgraph_history(&json!({
+            "signals": [
+                {"timestamp": t, "type": "MintSignal", "tokens": "3000000000000000000"},
+                {"timestamp": t + 86_400, "type": "BurnSignal", "tokens": "1000000000000000000"},
+            ],
+            "allocations": [
+                {"created_at": t, "closed_at": null, "allocated_tokens": "5000000000000000000"},
+            ],
+        }));
+        let h = out["history"].as_array().unwrap();
+        let last = h.last().unwrap();
+        assert!((last["signalGrt"].as_f64().unwrap() - 2.0).abs() < 1e-9);
+        assert!((last["stakeGrt"].as_f64().unwrap() - 5.0).abs() < 1e-9);
+    }
+
+    /// An allocation closed before a point contributes nothing to it. Counting it would make stake
+    /// only ever rise, which is the bug that turns a chart into a staircase.
+    #[test]
+    fn a_closed_allocation_stops_counting_from_the_week_it_closed() {
+        let t = now() - 60 * 86_400;
+        let out = subgraph_history(&json!({
+            "signals": [{"timestamp": t, "type": "MintSignal", "tokens": "1000000000000000000"}],
+            "allocations": [
+                {"created_at": t, "closed_at": t + 7 * 86_400, "allocated_tokens": "9000000000000000000"},
+            ],
+        }));
+        let h = out["history"].as_array().unwrap();
+        assert!(h.first().unwrap()["stakeGrt"].as_f64().unwrap() > 0.0);
+        assert_eq!(h.last().unwrap()["stakeGrt"].as_f64().unwrap(), 0.0);
+    }
+
+    /// Burns exceeding mints inside the window is ordinary when the mints predate it.
+    #[test]
+    fn signal_never_goes_negative() {
+        let t = now() - 30 * 86_400;
+        let out = subgraph_history(&json!({
+            "signals": [{"timestamp": t, "type": "BurnSignal", "tokens": "4000000000000000000"}],
+            "allocations": [],
+        }));
+        for p in out["history"].as_array().unwrap() {
+            assert!(p["signalGrt"].as_f64().unwrap() >= 0.0);
+        }
+    }
+}
