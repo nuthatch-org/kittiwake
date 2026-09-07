@@ -102,8 +102,13 @@ const IGNORE: &[&str] = &[".provenance", ".source"];
 
 #[tokio::main]
 async fn main() {
-    let incumbent_base =
-        arg("--incumbent").unwrap_or_else(|| "https://www.lodestar-dashboard.com".into());
+    // A **frozen** reference, deliberately, not the live dashboard. Since the rewrite went live the
+    // dashboard is this service for every migrated route, so comparing against it is comparing
+    // against ourselves. This deployment predates `src/proxy.ts` by an hour and therefore carries
+    // no rewrite at all; Vercel deployment URLs are permanent and an old deployment cannot start
+    // behaving differently, which is exactly the property a reference wants.
+    let incumbent_base = arg("--incumbent")
+        .unwrap_or_else(|| "https://graph-dashboard-6a34axx1u-nbgn.vercel.app".into());
     let ours_base = arg("--ours").unwrap_or_else(|| "http://127.0.0.1:8080".into());
     let verbose = std::env::args().any(|a| a == "--verbose");
 
@@ -121,8 +126,21 @@ async fn main() {
     let mut rows: Vec<Row> = Vec::new();
 
     for r in routes() {
-        let (a, a_status, a_ms) = timed(&http, &format!("{incumbent_base}{}", r.path)).await;
-        let (b, b_status, b_ms) = timed(&http, &format!("{ours_base}{}", r.path)).await;
+        let (a, a_status, a_ms, a_is_ours) =
+            timed(&http, &format!("{incumbent_base}{}", r.path)).await;
+        let (b, b_status, b_ms, _) = timed(&http, &format!("{ours_base}{}", r.path)).await;
+
+        // The check that stops this grading its own homework. After the cutover the public
+        // dashboard *is* kittiwake for every migrated route, so a harness pointed at it compares
+        // the service with itself and reports perfect parity for entirely the wrong reason: green,
+        // staying green, measuring nothing.
+        if a_is_ours {
+            eprintln!(
+                "\n  the incumbent at {incumbent_base} answered {} with an x-kittiwake header.\n                   That is this service, not the handler it replaced, so there is nothing to compare.\n                   Point --incumbent at a deployment made before the rewrite existed.",
+                r.path
+            );
+            std::process::exit(2);
+        }
 
         let name = r.path.replace(A, "<addr>").replace(D, "<deployment>");
         let (theirs, ours) = (median(a_ms), median(b_ms));
@@ -249,7 +267,11 @@ fn write_markdown(
     );
     let _ = writeln!(out, "- Run: {now}");
     let _ = writeln!(out, "- Ours: `{ours}`");
-    let _ = writeln!(out, "- Incumbent: `{incumbent}`");
+    let _ = writeln!(
+        out,
+        "- Incumbent: `{incumbent}` (a **frozen** pre-rewrite deployment; the live dashboard is \
+         this service now, so comparing against it would compare us with ourselves)"
+    );
     let _ = writeln!(
         out,
         "- Result: **{clean} matching, {broken} breaking, {unreachable} not compared**
@@ -381,14 +403,24 @@ const SAMPLES: usize = 3;
 /// numbers - the 23.5, 17.9 and 7.7 second routes that motivated this whole exercise - are in
 /// `docs/benchmarks.md` and are measured differently, because a cold path can only be measured
 /// once per cache lifetime and not on demand.
+/// Between every request, on both sides.
+///
+/// The service rate-limits at 120 reads a minute **per client**, and after the cutover a full run
+/// is roughly 170 requests all arriving from this one address. Firing them flat out means the
+/// harness trips the defence it helped build and reports six routes as "not compared", which looks
+/// like a parity problem and is nothing of the sort. 700 ms keeps it under 90 a minute.
+const PACE: std::time::Duration = std::time::Duration::from_millis(700);
+
 async fn timed(
     http: &reqwest::Client,
     url: &str,
-) -> (Option<serde_json::Value>, String, Vec<u128>) {
+) -> (Option<serde_json::Value>, String, Vec<u128>, bool) {
     let mut body = None;
     let mut status = String::new();
     let mut times = Vec::new();
+    let mut from_kittiwake = false;
     for i in 0..SAMPLES {
+        tokio::time::sleep(PACE).await;
         // A unique parameter per request, so the incumbent's CDN cannot answer. Without it the
         // "incumbent" column is a Vercel edge hit from a nearby PoP rather than the application
         // doing the work, and the comparison flatters it enormously - every route reads about 35 ms
@@ -403,7 +435,15 @@ async fn timed(
                 .unwrap_or(0)
         );
         let began = std::time::Instant::now();
-        let (b, st) = fetch(http, &bust).await;
+        let mut a = fetch(http, &bust).await;
+        // Rate-limited despite the pacing: wait out the window and try once more, rather than
+        // recording a refusal as a difference.
+        if a.status.starts_with("429") {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            a = fetch(http, &bust).await;
+        }
+        let (b, st) = (a.body, a.status);
+        from_kittiwake |= a.from_kittiwake;
         // Microseconds, not milliseconds. At millisecond resolution every fast route reads `0`,
         // which is then indistinguishable from "did not answer" and drops out of the ratio - so the
         // summary is computed only from the slow routes and reports a migration that made things
@@ -417,7 +457,7 @@ async fn timed(
             }
         }
     }
-    (body, status, times)
+    (body, status, times, from_kittiwake)
 }
 
 fn median(mut v: Vec<u128>) -> Option<u128> {
@@ -428,23 +468,51 @@ fn median(mut v: Vec<u128>) -> Option<u128> {
     Some(v[v.len() / 2])
 }
 
-async fn fetch(http: &reqwest::Client, url: &str) -> (Option<serde_json::Value>, String) {
+/// One answer, plus the two facts about it the caller needs beyond the body: what the status was,
+/// and whether it came from kittiwake rather than from the handler we mean to compare against.
+struct Answer {
+    body: Option<serde_json::Value>,
+    status: String,
+    from_kittiwake: bool,
+}
+
+async fn fetch(http: &reqwest::Client, url: &str) -> Answer {
     match http.get(url).send().await {
         Ok(r) => {
             let status = r.status();
+            let from_kittiwake = r
+                .headers()
+                .keys()
+                .any(|k| k.as_str().starts_with("x-kittiwake"));
+            // A 429 is us tripping the service's own rate limiter, which is a fact about the
+            // harness rather than about parity. Reported so the caller can slow down instead of
+            // recording it as a difference.
             match r.json::<serde_json::Value>().await {
-                Ok(v) if status.is_success() => (Some(v), status.to_string()),
-                Ok(_) => (None, status.to_string()),
-                Err(_) => (None, format!("{status}, unreadable body")),
+                Ok(v) if status.is_success() => Answer {
+                    body: Some(v),
+                    status: status.to_string(),
+                    from_kittiwake,
+                },
+                Ok(_) => Answer {
+                    body: None,
+                    status: status.to_string(),
+                    from_kittiwake,
+                },
+                Err(_) => Answer {
+                    body: None,
+                    status: format!("{status}, unreadable body"),
+                    from_kittiwake,
+                },
             }
         }
-        Err(e) => (
-            None,
-            if e.is_timeout() {
+        Err(e) => Answer {
+            body: None,
+            status: if e.is_timeout() {
                 "timeout".into()
             } else {
                 "unreachable".into()
             },
-        ),
+            from_kittiwake: false,
+        },
     }
 }
