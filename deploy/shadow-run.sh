@@ -2,6 +2,7 @@
 # The shadow run: both systems writing, and a way to tell whether they agree.
 #
 #   bash deploy/shadow-run.sh baseline   # before enabling anything
+#   bash deploy/shadow-run.sh seed       # start our cursors where theirs are
 #   bash deploy/shadow-run.sh enable     # grant the writes and turn the scheduler on
 #   bash deploy/shadow-run.sh compare    # after a cycle or two
 #   bash deploy/shadow-run.sh disable    # back out
@@ -24,6 +25,40 @@ CMD=${1:-}
 TABLES="epochs delegation_events allocations disputes network_snapshots rav_redemptions indexers"
 
 case "$CMD" in
+seed)
+  ssh -i "$KEY" "$HOST" 'bash -s' <<'BOX'
+set -euo pipefail
+export LC_ALL=C
+# Start our cursors where the platform's already are.
+#
+# Without this a cold start is not a shadow run, it is a backfill: 608,725 delegation events at
+# 1,000 a quarter-hour is six days, 852,326 allocations at 2,000 an hour is seventeen, and RAV
+# would re-read every collection ever made. Six days of nest permits spent re-writing rows that
+# are already there, because every one of those upserts is idempotent and would change nothing.
+#
+# What the shadow run is actually testing is whether this service keeps up *from here*, which is
+# the only thing that matters after cutover. The history is already in the tables.
+#
+# `allocations` cannot be copied: the platform tracks it by epoch and this service walks by id, so
+# its cursor is seeded from the highest id already ingested instead. That difference is itself a
+# finding - two implementations of the same walk with incompatible cursors cannot be handed over
+# by copying a row.
+sudo -u postgres psql -v ON_ERROR_STOP=1 -qAt lodestar <<'SQL'
+INSERT INTO ingestion_state (key, last_epoch, last_block, last_id, updated_at)
+SELECT 'kittiwake:' || key, last_epoch, last_block, last_id, NOW()
+  FROM ingestion_state WHERE key IN ('epochs','delegation_events','rav','disputes')
+ON CONFLICT (key) DO UPDATE SET
+  last_epoch = EXCLUDED.last_epoch, last_block = EXCLUDED.last_block,
+  last_id = EXCLUDED.last_id, updated_at = NOW();
+
+INSERT INTO ingestion_state (key, last_id, updated_at)
+SELECT 'kittiwake:allocations', max(id), NOW() FROM allocations
+ON CONFLICT (key) DO UPDATE SET last_id = EXCLUDED.last_id, updated_at = NOW();
+SQL
+sudo -u postgres psql -At -F'  ' lodestar -c   "SELECT key, COALESCE(last_epoch::text,'-'), COALESCE(last_block::text,'-'), COALESCE(left(last_id,12),'-')
+   FROM ingestion_state WHERE key LIKE 'kittiwake:%' ORDER BY key" | sed 's/^/  /'
+BOX
+  ;;
 baseline|compare)
   ssh -i "$KEY" "$HOST" "TABLES='$TABLES' LABEL='$CMD' bash -s" <<'BOX'
 set -euo pipefail
@@ -90,7 +125,7 @@ echo "  scheduler off, writes revoked"
 BOX
   ;;
 *)
-  echo "usage: $0 {baseline|enable|compare|disable}" >&2
+  echo "usage: $0 {baseline|seed|enable|compare|disable}" >&2
   exit 2
   ;;
 esac
