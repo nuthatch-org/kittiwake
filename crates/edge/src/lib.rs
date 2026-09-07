@@ -107,6 +107,16 @@ pub struct AppState {
 /// The header the edge proxy proves itself with.
 pub const EDGE_HEADER: &str = "x-lodestar-edge";
 
+/// The header the edge proxy names the real client in.
+///
+/// A header of our own rather than `X-Forwarded-For`, and the reason is Caddy. Caddy **replaces**
+/// the forwarded chain with its own peer unless that peer is in `trusted_proxies`, which is correct
+/// of it - preserving an arbitrary caller's chain is how spoofing works - but it means the browser
+/// address the edge put there never survives the hop. The alternative was to maintain a list of
+/// Vercel's egress ranges in the Caddyfile and keep it current, which is a list that goes stale
+/// silently. A header Caddy does not manage is simply passed through untouched.
+pub const CLIENT_HEADER: &str = "x-lodestar-client";
+
 pub(crate) fn client_ip(
     peer: SocketAddr,
     headers: &HeaderMap,
@@ -138,10 +148,10 @@ pub(crate) fn client_ip(
         })
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
 
-    // `X-Forwarded-For`'s leftmost entry is the real browser - and is also whatever an anonymous
-    // caller chose to put there. It is only worth reading when the request provably came through
-    // our own edge, which is what the secret establishes. Without it, every visitor arrives wearing
-    // the edge's address and 120 requests a minute is the whole world's budget.
+    // The edge names the real browser in `X-Lodestar-Client` - and so could anyone else, since it
+    // is just a header. It is only worth reading when the request provably came through our own
+    // edge, which is what the secret establishes. Without it, every visitor arrives wearing the
+    // edge's address and 120 requests a minute is the whole world's budget.
     let Some(secret) = edge_secret else {
         return caddys_peer;
     };
@@ -160,10 +170,10 @@ pub(crate) fn client_ip(
     }
 
     headers
-        .get("x-forwarded-for")
+        .get(CLIENT_HEADER)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
         .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        // The edge proved itself but named nobody. Its own address is the honest answer.
         .unwrap_or(caddys_peer)
 }
 
@@ -386,6 +396,7 @@ async fn get_metrics(State(st): State<AppState>) -> Response {
 pub fn router(state: AppState) -> Router {
     use axum::routing::post;
     Router::new()
+        .route("/whoami", get(get_whoami))
         .route("/health", get(get_health))
         .route("/ready", get(get_ready))
         .route("/metrics", get(get_metrics))
@@ -484,6 +495,51 @@ pub fn state(
     }
 }
 
+/// Which address the rate limiter attributed this request to.
+///
+/// The caller's own, so nothing is disclosed that they did not already know. Behind a proxy it is
+/// the one fact that is otherwise invisible, and getting it wrong puts every visitor in the world
+/// into a single rate-limit bucket while every log and dashboard says the service is healthy.
+///
+/// This exists because diagnosing exactly that took an afternoon of firing three hundred requests
+/// at the box and inferring the answer from how many came back 429. One request answers it now.
+async fn get_whoami(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let client = client_ip(peer, &headers, st.edge_secret.as_deref());
+    let mut resp = axum::Json(serde_json::json!({
+        // What we rate-limit by.
+        "client": client.to_string(),
+        // Who actually opened the connection. Loopback means something is in front of us.
+        "peer": peer.ip().to_string(),
+        // Whether this request proved it came through our own edge. False here with a proxy in
+        // front means the forwarded chain is not being believed, which is the failure above.
+        "edge_trusted": st.edge_secret.as_deref().is_some_and(|secret| {
+            headers
+                .get(EDGE_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|p| p.len() == secret.len() && p == secret)
+        }),
+        "named_client": headers
+            .get(CLIENT_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        "forwarded_for": headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        "real_ip": headers
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+    }))
+    .into_response();
+    no_store(resp.headers_mut());
+    resp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,10 +587,7 @@ mod tests {
     #[test]
     fn a_forwarded_header_without_the_edge_secret_names_nobody() {
         let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let h = headers(&[
-            ("x-forwarded-for", "1.2.3.4, 198.51.100.7"),
-            ("x-real-ip", "198.51.100.7"),
-        ]);
+        let h = headers(&[(CLIENT_HEADER, "1.2.3.4"), ("x-real-ip", "198.51.100.7")]);
         assert_eq!(client_ip(peer, &h, Some(SECRET)), ip("198.51.100.7"));
         assert_eq!(client_ip(peer, &h, None), ip("198.51.100.7"));
     }
@@ -544,7 +597,7 @@ mod tests {
     fn the_edge_secret_makes_the_real_client_visible() {
         let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
         let h = headers(&[
-            ("x-forwarded-for", "1.2.3.4, 198.51.100.7"),
+            (CLIENT_HEADER, "1.2.3.4"),
             ("x-real-ip", "198.51.100.7"),
             (EDGE_HEADER, SECRET),
         ]);
@@ -563,7 +616,7 @@ mod tests {
             "an-edge-secret-nobody-else-hasX",
         ] {
             let h = headers(&[
-                ("x-forwarded-for", "1.2.3.4, 198.51.100.7"),
+                (CLIENT_HEADER, "1.2.3.4"),
                 ("x-real-ip", "198.51.100.7"),
                 (EDGE_HEADER, attempt),
             ]);
@@ -581,7 +634,7 @@ mod tests {
     fn an_unconfigured_secret_cannot_be_satisfied() {
         let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
         let h = headers(&[
-            ("x-forwarded-for", "1.2.3.4, 198.51.100.7"),
+            (CLIENT_HEADER, "1.2.3.4"),
             ("x-real-ip", "198.51.100.7"),
             (EDGE_HEADER, ""),
         ]);
