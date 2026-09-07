@@ -54,6 +54,10 @@ export LC_ALL=C
 sudo -u postgres psql -v ON_ERROR_STOP=1 -qAt lodestar <<'SQL'
 GRANT INSERT, UPDATE, DELETE ON indexers, indexer_snapshots, epochs, delegation_events,
   allocations, disputes, network_snapshots, rav_redemptions, ingestion_state TO kittiwake;
+-- The sequences those inserts draw from. Granting the table without the sequence gets you a job
+-- that fails on its first write with `permission denied for sequence`, which is exactly what
+-- happened to `snapshot-network` on the first shadow run.
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO kittiwake;
 SQL
 echo "  writes granted"
 CFG=/etc/kittiwake/config.toml

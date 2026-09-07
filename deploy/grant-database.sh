@@ -85,7 +85,14 @@ GRANT INSERT ON cron_runs TO $ROLE;
 -- sequence, and the sequence is a separate object with its own permissions. Every job run failed to
 -- record itself until this was added, and it failed as a warning rather than an error, which is the
 -- quietest possible way for an audit trail to stop existing.
-GRANT USAGE ON SEQUENCE cron_runs_id_seq TO $ROLE;
+-- Every sequence, not one at a time. `INSERT` on a table with a serial primary key draws from a
+-- sequence, and the sequence is a separate object with its own permissions. Granting them
+-- individually is how this was done first, and it meant `cron_runs` worked while
+-- `network_snapshots` failed the moment the scheduler was turned on - the same bug twice, because
+-- the fix had been applied to the instance rather than the class. A sequence grant confers
+-- `nextval` and nothing else, so there is no reason to be miserly with it.
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO $ROLE;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE ON SEQUENCES TO $ROLE;
 SQL
 
 # The three tables that are ours. Created here as the superuser and owned by the role, so the
