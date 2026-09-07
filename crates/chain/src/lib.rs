@@ -312,7 +312,17 @@ impl Chain {
         let verifier: alloy::primitives::Address = SUBGRAPH_SERVICE.parse().ok()?;
         let who: alloy::primitives::Address = indexer.parse().ok()?;
         let c = IHorizonStaking::new(staking, provider);
-        let pool = c.getDelegationPool(who, verifier).call().await.ok()?;
+        // Bounded, because this sits in a request path. An RPC endpoint that stops answering must
+        // cost the reader a missing cross-check, not a hung page: the trail beside it is still
+        // worth showing, and `None` is how this route says "the chain did not answer" as distinct
+        // from "the chain says zero".
+        let pool = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            c.getDelegationPool(who, verifier).call(),
+        )
+        .await
+        .ok()?
+        .ok()?;
         let wei = |v: alloy::primitives::U256| -> f64 {
             v.to_string().parse::<f64>().unwrap_or(0.0) / 1e18
         };
