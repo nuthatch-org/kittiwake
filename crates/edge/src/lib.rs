@@ -397,6 +397,9 @@ pub fn router(state: AppState) -> Router {
     use axum::routing::post;
     Router::new()
         .route("/whoami", get(get_whoami))
+        // Also under /api, so it can be reached through the edge rewrite and the whole chain can be
+        // checked from a browser rather than only from the box.
+        .route("/api/whoami", get(get_whoami))
         .route("/health", get(get_health))
         .route("/ready", get(get_ready))
         .route("/metrics", get(get_metrics))
