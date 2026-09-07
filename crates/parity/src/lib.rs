@@ -23,13 +23,10 @@ fn tag(v: &serde_json::Value) -> &'static str {
     match v {
         serde_json::Value::Null => "null",
         serde_json::Value::Bool(_) => "bool",
-        serde_json::Value::Number(n) => {
-            if n.is_f64() && n.as_f64().is_some_and(|f| f.fract() != 0.0) {
-                "float"
-            } else {
-                "int"
-            }
-        }
+        // One tag for every JSON number. Splitting int from float would report `3` against `3.0`
+        // as a break, and the consumers are JavaScript, which has a single number type and cannot
+        // tell them apart. A TVL that happens to land on a whole number is not a contract change.
+        serde_json::Value::Number(_) => "number",
         serde_json::Value::String(s) => {
             if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
                 "numeric-string"
@@ -138,7 +135,7 @@ mod tests {
     #[test]
     fn a_long_list_describes_one_shape() {
         let sh = s(r#"{"rows":[{"a":1},{"a":2},{"a":3}]}"#);
-        assert_eq!(sh[".rows[].a"], BTreeSet::from(["int".to_string()]));
+        assert_eq!(sh[".rows[].a"], BTreeSet::from(["number".to_string()]));
         assert_eq!(sh.len(), 4, "root, rows, rows[], rows[].a");
     }
 
@@ -159,6 +156,15 @@ mod tests {
         let d = diff(&a, &b, &[]);
         assert!(d.breaking(), "a string-to-number change must be reported");
         assert_eq!(d.retyped[0].0, ".tokens");
+    }
+
+    /// A figure that happens to land on a whole number is not a contract change. Reporting it as
+    /// one produces breaks nobody can act on, and a harness people learn to ignore.
+    #[test]
+    fn a_whole_number_float_is_not_a_break() {
+        let incumbent = s(r#"{"tvl": 2612345678.5}"#);
+        let ours = s(r#"{"tvl": 2612345678.0}"#);
+        assert!(!diff(&incumbent, &ours, &[]).breaking());
     }
 
     #[test]

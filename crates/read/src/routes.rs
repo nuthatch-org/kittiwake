@@ -557,20 +557,76 @@ pub async fn rewards_history(ctx: &ReadCtx, addr: &str) -> Result<Read, ApiError
 // Provisions, payments, proofs
 // ---------------------------------------------------------------------------------------------
 
+/// `/api/provisions`, by indexer.
+///
+/// Two folds: the indexer's own provisions, and the network-wide totals for each data service they
+/// provision to. The totals are a property of the service rather than of this indexer, so they
+/// cannot come from the first query - and reporting a per-indexer figure under a network-wide name
+/// would be worse than leaving it out.
 pub async fn provisions_by_indexer(ctx: &ReadCtx, addr: &str) -> Result<Read, ApiError> {
     let sql = addr_or_400!(sql::provisions_by_indexer_sql(addr), "address");
+    let fetch: Fetcher = Arc::new(move |gate: NestGate, lane: Lane| {
+        let sql = sql.clone();
+        Box::pin(async move {
+            let mut spec = QuerySpec::read(NestId::Alloc, sql).with_timeout(T_FOLD);
+            spec.lane = lane;
+            let key = format!("alloc:{}", blake3::hash(spec.sql.as_bytes()).to_hex());
+            let rows = gate
+                .query_coalesced(&key, spec)
+                .await
+                .map_err(ApiError::from)?;
+
+            let services: Vec<String> = {
+                let mut v: Vec<String> = rows
+                    .rows
+                    .iter()
+                    .filter_map(|r| r.get("data_service").and_then(|s| s.as_str()))
+                    .map(str::to_string)
+                    .collect();
+                v.sort();
+                v.dedup();
+                v
+            };
+
+            let mut totals: std::collections::HashMap<String, serde_json::Value> =
+                Default::default();
+            if let Some(tsql) = sql::data_service_totals_sql(&services) {
+                let mut tspec = QuerySpec::read(NestId::Alloc, tsql).with_timeout(T_FOLD);
+                tspec.lane = lane;
+                let tkey = format!("alloc:{}", blake3::hash(tspec.sql.as_bytes()).to_hex());
+                if let Ok(t) = gate.query_coalesced(&tkey, tspec).await {
+                    for row in &t.rows {
+                        if let Some(id) = row.get("data_service").and_then(|s| s.as_str()) {
+                            totals.insert(id.to_string(), row.clone());
+                        }
+                    }
+                }
+            }
+
+            let mapped: Vec<serde_json::Value> = rows
+                .rows
+                .iter()
+                .map(|r| {
+                    let svc = r
+                        .get("data_service")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default();
+                    crate::shape::provision_with_totals(r, totals.get(svc))
+                })
+                .collect();
+            Ok((
+                serde_json::json!({ "provisions": mapped }),
+                rows.provenance.clone(),
+            ))
+        })
+    });
+
     ctx.cached(
         "provisions-indexer",
         NestId::Alloc,
-        serde_json::json!({"indexer": addr}),
+        serde_json::json!({ "indexer": addr }),
         CachePolicy::from_poll_interval(cadence::LIVE),
-        rows_shaped(
-            NestId::Alloc,
-            sql,
-            T_FOLD,
-            crate::shape::provision,
-            Some("provisions"),
-        ),
+        fetch,
     )
     .await
 }
@@ -658,13 +714,25 @@ pub async fn delegation_events(
         NestId::Alloc,
         serde_json::json!({"indexer": indexer, "first": first, "since": since}),
         CachePolicy::from_poll_interval(cadence::SLOW),
-        rows_shaped(
-            NestId::Alloc,
-            sql,
-            T_FOLD,
-            crate::shape::delegation_event,
-            Some("delegationEvents"),
-        ),
+        {
+            // The incumbent puts `source` inside `data` on this route and at the top level on
+            // others. Not a pattern worth rationalising - just one the callers already parse.
+            let inner = rows_shaped(
+                NestId::Alloc,
+                sql,
+                T_FOLD,
+                crate::shape::delegation_event,
+                Some("delegationEvents"),
+            );
+            Arc::new(move |gate, lane| {
+                let inner = inner.clone();
+                Box::pin(async move {
+                    let (mut v, p) = inner(gate, lane).await?;
+                    v["source"] = serde_json::json!("nuthatch");
+                    Ok((v, p))
+                })
+            })
+        },
     )
     .await
 }
@@ -800,17 +868,72 @@ pub async fn subgraph_deployments(
     .await
 }
 
+/// `/api/subgraph-fees-30d`: the directory rows for the deployments that earned fees, each with
+/// what it earned in the window.
+///
+/// Two folds and a join. The fee query alone answers "which deployments earned, and how much",
+/// which is not what the panel draws: it draws the deployment with its fee alongside.
 pub async fn subgraph_fees_30d(ctx: &ReadCtx, since: i64) -> Result<Read, ApiError> {
+    let fetch: Fetcher = Arc::new(move |gate: NestGate, lane: Lane| {
+        Box::pin(async move {
+            let mut fees =
+                QuerySpec::read(NestId::Alloc, sql::deployment_fees_since_sql(since, 200))
+                    .with_timeout(T_FOLD);
+            fees.lane = lane;
+            let fkey = format!("alloc:{}", blake3::hash(fees.sql.as_bytes()).to_hex());
+            let fee_rows = gate
+                .query_coalesced(&fkey, fees)
+                .await
+                .map_err(ApiError::from)?;
+
+            let mut by_id: std::collections::HashMap<String, serde_json::Value> =
+                Default::default();
+            let mut ids: Vec<String> = Vec::new();
+            for r in &fee_rows.rows {
+                if let Some(id) = r.get("id").and_then(|v| v.as_str()) {
+                    ids.push(id.to_string());
+                    if let Some(f) = r.get("query_fees") {
+                        by_id.insert(id.to_string(), f.clone());
+                    }
+                }
+            }
+
+            let Some(dsql) = sql::deployments_by_id_sql(&ids) else {
+                // No deployments earned in the window. An empty list, not an error.
+                return Ok((
+                    serde_json::Value::Array(vec![]),
+                    fee_rows.provenance.clone(),
+                ));
+            };
+            let mut deps = QuerySpec::read(NestId::Alloc, dsql).with_timeout(T_FOLD);
+            deps.lane = lane;
+            let dkey = format!("alloc:{}", blake3::hash(deps.sql.as_bytes()).to_hex());
+            let dep_rows = gate
+                .query_coalesced(&dkey, deps)
+                .await
+                .map_err(ApiError::from)?;
+
+            let mapped: Vec<serde_json::Value> = dep_rows
+                .rows
+                .iter()
+                .map(|r| {
+                    let id = r.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                    crate::shape::deployment(r, by_id.get(id))
+                })
+                .collect();
+            Ok((
+                serde_json::Value::Array(mapped),
+                older_of(&fee_rows.provenance, &dep_rows.provenance),
+            ))
+        })
+    });
+
     ctx.cached(
         "subgraph-fees-30d",
         NestId::Alloc,
-        serde_json::json!({"since": since}),
+        serde_json::json!({ "since": since }),
         CachePolicy::from_poll_interval(cadence::ARCHIVAL),
-        rows_only(
-            NestId::Alloc,
-            sql::deployment_fees_since_sql(since, 200),
-            T_FOLD,
-        ),
+        fetch,
     )
     .await
 }

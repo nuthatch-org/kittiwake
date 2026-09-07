@@ -147,6 +147,15 @@ pub fn delegation_event(r: &Value) -> Value {
 ///
 /// The service-wide totals are not in this row - they are a fold over every provision to that
 /// service - so they are null here rather than a per-indexer figure wearing a network-wide name.
+pub fn provision_with_totals(r: &Value, totals: Option<&Value>) -> Value {
+    let mut out = provision(r);
+    if let Some(tot) = totals {
+        out["dataService"]["totalTokensProvisioned"] = s0(tot, "total_tokens_provisioned");
+        out["dataService"]["totalTokensAllocated"] = s0(tot, "total_tokens_allocated");
+    }
+    out
+}
+
 pub fn provision(r: &Value) -> Value {
     json!({
         "id": t(r, "id"),
@@ -175,8 +184,10 @@ pub fn provision(r: &Value) -> Value {
 /// between them needs base58 and is done by the metadata pipeline, so the hash is the id here until
 /// that lands, and `displayName` is null rather than invented.
 pub fn deployment(r: &Value, fees_30d: Option<&Value>) -> Value {
+    let id = t(r, "id");
+    let id_str = id.as_str().unwrap_or_default().to_string();
     let mut out = json!({
-        "id": t(r, "id"),
+        "id": id,
         "ipfsHash": t(r, "id"),
         "signalledTokens": s0(r, "signalled_tokens"),
         "stakedTokens": s0(r, "staked_tokens"),
@@ -184,13 +195,30 @@ pub fn deployment(r: &Value, fees_30d: Option<&Value>) -> Value {
         "createdAt": i0(r, "created_at"),
         "displayName": Value::Null,
         "categories": json!([]),
-        "curatorSignals": json!([]),
-        "indexerAllocations": json!([]),
+        "curatorSignals": placeholders(&id_str, i0(r, "curator_count").as_i64().unwrap_or(0)),
+        "indexerAllocations": placeholders(
+            &id_str,
+            i0(r, "active_allocation_count").as_i64().unwrap_or(0),
+        ),
     });
     if let Some(f) = fees_30d {
         out["queryFees30d"] = f.clone();
     }
     out
+}
+
+/// `n` objects carrying only an id of the form `<deployment>-<i>`.
+///
+/// This looks like a placeholder because it is one. The incumbent sends these arrays and the
+/// frontend reads only their `length` - they carry a count, not data. Reproducing the exact shape
+/// costs one loop; fetching the real signals and allocations per deployment would cost a query per
+/// row of the directory and tell the reader nothing more.
+fn placeholders(deployment_id: &str, n: i64) -> Value {
+    Value::Array(
+        (0..n.clamp(0, 10_000))
+            .map(|i| json!({ "id": format!("{deployment_id}-{i}") }))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -253,6 +281,16 @@ mod tests {
         let r = json!({"allocation_count": "7", "created_at": "1700000000"});
         assert_eq!(indexer(&r)["allocationCount"], json!(7));
         assert_eq!(indexer(&r)["createdAt"], json!(1_700_000_000));
+    }
+
+    /// The arrays carry a count. Their length is the whole of what the frontend reads.
+    #[test]
+    fn the_nested_arrays_carry_the_counts_the_frontend_reads() {
+        let r = json!({"id": "0xabc", "curator_count": 2, "active_allocation_count": 3});
+        let d = deployment(&r, None);
+        assert_eq!(d["curatorSignals"].as_array().unwrap().len(), 2);
+        assert_eq!(d["indexerAllocations"].as_array().unwrap().len(), 3);
+        assert_eq!(d["curatorSignals"][0]["id"], json!("0xabc-0"));
     }
 
     #[test]
