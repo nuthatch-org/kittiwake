@@ -3076,6 +3076,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "kittiwake-dock"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "getrandom 0.4.3",
+ "hex",
+ "hmac 0.12.1",
+ "kittiwake-types",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror",
+]
+
+[[package]]
 name = "kittiwake-edge"
 version = "0.1.0"
 dependencies = [
