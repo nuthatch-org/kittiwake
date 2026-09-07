@@ -347,20 +347,31 @@ fn int_of(v: &serde_json::Value, key: &str) -> serde_json::Value {
     }
 }
 
-/// `/api/token-metrics`: the epoch series, from which issuance and rewards are derived.
+/// `/api/token-metrics`: issuance against burn, one point per epoch, oldest first.
+///
+/// The nest returns newest first because that is what every other epoch view wants; a chart reads
+/// left to right, so the series is reversed here rather than asking the nest twice.
 pub async fn token_metrics(ctx: &ReadCtx, first: i64) -> Result<Read, ApiError> {
+    let inner = rows_only(NestId::Alloc, sql::epochs_sql(first), T_QUICK);
+    let fetch: Fetcher = Arc::new(move |gate, lane| {
+        let inner = inner.clone();
+        Box::pin(async move {
+            let (v, p) = inner(gate, lane).await?;
+            let mut points: Vec<serde_json::Value> = v
+                .as_array()
+                .map(|rows| rows.iter().map(crate::shape::token_metric).collect())
+                .unwrap_or_default();
+            points.reverse();
+            Ok((serde_json::Value::Array(points), p))
+        })
+    });
+
     ctx.cached(
         "token-metrics",
         NestId::Alloc,
-        serde_json::json!({"first": first}),
+        serde_json::json!({ "first": first }),
         CachePolicy::from_poll_interval(cadence::SLOW),
-        many(
-            vec![
-                Part::rows("epochs", NestId::Alloc, sql::epochs_sql(first)),
-                Part::one("network", NestId::Alloc, sql::network_sql().to_string()),
-            ],
-            T_QUICK,
-        ),
+        fetch,
     )
     .await
 }
@@ -681,34 +692,45 @@ pub async fn provisions_by_service(
     .await
 }
 
-/// `/api/payments`: escrow balances, the transaction tail, and tally collections. Three folds.
+/// `/api/payments`: escrow balances, the transaction tail, tally collections, and the totals over
+/// them. Three folds against the same nest, coalesced separately.
 pub async fn payments(ctx: &ReadCtx, receiver: Option<&str>) -> Result<Read, ApiError> {
+    let accounts_sql = addr_or_400!(sql::escrow_accounts_sql(receiver, 100), "address");
+    let tx_sql = addr_or_400!(
+        sql::escrow_transactions_sql(receiver, if receiver.is_some() { 100 } else { 50 }),
+        "address"
+    );
+    let tally_sql = addr_or_400!(sql::tally_collected_sql(receiver, 50), "address");
+
     let parts = vec![
-        Part::rows(
-            "accounts",
-            NestId::Alloc,
-            addr_or_400!(sql::escrow_accounts_sql(receiver, 100), "address"),
-        ),
-        Part::rows(
-            "transactions",
-            NestId::Alloc,
-            addr_or_400!(
-                sql::escrow_transactions_sql(receiver, if receiver.is_some() { 100 } else { 50 }),
-                "address"
-            ),
-        ),
-        Part::rows(
-            "tally",
-            NestId::Alloc,
-            addr_or_400!(sql::tally_collected_sql(receiver, 50), "address"),
-        ),
+        Part::rows("accounts", NestId::Alloc, accounts_sql),
+        Part::rows("transactions", NestId::Alloc, tx_sql),
+        Part::rows("tally", NestId::Alloc, tally_sql),
     ];
+    let inner = many(parts, T_FOLD);
+    let fetch: Fetcher = Arc::new(move |gate, lane| {
+        let inner = inner.clone();
+        Box::pin(async move {
+            let (v, p) = inner(gate, lane).await?;
+            let arr = |k: &str| {
+                v.get(k)
+                    .and_then(|x| x.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            Ok((
+                crate::shape::payments(&arr("accounts"), &arr("transactions"), &arr("tally")),
+                p,
+            ))
+        })
+    });
+
     ctx.cached(
         "payments",
         NestId::Alloc,
-        serde_json::json!({"receiver": receiver}),
+        serde_json::json!({ "receiver": receiver }),
         CachePolicy::from_poll_interval(cadence::SLOW),
-        many(parts, T_FOLD),
+        fetch,
     )
     .await
 }
@@ -856,17 +878,29 @@ pub async fn delegation_flows(ctx: &ReadCtx, since: i64) -> Result<Read, ApiErro
 // Subgraphs: the GNS nest and the deployment views
 // ---------------------------------------------------------------------------------------------
 
+/// `/api/developer-activity`: subgraphs published per week over the window.
 pub async fn developer_activity(ctx: &ReadCtx, cutoff: i64) -> Result<Read, ApiError> {
+    let inner = rows_only(
+        NestId::Gns,
+        sql::subgraphs_published_since_sql(cutoff),
+        T_FOLD,
+    );
+    let now = cutoff + 12 * 30 * 86_400;
+    let fetch: Fetcher = Arc::new(move |gate, lane| {
+        let inner = inner.clone();
+        Box::pin(async move {
+            let (v, p) = inner(gate, lane).await?;
+            let rows = v.as_array().cloned().unwrap_or_default();
+            Ok((crate::shape::developer_activity(&rows, 12, now), p))
+        })
+    });
+
     ctx.cached(
         "developer-activity",
         NestId::Gns,
-        serde_json::json!({"cutoff": cutoff}),
+        serde_json::json!({ "cutoff": cutoff }),
         CachePolicy::from_poll_interval(cadence::ARCHIVAL),
-        rows_only(
-            NestId::Gns,
-            sql::subgraphs_published_since_sql(cutoff),
-            T_FOLD,
-        ),
+        fetch,
     )
     .await
 }

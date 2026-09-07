@@ -240,6 +240,81 @@ fn placeholders(deployment_id: &str, n: i64) -> Value {
 mod tests {
     use super::*;
 
+    /// Monday, because that is what the chart's axis claims. A Sunday-start week shifts every
+    /// point by a day and looks almost right.
+    #[test]
+    fn weeks_start_on_monday_in_utc() {
+        // 2026-09-07 is a Monday; 2026-09-06 a Sunday.
+        let monday = 1_788_739_200; // 2026-09-07T00:00:00Z
+        assert_eq!(week_start_utc(monday), "2026-09-07");
+        assert_eq!(
+            week_start_utc(monday - 1),
+            "2026-08-31",
+            "Sunday belongs to the week before"
+        );
+        assert_eq!(week_start_utc(monday + 6 * 86_400), "2026-09-07");
+    }
+
+    /// A quiet week is a week with no publications, not a week that did not happen.
+    #[test]
+    fn empty_weeks_are_emitted_so_the_axis_does_not_compress() {
+        let rows = vec![
+            json!({"createdAt": 1_785_888_000}), // 2026-08-03 week
+            json!({"createdAt": 1_787_097_600}), // two weeks later
+        ];
+        let out = developer_activity(&rows, 12, 1_788_739_200);
+        let weeks = out["weeks"].as_array().unwrap();
+        assert_eq!(weeks.len(), 3, "the quiet week in the middle must appear");
+        assert_eq!(weeks[1]["count"], json!(0));
+        assert_eq!(weeks[2]["cumulative"], json!(2));
+    }
+
+    /// The current week is still filling; comparing to it would always read as a collapse.
+    #[test]
+    fn week_over_week_ignores_the_week_still_in_progress() {
+        let now = 1_788_739_200; // a Monday
+        let rows = vec![
+            json!({"createdAt": now - 14 * 86_400}),
+            json!({"createdAt": now - 14 * 86_400}),
+            json!({"createdAt": now - 7 * 86_400}),
+            json!({"createdAt": now}),
+        ];
+        let out = developer_activity(&rows, 12, now);
+        assert_eq!(
+            out["lastWeekCount"],
+            json!(1),
+            "the last complete week, not the current one"
+        );
+        assert_eq!(out["weekOverWeekPct"], json!(-50.0));
+        assert_eq!(out["totalInWindow"], json!(4));
+    }
+
+    #[test]
+    fn a_dispute_burn_of_zero_means_none_happened() {
+        let r = json!({"id": 1374, "total_rewards": "2000000000000000000", "taxed_query_fees": "500000000000000000"});
+        let m = token_metric(&r);
+        assert_eq!(m["issuance"], json!(2.0));
+        assert_eq!(m["queryFeeTaxBurn"], json!(0.5));
+        assert_eq!(m["disputeBurn"], json!(0));
+        assert_eq!(m["net"], json!(1.5));
+    }
+
+    #[test]
+    fn payment_totals_are_summed_exactly_and_parties_counted_once() {
+        let accounts = vec![
+            json!({"payer": "0xa", "collector": "0xc", "receiver": "0xr", "balance": "1000000000000000000000000", "thawing": "5"}),
+            json!({"payer": "0xa", "collector": "0xc", "receiver": "0xs", "balance": "2000000000000000000000000", "thawing": "0"}),
+        ];
+        let out = payments(&accounts, &[], &[]);
+        assert_eq!(
+            out["totalEscrowBalance"],
+            json!("3000000000000000000000000")
+        );
+        assert_eq!(out["totalThawing"], json!("5"));
+        assert_eq!(out["activePayers"], json!(1), "one payer, twice");
+        assert_eq!(out["activeReceivers"], json!(2));
+    }
+
     #[test]
     fn wei_survives_the_translation_as_a_string() {
         let r = json!({"staked_tokens": "707387524504002513347899608"});
@@ -331,4 +406,209 @@ mod tests {
             json!("42")
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Derived shapes: figures the nest does not hold, computed from ones it does
+// ---------------------------------------------------------------------------------------------
+
+/// Wei as whole GRT. For display figures only, never for a balance a reader might act on.
+fn grt(v: &Value, key: &str) -> f64 {
+    match v.get(key) {
+        Some(Value::String(x)) => x.parse::<f64>().unwrap_or(0.0) / 1e18,
+        Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0) / 1e18,
+        _ => 0.0,
+    }
+}
+
+/// One epoch as an issuance-and-burn point.
+///
+/// `disputeBurn` is zero from this source: the burn is only known once a dispute is accepted and
+/// `StakeSlashed` is indexed, and none ever has been. Zero here means "none happened", which is
+/// true, rather than "we did not look".
+pub fn token_metric(r: &Value) -> Value {
+    let issuance = grt(r, "total_rewards");
+    let query_fee_tax_burn = grt(r, "taxed_query_fees");
+    json!({
+        "epoch": i0(r, "id"),
+        "issuance": issuance,
+        "queryFeeTaxBurn": query_fee_tax_burn,
+        "disputeBurn": 0,
+        "totalBurn": query_fee_tax_burn,
+        "net": issuance - query_fee_tax_burn,
+    })
+}
+
+/// The Monday of the week containing `unix`, as `YYYY-MM-DD` in UTC.
+///
+/// Weeks start on Monday because that is what the chart's axis says. Sunday-start weeks would
+/// shift every point by a day and look almost right.
+pub fn week_start_utc(unix: i64) -> String {
+    use chrono::{DateTime, Datelike, Duration, Utc};
+    let d: DateTime<Utc> = DateTime::from_timestamp(unix, 0).unwrap_or_default();
+    let back = d.weekday().num_days_from_monday() as i64;
+    (d - Duration::days(back)).format("%Y-%m-%d").to_string()
+}
+
+/// Weekly publication counts, with a running cumulative and the current week flagged partial.
+///
+/// Every week between the first and last is emitted, including the empty ones. A chart that skips
+/// quiet weeks compresses time and makes a lull look like continuity.
+pub fn developer_activity(rows: &[Value], window_months: i64, now: i64) -> Value {
+    use std::collections::BTreeMap;
+    let mut counts: BTreeMap<String, i64> = BTreeMap::new();
+    for r in rows {
+        let Some(ts) = r.get("createdAt").and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        *counts.entry(week_start_utc(ts)).or_insert(0) += 1;
+    }
+
+    let current = week_start_utc(now);
+    let mut weeks = Vec::new();
+    let mut cumulative = 0i64;
+    let mut total = 0i64;
+
+    if let (Some(first), Some(last)) = (
+        counts.keys().next().cloned(),
+        counts.keys().next_back().cloned(),
+    ) {
+        let parse = |s: &str| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok();
+        if let (Some(mut d), Some(end)) = (parse(&first), parse(&last)) {
+            while d <= end {
+                let key = d.format("%Y-%m-%d").to_string();
+                let count = counts.get(&key).copied().unwrap_or(0);
+                cumulative += count;
+                total += count;
+                weeks.push(json!({
+                    "weekStart": key.clone(),
+                    "count": count,
+                    "cumulative": cumulative,
+                    "partial": key == current,
+                }));
+                d += chrono::Duration::days(7);
+            }
+        }
+    }
+
+    // Week over week compares the last two complete weeks: the current one is still filling and
+    // would always read as a collapse.
+    let complete: Vec<i64> = weeks
+        .iter()
+        .filter(|w| w["partial"] != json!(true))
+        .filter_map(|w| w["count"].as_i64())
+        .collect();
+    let wow = match complete.len() {
+        0 | 1 => Value::Null,
+        n => {
+            let (last, prev) = (complete[n - 1], complete[n - 2]);
+            if prev == 0 {
+                Value::Null
+            } else {
+                json!(((last - prev) as f64 / prev as f64) * 100.0)
+            }
+        }
+    };
+
+    json!({
+        "weeks": weeks,
+        "windowMonths": window_months,
+        "totalInWindow": total,
+        "lastWeekCount": complete.last().copied().unwrap_or(0),
+        "weekOverWeekPct": wow,
+        "source": "nuthatch",
+    })
+}
+
+/// Sum a wei column across rows, exactly.
+fn sum_wei(rows: &[Value], key: &str) -> String {
+    let mut total: i128 = 0;
+    for r in rows {
+        let v = match r.get(key) {
+            Some(Value::String(x)) => x.parse::<i128>().unwrap_or(0),
+            Some(Value::Number(n)) => n.as_i64().map(i128::from).unwrap_or(0),
+            _ => 0,
+        };
+        total += v;
+    }
+    total.to_string()
+}
+
+fn distinct(rows: &[Value], key: &str) -> usize {
+    let mut seen: std::collections::BTreeSet<&str> = Default::default();
+    for r in rows {
+        if let Some(v) = r.get(key).and_then(|x| x.as_str()) {
+            seen.insert(v);
+        }
+    }
+    seen.len()
+}
+
+/// The payments panel: three lists and the totals over them.
+pub fn payments(accounts: &[Value], transactions: &[Value], tally: &[Value]) -> Value {
+    let escrow: Vec<Value> = accounts
+        .iter()
+        .map(|r| {
+            json!({
+                "id": format!(
+                    "{}-{}-{}",
+                    r.get("payer").and_then(|v| v.as_str()).unwrap_or_default(),
+                    r.get("collector").and_then(|v| v.as_str()).unwrap_or_default(),
+                    r.get("receiver").and_then(|v| v.as_str()).unwrap_or_default()
+                ),
+                "balance": s0(r, "balance"),
+                "totalAmountThawing": s0(r, "thawing"),
+                "thawEndTimestamp": s0(r, "thaw_end"),
+                "payer": { "id": t(r, "payer") },
+                "receiver": { "id": t(r, "receiver") },
+            })
+        })
+        .collect();
+
+    let recent: Vec<Value> = transactions
+        .iter()
+        .map(|r| {
+            json!({
+                "id": format!(
+                    "{}-{}",
+                    r.get("tx_hash").and_then(|v| v.as_str()).unwrap_or_default(),
+                    r.get("log_index").and_then(|v| v.as_i64()).unwrap_or(0)
+                ),
+                "type": t(r, "type"),
+                "amount": s0(r, "amount"),
+                "timestamp": s0(r, "block_timestamp"),
+                "allocationId": t(r, "allocation_id"),
+                "payer": { "id": t(r, "payer") },
+                "receiver": { "id": t(r, "receiver") },
+            })
+        })
+        .collect();
+
+    let collectors: Vec<Value> = tally
+        .iter()
+        .map(|r| {
+            json!({
+                "id": format!(
+                    "{}-{}",
+                    r.get("collection_id").and_then(|v| v.as_str()).unwrap_or_default(),
+                    r.get("receiver").and_then(|v| v.as_str()).unwrap_or_default()
+                ),
+                "collectionId": t(r, "collection_id"),
+                "tokens": s0(r, "tokens"),
+                "payer": { "id": t(r, "payer") },
+                "receiver": { "id": t(r, "receiver") },
+            })
+        })
+        .collect();
+
+    json!({
+        "escrowAccounts": escrow,
+        "recentTransactions": recent,
+        "topCollectors": collectors,
+        "totalEscrowBalance": sum_wei(accounts, "balance"),
+        "totalThawing": sum_wei(accounts, "thawing"),
+        "totalCollected": sum_wei(tally, "tokens"),
+        "activePayers": distinct(accounts, "payer"),
+        "activeReceivers": distinct(accounts, "receiver"),
+    })
 }
