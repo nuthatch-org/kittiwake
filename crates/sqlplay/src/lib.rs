@@ -24,7 +24,17 @@ pub struct Dataset {
     /// A frozen archive rather than a live follower. The reader must be told, or a page showing an
     /// archive beside three live datasets invites someone to read old data as current.
     pub archival: bool,
+    /// The query the playground offers first.
+    pub sample: &'static str,
 }
+
+/// The default sample.
+///
+/// A sample that names a table is a sample that breaks the day that table is renamed, and the first
+/// thing a visitor would see is an error on a page that works. `information_schema` cannot be
+/// wrong, and listing the tables is the right first move in an unfamiliar dataset anyway.
+pub const LIST_TABLES: &str =
+    "SELECT table_name\nFROM information_schema.tables\nORDER BY table_name\nLIMIT 50";
 
 pub const DATASETS: &[Dataset] = &[
     Dataset {
@@ -34,6 +44,7 @@ pub const DATASETS: &[Dataset] = &[
         chain: "Arbitrum One",
         description: "The delegation events from HorizonStaking, on the nest that indexes the whole protocol. The source behind the delegation feed on this dashboard.",
         archival: false,
+        sample: "SELECT block_number, serviceProvider, delegator, tokens\nFROM staking__tokens_delegated\nORDER BY block_number DESC\nLIMIT 20",
     },
     Dataset {
         id: "dips",
@@ -42,6 +53,7 @@ pub const DATASETS: &[Dataset] = &[
         chain: "Arbitrum One",
         description: "Direct Indexer Payments: the Issuance Allocator, Recurring Agreement Manager and Recurring Collector. Nothing else indexes these three contracts.",
         archival: false,
+        sample: LIST_TABLES,
     },
     Dataset {
         id: "dips-sepolia",
@@ -50,6 +62,7 @@ pub const DATASETS: &[Dataset] = &[
         chain: "Arbitrum Sepolia",
         description: "The same three DIPS contracts on the testnet where the agreement lifecycle has actually been exercised.",
         archival: false,
+        sample: "SELECT block_number, agreementId, tokens_dec\nFROM recurring_collector__r_c_a_collected\nORDER BY block_number DESC\nLIMIT 20",
     },
     Dataset {
         id: "gns",
@@ -58,6 +71,7 @@ pub const DATASETS: &[Dataset] = &[
         chain: "Arbitrum One",
         description: "The GNS publication events behind the developer-activity chart.",
         archival: false,
+        sample: LIST_TABLES,
     },
     Dataset {
         id: "legacy-flows",
@@ -66,6 +80,7 @@ pub const DATASETS: &[Dataset] = &[
         chain: "Arbitrum One",
         description: "Delegation across the Horizon and pre-Horizon staking contracts together. A frozen full-history archive, not a live follower: its data ends where the archive ends.",
         archival: true,
+        sample: LIST_TABLES,
     },
 ];
 

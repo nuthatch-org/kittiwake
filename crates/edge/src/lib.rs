@@ -281,19 +281,90 @@ pub(crate) fn envelope_root(read: kittiwake_read::Read) -> Response {
     resp
 }
 
-async fn get_sql_catalog(State(_st): State<AppState>) -> Response {
+/// The playground's catalogue: what may be asked, and what is actually there.
+///
+/// The labels, descriptions and samples are static and come straight from the source. Only the
+/// schema is fetched, because only the schema can be out of date: baking the static half into a
+/// cache means a deploy that fixes a wrong sample does not take effect for five minutes, and
+/// nothing on the page says why.
+///
+/// A dataset whose nest cannot be reached stays in the list with `available: false` and no tables,
+/// rather than vanishing. A dataset that disappears reads as one that never existed, and the
+/// visitor goes looking for what they did wrong.
+async fn get_sql_catalog(State(st): State<AppState>) -> Response {
+    let fetched = futures::future::join_all(kittiwake_sqlplay::DATASETS.iter().map(|d| {
+        let gate = st.read.gate.clone();
+        async move { (d.id, gate.tables(d.nest).await) }
+    }))
+    .await;
+
     let datasets: Vec<serde_json::Value> = kittiwake_sqlplay::DATASETS
         .iter()
         .map(|d| {
+            let tables = fetched
+                .iter()
+                .find(|(id, _)| *id == d.id)
+                .and_then(|(_, r)| r.as_ref().ok());
+            let tables: Vec<serde_json::Value> = tables
+                .map(|ts| ts.iter().map(sql_table).collect())
+                .unwrap_or_default();
             serde_json::json!({
                 "id": d.id, "label": d.label, "chain": d.chain,
                 "description": d.description, "archival": d.archival,
+                "sample": d.sample,
+                "available": !tables.is_empty(),
+                "tableCount": tables.len(),
+                "tables": tables,
             })
         })
         .collect();
-    let mut resp = axum::Json(serde_json::json!({ "datasets": datasets })).into_response();
+
+    // The surface as a whole is available if anything on it is. All five dark means the origin is
+    // gone rather than one nest being down, and the page should say so once instead of five times.
+    let available = datasets
+        .iter()
+        .any(|d| d["available"].as_bool().unwrap_or(false));
+
+    let mut resp = axum::Json(serde_json::json!({ "available": available, "datasets": datasets }))
+        .into_response();
     no_store(resp.headers_mut());
     resp
+}
+
+/// One table as the catalogue lists it.
+///
+/// `sol_type` is the Solidity type where the nest decoded one and the literal string `implicit`
+/// where it did not - a block number, a log index, the things the nest adds rather than decodes. In
+/// that case the storage type is the honest answer, and printing "implicit" would tell a reader
+/// nothing they can write a query against.
+fn sql_table(t: &serde_json::Value) -> serde_json::Value {
+    let columns: Vec<serde_json::Value> = t
+        .get("columns")
+        .and_then(|c| c.as_array())
+        .map(|cs| {
+            cs.iter()
+                .map(|c| {
+                    let sol = c.get("sol_type").and_then(|v| v.as_str()).unwrap_or("");
+                    let ty = if sol == "implicit" {
+                        c.get("storage").and_then(|v| v.as_str()).unwrap_or("")
+                    } else {
+                        sol
+                    };
+                    serde_json::json!({
+                        "name": c.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                        "type": ty,
+                        "indexed": c.get("indexed").and_then(|v| v.as_bool()).unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "name": t.get("table").and_then(|v| v.as_str()).unwrap_or(""),
+        "alias": t.get("alias").and_then(|v| v.as_str()).unwrap_or(""),
+        "event": t.get("event").and_then(|v| v.as_str()).unwrap_or(""),
+        "columns": columns,
+    })
 }
 
 #[derive(serde::Deserialize)]

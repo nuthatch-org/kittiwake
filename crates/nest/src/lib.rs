@@ -364,6 +364,31 @@ impl NestGate {
         result
     }
 
+    /// The nest's own description of what it holds: one entry per decoded event table.
+    ///
+    /// Not cached here. The SQL catalogue is the only caller, it caches the answer itself, and a
+    /// second cache underneath that would mean a nest coming back after a redeploy takes two
+    /// expiries to show up rather than one.
+    pub async fn tables(&self, nest: NestId) -> Result<Vec<serde_json::Value>, NestError> {
+        let req = self.authed(self.inner.http.get(self.url(nest, "/tables")));
+        let resp = tokio::time::timeout(Duration::from_secs(15), req.send())
+            .await
+            .map_err(|_| NestError::Timeout)?
+            .map_err(|e| NestError::Transport(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(NestError::Http(resp.status().as_u16()));
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| NestError::Decode(e.to_string()))?;
+        Ok(body
+            .get("tables")
+            .and_then(|t| t.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
     async fn fetch_ready(&self, nest: NestId) -> Result<ReadyBody, NestError> {
         let req = self.authed(self.inner.http.get(self.url(nest, "/ready")));
         let resp = tokio::time::timeout(Duration::from_secs(5), req.send())
