@@ -118,6 +118,12 @@ pub async fn indexer(
     Ok(envelope(routes::indexer(&st.read, &addr(&address)).await?))
 }
 
+/// `/api/indexer-status/[address]`: what this indexer is actually serving, right now.
+///
+/// The nest says what it has allocated to; only the indexer's own status endpoint says whether it
+/// is synced, and that is a live probe rather than a cached fold. The two are joined here: an
+/// allocation with no matching status is one the indexer is paid for and is not serving, which is
+/// the case this panel exists to surface.
 pub async fn indexer_status(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -125,9 +131,97 @@ pub async fn indexer_status(
     Path(address): Path<String>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
-    Ok(envelope(
-        routes::indexer_status(&st.read, &addr(&address)).await?,
-    ))
+    let address = addr(&address);
+    let read = routes::indexer_status(&st.read, &address).await?;
+
+    let data = &*read.entry.value;
+    let url = data
+        .pointer("/indexer/url")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let allocations = data
+        .get("activeAllocations")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // One probe for the whole indexer: its status endpoint answers for every deployment at once.
+    let probe = if url.is_empty() {
+        None
+    } else {
+        Some(st.ext.probe_indexer(&url).await)
+    };
+    let unreachable = probe.as_ref().map(|p| !p.reachable).unwrap_or(true);
+    let statuses: std::collections::HashMap<String, &kittiwake_ext::IndexingStatus> = probe
+        .as_ref()
+        .map(|p| {
+            p.statuses
+                .iter()
+                .map(|s| (s.deployment.clone(), s))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let (mut synced, mut syncing, mut failed, mut missing) = (0i64, 0i64, 0i64, 0i64);
+    let deployments: Vec<serde_json::Value> = allocations
+        .iter()
+        .map(|a| {
+            let dep = a
+                .get("subgraph_deployment")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let s = statuses.get(dep);
+            match s {
+                None => missing += 1,
+                Some(s) if s.health != "healthy" => failed += 1,
+                Some(s) if s.synced => synced += 1,
+                Some(_) => syncing += 1,
+            }
+            let progress = match s.and_then(|s| Some((s.latest_block?, s.chain_head_block?))) {
+                Some((l, h)) if h > 0 => (l as f64 / h as f64) * 100.0,
+                _ => 0.0,
+            };
+            let take = |k: &str, d: serde_json::Value| a.get(k).cloned().unwrap_or(d);
+            serde_json::json!({
+                "deploymentId": dep,
+                "ipfsHash": dep,
+                "displayName": serde_json::Value::Null,
+                "allocatedTokens": take("allocated_tokens", serde_json::json!("0")),
+                "signalledTokens": take("signalled_tokens", serde_json::json!("0")),
+                "stakedTokens": take("deployment_staked_tokens", serde_json::json!("0")),
+                "createdAtEpoch": take("created_at_epoch", serde_json::json!(0)),
+                "health": s.map(|s| s.health.clone()).unwrap_or_else(|| "unknown".into()),
+                // Unreachable is not unhealthy: we could not ask, which is a fact about us.
+                "status": if s.is_some() { "reachable" } else { "unreachable" },
+                "syncProgress": progress,
+                "latestBlock": s.and_then(|s| s.latest_block).unwrap_or(0),
+                "chainHeadBlock": s.and_then(|s| s.chain_head_block).unwrap_or(0),
+                "blocksBehind": s.and_then(|s| s.blocks_behind).unwrap_or(0),
+                "entityCount": "0",
+                "fatalError": "",
+                "network": "arbitrum-one",
+            })
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "data": {
+            "indexerAddress": address,
+            "indexerUrl": url,
+            "totalAllocations": deployments.len(),
+            "syncedCount": synced,
+            "syncingCount": syncing,
+            "failedCount": failed,
+            "unreachableCount": if unreachable { deployments.len() as i64 } else { missing },
+            "deployments": deployments,
+        },
+        "source": "nuthatch",
+        "provenance": &read.meta,
+    });
+    let mut resp = axum::Json(body).into_response();
+    crate::no_store(resp.headers_mut());
+    Ok(resp)
 }
 
 pub async fn apr_provenance(
