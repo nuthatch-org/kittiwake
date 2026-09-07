@@ -67,3 +67,35 @@ Percentiles are nearest-rank, not interpolated: with a few thousand samples, inv
 between two measurements is a worse answer than picking the measurement. The p99 and the max are
 reported alongside the p50, because a p50 that improves while the p99 degrades is a regression for
 whoever hits the p99.
+
+
+## Baseline before the switch, 2026-09-07
+
+Captured from the Nuremberg box, three calls per route, median of the middle two, both warm.
+
+| Route | Incumbent | kittiwake |
+|---|---|---|
+| `/api/network-stats` | 0.065 s | 0.0005 s |
+| `/api/indexers?first=100` | 0.078 s | 0.0011 s |
+| `/api/epochs?count=20` | 0.072 s | 0.0006 s |
+| `/api/curators?first=100` | 0.069 s | 0.0007 s |
+| `/api/indexer/<addr>` | 0.078 s | 0.0029 s |
+| `/api/payments` | 0.080 s | 0.0012 s |
+| `/api/poi?first=200` | 0.083 s | 0.0014 s |
+| `/api/subgraph-deployments?first=50` | 0.075 s | 0.0011 s |
+| `/api/delegation-flows?days=90` | 0.067 s | 0.0006 s |
+| `/api/dips` | 0.065 s | 0.0006 s |
+
+**Read this carefully, because it flatters us.** The incumbent column is a round trip from
+Nuremberg to Vercel's edge and back; most of those 65 to 80 milliseconds is network, not work. The
+kittiwake column is loopback on the same box, so it is nearly all work. The two are not the same
+measurement and the ratio between them is not a speed-up anyone will feel.
+
+What it does establish honestly: **kittiwake's server-side work is between 0.5 and 3 milliseconds
+on every route**, including the ones that fold hundreds of thousands of events. Whatever the
+network adds after the switch, it will add to that.
+
+The comparison that matters can only be taken after the switch: browser to Vercel to Nuremberg
+against today's browser to Vercel function. That measurement is worth taking on the same day, from
+the same place, at p50, p95 and p99 - and it is the reason this baseline is recorded now, while
+there is still something to compare against.

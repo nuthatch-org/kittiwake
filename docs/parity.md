@@ -38,6 +38,27 @@ consumer that parses it, and would otherwise look like a trivial difference.
 A wider type is not a break. Returning `{string, null}` where they only ever returned a string is a
 superset and safe; narrowing to only-null is not.
 
+## Where it stands
+
+**2026-09-07: 20 matching, 0 breaking.** Every route the harness covers returns the shape the
+dashboard is written against. Run it twice in a row to be sure - the live probes make one route
+mildly non-deterministic.
+
+Shape parity is necessary and not sufficient. Three defects got past it and were caught only by
+comparing values:
+
+- **POI consensus** returned the right shape with every deployment at 100%, because
+  `closed_at_epoch` arrives as the string `"1374"` and a bare `as_i64()` read it as absent. The
+  incumbent found 7 divergent deployments; we found 0. Now both find 7 and agree to three decimals.
+- **Indexer status** joined nothing, because the nest names a deployment in hex and the indexer's
+  own endpoint names it `Qm…`. Every allocation looked unserved. Both are the same 32 bytes; one
+  wears a multihash prefix and base58.
+- **Health classification** counted `unhealthy` as failed. It means "serving, with errors
+  recorded". Four working deployments were reported broken.
+
+So: run the harness, then compare a figure from each route by eye. The harness catches contract
+breaks; only a human comparing numbers catches a contract kept and an answer wrong.
+
 ## Where it stood on 2026-09-06
 
 First run: **1 matching, 17 breaking, 2 not compared.**

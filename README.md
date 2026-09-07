@@ -43,11 +43,10 @@ Working, tested, and exercised end to end against a stand-in nest:
 | The refresh pipeline that writes the scored directory | `ingest` | done |
 | Config, logging, metrics, health and readiness | `config`, `obs` | done |
 
-**Parity is the gate, and it is not yet met.** The routes serve correct data in the wrong shape:
-the nest's own column names, where the dashboard expects its own contract. `kittiwake-parity`
-measures this and stood at 1 matching, 17 breaking on 2026-09-06; `/api/network-stats` has since
-been shaped and matches exactly. See [`docs/parity.md`](docs/parity.md). No route should be pointed
-at this service until its parity check is clean.
+**Parity is met.** As of 2026-09-07, `kittiwake-parity` reports **20 matching, 0 breaking**: every
+route returns the shape the dashboard is written against, and the figures agree with the incumbent
+where they have been compared by hand. See [`docs/parity.md`](docs/parity.md), including the three
+defects that passed the shape check and were caught only by comparing values.
 
 **Thirty-five routes are live**: every nest-backed read the dashboard makes, the public SQL
 surface, the price and TVL figures, the eligibility oracle, and a live indexer probe.
