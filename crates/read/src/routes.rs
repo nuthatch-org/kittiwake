@@ -345,6 +345,59 @@ pub async fn network_stats(ctx: &ReadCtx) -> Result<Read, ApiError> {
     .await
 }
 
+/// `/api/grt-flow`: where the supply came from and where it went.
+///
+/// The same two nest reads and the same contract calls as [`network_stats`], shaped into the flow
+/// figures rather than the raw protocol row. It is a different question over the same data, which
+/// is why it shares the reads and not the shape - and why aliasing this route to `network_stats`,
+/// as it was until now, produced a 200 that the panel could not read.
+///
+/// Every figure is GRT rather than wei, because these are magnitudes for a chart and not balances
+/// for arithmetic. The two that must not be approximated - the supply and the totals it is
+/// computed from - are summed as integers first and divided once at the end.
+pub async fn grt_flow(ctx: &ReadCtx) -> Result<Read, ApiError> {
+    let chain = ctx.chain.clone();
+    let fetch: Fetcher = Arc::new(move |gate: NestGate, lane: Lane| {
+        let chain = chain.clone();
+        Box::pin(async move {
+            let mut net = QuerySpec::read(NestId::Alloc, sql::network_sql());
+            let mut par = QuerySpec::read(NestId::Alloc, sql::network_params_sql());
+            net.lane = lane;
+            par.lane = lane;
+            let (net, par) = tokio::join!(
+                gate.query_coalesced("alloc:network", net),
+                gate.query_coalesced("alloc:network-params", par),
+            );
+            let net = net.map_err(ApiError::from)?;
+            let par = par.map_err(ApiError::from)?;
+            let n = net.rows.first().cloned().unwrap_or(serde_json::Value::Null);
+            let p = par.rows.first().cloned().unwrap_or(serde_json::Value::Null);
+
+            let supply = match &chain {
+                Some(c) => match c.grt_supply_breakdown().await {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "grt supply breakdown unavailable for the flow");
+                        None
+                    }
+                },
+                None => None,
+            };
+            let value = shape::grt_flow(&n, &p, supply.as_ref(), net.provenance.as_of.unwrap_or(0));
+            Ok((value, older_of(&net.provenance, &par.provenance)))
+        })
+    });
+
+    ctx.cached(
+        "grt-flow",
+        NestId::Alloc,
+        serde_json::json!({}),
+        CachePolicy::from_poll_interval(cadence::SLOW),
+        fetch,
+    )
+    .await
+}
+
 /// A nest column as the string the frontend expects. Wei never becomes a number on this path.
 fn str_of(v: &serde_json::Value, key: &str) -> serde_json::Value {
     match v.get(key) {

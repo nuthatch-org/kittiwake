@@ -1806,3 +1806,196 @@ mod subgraph_history_tests {
         }
     }
 }
+
+/// Where the GRT supply came from and where it went.
+///
+/// Mints and burns are summed as **integers** and divided once at the end. They are wei totals in
+/// the billions of tokens; adding them as `f64` first rounds at every step, where summing exactly
+/// and dividing once rounds only at the end. That last rounding is unavoidable - an `f64` holds
+/// about sixteen significant figures and 1.006e27 wei needs more - so the answer is right to the
+/// nearest ten-millionth of a GRT rather than exact. For a chart that is fine; anything that must
+/// be exact keeps the wei string.
+///
+/// `globalSupply` prefers the three contract reads over the constant, and says which it used in
+/// `supplyBasis`. The approximation is there so the page renders when a chain is unreachable; a
+/// reader quoting an issuance rate deserves to know it was computed against a guess.
+pub fn grt_flow(
+    n: &Value,
+    p: &Value,
+    supply: Option<&kittiwake_chain::SupplyBreakdown>,
+    as_of: i64,
+) -> Value {
+    /// The circulating supply used when the contracts cannot be read. Approximate by construction.
+    const CIRCULATING_SUPPLY_APPROX: f64 = 11_500_000_000.0;
+
+    let wei = |v: &Value, k: &str| -> u128 {
+        match v.get(k) {
+            Some(Value::String(x)) => x.parse().unwrap_or(0),
+            Some(Value::Number(num)) => num.as_u64().unwrap_or(0) as u128,
+            _ => 0,
+        }
+    };
+    let as_grt = |x: u128| num(x as f64 / 1e18);
+
+    let global_supply = supply
+        .map(|b| b.global_supply)
+        .unwrap_or(CIRCULATING_SUPPLY_APPROX);
+    let issuance_per_block = grt(n, "issuance_per_block");
+    let annual_issuance = issuance_per_block * kittiwake_rewards::L1_BLOCKS_PER_YEAR;
+    let issuance_rate_pct = if global_supply > 0.0 && issuance_per_block >= 0.0 {
+        (annual_issuance / global_supply) * 100.0
+    } else {
+        0.0
+    };
+
+    let minted = wei(n, "bridge_minted") + wei(n, "total_indexing_rewards");
+    let burned =
+        wei(n, "bridge_burned") + wei(p, "total_curation_tax") + wei(p, "total_protocol_tax");
+
+    // Parts per million to percent, as the protocol denominates its cuts.
+    let ppm = |v: &Value, k: &str| num(i0(v, k).as_f64().unwrap_or(0.0) / 10_000.0);
+
+    json!({
+        "blockNumber": as_of,
+        "supply": num(grt(n, "total_supply")),
+        "globalSupply": num(global_supply),
+        "supplyBasis": if supply.is_some() { "onchain" } else { "approx" },
+        "supplyBreakdown": supply.map(|b| json!({
+            "l1TotalSupply": num(b.l1_total_supply),
+            "l2TotalSupply": num(b.l2_total_supply),
+            "bridgeEscrow": num(b.bridge_escrow),
+            "globalSupply": num(b.global_supply),
+        })),
+        "minted": as_grt(minted),
+        "burned": as_grt(burned),
+        "indexingRewards": num(grt(n, "total_indexing_rewards")),
+        "queryFees": num(grt(n, "total_query_fees")),
+        "staked": num(grt(n, "total_tokens_staked")),
+        "delegated": num(grt(n, "total_delegated_tokens")),
+        "signalled": num(grt(n, "total_tokens_signalled")),
+        "allocated": num(grt(n, "total_tokens_allocated")),
+        "issuancePerBlock": num(issuance_per_block),
+        "annualIssuance": num(annual_issuance),
+        "issuanceRatePct": num(issuance_rate_pct),
+        "counts": {
+            "indexers": i0(n, "indexer_count"),
+            "stakedIndexers": i0(n, "staked_indexers_count"),
+            "delegators": i0(n, "delegator_count"),
+            "curators": i0(n, "curator_count"),
+            "currentEpoch": i0(n, "current_epoch"),
+        },
+        "params": {
+            "protocolFeePct": ppm(p, "protocol_payment_cut"),
+            "curationTaxPct": ppm(p, "curation_tax_percentage"),
+            // No Horizon equivalent; the delegation tax was removed with the upgrade.
+            "delegationTaxPct": 0,
+            "delegationRatio": i0(p, "delegation_ratio"),
+        },
+        "source": "nuthatch",
+    })
+}
+
+#[cfg(test)]
+mod grt_flow_tests {
+    use super::*;
+
+    fn net() -> Value {
+        json!({
+            "total_supply": "10800000000000000000000000000",
+            "total_indexing_rewards": "3000000000000000000000000000",
+            "bridge_minted": "2000000000000000000000000000",
+            "bridge_burned": "1000000000000000000000000000",
+            "total_query_fees": "500000000000000000000000",
+            "total_tokens_staked": "900000000000000000000000000",
+            "total_delegated_tokens": "400000000000000000000000000",
+            "total_tokens_signalled": "20000000000000000000000000",
+            "total_tokens_allocated": "800000000000000000000000000",
+            "issuance_per_block": "114000000000000000000",
+            "indexer_count": 184,
+            "current_epoch": 1374,
+        })
+    }
+
+    fn params() -> Value {
+        json!({
+            "total_curation_tax": "5000000000000000000000000",
+            "total_protocol_tax": "1000000000000000000000000",
+            "protocol_payment_cut": 10000,
+            "curation_tax_percentage": 10000,
+            "delegation_ratio": 16,
+        })
+    }
+
+    /// Mints and burns are sums of two wei totals in the billions. Adding them as floats first and
+    /// dividing after loses the low digits before the division; this pins the exact figure.
+    #[test]
+    fn mints_and_burns_are_summed_as_integers_and_divided_once() {
+        let f = grt_flow(&net(), &params(), None, 100);
+        // 2e9 bridge + 3e9 rewards.
+        assert_eq!(f["minted"].as_f64().unwrap(), 5_000_000_000.0);
+        // 1e9 bridge + 5e6 curation + 1e6 protocol. Within a ten-millionth of a GRT: the sum is
+        // exact and the single division to f64 is where the last digit goes.
+        assert!(
+            (f["burned"].as_f64().unwrap() - 1_006_000_000.0).abs() < 1e-6,
+            "got {}",
+            f["burned"]
+        );
+    }
+
+    /// The reader is told which supply the issuance rate was computed against, because one of them
+    /// is a guess.
+    #[test]
+    fn the_supply_basis_says_whether_the_chain_answered() {
+        let f = grt_flow(&net(), &params(), None, 100);
+        assert_eq!(f["supplyBasis"], json!("approx"));
+        assert_eq!(f["globalSupply"].as_f64().unwrap(), 11_500_000_000.0);
+        assert_eq!(f["supplyBreakdown"], Value::Null);
+
+        let b = kittiwake_chain::SupplyBreakdown {
+            l1_total_supply: 8.0e9,
+            l2_total_supply: 4.0e9,
+            bridge_escrow: 1.0e9,
+            global_supply: 11.0e9,
+        };
+        let f = grt_flow(&net(), &params(), Some(&b), 100);
+        assert_eq!(f["supplyBasis"], json!("onchain"));
+        assert_eq!(f["globalSupply"].as_f64().unwrap(), 11.0e9);
+        assert_eq!(
+            f["supplyBreakdown"]["bridgeEscrow"].as_f64().unwrap(),
+            1.0e9
+        );
+    }
+
+    #[test]
+    fn issuance_uses_the_one_blocks_per_year_figure() {
+        let f = grt_flow(&net(), &params(), None, 100);
+        let per_block = f["issuancePerBlock"].as_f64().unwrap();
+        assert!((per_block - 114.0).abs() < 1e-9);
+        let annual = f["annualIssuance"].as_f64().unwrap();
+        assert!(
+            (annual - 114.0 * kittiwake_rewards::L1_BLOCKS_PER_YEAR).abs() < 1.0,
+            "got {annual}"
+        );
+        // Rate is annual issuance over the supply it was computed against.
+        let rate = f["issuanceRatePct"].as_f64().unwrap();
+        assert!((rate - (annual / 11_500_000_000.0) * 100.0).abs() < 1e-9);
+    }
+
+    /// A ppm cut of 10,000 is one percent, not ten thousand.
+    #[test]
+    fn cuts_are_parts_per_million_rather_than_percentages() {
+        let f = grt_flow(&net(), &params(), None, 100);
+        assert_eq!(f["params"]["protocolFeePct"].as_f64().unwrap(), 1.0);
+        assert_eq!(f["params"]["curationTaxPct"].as_f64().unwrap(), 1.0);
+        assert_eq!(f["params"]["delegationTaxPct"].as_i64().unwrap(), 0);
+    }
+
+    /// Nothing in the row must panic or invent a figure.
+    #[test]
+    fn an_empty_row_gives_zeroes_rather_than_nonsense() {
+        let f = grt_flow(&json!({}), &json!({}), None, 0);
+        assert_eq!(f["minted"].as_f64().unwrap(), 0.0);
+        assert_eq!(f["issuanceRatePct"].as_f64().unwrap(), 0.0);
+        assert_eq!(f["blockNumber"], json!(0));
+    }
+}

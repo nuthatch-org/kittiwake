@@ -493,7 +493,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/epochs", get(handlers::epochs))
         .route("/api/network-stats", get(handlers::network_stats))
         // Same fold, different panel: one cache entry serves both.
-        .route("/api/grt-flow", get(handlers::network_stats))
+        .route("/api/grt-flow", get(handlers::grt_flow))
         .route("/api/token-metrics", get(handlers::token_metrics))
         // Positions
         .route("/api/portfolio", get(handlers::portfolio))

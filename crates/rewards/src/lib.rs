@@ -324,3 +324,36 @@ mod tests {
         assert_eq!(c.utilization_percent, 50.0);
     }
 }
+
+/// L1 blocks in a year, which is what issuance is denominated against.
+///
+/// **One figure, in one place, resolving a split that had been live for months.** The dashboard
+/// carried two: `network-math.ts` used 2,610,223 - 365.25 days at 12.09 seconds - for the issuance
+/// percentage a reader sees, and `refresh.ts` used 2,628,000 - 365 days at a flat 12 - for the
+/// scores those readers were ranking indexers by. About 0.7% apart, and apart since both were
+/// written, so the number on the page and the number behind the ranking were never the same number.
+///
+/// 12.09 seconds is the measured average slot time including missed slots; 12 is the nominal one.
+/// The measured figure is the more defensible, so it wins.
+///
+/// **Why this does not move any ranking.** Issuance scales every indexer's APR by the same factor,
+/// and the score's APR bands are interpolated monotonically, so a uniform multiplier preserves
+/// order exactly. Absolute scores shift by well under a point; nobody changes places.
+pub const L1_BLOCKS_PER_YEAR: f64 = 2_610_223.0;
+
+#[cfg(test)]
+mod blocks_per_year_tests {
+    use super::L1_BLOCKS_PER_YEAR;
+
+    /// Pinned, because the whole value of this constant is that there is exactly one of it. A
+    /// second figure appearing anywhere is the bug it was written to close.
+    #[test]
+    fn the_figure_is_the_measured_one_and_is_stated_once() {
+        assert_eq!(L1_BLOCKS_PER_YEAR, 2_610_223.0);
+        // 365.25 days at 12.09 seconds, rounded, which is where it comes from.
+        assert_eq!(
+            ((365.25_f64 * 24.0 * 3600.0) / 12.09).round(),
+            L1_BLOCKS_PER_YEAR
+        );
+    }
+}

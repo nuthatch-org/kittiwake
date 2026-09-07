@@ -329,6 +329,19 @@ pub async fn network_stats(
     Ok(envelope(routes::network_stats(&st.read).await?))
 }
 
+/// `/api/grt-flow`: the supply, where it came from and where it went.
+///
+/// Its own handler, not an alias of `network_stats`. It was aliased until 2026-09-07 and therefore
+/// answered 200 with the protocol row rather than the flow figures, which the panel could not read.
+pub async fn grt_flow(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    Ok(envelope(routes::grt_flow(&st.read).await?))
+}
+
 pub async fn token_metrics(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,

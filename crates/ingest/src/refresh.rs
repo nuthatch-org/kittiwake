@@ -17,14 +17,7 @@ use kittiwake_types::NestId;
 
 use crate::{IngestError, Ingested, i, page, s};
 
-/// Blocks per year on L1, which is what issuance is denominated against.
-///
-/// 2,628,000 is the figure the existing refresh uses (365 days at twelve seconds). Note that
-/// `network-math.ts` uses 2,610,224 for the *displayed* issuance percentage, from 365.25 days at
-/// 12.09 seconds. The two have differed all along, by about 0.7%. This one is kept because it is
-/// the one that has been feeding the scores; the discrepancy is worth resolving in one direction
-/// or the other rather than inherited silently.
-const L1_BLOCKS_PER_YEAR: f64 = 2_628_000.0;
+use kittiwake_rewards::L1_BLOCKS_PER_YEAR;
 
 /// How many indexers we ask the oracle about at once. The oracle is five calls per indexer against
 /// one RPC endpoint, so this is politeness rather than throughput.
@@ -432,6 +425,8 @@ mod tests {
     /// percentage. Pinned here so the discrepancy cannot be closed by accident in one place only.
     #[test]
     fn the_issuance_year_is_the_one_the_scores_have_always_used() {
-        assert_eq!(super::L1_BLOCKS_PER_YEAR, 2_628_000.0);
+        // Unified with the figure the displayed issuance percentage uses; see
+        // `kittiwake_rewards::L1_BLOCKS_PER_YEAR` for why this moved and why no ranking did.
+        assert_eq!(super::L1_BLOCKS_PER_YEAR, 2_610_223.0);
     }
 }
