@@ -5,6 +5,28 @@
 
 use kittiwake_db::Pool;
 
+/// How this service's cursors are namespaced in `ingestion_state`.
+///
+/// The platform's crons use the bare keys - `epochs`, `delegation_events`, `allocations`, `rav`.
+/// Sharing them would be wrong twice over.
+///
+/// **It is unsafe.** Two writers advancing one cursor each resume from where the *other* stopped.
+/// The upserts are idempotent so the tables still converge, but that depends on both
+/// implementations agreeing exactly about cursor semantics, and ours does not have to: a
+/// disagreement means one advances past rows neither has written, which is silent data loss in the
+/// dashboard's own history.
+///
+/// **And it destroys the comparison.** A shadow run exists to answer "would this service write what
+/// the platform writes", and with one cursor there is no way to tell which system produced a row.
+///
+/// Separate cursors mean both walk independently, both write the same rows, the tables converge,
+/// and the two can be compared. At cutover the platform's crons stop and ours are already current.
+const PREFIX: &str = "kittiwake:";
+
+fn key(k: &str) -> String {
+    format!("{PREFIX}{k}")
+}
+
 #[derive(Debug, Default, Clone, sqlx::FromRow)]
 pub struct State {
     pub last_epoch: Option<i32>,
@@ -16,7 +38,7 @@ pub async fn get(pool: &Pool, key: &str) -> Result<State, sqlx::Error> {
     let row: Option<State> = sqlx::query_as(
         "SELECT last_epoch, last_block, last_id FROM ingestion_state WHERE key = $1",
     )
-    .bind(key)
+    .bind(self::key(key))
     .fetch_optional(pool)
     .await?;
     Ok(row.unwrap_or_default())
@@ -40,7 +62,7 @@ pub async fn set(
          last_id = COALESCE(EXCLUDED.last_id, ingestion_state.last_id), \
          updated_at = NOW()",
     )
-    .bind(key)
+    .bind(self::key(key))
     .bind(last_epoch)
     .bind(last_block)
     .bind(last_id)
@@ -55,8 +77,22 @@ pub async fn touch(pool: &Pool, key: &str) -> Result<(), sqlx::Error> {
         "INSERT INTO ingestion_state (key, updated_at) VALUES ($1, NOW()) \
          ON CONFLICT (key) DO UPDATE SET updated_at = NOW()",
     )
-    .bind(key)
+    .bind(self::key(key))
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pinned, because the whole safety of running both systems at once rests on these keys not
+    /// colliding. A change here silently re-shares the cursors.
+    #[test]
+    fn our_cursors_are_namespaced_away_from_the_platforms() {
+        assert_eq!(key("epochs"), "kittiwake:epochs");
+        assert_eq!(key("rav"), "kittiwake:rav");
+        assert_ne!(key("delegation_events"), "delegation_events");
+    }
 }
