@@ -121,6 +121,12 @@ pub struct Config {
     pub cache: Option<CacheSettings>,
     #[serde(default)]
     pub limits: Option<LimitSettings>,
+    /// The secret the edge proxy presents so its `X-Forwarded-For` can be believed.
+    ///
+    /// Absent is safe and, once traffic arrives through a rewrite, wrong: every visitor then looks
+    /// like the edge and shares one rate-limit bucket. Set it here and in the proxy that fronts
+    /// this service, and nowhere else.
+    pub edge_secret: Option<String>,
     /// Turns the in-process scheduler on. Off by default so a second instance, or a staging box,
     /// cannot start writing to the same Postgres behind your back.
     #[serde(default)]
@@ -206,6 +212,7 @@ mod tests {
                 cron_queue_timeout_secs: 120,
             },
             database_url: None,
+            edge_secret: None,
             arbitrum_rpc_url: None,
             mainnet_rpc_url: None,
             database_max_connections: 16,

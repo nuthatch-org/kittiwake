@@ -1,10 +1,19 @@
-# The only hop allowed to set X-Forwarded-For. The service honours that header solely from a
-# loopback peer, so a caller cannot choose their own rate-limit bucket by sending one.
+# The one hop allowed to say who the caller is.
+#
+# `X-Real-IP` is set unconditionally to Caddy's own TCP peer, which is the one fact here that no
+# caller can forge - whatever they send in that header is overwritten. That is the address the
+# service rate-limits by, unless the request also proves it came through our own edge.
+#
+# `X-Forwarded-For` is deliberately NOT set. Caddy appends its peer to whatever arrived, which
+# preserves the chain the edge sends; the leftmost entry is then the real browser. The service reads
+# that entry only when `X-Lodestar-Edge` matches its configured `edge_secret`, because otherwise it
+# is simply a header a stranger chose. Setting it here as `{remote_host}` - which this file used to
+# do, and which Caddy warns is redundant - replaced that chain with Caddy's own peer, so every
+# visitor in the world arrived wearing the edge's address and shared one rate-limit bucket.
 api.lodestar-dashboard.com {
 	encode zstd gzip
 	reverse_proxy 127.0.0.1:8080 {
 		header_up X-Real-IP {remote_host}
-		header_up X-Forwarded-For {remote_host}
 	}
 	header {
 		-Server

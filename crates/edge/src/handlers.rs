@@ -26,8 +26,10 @@ fn now() -> i64 {
 /// Check the read budget for this caller, or refuse.
 macro_rules! budget {
     ($st:expr, $peer:expr, $headers:expr) => {
-        $st.limits
-            .check(&$st.limits.read, client_ip($peer, &$headers))?
+        $st.limits.check(
+            &$st.limits.read,
+            client_ip($peer, &$headers, $st.edge_secret.as_deref()),
+        )?
     };
 }
 
@@ -706,8 +708,10 @@ pub async fn indexer_node_health(
     headers: HeaderMap,
     Query(q): Query<NodeHealthQuery>,
 ) -> Result<Response, ErrorResponse> {
-    st.limits
-        .check(&st.limits.mutation, client_ip(peer, &headers))?;
+    st.limits.check(
+        &st.limits.mutation,
+        client_ip(peer, &headers, st.edge_secret.as_deref()),
+    )?;
     let result = st.ext.probe_indexer(&q.url).await;
     let mut resp = axum::Json(serde_json::json!({ "data": result })).into_response();
     crate::no_store(resp.headers_mut());

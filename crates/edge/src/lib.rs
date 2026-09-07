@@ -86,6 +86,9 @@ pub struct AppState {
     pub read: ReadCtx,
     pub ext: kittiwake_ext::Ext,
     pub ipfs: kittiwake_ext::Ipfs,
+    /// The secret the edge proxy presents. Absent means no request is ever trusted to name a client
+    /// other than the one that connected - safe, and wrong once traffic arrives through Vercel.
+    pub edge_secret: Option<Arc<str>>,
     /// Absent when no Arbitrum RPC is configured; the routes that need it say so rather than
     /// silently returning nothing.
     pub chain: Option<kittiwake_chain::Chain>,
@@ -101,17 +104,67 @@ pub struct AppState {
 /// `X-Forwarded-For` is honoured **only** when the immediate peer is loopback, which is the only
 /// case where the header was written by our own Caddy rather than by the caller. Trusting it
 /// unconditionally would let anyone choose their own rate-limit bucket.
-pub(crate) fn client_ip(peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+/// The header the edge proxy proves itself with.
+pub const EDGE_HEADER: &str = "x-lodestar-edge";
+
+pub(crate) fn client_ip(
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    edge_secret: Option<&str>,
+) -> IpAddr {
     let peer_ip = peer.ip();
+
+    // A direct connection. Nothing in front, so the peer is the caller and no header is worth
+    // reading.
     if !peer_ip.is_loopback() {
         return peer_ip;
     }
+
+    // Behind Caddy. Two questions, and conflating them is what made every visitor share one
+    // rate-limit bucket: *who connected to Caddy*, which Caddy tells us and nobody else can forge,
+    // and *who the browser was*, which only something upstream of Caddy knows.
+    let caddys_peer = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        // Caddy appends its own peer to the forwarded chain, so the rightmost entry says the same
+        // thing. A fallback for a proxy that sets one and not the other.
+        .or_else(|| {
+            headers
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.rsplit(',').next())
+                .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        })
+        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+    // `X-Forwarded-For`'s leftmost entry is the real browser - and is also whatever an anonymous
+    // caller chose to put there. It is only worth reading when the request provably came through
+    // our own edge, which is what the secret establishes. Without it, every visitor arrives wearing
+    // the edge's address and 120 requests a minute is the whole world's budget.
+    let Some(secret) = edge_secret else {
+        return caddys_peer;
+    };
+    let presented = headers.get(EDGE_HEADER).and_then(|v| v.to_str().ok());
+    let Some(presented) = presented else {
+        return caddys_peer;
+    };
+    // Constant time. A byte-at-a-time comparison of a shared secret is a few thousand requests away
+    // from being no secret at all.
+    let ok: bool = <subtle::Choice as Into<bool>>::into(subtle::ConstantTimeEq::ct_eq(
+        presented.as_bytes(),
+        secret.as_bytes(),
+    ));
+    if presented.len() != secret.len() || !ok {
+        return caddys_peer;
+    }
+
     headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split(',').next())
         .and_then(|v| v.trim().parse::<IpAddr>().ok())
-        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        .unwrap_or(caddys_peer)
 }
 
 impl IntoResponse for ErrorResponse {
@@ -245,7 +298,10 @@ async fn post_sql_query(
     headers: HeaderMap,
     axum::Json(body): axum::Json<SqlQuery>,
 ) -> Result<Response, ErrorResponse> {
-    st.limits.check(&st.limits.sql, client_ip(peer, &headers))?;
+    st.limits.check(
+        &st.limits.sql,
+        client_ip(peer, &headers, st.edge_secret.as_deref()),
+    )?;
 
     let dataset = kittiwake_sqlplay::find_dataset(&body.dataset)
         .ok_or_else(|| ApiError::BadRequest(format!("unknown dataset {:?}", body.dataset)))?;
@@ -413,12 +469,14 @@ pub fn state(
     metrics: Option<kittiwake_obs::PrometheusHandle>,
     pool: Option<kittiwake_db::Pool>,
     read: ReadCtx,
+    edge_secret: Option<String>,
 ) -> AppState {
     AppState {
         chain: read.chain.clone(),
         read,
         ext: kittiwake_ext::Ext::default(),
         ipfs: kittiwake_ext::Ipfs::default(),
+        edge_secret: edge_secret.map(|s| Arc::from(s.as_str())),
         pool,
         limits: Arc::new(limits),
         metrics,
@@ -439,25 +497,117 @@ mod tests {
         h
     }
 
-    #[test]
-    fn a_forwarded_header_from_a_stranger_is_ignored() {
-        let peer: SocketAddr = "203.0.113.9:5000".parse().unwrap();
-        let headers = hdr("x-forwarded-for", "1.2.3.4");
-        assert_eq!(
-            client_ip(peer, &headers),
-            "203.0.113.9".parse::<IpAddr>().unwrap(),
-            "only our own front hop may name the client"
-        );
+    const SECRET: &str = "an-edge-secret-nobody-else-has";
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
     }
 
     #[test]
-    fn a_forwarded_header_from_our_own_proxy_is_honoured() {
-        let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let headers = hdr("x-forwarded-for", "1.2.3.4, 10.0.0.1");
+    fn a_forwarded_header_from_a_stranger_is_ignored() {
+        let peer: SocketAddr = "203.0.113.9:5000".parse().unwrap();
+        let h = hdr("x-forwarded-for", "1.2.3.4");
         assert_eq!(
-            client_ip(peer, &headers),
-            "1.2.3.4".parse::<IpAddr>().unwrap()
+            client_ip(peer, &h, Some(SECRET)),
+            ip("203.0.113.9"),
+            "a direct caller is its own address, whatever it claims"
         );
+    }
+
+    /// The one that made this whole change necessary. Behind the proxy, `X-Forwarded-For` alone is
+    /// not evidence: anyone can send one. Without the edge secret the caller is Caddy's peer, which
+    /// Caddy names and nobody can forge.
+    #[test]
+    fn a_forwarded_header_without_the_edge_secret_names_nobody() {
+        let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let h = headers(&[
+            ("x-forwarded-for", "1.2.3.4, 198.51.100.7"),
+            ("x-real-ip", "198.51.100.7"),
+        ]);
+        assert_eq!(client_ip(peer, &h, Some(SECRET)), ip("198.51.100.7"));
+        assert_eq!(client_ip(peer, &h, None), ip("198.51.100.7"));
+    }
+
+    /// And with it, the browser at the far end gets its own bucket - which is the entire point.
+    #[test]
+    fn the_edge_secret_makes_the_real_client_visible() {
+        let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let h = headers(&[
+            ("x-forwarded-for", "1.2.3.4, 198.51.100.7"),
+            ("x-real-ip", "198.51.100.7"),
+            (EDGE_HEADER, SECRET),
+        ]);
+        assert_eq!(client_ip(peer, &h, Some(SECRET)), ip("1.2.3.4"));
+    }
+
+    /// A wrong secret must be worth exactly as much as no secret. Anything else and guessing is
+    /// cheaper than not guessing.
+    #[test]
+    fn a_wrong_or_truncated_secret_earns_nothing() {
+        let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        for attempt in [
+            "",
+            "wrong",
+            &SECRET[..SECRET.len() - 1],
+            "an-edge-secret-nobody-else-hasX",
+        ] {
+            let h = headers(&[
+                ("x-forwarded-for", "1.2.3.4, 198.51.100.7"),
+                ("x-real-ip", "198.51.100.7"),
+                (EDGE_HEADER, attempt),
+            ]);
+            assert_eq!(
+                client_ip(peer, &h, Some(SECRET)),
+                ip("198.51.100.7"),
+                "{attempt:?} must not buy the right to name a client"
+            );
+        }
+    }
+
+    /// If the service has no secret configured, a caller presenting one must not be able to invent
+    /// the comparison. Absent means absent.
+    #[test]
+    fn an_unconfigured_secret_cannot_be_satisfied() {
+        let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let h = headers(&[
+            ("x-forwarded-for", "1.2.3.4, 198.51.100.7"),
+            ("x-real-ip", "198.51.100.7"),
+            (EDGE_HEADER, ""),
+        ]);
+        assert_eq!(client_ip(peer, &h, None), ip("198.51.100.7"));
+    }
+
+    /// A proxy that sets the forwarded chain but not `X-Real-IP`: the rightmost entry is the hop
+    /// nearest us, which is the same fact under a different name.
+    #[test]
+    fn the_rightmost_forwarded_entry_stands_in_for_a_missing_real_ip() {
+        let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let h = hdr("x-forwarded-for", "1.2.3.4, 198.51.100.7");
+        assert_eq!(client_ip(peer, &h, Some(SECRET)), ip("198.51.100.7"));
+    }
+
+    /// Nothing usable at all is loopback rather than a guess - one shared bucket, which is the
+    /// conservative direction to fail in.
+    #[test]
+    fn no_usable_header_falls_back_rather_than_inventing() {
+        let peer: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        assert_eq!(
+            client_ip(peer, &HeaderMap::new(), Some(SECRET)),
+            ip("127.0.0.1")
+        );
+        let h = headers(&[("x-real-ip", "not an address"), (EDGE_HEADER, SECRET)]);
+        assert_eq!(client_ip(peer, &h, Some(SECRET)), ip("127.0.0.1"));
     }
 
     #[test]

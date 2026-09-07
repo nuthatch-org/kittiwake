@@ -131,7 +131,22 @@ async fn main() -> anyhow::Result<()> {
     let read = ReadCtx::new(gate.clone(), store.clone(), cache_cfg.schema_version)
         .with_chain(chain.clone());
 
-    let state = kittiwake_edge::state(limits, metrics, pool.clone(), read.clone());
+    // Said once, loudly, rather than discovered when the rate limiter starts refusing everyone:
+    // without this the service cannot tell one visitor behind a proxy from another.
+    if cfg.edge_secret.is_none() {
+        tracing::warn!(
+            "no edge_secret: every request arriving through a proxy is attributed to the proxy's \
+             own address, so all callers share one rate-limit bucket. Set it before any rewrite \
+             sends real traffic here."
+        );
+    }
+    let state = kittiwake_edge::state(
+        limits,
+        metrics,
+        pool.clone(),
+        read.clone(),
+        cfg.edge_secret.clone(),
+    );
     let limits_handle = state.limits.clone();
 
     // Keyed rate-limit state grows with distinct callers; sweep the idle ones periodically so a

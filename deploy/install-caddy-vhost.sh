@@ -19,14 +19,22 @@ FRAGMENT=$(dirname "$0")/Caddyfile.fragment
 [ -r "$FRAGMENT" ] || { echo "no $FRAGMENT" >&2; exit 1; }
 
 # Resolve first, and refuse rather than let Caddy spend an hour backing off against a name that
-# does not exist yet. Checked from here, which is not where Let's Encrypt checks from, so this is a
-# guard against the obvious mistake rather than a guarantee.
-resolved=$(dig +short "$NAME" A | head -1)
+# does not exist yet.
+#
+# Asked of the domain's own authoritative nameservers rather than of whatever resolver this machine
+# uses. Two reasons, and the second one cost me a run: Let's Encrypt queries authoritative servers,
+# so that is the answer that decides whether the challenge works; and a resolver that has already
+# been asked for this name while it did not exist will keep saying so for the length of the SOA
+# negative-cache TTL, which produces a confident "the record is missing" about a record that is
+# plainly there.
+NS=$(dig +short NS "${NAME#*.}" | head -1)
+resolved=$(dig +short ${NS:+@"$NS"} "$NAME" A | head -1)
 if [ -z "$resolved" ]; then
-  echo "$NAME does not resolve yet. Add the A record first; DNS is step 2, this is step 3." >&2
+  echo "$NAME does not resolve at ${NS:-the default resolver}." >&2
+  echo "Add the A record first; DNS is step 2, this is step 3." >&2
   exit 1
 fi
-echo "$NAME resolves to $resolved"
+echo "$NAME resolves to $resolved (asked ${NS:-the default resolver})"
 
 # The fragment travels as an environment variable rather than on stdin, because stdin is already
 # carrying the script itself. Feeding ssh two of them silently gets you one.
