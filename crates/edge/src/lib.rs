@@ -573,6 +573,30 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// The regression that 400'd three routes in production for twenty minutes.
+    ///
+    /// Base58 is case-sensitive, so a normaliser that lowercases turns a valid CID into rubbish.
+    /// Both spellings must reach the same id, because the frontend sends one and the nest stores
+    /// the other.
+    #[test]
+    fn both_spellings_of_a_deployment_reach_the_same_id() {
+        let cid = "Qmd5j2CeMs5NBUASQWjGbFmFpxGWhwKbgrTBZwV8hj65QJ";
+        let hex = "0xdb0c77a3184bf017abafb7606794d77ff53d9a59a0bc1dc23f1a762bd1e631ff";
+        assert_eq!(crate::handlers::deployment_id(cid), hex);
+        assert_eq!(crate::handlers::deployment_id(hex), hex);
+        // Mixed case hex is still hex; only the CID form is case-sensitive.
+        assert_eq!(crate::handlers::deployment_id(&hex.to_uppercase()), hex);
+        assert_eq!(crate::handlers::deployment_id(&format!("  {cid}  ")), hex);
+    }
+
+    /// Anything that is neither is passed through for the SQL builder to refuse, rather than being
+    /// mangled into something that looks plausible.
+    #[test]
+    fn nonsense_is_left_for_the_validator_to_refuse() {
+        assert_eq!(crate::handlers::deployment_id("' OR 1=1 --"), "' or 1=1 --");
+        assert_eq!(crate::handlers::deployment_id(""), "");
+    }
+
     #[test]
     fn a_forwarded_header_from_a_stranger_is_ignored() {
         let peer: SocketAddr = "203.0.113.9:5000".parse().unwrap();

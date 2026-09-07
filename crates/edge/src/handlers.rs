@@ -90,6 +90,21 @@ fn addr(raw: &str) -> String {
     raw.trim().to_lowercase()
 }
 
+/// A deployment id, from either spelling the reader might arrive with.
+///
+/// The nest stores deployments as a bytes32 hex id. Every link and label in the app is built from
+/// the `Qm…` CIDv0, which is the same bytes wearing a multihash prefix and base58. So a route path
+/// carries the CID and the query needs the hex.
+///
+/// Lowercasing is what a naive normaliser does, and it is exactly wrong here: base58 is
+/// **case-sensitive**, so `to_lowercase` turns a valid CID into rubbish that then fails validation.
+/// That shipped, and it 400'd `/api/indexing-status`, `/api/subgraph-curation` and
+/// `/api/subgraph-history` for every caller using the form the frontend actually sends.
+pub(crate) fn deployment_id(raw: &str) -> String {
+    let t = raw.trim();
+    kittiwake_read::shape::ipfs_hash_to_bytes32(t).unwrap_or_else(|| t.to_lowercase())
+}
+
 pub async fn indexers(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -530,7 +545,7 @@ pub async fn subgraph_curation(
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
     Ok(envelope(
-        routes::subgraph_curation(&st.read, &addr(&hash)).await?,
+        routes::subgraph_curation(&st.read, &deployment_id(&hash)).await?,
     ))
 }
 
@@ -542,7 +557,7 @@ pub async fn subgraph_history(
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
     Ok(envelope(
-        routes::subgraph_history(&st.read, &addr(&hash)).await?,
+        routes::subgraph_history(&st.read, &deployment_id(&hash)).await?,
     ))
 }
 
@@ -554,7 +569,7 @@ pub async fn indexing_status(
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
     Ok(envelope(
-        routes::deployment_status(&st.read, &addr(&hash)).await?,
+        routes::deployment_status(&st.read, &deployment_id(&hash)).await?,
     ))
 }
 

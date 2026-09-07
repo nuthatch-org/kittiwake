@@ -28,14 +28,17 @@ struct Route {
 /// detail route answers 404 for it, which is a fact about the fixture rather than about parity.
 const A: &str = "0x090f7382f9ea85c733cd501f4d87f16cb5b83ed3";
 
+/// A real deployment with signal and allocations, in the CIDv0 form every link in the app uses.
+const D: &str = "Qmbsc6XQWbiv4DfLVfaNciScqYLyDWUYjWzrFBbzzmRsMB";
+
 /// Route paths are built from a fixture address, so they outlive the call that made them.
 fn leak(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
 
 fn routes() -> Vec<Route> {
-    let both = |path: &'static str| Route {
-        path,
+    let both = |path: &str| Route {
+        path: leak(path.to_string()),
         incumbent_at: "",
         ours_at: "",
     };
@@ -60,6 +63,12 @@ fn routes() -> Vec<Route> {
         both("/api/dips"),
         both("/api/horizon/activity"),
         both("/api/subgraph-search?q=uniswap"),
+        // The three routes that take a deployment, in the `Qm…` form the frontend actually sends.
+        // All three shipped 400ing because the handler lowercased a case-sensitive base58 CID, and
+        // none of them was in this table, which is why nobody found out until a user would have.
+        both(&format!("/api/indexing-status/{D}")),
+        both(&format!("/api/subgraph-curation/{D}")),
+        both(&format!("/api/subgraph-history/{D}")),
         both("/api/chain-lag"),
         both("/api/dropped-chains"),
         both("/api/price"),
@@ -115,7 +124,7 @@ async fn main() {
         let (a, a_status, a_ms) = timed(&http, &format!("{incumbent_base}{}", r.path)).await;
         let (b, b_status, b_ms) = timed(&http, &format!("{ours_base}{}", r.path)).await;
 
-        let name = r.path.replace(A, "<addr>");
+        let name = r.path.replace(A, "<addr>").replace(D, "<deployment>");
         let (theirs, ours) = (median(a_ms), median(b_ms));
         match (a, b) {
             (Some(a), Some(b)) => {
