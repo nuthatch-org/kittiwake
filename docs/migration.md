@@ -24,6 +24,27 @@ service returns the same shape, ignoring the added `provenance` key.
 | 10 | the long tail | some of it droppable | to do |
 | 11 | frontend hooks | only now do the hooks change | to do |
 
+## The route ledger
+
+Counted rather than estimated, on 2026-09-07. Lodestar has **90 API routes** outside the crons.
+This service serves **36**. Of the 54 remaining, **nine are deletions rather than ports** - the
+three `push/*`, two `lodie/*`, two `seahorn/*` (dead upstream since July), `provider-liveness`
+(goes with Dispatch), and `/api/health`, which exists here as `/health` at the root.
+
+That leaves **45 routes of real work**, in four blocks and one long tail:
+
+| Block | Routes | Character |
+|---|---|---|
+| The Dock (`studio/*`) | 9 | Sessions, deploy keys, IPFS upload, the on-chain bounty lifecycle. Sessions are done (`crates/dock`); the routes are not. |
+| Scuttlebutt | 6 | A **rewrite**, not a port: axum SSE and a broadcast channel, rather than dragging the Node concurrency model across. |
+| The disassembler | 3 | Onto wasmtime with fuel and epoch limits. Better sandbox posture than what it replaces. |
+| The SQL upper tier | 2 | `sql/named` and `sql/receipt`. The catalogue and ad-hoc query are already here. |
+| The long tail | 25 | Mixed. Roughly a third are nest reads that port in an afternoon; the rest touch Postgres, the chain or a third party. |
+
+The long tail is worth triaging rather than working through in order, because some of it should be
+dropped rather than carried. `blog/search-index`, `analytics/*`, `vote` and `x402/query` are each
+worth a moment's thought about whether anyone reads them.
+
 ## The cron ledger
 
 Seventeen crons, and only nine of them were ever jobs this service should run. The count is worth
