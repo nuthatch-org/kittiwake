@@ -817,3 +817,99 @@ async fn live_or(
     crate::no_store(resp.headers_mut());
     Ok(resp)
 }
+
+/// `/api/subgraph-search`: one box, three questions.
+///
+/// A `0x…` address searches deployment manifests, a `Qm…` prefix searches deployment hashes, and
+/// anything else searches display names. Names live only in IPFS documents, so that last one reads
+/// the cache the warm job fills; a subgraph published minutes ago is not findable by name until
+/// that job has been round.
+pub async fn subgraph_search(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<SearchQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let pool = st
+        .pool
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("no database is configured".into()))?;
+    let hits = kittiwake_read::search::search(
+        pool,
+        &st.ipfs,
+        &st.read.gate,
+        kittiwake_nest::Lane::Read,
+        q.q.as_deref().unwrap_or(""),
+    )
+    .await?;
+    let mut resp =
+        axum::Json(serde_json::json!({ "data": hits, "source": "nuthatch" })).into_response();
+    crate::no_store(resp.headers_mut());
+    Ok(resp)
+}
+
+#[derive(serde::Deserialize)]
+pub struct SearchQuery {
+    pub q: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct NamesBody {
+    #[serde(default)]
+    pub hashes: Vec<String>,
+}
+
+/// `/api/subgraph-names`: deployment hashes to display names, in a batch.
+///
+/// Foghorn's needs-attention surface is the caller: the deployments it reports are often unsignalled
+/// and so never appear in any top-N list that would have carried a name already.
+///
+/// Only named deployments appear in the answer. That is the incumbent's shape, and it is what the
+/// caller merges into its own rows.
+pub async fn subgraph_names(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<NamesBody>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let pool = st
+        .pool
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("no database is configured".into()))?;
+
+    // Capped at five hundred, as the incumbent caps it: this fans out to one IPFS fetch per
+    // uncached document, and an uncapped list is a way to ask us to spend an afternoon on it.
+    let mut seen = std::collections::BTreeSet::new();
+    let hashes: Vec<String> = body
+        .hashes
+        .into_iter()
+        .filter(|h| h.starts_with("Qm") || h.starts_with("baf"))
+        .filter(|h| seen.insert(h.clone()))
+        .take(500)
+        .collect();
+    if hashes.is_empty() {
+        let mut resp = axum::Json(serde_json::json!({ "data": {} })).into_response();
+        crate::no_store(resp.headers_mut());
+        return Ok(resp);
+    }
+
+    let names = kittiwake_read::search::display_names_for_deployments(
+        pool,
+        &st.ipfs,
+        &st.read.gate,
+        kittiwake_nest::Lane::Read,
+        &hashes,
+    )
+    .await?;
+    let map: serde_json::Map<String, serde_json::Value> = names
+        .into_iter()
+        .filter_map(|(h, n)| Some((h, serde_json::Value::String(n?))))
+        .collect();
+
+    let mut resp =
+        axum::Json(serde_json::json!({ "data": map, "source": "nuthatch" })).into_response();
+    crate::no_store(resp.headers_mut());
+    Ok(resp)
+}

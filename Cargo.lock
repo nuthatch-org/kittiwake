@@ -3107,6 +3107,7 @@ dependencies = [
 name = "kittiwake-ext"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "kittiwake-cache",
  "kittiwake-ssrf",
  "kittiwake-types",
@@ -3114,6 +3115,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sqlx",
  "tokio",
  "tracing",
  "wiremock",
@@ -3195,11 +3197,13 @@ dependencies = [
  "kittiwake-cache",
  "kittiwake-chain",
  "kittiwake-db",
+ "kittiwake-ext",
  "kittiwake-nest",
  "kittiwake-types",
  "metrics",
  "serde",
  "serde_json",
+ "sqlx",
  "tokio",
  "tracing",
  "wiremock",

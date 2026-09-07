@@ -967,6 +967,25 @@ pub fn deployment_ipfs_hash(hex_id: &str) -> Option<String> {
     Some(bs58::encode(bytes).into_string())
 }
 
+/// The inverse: a `Qm…` CIDv0 back to the bytes32 id the nest stores.
+///
+/// Strict on purpose. A CIDv0 is exactly the multihash `0x1220 || <32 bytes>`, so anything that
+/// decodes to a different length or a different prefix is not one, and returning `None` is the only
+/// honest answer. Silently truncating or padding would produce a plausible-looking id that joins to
+/// nothing, which is the failure that takes a day to find.
+pub fn ipfs_hash_to_bytes32(cid: &str) -> Option<String> {
+    let bytes = bs58::decode(cid).into_vec().ok()?;
+    if bytes.len() != 34 || bytes[0] != 0x12 || bytes[1] != 0x20 {
+        return None;
+    }
+    let mut out = String::with_capacity(66);
+    out.push_str("0x");
+    for b in &bytes[2..] {
+        out.push_str(&format!("{b:02x}"));
+    }
+    Some(out)
+}
+
 /// The `Qm…` form when the id converts, the id itself otherwise. Never empty, never invented.
 pub fn ipfs_or_id(hex_id: &str) -> String {
     deployment_ipfs_hash(hex_id).unwrap_or_else(|| hex_id.to_string())
@@ -1463,6 +1482,30 @@ mod tests {
 
     /// A real pair, taken from the incumbent's own POI output. Getting this wrong silently unjoins
     /// every allocation from every status an indexer reports.
+    #[test]
+    fn a_cid_round_trips_back_to_the_id_it_came_from() {
+        // The same real pair the forward test pins, walked the other way.
+        let id = "0xdb0c77a3184bf017abafb7606794d77ff53d9a59a0bc1dc23f1a762bd1e631ff";
+        let cid = "Qmd5j2CeMs5NBUASQWjGbFmFpxGWhwKbgrTBZwV8hj65QJ";
+        assert_eq!(ipfs_hash_to_bytes32(cid).as_deref(), Some(id));
+        assert_eq!(deployment_ipfs_hash(id).as_deref(), Some(cid));
+    }
+
+    /// Anything that is not a CIDv0 must fail rather than produce a plausible id.
+    #[test]
+    fn a_non_cid_does_not_become_an_id() {
+        assert_eq!(ipfs_hash_to_bytes32(""), None);
+        assert_eq!(ipfs_hash_to_bytes32("not base58 at all!"), None);
+        // Valid base58, wrong length - the case a lenient decoder would wave through.
+        assert_eq!(ipfs_hash_to_bytes32("QmXoypiz"), None);
+        assert_eq!(
+            ipfs_hash_to_bytes32(
+                "0xdb0c77a3184bf017abafb7606794d77ff53d9a59a0bc1dc23f1a762bd1e631ff"
+            ),
+            None
+        );
+    }
+
     #[test]
     fn a_deployment_id_converts_to_the_ipfs_hash_the_indexer_reports() {
         assert_eq!(

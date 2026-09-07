@@ -412,6 +412,41 @@ fn median(values: &[i64]) -> serde_json::Value {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The IPFS cache behind search
+// ---------------------------------------------------------------------------------------------
+
+/// How many documents one run may fetch. The incumbent's figure. It keeps a run inside its slot;
+/// the remainder is picked up on the next one, and `remaining` says whether that is keeping up.
+const WARM_BUDGET: usize = 150;
+
+/// Fill the IPFS cache that name and manifest search read.
+///
+/// Not a live job in the sense the others are: it writes to `ipfs_metadata`, which the platform's
+/// own warm cron also writes. Both write the same document under the same CID, though, and the
+/// upsert is idempotent, so two writers here race to the same answer rather than to different ones.
+/// That is why it is not behind `scheduler_enabled` with the rest.
+pub async fn warm_ipfs(
+    pool: &kittiwake_db::Pool,
+    ipfs: &kittiwake_ext::Ipfs,
+    gate: &NestGate,
+    lane: Lane,
+) -> Result<Ingested, IngestError> {
+    let warmed = kittiwake_read::search::warm(pool, ipfs, gate, lane, WARM_BUDGET)
+        .await
+        .map_err(|e| IngestError::Refused(e.to_string()))?;
+    if warmed.remaining > 0 {
+        tracing::info!(
+            fetched = warmed.fetched,
+            remaining = warmed.remaining,
+            "ipfs cache warmed; more to do"
+        );
+    }
+    Ok(Ingested {
+        rows: warmed.fetched as u64,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{History, dropped_since, median};

@@ -21,9 +21,15 @@ fn mins(n: u64) -> Duration {
 
 /// Every nest-to-Postgres job, staggered.
 ///
-/// The offsets are the same ones the platform schedules encoded, kept so a comparison between the
-/// two systems is like for like: epochs at :03 past every ten minutes, delegations at :08 past
-/// every fifteen, allocations at :13 past the hour, and so on.
+/// The offsets started as the platform's own, kept so a comparison between the two systems would be
+/// like for like. They are not any more, and the reason is worth recording: the platform schedule
+/// collides with itself. Epochs on `3-59/10` and delegations on `8-59/15` both land on :23 and :53,
+/// and the hourly RAV ingest on :23 joins them. Three jobs, one moment, one nest.
+///
+/// So the offsets here are chosen instead of inherited, and `no_two_jobs_fire_at_the_same_minute_of_the_hour`
+/// holds them to it. Anyone diffing the two schedules should expect delegations at :01 rather than
+/// :08, allocations at :18 rather than :13, RAV at :28 rather than :23, and disputes at :48 rather
+/// than on the hour.
 /// Jobs that write only into this process's own memory.
 ///
 /// Safe to run whenever the service is up, because nothing outside this process can see what they
@@ -31,6 +37,7 @@ fn mins(n: u64) -> Duration {
 /// other system also writes to" - and these do not.
 pub fn live_jobs(store: kittiwake_cache::Store, pool: Option<Pool>, ext: Ext) -> Vec<JobDef> {
     let mut jobs = Vec::new();
+    let pool_for_warm = pool.clone();
     {
         // Every two minutes, as the platform schedule had it. Writes into the process's own store
         // rather than Redis, because the route that reads it is in this process.
@@ -89,6 +96,31 @@ pub fn live_jobs(store: kittiwake_cache::Store, pool: Option<Pool>, ext: Ext) ->
                             rows_written: i.rows,
                         })
                         .map_err(|e| e.to_string())
+                    })
+                }),
+            )
+            .staggered(mins(6)),
+        );
+    }
+
+    // The IPFS cache behind search. Ten minutes, as the platform schedule had it, offset off the
+    // chain-health run so the two never contend for the same nest permits.
+    if let Some(pool) = pool_for_warm {
+        let ipfs = kittiwake_ext::Ipfs::default();
+        jobs.push(
+            JobDef::every(
+                "warm-ipfs",
+                mins(10),
+                Arc::new(move |ctx| {
+                    let pool = pool.clone();
+                    let ipfs = ipfs.clone();
+                    Box::pin(async move {
+                        kittiwake_ingest::live::warm_ipfs(&pool, &ipfs, &ctx.gate, ctx.lane)
+                            .await
+                            .map(|i| JobOutcome {
+                                rows_written: i.rows,
+                            })
+                            .map_err(|e| e.to_string())
                     })
                 }),
             )
@@ -178,7 +210,7 @@ pub fn ingest_jobs(pool: Pool, ext: Ext, chain: Option<kittiwake_chain::Chain>) 
                     })
                 }),
             )
-            .staggered(mins(8)),
+            .staggered(mins(1)),
         );
     }
 
@@ -200,7 +232,7 @@ pub fn ingest_jobs(pool: Pool, ext: Ext, chain: Option<kittiwake_chain::Chain>) 
                     })
                 }),
             )
-            .staggered(mins(13)),
+            .staggered(mins(18)),
         );
     }
 
@@ -225,27 +257,30 @@ pub fn ingest_jobs(pool: Pool, ext: Ext, chain: Option<kittiwake_chain::Chain>) 
                     })
                 }),
             )
-            .staggered(mins(23)),
+            .staggered(mins(28)),
         );
     }
 
     {
         let pool = pool.clone();
-        jobs.push(JobDef::every(
-            "ingest-disputes",
-            mins(360),
-            Arc::new(move |ctx| {
-                let pool = pool.clone();
-                Box::pin(async move {
-                    kittiwake_ingest::disputes(&pool, &ctx.gate, ctx.lane)
-                        .await
-                        .map(|i| JobOutcome {
-                            rows_written: i.rows,
-                        })
-                        .map_err(|e| e.to_string())
-                })
-            }),
-        ));
+        jobs.push(
+            JobDef::every(
+                "ingest-disputes",
+                mins(360),
+                Arc::new(move |ctx| {
+                    let pool = pool.clone();
+                    Box::pin(async move {
+                        kittiwake_ingest::disputes(&pool, &ctx.gate, ctx.lane)
+                            .await
+                            .map(|i| JobOutcome {
+                                rows_written: i.rows,
+                            })
+                            .map_err(|e| e.to_string())
+                    })
+                }),
+            )
+            .staggered(mins(48)),
+        );
     }
 
     {
@@ -288,19 +323,61 @@ pub fn ingest_jobs(pool: Pool, ext: Ext, chain: Option<kittiwake_chain::Chain>) 
 mod tests {
     use super::*;
 
-    /// Two jobs sharing a period must not share a firing moment.
+    /// No two jobs may fire at the same moment in an hour.
+    ///
+    /// The earlier version of this only compared jobs that shared a period, which let a
+    /// thirty-minute job and a ten-minute job both land on the fourth minute and contend for the
+    /// same nest permits - exactly the collision the offsets exist to prevent. The one-minute
+    /// warmer is excluded because it fires every minute by definition and would make the property
+    /// unsatisfiable; it draws from the same background lane and queues rather than failing.
+    #[test]
+    fn no_two_jobs_fire_at_the_same_minute_of_the_hour() {
+        let schedule: Vec<(&str, u64, u64)> = vec![
+            ("ingest-epochs", 10, 3),
+            ("ingest-delegations", 15, 1),
+            ("ingest-allocations", 60, 18),
+            ("ingest-rav", 60, 28),
+            ("ingest-disputes", 60, 48),
+            ("refresh", 5, 0),
+            ("snapshot-network", 5, 2),
+            ("warm-ipfs", 10, 4),
+            ("refresh-chain-health", 30, 6),
+        ];
+        let fires = |period: u64, offset: u64| -> Vec<u64> {
+            (0..60)
+                .filter(|m| *m >= offset && (m - offset).is_multiple_of(period))
+                .collect()
+        };
+        for (i, a) in schedule.iter().enumerate() {
+            for b in schedule.iter().skip(i + 1) {
+                let (fa, fb) = (fires(a.1, a.2), fires(b.1, b.2));
+                let clash: Vec<u64> = fa.iter().filter(|m| fb.contains(m)).copied().collect();
+                assert!(
+                    clash.is_empty(),
+                    "{} and {} both fire at minute {:?}",
+                    a.0,
+                    b.0,
+                    clash
+                );
+            }
+        }
+    }
+
+    /// Kept as well: a shared period with a shared offset is the same fault stated more directly.
     #[test]
     fn no_two_jobs_on_the_same_period_share_an_offset() {
         // Built without a live pool: only the schedule shape is under test.
         let names_and_offsets: Vec<(&str, Duration, Duration)> = vec![
             ("ingest-epochs", mins(10), mins(3)),
-            ("ingest-delegations", mins(15), mins(8)),
-            ("ingest-allocations", mins(60), mins(13)),
-            ("ingest-rav", mins(60), mins(23)),
-            ("ingest-disputes", mins(360), Duration::ZERO),
+            ("ingest-delegations", mins(15), mins(1)),
+            ("ingest-allocations", mins(60), mins(18)),
+            ("ingest-rav", mins(60), mins(28)),
+            ("ingest-disputes", mins(360), mins(48)),
             ("refresh", mins(5), Duration::ZERO),
             ("snapshot-network", mins(5), mins(2)),
             ("warm", mins(1), Duration::ZERO),
+            ("warm-ipfs", mins(10), mins(4)),
+            ("refresh-chain-health", mins(30), mins(6)),
         ];
         for (i, a) in names_and_offsets.iter().enumerate() {
             for b in names_and_offsets.iter().skip(i + 1) {

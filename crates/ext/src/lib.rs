@@ -366,3 +366,227 @@ mod probe_tests {
         assert_eq!(parse_status(&v).unwrap().blocks_behind, Some(0));
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// IPFS
+// ---------------------------------------------------------------------------------------------
+
+/// The Graph's public IPFS gateway. Overridable, because a self-hosted node is faster and does not
+/// share a rate limit with everyone else on the network.
+pub const THEGRAPH_IPFS: &str = "https://api.thegraph.com/ipfs";
+
+/// Documents behind CIDs, cached in Postgres.
+///
+/// Two document kinds share one table and one CID space: subgraph metadata, which is JSON, and
+/// deployment manifests, which are YAML and stored as text. A CID is one or the other, never both,
+/// so `json` and `text` are separate columns rather than one polymorphic blob.
+///
+/// The cache is what makes search possible at all. Name search is a query against the cached
+/// documents rather than against IPFS - nothing else would answer inside a request - which is why
+/// the warm job exists and why a subgraph nobody has fetched is not findable until it has run.
+#[derive(Clone)]
+pub struct Ipfs {
+    http: reqwest::Client,
+    endpoint: String,
+}
+
+/// How long a failed fetch is honoured before it is tried again. An IPFS gateway that is down for
+/// a minute must not cost us a re-fetch storm, and one that is down for a day must not permanently
+/// poison a document.
+const FAILURE_TTL: Duration = Duration::from_secs(3600);
+
+impl Default for Ipfs {
+    fn default() -> Self {
+        Self::new(THEGRAPH_IPFS)
+    }
+}
+
+impl Ipfs {
+    pub fn new(endpoint: &str) -> Self {
+        Self {
+            http: reqwest::Client::builder()
+                // IPFS is content-addressed and slow; eight seconds is the incumbent's figure and
+                // is long enough for a cold block and short enough not to hold a warm job's slot.
+                .timeout(Duration::from_secs(8))
+                .user_agent(concat!("kittiwake/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .unwrap_or_default(),
+            endpoint: endpoint.trim_end_matches('/').to_string(),
+        }
+    }
+
+    /// The IPFS API's `cat`, which The Graph's endpoint serves on POST rather than GET.
+    pub async fn cat(&self, cid: &str) -> Result<String, String> {
+        let url = format!("{}/api/v0/cat", self.endpoint);
+        let res = self
+            .http
+            .post(&url)
+            .query(&[("arg", cid)])
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    "timed out".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+        if !res.status().is_success() {
+            return Err(format!("ipfs cat {cid}: HTTP {}", res.status().as_u16()));
+        }
+        res.text().await.map_err(|e| e.to_string())
+    }
+}
+
+/// What the cache holds for one CID.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CachedDoc {
+    pub cid: String,
+    pub json: Option<serde_json::Value>,
+    pub text: Option<String>,
+    pub error: Option<String>,
+    pub fetched_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl CachedDoc {
+    /// A failure recent enough that re-fetching it now would just fail again.
+    pub fn failed_recently(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        // A negative age (a clock skew, a row written slightly in the future) converts to no
+        // Duration at all, and is treated as recent - the conservative direction.
+        self.error.is_some()
+            && (now - self.fetched_at)
+                .to_std()
+                .map(|d| d < FAILURE_TTL)
+                .unwrap_or(true)
+    }
+}
+
+/// Read whatever the cache holds for these CIDs. Absent CIDs are simply absent from the result.
+pub async fn cached_docs(
+    pool: &sqlx::PgPool,
+    cids: &[String],
+) -> Result<Vec<CachedDoc>, sqlx::Error> {
+    if cids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as::<_, CachedDoc>(
+        "SELECT cid, json, text, error, fetched_at FROM ipfs_metadata WHERE cid = ANY($1)",
+    )
+    .bind(cids)
+    .fetch_all(pool)
+    .await
+}
+
+/// Fetch one JSON document and record the outcome, returning what the cache now holds for it.
+///
+/// A document that fetched but is not JSON is recorded as `not json` and, because that is a
+/// permanent property of the document rather than a transient failure, is not retried on the
+/// hourly schedule the way a network error is.
+pub async fn fetch_json(pool: &sqlx::PgPool, ipfs: &Ipfs, cid: &str) -> Option<serde_json::Value> {
+    let (json, error) = match ipfs.cat(cid).await {
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(v) => (Some(v), None),
+            Err(_) => (None, Some("not json".to_string())),
+        },
+        Err(e) => {
+            tracing::debug!(cid, err = %e, "ipfs fetch failed");
+            (None, Some(e))
+        }
+    };
+    if let Err(e) = sqlx::query(
+        "INSERT INTO ipfs_metadata (cid, json, error, fetched_at) VALUES ($1, $2, $3, NOW()) \
+         ON CONFLICT (cid) DO UPDATE SET json = EXCLUDED.json, error = EXCLUDED.error, \
+         fetched_at = NOW()",
+    )
+    .bind(cid)
+    .bind(&json)
+    .bind(&error)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(cid, err = %e, "ipfs cache write failed");
+    }
+    json
+}
+
+/// The same for a text document - a deployment manifest.
+pub async fn fetch_text(pool: &sqlx::PgPool, ipfs: &Ipfs, cid: &str) -> Option<String> {
+    let (text, error) = match ipfs.cat(cid).await {
+        Ok(t) => (Some(t), None),
+        Err(e) => {
+            tracing::debug!(cid, err = %e, "ipfs fetch failed");
+            (None, Some(e))
+        }
+    };
+    if let Err(e) = sqlx::query(
+        "INSERT INTO ipfs_metadata (cid, text, error, fetched_at) VALUES ($1, $2, $3, NOW()) \
+         ON CONFLICT (cid) DO UPDATE SET text = EXCLUDED.text, error = EXCLUDED.error, \
+         fetched_at = NOW()",
+    )
+    .bind(cid)
+    .bind(&text)
+    .bind(&error)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(cid, err = %e, "ipfs cache write failed");
+    }
+    text
+}
+
+#[cfg(test)]
+mod ipfs_tests {
+    use super::*;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn cat_posts_the_cid_as_a_query_argument() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .and(query_param("arg", "QmAbc"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("{\"displayName\":\"Uniswap\"}"),
+            )
+            .mount(&server)
+            .await;
+
+        let ipfs = Ipfs::new(&server.uri());
+        assert_eq!(
+            ipfs.cat("QmAbc").await.unwrap(),
+            "{\"displayName\":\"Uniswap\"}"
+        );
+    }
+
+    /// A 404 is an error, not an empty document. Returning `Ok("")` here would cache a subgraph
+    /// with no name as if that were the truth.
+    #[tokio::test]
+    async fn a_missing_document_is_an_error_rather_than_an_empty_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let err = Ipfs::new(&server.uri()).cat("QmAbc").await.unwrap_err();
+        assert!(err.contains("404"), "{err}");
+    }
+
+    #[test]
+    fn a_recent_failure_is_honoured_and_an_old_one_is_not() {
+        let now = chrono::Utc::now();
+        let doc = |err: Option<&str>, age_secs: i64| CachedDoc {
+            cid: "QmAbc".into(),
+            json: None,
+            text: None,
+            error: err.map(|e| e.to_string()),
+            fetched_at: now - chrono::Duration::seconds(age_secs),
+        };
+        assert!(doc(Some("timed out"), 60).failed_recently(now));
+        assert!(!doc(Some("timed out"), 7200).failed_recently(now));
+        // A success is never "failed recently", however old it is.
+        assert!(!doc(None, 60).failed_recently(now));
+    }
+}

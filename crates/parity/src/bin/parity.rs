@@ -59,6 +59,7 @@ fn routes() -> Vec<Route> {
         both("/api/subgraph-fees-30d"),
         both("/api/dips"),
         both("/api/horizon/activity"),
+        both("/api/subgraph-search?q=uniswap"),
         both("/api/chain-lag"),
         both("/api/dropped-chains"),
         both("/api/price"),

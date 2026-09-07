@@ -85,6 +85,7 @@ impl Limits {
 pub struct AppState {
     pub read: ReadCtx,
     pub ext: kittiwake_ext::Ext,
+    pub ipfs: kittiwake_ext::Ipfs,
     /// Absent when no Arbitrum RPC is configured; the routes that need it say so rather than
     /// silently returning nothing.
     pub chain: Option<kittiwake_chain::Chain>,
@@ -386,6 +387,8 @@ pub fn router(state: AppState) -> Router {
         // The public SQL surface
         .route("/api/indexers-enriched", get(handlers::indexers_enriched))
         .route("/api/horizon/activity", get(handlers::horizon_activity))
+        .route("/api/subgraph-search", get(handlers::subgraph_search))
+        .route("/api/subgraph-names", post(handlers::subgraph_names))
         .route("/api/chain-lag", get(handlers::chain_lag))
         .route("/api/dropped-chains", get(handlers::dropped_chains))
         .route("/api/reo", get(handlers::reo))
@@ -415,6 +418,7 @@ pub fn state(
         chain: read.chain.clone(),
         read,
         ext: kittiwake_ext::Ext::default(),
+        ipfs: kittiwake_ext::Ipfs::default(),
         pool,
         limits: Arc::new(limits),
         metrics,
