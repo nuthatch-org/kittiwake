@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use kittiwake_read::routes;
 use kittiwake_types::ApiError;
 
-use crate::{AppState, ErrorResponse, client_ip, envelope};
+use crate::{AppState, ErrorResponse, client_ip, envelope, envelope_root};
 
 /// Seconds since the epoch, for the "since" windows.
 fn now() -> i64 {
@@ -457,12 +457,13 @@ pub async fn price(
                 let ext = ext.clone();
                 Box::pin(async move {
                     let (usd, change) = ext.grt_price().await?;
-                    Ok(serde_json::json!({ "usd": usd, "change24h": change }))
+                    // `price`, not `usd`: the callers were written against the incumbent.
+                    Ok(serde_json::json!({ "price": usd, "change24h": change }))
                 })
             })
         })
         .await?;
-    Ok(envelope(read))
+    Ok(envelope_root(read))
 }
 
 /// `/api/tvl`.
@@ -480,12 +481,12 @@ pub async fn tvl(
                 let ext = ext.clone();
                 Box::pin(async move {
                     let tvl = ext.arbitrum_tvl().await?;
-                    Ok(serde_json::json!({ "chain": "Arbitrum", "tvlUsd": tvl }))
+                    Ok(serde_json::json!({ "tvl": tvl }))
                 })
             })
         })
         .await?;
-    Ok(envelope(read))
+    Ok(envelope_root(read))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -522,12 +523,32 @@ pub async fn reo(
                 let address = address.clone();
                 Box::pin(async move {
                     let e = chain.eligibility(&address).await?;
-                    Ok(serde_json::to_value(e).unwrap_or(serde_json::Value::Null))
+                    // Under `status`, in the vocabulary the panel reads. `daysRemaining` is a
+                    // float because a partial day is the useful part of the answer.
+                    let expires_at = match (e.renewed_at, e.period_seconds) {
+                        (Some(r), Some(p)) if r > 0 => serde_json::json!(r + p),
+                        _ => serde_json::Value::Null,
+                    };
+                    Ok(serde_json::json!({ "status": {
+                        "address": address,
+                        "available": true,
+                        "isEligible": e.eligible,
+                        "status": if e.eligible { "eligible" } else { "ineligible" },
+                        "source": "oracle",
+                        "renewalTimestamp": e.renewed_at,
+                        "eligibilityPeriod": e.period_seconds,
+                        "expiresAt": expires_at,
+                        "daysRemaining": e.expires_in.map(|s| s as f64 / 86_400.0),
+                        // Ours to add: the oracle's own currency, which the incumbent cannot say.
+                        "oracleUpdatedAt": e.oracle_updated_at,
+                        "oracleStale": e.oracle_stale,
+                        "enforced": e.enforced,
+                    }}))
                 })
             })
         })
         .await?;
-    Ok(envelope(read))
+    Ok(envelope_root(read))
 }
 
 #[derive(serde::Deserialize)]

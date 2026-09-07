@@ -113,6 +113,35 @@ pub fn many(parts: Vec<Part>, timeout: Duration) -> Fetcher {
     })
 }
 
+/// One query whose rows are shaped and returned, optionally nested under a key.
+///
+/// The nesting is not decoration: the dashboard's hooks read `data.indexers`, `data.epoches` and
+/// so on, and a bare array where an object is expected is as broken as a missing field.
+pub fn rows_shaped(
+    nest: NestId,
+    sql: String,
+    timeout: Duration,
+    map: fn(&serde_json::Value) -> serde_json::Value,
+    under: Option<&'static str>,
+) -> Fetcher {
+    let inner = rows_only(nest, sql, timeout);
+    Arc::new(move |gate, lane| {
+        let inner = inner.clone();
+        Box::pin(async move {
+            let (v, p) = inner(gate, lane).await?;
+            let mapped: Vec<serde_json::Value> = v
+                .as_array()
+                .map(|rows| rows.iter().map(map).collect())
+                .unwrap_or_default();
+            let out = match under {
+                Some(key) => serde_json::json!({ key: mapped }),
+                None => serde_json::Value::Array(mapped),
+            };
+            Ok((out, p))
+        })
+    })
+}
+
 /// One query whose rows are the whole answer.
 pub fn rows_only(nest: NestId, sql: String, timeout: Duration) -> Fetcher {
     let part = Part::rows("rows", nest, sql);
@@ -167,7 +196,7 @@ pub async fn indexers(ctx: &ReadCtx, p: IndexersParams) -> Result<Read, ApiError
         NestId::Alloc,
         serde_json::json!({"first": p.first, "skip": p.skip, "orderBy": p.order_by, "desc": p.descending}),
         CachePolicy::from_poll_interval(cadence::LIVE),
-        rows_only(NestId::Alloc, sql, T_FOLD),
+        rows_shaped(NestId::Alloc, sql, T_FOLD, crate::shape::indexer, Some("indexers")),
     )
     .await
 }
@@ -178,7 +207,13 @@ pub async fn curators(ctx: &ReadCtx, first: i64, skip: i64) -> Result<Read, ApiE
         NestId::Alloc,
         serde_json::json!({"first": first, "skip": skip}),
         CachePolicy::from_poll_interval(cadence::LIVE),
-        rows_only(NestId::Alloc, sql::curators_sql(first, skip), T_FOLD),
+        rows_shaped(
+            NestId::Alloc,
+            sql::curators_sql(first, skip),
+            T_FOLD,
+            crate::shape::curator,
+            None,
+        ),
     )
     .await
 }
@@ -189,7 +224,13 @@ pub async fn epochs(ctx: &ReadCtx, first: i64) -> Result<Read, ApiError> {
         NestId::Alloc,
         serde_json::json!({"first": first}),
         CachePolicy::from_poll_interval(cadence::SLOW),
-        rows_only(NestId::Alloc, sql::epochs_sql(first), T_QUICK),
+        rows_shaped(
+            NestId::Alloc,
+            sql::epochs_sql(first),
+            T_QUICK,
+            crate::shape::epoch,
+            Some("epoches"),
+        ),
     )
     .await
 }
@@ -523,7 +564,13 @@ pub async fn provisions_by_indexer(ctx: &ReadCtx, addr: &str) -> Result<Read, Ap
         NestId::Alloc,
         serde_json::json!({"indexer": addr}),
         CachePolicy::from_poll_interval(cadence::LIVE),
-        rows_only(NestId::Alloc, sql, T_FOLD),
+        rows_shaped(
+            NestId::Alloc,
+            sql,
+            T_FOLD,
+            crate::shape::provision,
+            Some("provisions"),
+        ),
     )
     .await
 }
@@ -540,7 +587,13 @@ pub async fn provisions_by_service(
         NestId::Alloc,
         serde_json::json!({"service": addr, "first": first, "skip": skip}),
         CachePolicy::from_poll_interval(cadence::LIVE),
-        rows_only(NestId::Alloc, sql, T_FOLD),
+        rows_shaped(
+            NestId::Alloc,
+            sql,
+            T_FOLD,
+            crate::shape::provision,
+            Some("provisions"),
+        ),
     )
     .await
 }
@@ -605,7 +658,13 @@ pub async fn delegation_events(
         NestId::Alloc,
         serde_json::json!({"indexer": indexer, "first": first, "since": since}),
         CachePolicy::from_poll_interval(cadence::SLOW),
-        rows_only(NestId::Alloc, sql, T_FOLD),
+        rows_shaped(
+            NestId::Alloc,
+            sql,
+            T_FOLD,
+            crate::shape::delegation_event,
+            Some("delegationEvents"),
+        ),
     )
     .await
 }
@@ -730,7 +789,13 @@ pub async fn subgraph_deployments(
         NestId::Alloc,
         serde_json::json!({"first": first, "skip": skip, "orderBy": order_by, "desc": descending}),
         CachePolicy::from_poll_interval(cadence::LIVE),
-        rows_only(NestId::Alloc, sql, T_FOLD),
+        rows_shaped(
+            NestId::Alloc,
+            sql,
+            T_FOLD,
+            |r| crate::shape::deployment(r, None),
+            None,
+        ),
     )
     .await
 }

@@ -186,9 +186,34 @@ fn provenance_headers(headers: &mut HeaderMap, meta: &Meta) {
 pub(crate) fn envelope(read: kittiwake_read::Read) -> Response {
     let body = serde_json::json!({
         "data": &*read.entry.value,
+        // The incumbent carries this and some consumers read it. Cheap, and true.
+        "source": "nuthatch",
         "provenance": &read.meta,
     });
     let mut resp = axum::Json(body).into_response();
+    provenance_headers(resp.headers_mut(), &read.meta);
+    no_store(resp.headers_mut());
+    resp
+}
+
+/// For the routes whose payload sits at the root rather than under `data`.
+///
+/// `/api/price` answers `{price, change24h}` and nothing else. Wrapping it would be tidier and
+/// would break every caller, so the shape the callers already parse wins.
+pub(crate) fn envelope_root(read: kittiwake_read::Read) -> Response {
+    let mut body = match &*read.entry.value {
+        serde_json::Value::Object(map) => map.clone(),
+        other => {
+            let mut m = serde_json::Map::new();
+            m.insert("data".into(), other.clone());
+            m
+        }
+    };
+    body.insert(
+        "provenance".into(),
+        serde_json::to_value(&read.meta).unwrap_or_default(),
+    );
+    let mut resp = axum::Json(serde_json::Value::Object(body)).into_response();
     provenance_headers(resp.headers_mut(), &read.meta);
     no_store(resp.headers_mut());
     resp
