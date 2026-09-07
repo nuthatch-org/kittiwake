@@ -474,7 +474,39 @@ pub async fn subgraph_deployments(
         q.descending(),
     )
     .await?;
-    Ok(envelope(read))
+    Ok(envelope(named(&st, read).await))
+}
+
+/// Put the names on a deployment list, when there is a database to read them from.
+///
+/// Without this the list carries `displayName: null` for everything. That looked like parity for a
+/// while because the incumbent was returning null too - it was storing every metadata document
+/// double-encoded (lodestar#100) - so both were blank and the diff was clean. Fixing theirs is what
+/// exposed this one, which is a decent argument for comparing against something that works.
+async fn named(st: &AppState, mut read: kittiwake_read::Read) -> kittiwake_read::Read {
+    let Some(pool) = st.pool.as_ref() else {
+        return read;
+    };
+    let mut data = (*read.entry.value).clone();
+    kittiwake_read::search::enrich_deployments(
+        pool,
+        &st.ipfs,
+        &st.read.gate,
+        kittiwake_nest::Lane::Read,
+        &mut data,
+    )
+    .await;
+    // A fresh entry rather than a mutation: the cached one is shared, and enriching it in place
+    // would put names into the cache keyed by a query that did not ask for them - and, worse, make
+    // the cached value depend on whether a database happened to be configured on the run that
+    // filled it. The provenance and age carry over unchanged, because they still describe where
+    // the figures came from.
+    read.entry = std::sync::Arc::new(kittiwake_cache::Entry {
+        value: std::sync::Arc::new(data),
+        provenance: read.entry.provenance.clone(),
+        fetched_at: read.entry.fetched_at,
+    });
+    read
 }
 
 pub async fn subgraph_fees_30d(
@@ -484,7 +516,8 @@ pub async fn subgraph_fees_30d(
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
     let since = now() - 30 * 86_400;
-    Ok(envelope(routes::subgraph_fees_30d(&st.read, since).await?))
+    let read = routes::subgraph_fees_30d(&st.read, since).await?;
+    Ok(envelope(named(&st, read).await))
 }
 
 pub async fn subgraph_curation(

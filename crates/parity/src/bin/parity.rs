@@ -201,6 +201,11 @@ impl Row {
             _ => None,
         }
     }
+
+    fn ms(v: Option<u128>) -> String {
+        v.map(|us| format!("{:.1} ms", us as f64 / 1000.0))
+            .unwrap_or_else(|| "-".into())
+    }
 }
 
 /// Write the tracker.
@@ -269,7 +274,6 @@ fn write_markdown(
 ",
     );
     for r in rows {
-        let ms = |v: Option<u128>| v.map(|x| format!("{x} ms")).unwrap_or_else(|| "-".into());
         let speed = r
             .speedup()
             .map(|s| format!("{s:.1}x"))
@@ -279,8 +283,8 @@ fn write_markdown(
             "| `{}` | {} | {} | {} | {} |",
             r.name,
             r.verdict,
-            ms(r.theirs_ms),
-            ms(r.ours_ms),
+            Row::ms(r.theirs_ms),
+            Row::ms(r.ours_ms),
             speed
         );
     }
@@ -375,10 +379,27 @@ async fn timed(
     let mut body = None;
     let mut status = String::new();
     let mut times = Vec::new();
-    for _ in 0..SAMPLES {
+    for i in 0..SAMPLES {
+        // A unique parameter per request, so the incumbent's CDN cannot answer. Without it the
+        // "incumbent" column is a Vercel edge hit from a nearby PoP rather than the application
+        // doing the work, and the comparison flatters it enormously - every route reads about 35 ms
+        // whatever it actually costs to compute. Unknown query parameters are ignored on both
+        // sides. Ours sends `no-store` anyway; this keeps the two symmetrical.
+        let sep = if url.contains('?') { '&' } else { '?' };
+        let bust = format!(
+            "{url}{sep}_cb={}-{i}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
         let began = std::time::Instant::now();
-        let (b, st) = fetch(http, url).await;
-        let elapsed = began.elapsed().as_millis();
+        let (b, st) = fetch(http, &bust).await;
+        // Microseconds, not milliseconds. At millisecond resolution every fast route reads `0`,
+        // which is then indistinguishable from "did not answer" and drops out of the ratio - so the
+        // summary is computed only from the slow routes and reports a migration that made things
+        // worse. Measured that, believed it for about a minute.
+        let elapsed = began.elapsed().as_micros();
         status = st;
         if b.is_some() {
             times.push(elapsed);

@@ -497,6 +497,64 @@ pub async fn display_names_for_deployments(
     Ok(out)
 }
 
+/// Fill in `displayName` and `categories` on a list of deployments.
+///
+/// The names live in IPFS documents keyed off the GNS nest, which is a different nest and a
+/// different store from the one that produced the list, so this cannot be part of the shaping - it
+/// needs a database and a second nest read. `shape::deployment` therefore leaves both fields
+/// null-and-empty and this fills them in afterwards.
+///
+/// It is a no-op that logs nothing when the metadata is unavailable, because a deployment with no
+/// name is an ordinary thing and a list that fails because a name is missing would be worse than a
+/// list with a gap in it.
+pub async fn enrich_deployments(
+    pool: &Pool,
+    ipfs: &Ipfs,
+    gate: &NestGate,
+    lane: Lane,
+    data: &mut serde_json::Value,
+) {
+    let Some(items) = data.as_array_mut() else {
+        return;
+    };
+    let ids: Vec<String> = items
+        .iter()
+        .filter_map(|d| Some(d.get("id")?.as_str()?.to_lowercase()))
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let meta = match subgraph_metadata_for_deployments(pool, ipfs, gate, lane, &ids).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(err = %e, "deployment metadata unavailable; the list keeps its gaps");
+            return;
+        }
+    };
+    for item in items {
+        let Some(id) = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_lowercase())
+        else {
+            continue;
+        };
+        let Some(m) = meta.get(&id) else { continue };
+        if let Some(name) = m.display_name() {
+            item["displayName"] = serde_json::Value::String(name.to_string());
+        }
+        if let Some(cats) = m
+            .metadata
+            .as_ref()
+            .and_then(|d| d.get("categories"))
+            .cloned()
+            && cats.is_array()
+        {
+            item["categories"] = cats;
+        }
+    }
+}
+
 /// What one warm run did.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Warmed {
