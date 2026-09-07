@@ -199,3 +199,127 @@ mod tests {
         assert!(!diff(&incumbent, &ours_union, &[]).breaking());
     }
 }
+
+/// Every route the edge serves must be compared, or excused in writing.
+///
+/// This is the check that was missing on 2026-09-07, when three deployment routes went into the
+/// rewrite without ever being in the harness table. They answered `200` with an entirely different
+/// payload and did so in production for an hour, because nothing connected "this service serves it"
+/// to "something checks it".
+///
+/// The two lists live in the same repository, so the connection can simply be asserted. The router
+/// source is read at compile time and every `.route("/api/…")` in it must appear either in the
+/// harness table or in [`UNCHECKED`] with a reason. Adding a route without doing one or the other
+/// fails the build, which is the point: an unchecked route should be a decision somebody wrote
+/// down, not an omission nobody noticed.
+pub mod coverage {
+    /// The router, as source. Read at compile time rather than by enumerating axum's routes,
+    /// because axum does not expose them and a test that cannot see the truth is decoration.
+    const ROUTER: &str = include_str!("../../edge/src/lib.rs");
+
+    /// Routes the harness deliberately does not compare, each with the reason.
+    ///
+    /// Every entry here is a thing somebody chose. Empty would be better; a long list is a smell.
+    pub const UNCHECKED: &[(&str, &str)] = &[
+        (
+            "/api/whoami",
+            "a diagnostic that reports the caller's own address, so it has no incumbent to match",
+        ),
+        (
+            "/api/sql/query",
+            "POST with a body; the harness only issues GETs",
+        ),
+        (
+            "/api/indexer-node-health",
+            "probes a third party's endpoint, so the answer depends on that host rather than on us",
+        ),
+        (
+            "/api/subgraph-names",
+            "POST with a body; the harness only issues GETs",
+        ),
+        (
+            "/api/indexers-enriched",
+            "reads rows the platform's own crons write, so both sides read the same table and a \
+             match proves nothing about this service",
+        ),
+    ];
+
+    /// The `/api/...` paths the edge registers, with axum's `{param}` segments left as they are.
+    ///
+    /// Whitespace after `.route(` is skipped, because rustfmt wraps a long registration onto its
+    /// own line and a matcher for `.route("` alone silently misses every one of those. The first
+    /// version of this did exactly that and quietly excused four routes; the test below is what
+    /// caught it.
+    pub fn served_paths() -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, _) in ROUTER.match_indices(".route(") {
+            let rest = ROUTER[i + ".route(".len()..].trim_start();
+            let Some(rest) = rest.strip_prefix('"') else {
+                continue;
+            };
+            if let Some(end) = rest.find('"') {
+                let p = &rest[..end];
+                if p.starts_with("/api/") {
+                    out.push(p.to_string());
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::coverage::*;
+
+    /// Sanity: if the extraction breaks, every other assertion here passes vacuously.
+    #[test]
+    fn the_router_is_readable_and_has_routes_in_it() {
+        let served = served_paths();
+        assert!(
+            served.len() > 25,
+            "only found {} routes; the extraction is broken, not the router",
+            served.len()
+        );
+        assert!(served.contains(&"/api/network-stats".to_string()));
+    }
+
+    /// rustfmt puts a long registration's path on its own line. Missing those is invisible: the
+    /// route is served, the extractor does not see it, and it is excused from comparison by
+    /// accident rather than by decision. This is one that is written that way today.
+    #[test]
+    fn a_route_wrapped_onto_its_own_line_is_still_found() {
+        let served = served_paths();
+        assert!(
+            served.contains(&"/api/indexer-node-health".to_string()),
+            "multi-line route registrations are being missed: {served:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_excused_twice_or_without_a_reason() {
+        for (path, why) in UNCHECKED {
+            assert!(!why.trim().is_empty(), "{path} is excused without a reason");
+            assert_eq!(
+                UNCHECKED.iter().filter(|(p, _)| p == path).count(),
+                1,
+                "{path} is listed twice"
+            );
+        }
+    }
+
+    /// An excuse for a route that no longer exists is a stale excuse, and it would silently cover
+    /// for a future route that happened to take the same path.
+    #[test]
+    fn every_excuse_is_for_a_route_that_exists() {
+        let served = served_paths();
+        for (path, _) in UNCHECKED {
+            assert!(
+                served.contains(&path.to_string()),
+                "{path} is excused from comparison but the router does not serve it"
+            );
+        }
+    }
+}

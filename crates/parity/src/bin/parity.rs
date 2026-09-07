@@ -63,6 +63,11 @@ fn routes() -> Vec<Route> {
         both("/api/dips"),
         both("/api/horizon/activity"),
         both("/api/subgraph-search?q=uniswap"),
+        both("/api/grt-flow"),
+        both("/api/sql/catalog"),
+        both(&format!("/api/rewards-history?address={A}")),
+        both(&format!("/api/apr-provenance/{A}")),
+        both(&format!("/api/indexer-stake-history/{A}")),
         // The three routes that take a deployment, in the `Qm…` form the frontend actually sends.
         // All three shipped 400ing because the handler lowercased a case-sensitive base58 CID, and
         // none of them was in this table, which is why nobody found out until a user would have.
@@ -514,5 +519,57 @@ async fn fetch(http: &reqwest::Client, url: &str) -> Answer {
             },
             from_kittiwake: false,
         },
+    }
+}
+
+/// The paths this harness compares, reduced to the shape the router registers them under.
+#[cfg(test)]
+fn compared_paths() -> Vec<String> {
+    routes()
+        .into_iter()
+        .map(|r| {
+            let p = r.path.split('?').next().unwrap_or(r.path);
+            // A fixture standing where the router has a `{param}` segment.
+            let p = p.replace(A, "{x}").replace(D, "{x}");
+            match p.find("/{x}") {
+                Some(i) => format!("{}/{{x}}", &p[..i]),
+                None => p,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod coverage {
+    use super::compared_paths;
+    use kittiwake_parity::coverage::{UNCHECKED, served_paths};
+
+    /// **The check that was missing.** Every route the edge serves is either compared here or
+    /// excused in writing. On 2026-09-07 three deployment routes went into the production rewrite
+    /// having never been in this table, answered `200` with a completely different payload, and did
+    /// so for an hour. Nothing connected "we serve it" to "something checks it". This is that
+    /// connection.
+    #[test]
+    fn every_route_the_edge_serves_is_compared_or_excused() {
+        let compared = compared_paths();
+        let excused: Vec<&str> = UNCHECKED.iter().map(|(p, _)| *p).collect();
+
+        let mut unchecked = Vec::new();
+        for path in served_paths() {
+            // The router names its parameters; the name does not matter for coverage.
+            let normalised = match path.find("/{") {
+                Some(i) => format!("{}/{{x}}", &path[..i]),
+                None => path.clone(),
+            };
+            if !compared.contains(&normalised) && !excused.contains(&path.as_str()) {
+                unchecked.push(path);
+            }
+        }
+
+        assert!(
+            unchecked.is_empty(),
+            "these routes are served but never compared, and nothing would notice if they broke:\n  {}\n\nAdd them to `routes()`, or to `UNCHECKED` with the reason.",
+            unchecked.join("\n  ")
+        );
     }
 }
