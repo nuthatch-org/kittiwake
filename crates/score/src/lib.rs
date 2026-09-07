@@ -8,9 +8,13 @@
 //!
 //! - **Self-stake is scored on the absolute amount, not as a ratio of total stake.** Attracting
 //!   delegation is a sign of trust; scoring the ratio would punish an indexer for being popular.
-//! - **An operationally excellent indexer that takes everything still scores badly.** The delegator
-//!   cut is weighted at ten and a hundred-percent reward cut caps cut stability at five, because
-//!   the score is for delegators, and a delegator earns nothing from such an indexer.
+//! - **Taking everything is a deduction, not a disqualification.** A hundred-percent reward cut
+//!   zeroes delegatorCut (10) and delegatorAPY (8) and caps cutStability (6) at five. That is 24
+//!   points, so a flawless indexer taking the lot goes from 100 (A) to 76 (B): marked down and
+//!   still passing. The dashboard used to claim such an indexer "scores poorly"; it does not, and
+//!   the copy has been corrected rather than the weights. Whether 24 points is enough is an open
+//!   product question in kittiwake#14. The hard exclusion at a cut of 90% or more lives in the
+//!   one-click delegation filter, which is a different instrument from this one.
 
 use serde::{Deserialize, Serialize};
 
@@ -510,15 +514,20 @@ mod tests {
     }
 
     /// What taking everything actually costs, which is less than the published design principle
-    /// claims.
+    /// used to claim.
     ///
-    /// The dashboard says "an operationally excellent indexer that takes 100% of rewards still
+    /// The dashboard said "an operationally excellent indexer that takes 100% of rewards still
     /// scores poorly because delegators earn nothing". The arithmetic disagrees: cut is weighted
-    /// at ten and stability at six, so an otherwise flawless indexer taking everything scores
-    /// **70, a B**. This test pins the real number rather than the aspiration. Either the weights
-    /// or the claim should move; that is a decision about the model, not a defect in this port.
+    /// at ten and stability at six, so taking everything is a deduction rather than a
+    /// disqualification. The copy has been corrected in nightswatchhq/lodestar; see kittiwake#14.
+    ///
+    /// This case is the `base()` fixture with the cut turned up, so it is a *good* indexer rather
+    /// than a flawless one: it also carries queryVolume 70, dataServiceDiversity 40 and a neutral
+    /// delegationTrend 50. It lands on **70, a B**. For what a genuinely flawless indexer scores
+    /// see `taking_everything_costs_a_flawless_indexer_twenty_four_points`, which is the number the
+    /// published copy quotes.
     #[test]
-    fn taking_everything_costs_thirty_points_but_not_the_grade() {
+    fn taking_everything_costs_a_good_indexer_the_grade_but_not_the_pass() {
         let greedy = Input {
             reo: Reo::Eligible,
             self_stake_grt: 20_000_000.0,
@@ -540,6 +549,45 @@ mod tests {
             Grade::B,
             "the published claim would need this to be D or F"
         );
+    }
+
+    /// The number the published copy quotes: what a 100% cut costs an indexer that is otherwise
+    /// perfect. Same inputs as `a_perfect_indexer_scores_a_hundred`, cut turned up.
+    ///
+    /// A flawless indexer scores 100 (A). Taking everything zeroes delegatorCut (10) and
+    /// delegatorAPY (8) and caps cutStability (6) at 5, which is 24 points, landing on **76, a B**.
+    /// The dashboard's README and the Score tooltip both quote 76; if this test moves, that copy is
+    /// wrong until it moves with it.
+    #[test]
+    fn taking_everything_costs_a_flawless_indexer_twenty_four_points() {
+        let flawless = Input {
+            reo: Reo::Eligible,
+            self_stake_grt: 20_000_000.0,
+            allocated_grt: 1_000_000.0,
+            delegation_utilization: 10.0,
+            reward_cut_ppm: 0.0,
+            query_fees_collected_grt: 200_000.0,
+            net_flow_grt_7d: 100_000.0,
+            delegator_apr: 25.0,
+            distinct_data_services: 3,
+            delegator_parameter_cooldown: 86_400,
+            ..base()
+        };
+        let greedy = Input {
+            reward_cut_ppm: 1_000_000.0,
+            query_fee_cut_ppm: 1_000_000.0,
+            delegator_apr: 0.0,
+            ..flawless.clone()
+        };
+
+        let good = calculate(&flawless);
+        let bad = calculate(&greedy);
+
+        assert_eq!(good.composite, 100);
+        assert_eq!(good.grade, Grade::A);
+        assert_eq!(bad.composite, 76, "breakdown {:?}", bad.breakdown);
+        assert_eq!(bad.grade, Grade::B);
+        assert_eq!(good.composite - bad.composite, 24);
     }
 
     /// Attracting delegation must not lower the self-stake score. Scoring the ratio would punish
