@@ -18,6 +18,7 @@ kittiwake-obs = { version = "0.1.0", path = "../obs" }
 kittiwake-read = { version = "0.1.0", path = "../read" }
 kittiwake-score = { version = "0.1.0", path = "../score" }
 kittiwake-sqlplay = { version = "0.1.0", path = "../sqlplay" }
+kittiwake-ssrf = { version = "0.1.0", path = "../ssrf" }
 kittiwake-types = { version = "0.1.0", path = "../types" }
 metrics = "0.24.6"
 serde = { version = "1.0.229", features = ["derive"] }

@@ -1114,15 +1114,32 @@ pub async fn deployment_status(ctx: &ReadCtx, dep: &str) -> Result<Read, ApiErro
 // DIPS
 // ---------------------------------------------------------------------------------------------
 
-/// `/api/dips`. Four folds against the DIPS nest, which admits two concurrent queries; the gate is
-/// what stops that being a problem. The Node version fired all four at once and survived only
-/// because the client happened to stagger them, which was not a property anyone chose.
+/// `/api/dips`: where protocol issuance actually goes.
+///
+/// Four folds against the DIPS nest, which admits two concurrent queries. The gate is what makes
+/// that safe: the Node version fired all four at once and survived only because the client
+/// happened to stagger them, which was not a property anyone chose.
 pub async fn dips(ctx: &ReadCtx, sepolia: bool) -> Result<Read, ApiError> {
     let nest = if sepolia {
         NestId::DipsSepolia
     } else {
         NestId::Dips
     };
+    let Some(distributed) =
+        sql::dips_latest_per_target_sql("issuance_allocator__issuance_distributed")
+    else {
+        return Err(ApiError::Internal(
+            "dips table allowlist rejected its own entry".into(),
+        ));
+    };
+    let Some(self_minted) =
+        sql::dips_latest_per_target_sql("issuance_allocator__issuance_self_mint_allowance")
+    else {
+        return Err(ApiError::Internal(
+            "dips table allowlist rejected its own entry".into(),
+        ));
+    };
+
     let parts = vec![
         Part::rows(
             "allocations",
@@ -1130,13 +1147,38 @@ pub async fn dips(ctx: &ReadCtx, sepolia: bool) -> Result<Read, ApiError> {
             sql::DIPS_CURRENT_ALLOCATION_SQL.to_string(),
         ),
         Part::rows("timeline", nest, sql::DIPS_TIMELINE_SQL.to_string()),
+        Part::rows("distributed", nest, distributed),
+        Part::rows("selfMinted", nest, self_minted),
     ];
+    let inner = many(parts, T_FOLD);
+    let fetch: Fetcher = Arc::new(move |gate, lane| {
+        let inner = inner.clone();
+        Box::pin(async move {
+            let (v, p) = inner(gate, lane).await?;
+            let arr = |k: &str| {
+                v.get(k)
+                    .and_then(|x| x.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            Ok((
+                crate::shape::dips(
+                    &arr("allocations"),
+                    &arr("timeline"),
+                    &arr("distributed"),
+                    &arr("selfMinted"),
+                ),
+                p,
+            ))
+        })
+    });
+
     ctx.cached(
         "dips",
         nest,
-        serde_json::json!({"sepolia": sepolia}),
+        serde_json::json!({ "sepolia": sepolia }),
         CachePolicy::from_poll_interval(cadence::SLOW),
-        many(parts, T_FOLD),
+        fetch,
     )
     .await
 }

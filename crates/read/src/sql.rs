@@ -744,6 +744,24 @@ pub const SUBGRAPH_METADATA_SQL: &str = "SELECT subgraph_metadata FROM subgraph_
 pub const DIPS_CURRENT_ALLOCATION_SQL: &str = "SELECT * FROM dips_current_allocation";
 pub const DIPS_TIMELINE_SQL: &str = "SELECT * FROM dips_timeline ORDER BY block_number";
 
+/// The newest distribution per target. A join against the per-target maximum block, because the
+/// question is "when was this target last paid", not "every time it was ever paid".
+pub fn dips_latest_per_target_sql(table: &str) -> Option<String> {
+    // An allowlist, not interpolation: these two table names are the only ones this shape fits.
+    const ALLOWED: [&str; 2] = [
+        "issuance_allocator__issuance_distributed",
+        "issuance_allocator__issuance_self_mint_allowance",
+    ];
+    if !ALLOWED.contains(&table) {
+        return None;
+    }
+    Some(format!(
+        "SELECT d.target, d.block_number, d.block_timestamp, d.amount_dec FROM \"{table}\" d \
+         JOIN (SELECT target AS t, max(block_number) AS bn FROM \"{table}\" GROUP BY target) l \
+         ON d.target = l.t AND d.block_number = l.bn"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

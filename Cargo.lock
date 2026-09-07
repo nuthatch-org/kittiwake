@@ -3092,6 +3092,7 @@ dependencies = [
  "kittiwake-read",
  "kittiwake-score",
  "kittiwake-sqlplay",
+ "kittiwake-ssrf",
  "kittiwake-types",
  "metrics",
  "serde",

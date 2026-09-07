@@ -770,6 +770,176 @@ pub fn delegator(r: &Value) -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------------------------
+// Direct Indexer Payments
+// ---------------------------------------------------------------------------------------------
+
+/// Arbitrum One, reconciled against the contracts repository's address book rather than against a
+/// previous reading of this file.
+pub mod dips_addr {
+    pub const ISSUANCE_ALLOCATOR: &str = "0xb64f29b2d81140ffc3a135e319561a1bd03b1a7e";
+    pub const AGREEMENT_MANAGER: &str = "0x51f860b03dee6a6ea27392dcceccd908204149f2";
+    pub const RECURRING_COLLECTOR: &str = "0xff0dc7310fbfbcc2524dae230cd4f34727eb84ee";
+    /// The indexing-agreement side of the split. Non-zero here means DIPS is funding indexers.
+    pub const DEFAULT_ALLOCATION: &str = "0x28cd50e9e02856908f4c1966ab035b1f6c4dde1e";
+    pub const REWARDS_MANAGER: &str = "0x971b9d3d0ae3eca029cab5ea1fb0f72c85e6a525";
+    pub const INNOVATION_ALLOCATION: &str = "0x2ff06ba8086f37ba656a5b75405bf985f738b16e";
+    pub const RECLAIMED_REWARDS: &str = "0xe26cdc4ef915d12551ea67a7cbb838e91a24bb37";
+}
+
+/// A name for an address the panel would otherwise render as a bare hex string.
+fn dips_label(addr: &str) -> Option<&'static str> {
+    Some(match addr {
+        dips_addr::DEFAULT_ALLOCATION => "Indexing agreements (DefaultAllocation)",
+        dips_addr::REWARDS_MANAGER => "Indexing rewards (RewardsManager)",
+        dips_addr::INNOVATION_ALLOCATION => "Innovation allocation (GIP-0089)",
+        dips_addr::RECLAIMED_REWARDS => "Reclaimed rewards",
+        dips_addr::ISSUANCE_ALLOCATOR => "Issuance Allocator",
+        dips_addr::AGREEMENT_MANAGER => "Recurring Agreement Manager",
+        dips_addr::RECURRING_COLLECTOR => "Recurring Collector",
+        "0x02753bae61c08abd4351bce7f48524935c2cc78e" => "Rewards Eligibility Oracle A",
+        "0xeebc4919a239c1315a7e0652e692812719bad591" => "Rewards Eligibility Oracle B",
+        "0xae656a0aa51cd465b7506f98f2e8fbb82aa79894" => "Network Operator",
+        "0x7700d56d2cfafa620048633b2586b063ecd93dd1" => "Innovation Operator",
+        _ => return None,
+    })
+}
+
+fn dips_step_label(step: &str) -> &str {
+    match step {
+        "issuance_rate_set" => "Allocator issuance rate set",
+        "agreement_manager_wired" => "Agreement manager wired to allocator",
+        "collector_pause_guardian_set" => "Collector pause guardian set",
+        "eligibility_oracle_set" => "Provider eligibility oracle set",
+        "default_target_set" => "Default target set",
+        "target_allocation_set" => "Target allocation set",
+        other => other,
+    }
+}
+
+fn dec_grt(v: &Value, key: &str) -> f64 {
+    match v.get(key) {
+        Some(Value::String(x)) => x.parse::<f64>().unwrap_or(0.0) / 1e18,
+        Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0) / 1e18,
+        _ => 0.0,
+    }
+}
+
+/// The issuance split, and how it was arrived at.
+///
+/// Two targets are always present whether or not the allocator has ever mentioned them: the
+/// indexing-agreement side and the rewards manager. A panel that hides a target sitting at zero
+/// cannot show that it is at zero, which is the whole question DIPS raises.
+///
+/// `configuredNotDistributed` is the interesting flag: a target with a rate configured that has
+/// never received a distribution. Configured and unpaid is a different state from unconfigured,
+/// and it is the one worth noticing.
+pub fn dips(
+    allocations: &[Value],
+    timeline_rows: &[Value],
+    distributed: &[Value],
+    self_minted: &[Value],
+) -> Value {
+    use std::collections::BTreeMap;
+
+    let mut delivered: BTreeMap<String, i64> = BTreeMap::new();
+    for r in distributed.iter().chain(self_minted.iter()) {
+        let Some(target) = r.get("target").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let ts = match r.get("block_timestamp") {
+            Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
+            Some(Value::String(s)) => s.parse().unwrap_or(0),
+            _ => 0,
+        };
+        let e = delivered.entry(target.to_lowercase()).or_insert(0);
+        *e = (*e).max(ts);
+    }
+
+    let observed: BTreeMap<String, &Value> = allocations
+        .iter()
+        .filter_map(|r| Some((r.get("target")?.as_str()?.to_lowercase(), r)))
+        .collect();
+
+    let rate_of =
+        |r: &Value| dec_grt(r, "allocator_minting_rate_dec") + dec_grt(r, "self_minting_rate_dec");
+    let total_rate: f64 = allocations.iter().map(rate_of).sum();
+
+    let mut targets: Vec<String> = observed.keys().cloned().collect();
+    for always in [dips_addr::DEFAULT_ALLOCATION, dips_addr::REWARDS_MANAGER] {
+        if !targets.iter().any(|t| t == always) {
+            targets.push(always.to_string());
+        }
+    }
+
+    let mut allocs: Vec<Value> = targets
+        .iter()
+        .map(|target| {
+            let row = observed.get(target);
+            let rate = row.map(|r| rate_of(r)).unwrap_or(0.0);
+            let last = delivered.get(target).copied();
+            json!({
+                "target": target,
+                "label": dips_label(target).unwrap_or(target),
+                "rate": rate,
+                "sharePct": if total_rate > 0.0 { (rate / total_rate) * 100.0 } else { 0.0 },
+                "selfMinting": row.map(|r| dec_grt(r, "self_minting_rate_dec") > 0.0).unwrap_or(false),
+                "lastDistributedAt": last,
+                "configuredNotDistributed": rate > 0.0 && last.is_none(),
+                "observed": row.is_some(),
+            })
+        })
+        .collect();
+    allocs.sort_by(|a, b| {
+        b["rate"]
+            .as_f64()
+            .partial_cmp(&a["rate"].as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let agreement_rate = observed
+        .get(dips_addr::DEFAULT_ALLOCATION)
+        .map(|r| rate_of(r))
+        .unwrap_or(0.0);
+
+    let timeline: Vec<Value> = timeline_rows
+        .iter()
+        .map(|r| {
+            let step = r.get("step").and_then(|v| v.as_str()).unwrap_or_default();
+            let subject = r
+                .get("subject")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            json!({
+                "block": i0(r, "block_number"),
+                "timestamp": i0(r, "block_timestamp"),
+                "txHash": t(r, "tx_hash"),
+                "step": step,
+                "label": dips_step_label(step),
+                "subject": subject,
+                "subjectLabel": dips_label(&subject.to_lowercase()),
+                "rate": r.get("rate_dec").filter(|v| !v.is_null()).map(|_| dec_grt(r, "rate_dec")),
+            })
+        })
+        .collect();
+
+    json!({
+        "available": true,
+        "totalRate": total_rate,
+        "agreementRate": agreement_rate,
+        // Live means the indexing-agreement side is actually funded, not merely wired up.
+        "live": agreement_rate > 0.0,
+        "configuredNotDistributed": allocs
+            .iter()
+            .filter(|a| a["configuredNotDistributed"] == json!(true))
+            .map(|a| a["target"].clone())
+            .collect::<Vec<_>>(),
+        "allocations": allocs,
+        "timeline": timeline,
+        "lastConfiguredAt": timeline.last().map(|t| t["timestamp"].clone()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1128,5 +1298,63 @@ mod tests {
         let out = poi_overview(&[]);
         assert_eq!(out["summary"]["overallConsensusRate"], json!(100.0));
         assert_eq!(out["summary"]["deploymentsTracked"], json!(0));
+    }
+
+    /// A target sitting at zero must still appear. A panel that hides it cannot show that DIPS is
+    /// configured and unfunded, which is the whole question the panel exists to answer.
+    #[test]
+    fn the_two_headline_targets_appear_even_when_the_allocator_never_mentions_them() {
+        let out = dips(&[], &[], &[], &[]);
+        let targets: Vec<&str> = out["allocations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["target"].as_str().unwrap())
+            .collect();
+        assert!(targets.contains(&dips_addr::DEFAULT_ALLOCATION));
+        assert!(targets.contains(&dips_addr::REWARDS_MANAGER));
+        assert_eq!(out["live"], json!(false), "nothing configured is not live");
+        assert_eq!(out["agreementRate"], json!(0.0));
+    }
+
+    /// Configured and unpaid is a different state from unconfigured, and the one worth noticing.
+    #[test]
+    fn a_configured_target_that_has_never_been_paid_is_flagged() {
+        let allocations = vec![json!({
+            "target": dips_addr::DEFAULT_ALLOCATION,
+            "allocator_minting_rate_dec": "1000000000000000000",
+            "self_minting_rate_dec": "0"
+        })];
+        let out = dips(&allocations, &[], &[], &[]);
+        let a = &out["allocations"][0];
+        assert_eq!(a["configuredNotDistributed"], json!(true));
+        assert_eq!(out["live"], json!(true), "a funded agreement side is live");
+        assert_eq!(
+            out["configuredNotDistributed"][0],
+            json!(dips_addr::DEFAULT_ALLOCATION)
+        );
+
+        // Once a distribution lands, the flag clears.
+        let paid = vec![json!({"target": dips_addr::DEFAULT_ALLOCATION, "block_timestamp": 1700})];
+        let out2 = dips(&allocations, &[], &paid, &[]);
+        assert_eq!(
+            out2["allocations"][0]["configuredNotDistributed"],
+            json!(false)
+        );
+        assert_eq!(out2["allocations"][0]["lastDistributedAt"], json!(1700));
+    }
+
+    #[test]
+    fn a_known_address_is_named_and_an_unknown_one_is_shown_as_itself() {
+        assert_eq!(
+            dips_label(dips_addr::REWARDS_MANAGER),
+            Some("Indexing rewards (RewardsManager)")
+        );
+        assert_eq!(dips_label("0xdeadbeef"), None);
+        assert_eq!(
+            dips_step_label("issuance_rate_set"),
+            "Allocator issuance rate set"
+        );
+        assert_eq!(dips_step_label("something_new"), "something_new");
     }
 }
