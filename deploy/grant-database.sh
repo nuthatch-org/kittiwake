@@ -81,6 +81,11 @@ GRANT SELECT ON ingestion_state, epochs, delegation_events, disputes, network_sn
 
 GRANT INSERT, UPDATE ON ipfs_metadata TO $ROLE;
 GRANT INSERT ON cron_runs TO $ROLE;
+-- INSERT on a table with a serial primary key is not enough on its own: the default draws from the
+-- sequence, and the sequence is a separate object with its own permissions. Every job run failed to
+-- record itself until this was added, and it failed as a warning rather than an error, which is the
+-- quietest possible way for an audit trail to stop existing.
+GRANT USAGE ON SEQUENCE cron_runs_id_seq TO $ROLE;
 SQL
 
 # The three tables that are ours. Created here as the superuser and owned by the role, so the

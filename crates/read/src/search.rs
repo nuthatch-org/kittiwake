@@ -62,6 +62,47 @@ async fn ask(
     Ok(gate.query(&spec).await?.rows)
 }
 
+/// How many ids may go into one `IN (...)` list.
+///
+/// The nest takes its SQL as a URL query parameter and refuses a request line over 16 KB with a
+/// bare `400`. A bytes32 id costs 69 characters quoted, so 433 of them - which is what a search for
+/// "uniswap" produces - builds a 34 KB URL and fails. At 100 the URL is about 8 KB, half the limit,
+/// with room for the rest of the statement.
+///
+/// The measurement, so the next person changing this does not have to repeat it: 200 ids and 15.7 KB
+/// is accepted, 433 and 33.9 KB is refused.
+const IN_LIST_CHUNK: usize = 100;
+
+/// Run a query once per chunk of ids and concatenate the rows.
+///
+/// Chunks go out concurrently but bounded, because they all draw on one nest and the point of the
+/// gate is that we never ask it for more than it admits.
+async fn ask_chunked<F>(
+    gate: &NestGate,
+    nest: NestId,
+    lane: Lane,
+    ids: &[String],
+    build: F,
+) -> Result<Vec<serde_json::Value>, ApiError>
+where
+    F: Fn(&[String]) -> String,
+{
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sqls: Vec<String> = ids.chunks(IN_LIST_CHUNK).map(&build).collect();
+    let results: Vec<Result<Vec<serde_json::Value>, ApiError>> =
+        futures::stream::iter(sqls.into_iter().map(|sql| ask(gate, nest, sql, lane)))
+            .buffer_unordered(4)
+            .collect()
+            .await;
+    let mut rows = Vec::new();
+    for r in results {
+        rows.extend(r?);
+    }
+    Ok(rows)
+}
+
 /// The JSON documents behind these CIDs: from the cache where it has them, from IPFS where it does
 /// not, and into the cache either way.
 async fn json_docs(
@@ -154,13 +195,15 @@ pub async fn subgraph_metadata_for_deployments(
         return Ok(BTreeMap::new());
     }
 
-    let sql = format!(
-        "SELECT deployment_id, subgraph_id, subgraph_metadata, version_metadata FROM (\
-         SELECT *, ROW_NUMBER() OVER (PARTITION BY LOWER(deployment_id) ORDER BY created_at DESC) \
-         AS rn FROM deployment_subgraphs WHERE LOWER(deployment_id) IN ({})) WHERE rn = 1",
-        quoted(&ids)
-    );
-    let rows = ask(gate, NestId::Gns, sql, lane).await?;
+    let rows = ask_chunked(gate, NestId::Gns, lane, &ids, |chunk| {
+        format!(
+            "SELECT deployment_id, subgraph_id, subgraph_metadata, version_metadata FROM (\
+             SELECT *, ROW_NUMBER() OVER (PARTITION BY LOWER(deployment_id) ORDER BY created_at \
+             DESC) AS rn FROM deployment_subgraphs WHERE LOWER(deployment_id) IN ({})) WHERE rn = 1",
+            quoted(chunk)
+        )
+    })
+    .await?;
 
     // Every CID both columns want, fetched once. Two subgraphs sharing a metadata document - which
     // happens, forks keep their parent's - would otherwise be two fetches of the same bytes.
@@ -218,13 +261,13 @@ async fn hits_for_deployments(
         return Ok(Vec::new());
     }
 
-    let figures_sql = format!(
-        "SELECT id, CAST(signalled_tokens AS VARCHAR) AS signalled_tokens, \
-         CAST(staked_tokens AS VARCHAR) AS staked_tokens FROM lodestar_deployments WHERE id IN ({})",
-        quoted(&ids)
-    );
     let (figures, meta) = tokio::join!(
-        ask(gate, NestId::Alloc, figures_sql, lane),
+        ask_chunked(gate, NestId::Alloc, lane, &ids, |chunk| format!(
+            "SELECT id, CAST(signalled_tokens AS VARCHAR) AS signalled_tokens, \
+             CAST(staked_tokens AS VARCHAR) AS staked_tokens FROM lodestar_deployments \
+             WHERE id IN ({})",
+            quoted(chunk)
+        )),
         subgraph_metadata_for_deployments(pool, ipfs, gate, lane, &ids),
     );
     let figures = figures?;
@@ -354,16 +397,17 @@ pub async fn by_name(
         return Ok(Vec::new());
     }
 
-    let sql = format!(
-        "SELECT current_deployment_id FROM subgraph_current WHERE NOT deprecated \
-         AND LOWER(subgraph_metadata) IN ({})",
-        quoted(&hashes)
-    );
-    let ids: Vec<String> = ask(gate, NestId::Gns, sql, lane)
-        .await?
-        .iter()
-        .filter_map(|r| Some(r.get("current_deployment_id")?.as_str()?.to_lowercase()))
-        .collect();
+    let ids: Vec<String> = ask_chunked(gate, NestId::Gns, lane, &hashes, |chunk| {
+        format!(
+            "SELECT current_deployment_id FROM subgraph_current WHERE NOT deprecated \
+             AND LOWER(subgraph_metadata) IN ({})",
+            quoted(chunk)
+        )
+    })
+    .await?
+    .iter()
+    .filter_map(|r| Some(r.get("current_deployment_id")?.as_str()?.to_lowercase()))
+    .collect();
     hits_for_deployments(pool, ipfs, gate, lane, &ids, limit).await
 }
 
@@ -587,6 +631,23 @@ mod tests {
         assert!(!is_id("0xdead"));
         assert!(!is_id("' OR 1=1 --"));
         assert!(!is_id(""));
+    }
+
+    /// The failure this constant exists for: a search that matches many subgraphs must not build a
+    /// URL the nest refuses. 433 was the real number, from "uniswap".
+    #[test]
+    fn a_large_id_list_is_chunked_below_the_nests_url_limit() {
+        let ids: Vec<String> = (0..433).map(|i| format!("0x{i:064x}")).collect();
+        let chunks: Vec<_> = ids.chunks(IN_LIST_CHUNK).collect();
+        assert_eq!(chunks.len(), 5);
+        for c in chunks {
+            // The `IN (...)` list plus a generous allowance for the rest of the statement, against
+            // the 16 KB the nest accepts.
+            assert!(
+                quoted(c).len() + 500 < 16_384,
+                "a chunk builds a URL the nest would refuse"
+            );
+        }
     }
 
     #[test]

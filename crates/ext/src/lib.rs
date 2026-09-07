@@ -461,6 +461,25 @@ impl CachedDoc {
     }
 }
 
+/// Undo a document that was stored as a JSON string containing JSON rather than as JSON.
+///
+/// The service this replaces writes `${JSON.stringify(doc)}::jsonb` through postgres.js, which sees
+/// a JavaScript string bound to a `jsonb` column and encodes it as a JSON *string* - so the column
+/// holds `"{\"displayName\":\"Lido Ethereum\"}"` rather than an object, and `json->>'displayName'`
+/// finds nothing. Every one of the 15,972 cached documents is stored that way, which is why no
+/// subgraph on the dashboard has a name.
+///
+/// We write objects. But we read a table that is mostly not ours and has years of these in it, so
+/// this is tolerant on the way in and strict on the way out: a legacy row still yields a name, and
+/// nothing we write adds another. It stays useful even after the table is repaired, because a
+/// rollback to the old handler would start producing them again.
+pub fn undouble(v: serde_json::Value) -> serde_json::Value {
+    match &v {
+        serde_json::Value::String(s) => serde_json::from_str(s).unwrap_or(v),
+        _ => v,
+    }
+}
+
 /// Read whatever the cache holds for these CIDs. Absent CIDs are simply absent from the result.
 pub async fn cached_docs(
     pool: &sqlx::PgPool,
@@ -469,12 +488,16 @@ pub async fn cached_docs(
     if cids.is_empty() {
         return Ok(Vec::new());
     }
-    sqlx::query_as::<_, CachedDoc>(
+    let mut rows = sqlx::query_as::<_, CachedDoc>(
         "SELECT cid, json, text, error, fetched_at FROM ipfs_metadata WHERE cid = ANY($1)",
     )
     .bind(cids)
     .fetch_all(pool)
-    .await
+    .await?;
+    for r in &mut rows {
+        r.json = r.json.take().map(undouble);
+    }
+    Ok(rows)
 }
 
 /// Fetch one JSON document and record the outcome, returning what the cache now holds for it.
@@ -572,6 +595,30 @@ mod ipfs_tests {
 
         let err = Ipfs::new(&server.uri()).cat("QmAbc").await.unwrap_err();
         assert!(err.contains("404"), "{err}");
+    }
+
+    /// The bug that leaves every subgraph on the dashboard nameless.
+    #[test]
+    fn a_document_stored_as_a_string_of_json_is_read_as_the_document() {
+        let wrapped = serde_json::json!("{\"displayName\":\"Lido Ethereum\"}");
+        assert_eq!(
+            undouble(wrapped)["displayName"],
+            serde_json::json!("Lido Ethereum")
+        );
+    }
+
+    #[test]
+    fn a_document_stored_properly_is_left_alone() {
+        let plain = serde_json::json!({"displayName": "Lido Ethereum"});
+        assert_eq!(undouble(plain.clone()), plain);
+    }
+
+    /// A string that is not JSON is a value in its own right, not a broken document. Parsing it
+    /// leniently would turn `"123"` into the number 123 and a name into something else entirely.
+    #[test]
+    fn a_string_that_is_not_json_stays_a_string() {
+        let s = serde_json::json!("just a name");
+        assert_eq!(undouble(s.clone()), s);
     }
 
     #[test]
