@@ -175,9 +175,12 @@ pub async fn indexer_status(
             // indexer uses, or nothing matches and a healthy indexer reads as serving nothing.
             let ipfs = kittiwake_read::shape::ipfs_or_id(dep);
             let s = statuses.get(ipfs.as_str());
+            // Only `failed` is a failure. `unhealthy` means the deployment has recorded errors
+            // and is still serving; counting it as failed would report four working deployments
+            // as broken, which is the sort of wrong that gets an indexer chased for nothing.
             match s {
                 None => missing += 1,
-                Some(s) if s.health != "healthy" => failed += 1,
+                Some(s) if s.health == "failed" => failed += 1,
                 Some(s) if s.synced => synced += 1,
                 Some(_) => syncing += 1,
             }
@@ -193,10 +196,16 @@ pub async fn indexer_status(
                 "allocatedTokens": take("allocated_tokens", serde_json::json!("0")),
                 "signalledTokens": take("signalled_tokens", serde_json::json!("0")),
                 "stakedTokens": take("deployment_staked_tokens", serde_json::json!("0")),
-                "createdAtEpoch": take("created_at_epoch", serde_json::json!(0)),
+                // The nest sends this as a string on this view and a number on others.
+                "createdAtEpoch": kittiwake_read::shape::i0(a, "created_at_epoch"),
                 "health": s.map(|s| s.health.clone()).unwrap_or_else(|| "unknown".into()),
                 // Unreachable is not unhealthy: we could not ask, which is a fact about us.
-                "status": if s.is_some() { "reachable" } else { "unreachable" },
+                "status": match s {
+                    None => "unreachable",
+                    Some(s) if s.health == "failed" => "failed",
+                    Some(s) if s.synced => "synced",
+                    Some(_) => "syncing",
+                },
                 "syncProgress": progress,
                 "latestBlock": s.and_then(|s| s.latest_block).unwrap_or(0),
                 "chainHeadBlock": s.and_then(|s| s.chain_head_block).unwrap_or(0),
