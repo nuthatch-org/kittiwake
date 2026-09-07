@@ -380,9 +380,8 @@ pub async fn token_metrics(ctx: &ReadCtx, first: i64) -> Result<Read, ApiError> 
 // One indexer
 // ---------------------------------------------------------------------------------------------
 
-/// `/api/indexer/[address]`. Seven folds behind one answer, measured at 17.9 seconds cold. Each
-/// part coalesces separately, so a concurrent `/api/indexer-status` for the same address pays for
-/// none of the folds they share.
+/// `/api/indexer/[address]`: the whole profile. Six folds, measured at 17.9 seconds cold, which is
+/// why the warmer keeps the hot ones filled.
 pub async fn indexer(ctx: &ReadCtx, addr: &str) -> Result<Read, ApiError> {
     let parts = vec![
         Part::one(
@@ -396,37 +395,57 @@ pub async fn indexer(ctx: &ReadCtx, addr: &str) -> Result<Read, ApiError> {
             addr_or_400!(sql::indexer_operators_sql(addr), "address"),
         ),
         Part::rows(
-            "delegators",
-            NestId::Alloc,
-            addr_or_400!(sql::indexer_delegators_sql(addr, 100), "address"),
-        ),
-        Part::rows(
-            "activeAllocations",
+            "active",
             NestId::Alloc,
             addr_or_400!(sql::indexer_active_allocations_sql(addr), "address"),
         ),
         Part::rows(
-            "closedAllocations",
+            "closed",
             NestId::Alloc,
             addr_or_400!(sql::indexer_closed_allocations_sql(addr, 500), "address"),
         ),
-        Part::rows(
-            "provisions",
-            NestId::Alloc,
-            addr_or_400!(sql::provisions_by_indexer_sql(addr), "address"),
-        ),
         Part::one(
-            "networkParams",
+            "params",
             NestId::Alloc,
             sql::DELEGATION_RATIO_SQL.to_string(),
         ),
     ];
+    let inner = many(parts, T_FOLD);
+    let fetch: Fetcher = Arc::new(move |gate, lane| {
+        let inner = inner.clone();
+        Box::pin(async move {
+            let (v, p) = inner(gate, lane).await?;
+            let arr = |k: &str| {
+                v.get(k)
+                    .and_then(|x| x.as_array())
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            let row = v.get("indexer").cloned().unwrap_or(serde_json::Value::Null);
+            // The protocol's delegation ratio, defaulting to sixteen if the view is unreadable.
+            let ratio = v
+                .get("params")
+                .and_then(|p| p.get("delegation_ratio"))
+                .and_then(|r| r.as_f64())
+                .unwrap_or(16.0);
+
+            let shaped = crate::shape::indexer_detail(
+                &row,
+                &arr("operators"),
+                &arr("active"),
+                &arr("closed"),
+                ratio,
+            );
+            Ok((serde_json::json!({ "indexer": shaped }), p))
+        })
+    });
+
     ctx.cached(
         "indexer",
         NestId::Alloc,
-        serde_json::json!({"address": addr}),
+        serde_json::json!({ "address": addr }),
         CachePolicy::from_poll_interval(cadence::LIVE),
-        many(parts, T_FOLD),
+        fetch,
     )
     .await
 }

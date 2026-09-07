@@ -236,178 +236,6 @@ fn placeholders(deployment_id: &str, n: i64) -> Value {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Monday, because that is what the chart's axis claims. A Sunday-start week shifts every
-    /// point by a day and looks almost right.
-    #[test]
-    fn weeks_start_on_monday_in_utc() {
-        // 2026-09-07 is a Monday; 2026-09-06 a Sunday.
-        let monday = 1_788_739_200; // 2026-09-07T00:00:00Z
-        assert_eq!(week_start_utc(monday), "2026-09-07");
-        assert_eq!(
-            week_start_utc(monday - 1),
-            "2026-08-31",
-            "Sunday belongs to the week before"
-        );
-        assert_eq!(week_start_utc(monday + 6 * 86_400), "2026-09-07");
-    }
-
-    /// A quiet week is a week with no publications, not a week that did not happen.
-    #[test]
-    fn empty_weeks_are_emitted_so_the_axis_does_not_compress() {
-        let rows = vec![
-            json!({"createdAt": 1_785_888_000}), // 2026-08-03 week
-            json!({"createdAt": 1_787_097_600}), // two weeks later
-        ];
-        let out = developer_activity(&rows, 12, 1_788_739_200);
-        let weeks = out["weeks"].as_array().unwrap();
-        assert_eq!(weeks.len(), 3, "the quiet week in the middle must appear");
-        assert_eq!(weeks[1]["count"], json!(0));
-        assert_eq!(weeks[2]["cumulative"], json!(2));
-    }
-
-    /// The current week is still filling; comparing to it would always read as a collapse.
-    #[test]
-    fn week_over_week_ignores_the_week_still_in_progress() {
-        let now = 1_788_739_200; // a Monday
-        let rows = vec![
-            json!({"createdAt": now - 14 * 86_400}),
-            json!({"createdAt": now - 14 * 86_400}),
-            json!({"createdAt": now - 7 * 86_400}),
-            json!({"createdAt": now}),
-        ];
-        let out = developer_activity(&rows, 12, now);
-        assert_eq!(
-            out["lastWeekCount"],
-            json!(1),
-            "the last complete week, not the current one"
-        );
-        assert_eq!(out["weekOverWeekPct"], json!(-50.0));
-        assert_eq!(out["totalInWindow"], json!(4));
-    }
-
-    #[test]
-    fn a_dispute_burn_of_zero_means_none_happened() {
-        let r = json!({"id": 1374, "total_rewards": "2000000000000000000", "taxed_query_fees": "500000000000000000"});
-        let m = token_metric(&r);
-        assert_eq!(m["issuance"], json!(2.0));
-        assert_eq!(m["queryFeeTaxBurn"], json!(0.5));
-        assert_eq!(m["disputeBurn"], json!(0));
-        assert_eq!(m["net"], json!(1.5));
-    }
-
-    #[test]
-    fn payment_totals_are_summed_exactly_and_parties_counted_once() {
-        let accounts = vec![
-            json!({"payer": "0xa", "collector": "0xc", "receiver": "0xr", "balance": "1000000000000000000000000", "thawing": "5"}),
-            json!({"payer": "0xa", "collector": "0xc", "receiver": "0xs", "balance": "2000000000000000000000000", "thawing": "0"}),
-        ];
-        let out = payments(&accounts, &[], &[]);
-        assert_eq!(
-            out["totalEscrowBalance"],
-            json!("3000000000000000000000000")
-        );
-        assert_eq!(out["totalThawing"], json!("5"));
-        assert_eq!(out["activePayers"], json!(1), "one payer, twice");
-        assert_eq!(out["activeReceivers"], json!(2));
-    }
-
-    #[test]
-    fn wei_survives_the_translation_as_a_string() {
-        let r = json!({"staked_tokens": "707387524504002513347899608"});
-        assert_eq!(
-            indexer(&r)["stakedTokens"],
-            json!("707387524504002513347899608"),
-            "wei must never become a number"
-        );
-    }
-
-    /// 27-digit figures do not survive an f64, and the error is larger than a whole GRT.
-    #[test]
-    fn two_wei_figures_are_added_exactly() {
-        let r = json!({
-            "query_fees_collected": "23679683366672773102064606",
-            "curator_query_fees": "1183984168333638655103230"
-        });
-        assert_eq!(
-            add_wei(&r, "query_fees_collected", "curator_query_fees"),
-            json!("24863667535006411757167836")
-        );
-    }
-
-    #[test]
-    fn a_missing_figure_is_zero_and_a_missing_name_is_null() {
-        let empty = json!({});
-        assert_eq!(curator(&empty)["totalSignalledTokens"], json!("0"));
-        assert_eq!(curator(&empty)["signalCount"], json!(0));
-        assert_eq!(indexer(&empty)["url"], Value::Null);
-        assert_eq!(
-            indexer(&empty)["account"]["defaultDisplayName"],
-            Value::Null
-        );
-    }
-
-    #[test]
-    fn an_epoch_reports_both_fee_columns_as_one_total() {
-        let r = json!({
-            "id": 1374, "start_block": 100, "end_block": 200,
-            "query_fees_collected": "10", "curator_query_fees": "5"
-        });
-        let e = epoch(&r);
-        assert_eq!(
-            e["id"],
-            json!("1374"),
-            "the incumbent sends the id as a string"
-        );
-        assert_eq!(e["startBlock"], json!(100));
-        assert_eq!(e["totalQueryFees"], json!("15"));
-    }
-
-    #[test]
-    fn a_number_arriving_as_a_string_is_still_a_number_where_one_is_expected() {
-        let r = json!({"allocation_count": "7", "created_at": "1700000000"});
-        assert_eq!(indexer(&r)["allocationCount"], json!(7));
-        assert_eq!(indexer(&r)["createdAt"], json!(1_700_000_000));
-    }
-
-    /// The arrays carry a count. Their length is the whole of what the frontend reads.
-    #[test]
-    fn a_sampled_call_return_decodes_to_a_decimal_string() {
-        assert_eq!(
-            decode_uint_word("0x000000000000000000000000000000000000000000000000000000000024ea00"),
-            Some("2419200".to_string())
-        );
-        assert_eq!(decode_uint_word("0x"), None);
-        assert_eq!(
-            decode_uint_word("not hex"),
-            None,
-            "a bad word is absent, never zero"
-        );
-    }
-
-    #[test]
-    fn the_nested_arrays_carry_the_counts_the_frontend_reads() {
-        let r = json!({"id": "0xabc", "curator_count": 2, "active_allocation_count": 3});
-        let d = deployment(&r, None);
-        assert_eq!(d["curatorSignals"].as_array().unwrap().len(), 2);
-        assert_eq!(d["indexerAllocations"].as_array().unwrap().len(), 3);
-        assert_eq!(d["curatorSignals"][0]["id"], json!("0xabc-0"));
-    }
-
-    #[test]
-    fn a_deployment_gains_its_thirty_day_fees_only_when_asked() {
-        let r = json!({"id": "0xabc", "signalled_tokens": "1"});
-        assert!(deployment(&r, None).get("queryFees30d").is_none());
-        assert_eq!(
-            deployment(&r, Some(&json!("42")))["queryFees30d"],
-            json!("42")
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------------------------
 // Derived shapes: figures the nest does not hold, computed from ones it does
 // ---------------------------------------------------------------------------------------------
@@ -611,4 +439,435 @@ pub fn payments(accounts: &[Value], transactions: &[Value], tally: &[Value]) -> 
         "activePayers": distinct(accounts, "payer"),
         "activeReceivers": distinct(accounts, "receiver"),
     })
+}
+
+// ---------------------------------------------------------------------------------------------
+// One indexer, in full
+// ---------------------------------------------------------------------------------------------
+
+/// The ratios the profile page shows, derived exactly as the incumbent derives them.
+///
+/// Two subtleties worth keeping. **Locked tokens do not count as usable own stake**: they are
+/// spoken for, so an indexer with most of its stake locked is not as well capitalised as its
+/// headline figure suggests. And **delegation above capacity is not usable either**: the ratios
+/// are taken against `min(maxUsable, usableOwn + delegated)`, so over-delegating cannot flatter
+/// an indexer's own-stake ratio.
+pub fn derived_indexer_metrics(r: &Value, delegation_ratio: f64) -> Value {
+    let g = |k: &str| grt(r, k);
+    let staked = g("staked_tokens");
+    let locked = g("locked_tokens");
+    let delegated = g("delegated_tokens");
+
+    let usable_own = staked - locked;
+    let max_usable = usable_own + usable_own * delegation_ratio;
+    let total_usable = max_usable.min(usable_own + delegated);
+
+    let own_stake_ratio = if total_usable == 0.0 {
+        0.0
+    } else {
+        usable_own / total_usable
+    };
+    let delegated_stake_ratio = if own_stake_ratio == 0.0 {
+        0.0
+    } else {
+        1.0 - own_stake_ratio
+    };
+
+    let cut = match r.get("indexing_reward_cut") {
+        Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+        Some(Value::String(s)) => s.parse().unwrap_or(0.0),
+        _ => 0.0,
+    };
+    let delegator_cut = (1_000_000.0 - cut) / 1_000_000.0;
+    let effective_cut = if delegated_stake_ratio == 0.0 {
+        0.0
+    } else {
+        1.0 - delegator_cut / delegated_stake_ratio
+    };
+
+    let max_delegated = staked * delegation_ratio;
+    let dilution_denom = max_delegated.max(delegated);
+    let dilution = if dilution_denom == 0.0 {
+        0.0
+    } else {
+        1.0 - max_delegated / dilution_denom
+    };
+    let own_generation = if own_stake_ratio == 0.0 {
+        0.0
+    } else {
+        cut / 1_000_000.0 / own_stake_ratio
+    };
+
+    // Capacity in wei, exactly: own stake plus delegation up to the ratio, and no further.
+    let wei = |k: &str| -> u128 {
+        match r.get(k) {
+            Some(Value::String(s)) => s.parse().unwrap_or(0),
+            Some(Value::Number(n)) => n.as_u64().map(u128::from).unwrap_or(0),
+            _ => 0,
+        }
+    };
+    let staked_wei = wei("staked_tokens");
+    let delegated_wei = wei("delegated_tokens");
+    let max_delegated_wei = staked_wei.saturating_mul(delegation_ratio as u128);
+    let capacity = staked_wei + delegated_wei.min(max_delegated_wei);
+
+    json!({
+        "tokenCapacity": capacity.to_string(),
+        "ownStakeRatio": own_stake_ratio.to_string(),
+        "delegatedStakeRatio": delegated_stake_ratio.to_string(),
+        "indexingRewardEffectiveCut": effective_cut.to_string(),
+        "overDelegationDilution": dilution.to_string(),
+        "indexerRewardsOwnGenerationRatio": own_generation.to_string(),
+    })
+}
+
+fn deployment_stub(r: &Value, with_stats: bool) -> Value {
+    let id = t(r, "subgraph_deployment");
+    let mut out = json!({
+        "id": id.clone(),
+        "ipfsHash": id,
+        "versions": json!([]),
+    });
+    if with_stats {
+        out["signalledTokens"] = s0(r, "signalled_tokens");
+        out["stakedTokens"] = s0(r, "deployment_staked_tokens");
+    }
+    out
+}
+
+pub fn active_allocation(r: &Value) -> Value {
+    json!({
+        "id": t(r, "id"),
+        "allocatedTokens": s0(r, "allocated_tokens"),
+        "createdAtEpoch": i0(r, "created_at_epoch"),
+        "subgraphDeployment": deployment_stub(r, true),
+    })
+}
+
+pub fn closed_allocation(r: &Value) -> Value {
+    json!({
+        "id": t(r, "id"),
+        "allocatedTokens": s0(r, "allocated_tokens"),
+        "createdAtEpoch": i0(r, "created_at_epoch"),
+        "closedAtEpoch": i0(r, "closed_at_epoch"),
+        "closedAt": i0(r, "closed_at"),
+        "indexingRewards": s0(r, "indexing_rewards"),
+        "queryFeesCollected": s0(r, "query_fees_collected"),
+        "poi": t(r, "poi"),
+        "forceClosed": r.get("force_closed").cloned().unwrap_or(json!(false)),
+        "subgraphDeployment": deployment_stub(r, false),
+    })
+}
+
+/// The whole indexer profile.
+#[allow(clippy::too_many_arguments)]
+pub fn indexer_detail(
+    row: &Value,
+    operators: &[Value],
+    active: &[Value],
+    closed: &[Value],
+    delegation_ratio: f64,
+) -> Value {
+    let mut out = json!({
+        "id": t(row, "id"),
+        "account": json!({
+            "id": t(row, "id"),
+            "defaultDisplayName": Value::Null,
+            "metadata": Value::Null,
+            "operators": operators
+                .iter()
+                .map(|o| json!({ "id": t(o, "operator") }))
+                .collect::<Vec<_>>(),
+        }),
+        "stakedTokens": s0(row, "staked_tokens"),
+        "lockedTokens": s0(row, "locked_tokens"),
+        "delegatedTokens": s0(row, "delegated_tokens"),
+        "delegatedThawingTokens": s0(row, "delegated_thawing_tokens"),
+        "allocatedTokens": s0(row, "allocated_tokens"),
+        "provisionedTokens": s0(row, "provisioned_tokens"),
+        "allocationCount": i0(row, "allocation_count"),
+        "indexingRewardCut": i0(row, "indexing_reward_cut"),
+        "queryFeeCut": i0(row, "query_fee_cut"),
+        "delegatorParameterCooldown": json!(0),
+        "lastDelegationParameterUpdate": i0(row, "last_delegation_parameter_update"),
+        "rewardsEarned": s0(row, "rewards_earned"),
+        "queryFeesCollected": s0(row, "query_fees_collected"),
+        "delegatorShares": s0(row, "delegator_shares"),
+        "url": t(row, "url"),
+        "geoHash": t(row, "geohash"),
+        "createdAt": i0(row, "created_at"),
+        "allocations": active.iter().map(active_allocation).collect::<Vec<_>>(),
+        "closedAllocations": closed.iter().map(closed_allocation).collect::<Vec<_>>(),
+    });
+
+    if let Value::Object(derived) = derived_indexer_metrics(row, delegation_ratio) {
+        for (k, v) in derived {
+            out[k] = v;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Monday, because that is what the chart's axis claims. A Sunday-start week shifts every
+    /// point by a day and looks almost right.
+    #[test]
+    fn weeks_start_on_monday_in_utc() {
+        // 2026-09-07 is a Monday; 2026-09-06 a Sunday.
+        let monday = 1_788_739_200; // 2026-09-07T00:00:00Z
+        assert_eq!(week_start_utc(monday), "2026-09-07");
+        assert_eq!(
+            week_start_utc(monday - 1),
+            "2026-08-31",
+            "Sunday belongs to the week before"
+        );
+        assert_eq!(week_start_utc(monday + 6 * 86_400), "2026-09-07");
+    }
+
+    /// A quiet week is a week with no publications, not a week that did not happen.
+    #[test]
+    fn empty_weeks_are_emitted_so_the_axis_does_not_compress() {
+        let rows = vec![
+            json!({"createdAt": 1_785_888_000}), // 2026-08-03 week
+            json!({"createdAt": 1_787_097_600}), // two weeks later
+        ];
+        let out = developer_activity(&rows, 12, 1_788_739_200);
+        let weeks = out["weeks"].as_array().unwrap();
+        assert_eq!(weeks.len(), 3, "the quiet week in the middle must appear");
+        assert_eq!(weeks[1]["count"], json!(0));
+        assert_eq!(weeks[2]["cumulative"], json!(2));
+    }
+
+    /// The current week is still filling; comparing to it would always read as a collapse.
+    #[test]
+    fn week_over_week_ignores_the_week_still_in_progress() {
+        let now = 1_788_739_200; // a Monday
+        let rows = vec![
+            json!({"createdAt": now - 14 * 86_400}),
+            json!({"createdAt": now - 14 * 86_400}),
+            json!({"createdAt": now - 7 * 86_400}),
+            json!({"createdAt": now}),
+        ];
+        let out = developer_activity(&rows, 12, now);
+        assert_eq!(
+            out["lastWeekCount"],
+            json!(1),
+            "the last complete week, not the current one"
+        );
+        assert_eq!(out["weekOverWeekPct"], json!(-50.0));
+        assert_eq!(out["totalInWindow"], json!(4));
+    }
+
+    #[test]
+    fn a_dispute_burn_of_zero_means_none_happened() {
+        let r = json!({"id": 1374, "total_rewards": "2000000000000000000", "taxed_query_fees": "500000000000000000"});
+        let m = token_metric(&r);
+        assert_eq!(m["issuance"], json!(2.0));
+        assert_eq!(m["queryFeeTaxBurn"], json!(0.5));
+        assert_eq!(m["disputeBurn"], json!(0));
+        assert_eq!(m["net"], json!(1.5));
+    }
+
+    #[test]
+    fn payment_totals_are_summed_exactly_and_parties_counted_once() {
+        let accounts = vec![
+            json!({"payer": "0xa", "collector": "0xc", "receiver": "0xr", "balance": "1000000000000000000000000", "thawing": "5"}),
+            json!({"payer": "0xa", "collector": "0xc", "receiver": "0xs", "balance": "2000000000000000000000000", "thawing": "0"}),
+        ];
+        let out = payments(&accounts, &[], &[]);
+        assert_eq!(
+            out["totalEscrowBalance"],
+            json!("3000000000000000000000000")
+        );
+        assert_eq!(out["totalThawing"], json!("5"));
+        assert_eq!(out["activePayers"], json!(1), "one payer, twice");
+        assert_eq!(out["activeReceivers"], json!(2));
+    }
+
+    #[test]
+    fn wei_survives_the_translation_as_a_string() {
+        let r = json!({"staked_tokens": "707387524504002513347899608"});
+        assert_eq!(
+            indexer(&r)["stakedTokens"],
+            json!("707387524504002513347899608"),
+            "wei must never become a number"
+        );
+    }
+
+    /// 27-digit figures do not survive an f64, and the error is larger than a whole GRT.
+    #[test]
+    fn two_wei_figures_are_added_exactly() {
+        let r = json!({
+            "query_fees_collected": "23679683366672773102064606",
+            "curator_query_fees": "1183984168333638655103230"
+        });
+        assert_eq!(
+            add_wei(&r, "query_fees_collected", "curator_query_fees"),
+            json!("24863667535006411757167836")
+        );
+    }
+
+    #[test]
+    fn a_missing_figure_is_zero_and_a_missing_name_is_null() {
+        let empty = json!({});
+        assert_eq!(curator(&empty)["totalSignalledTokens"], json!("0"));
+        assert_eq!(curator(&empty)["signalCount"], json!(0));
+        assert_eq!(indexer(&empty)["url"], Value::Null);
+        assert_eq!(
+            indexer(&empty)["account"]["defaultDisplayName"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn an_epoch_reports_both_fee_columns_as_one_total() {
+        let r = json!({
+            "id": 1374, "start_block": 100, "end_block": 200,
+            "query_fees_collected": "10", "curator_query_fees": "5"
+        });
+        let e = epoch(&r);
+        assert_eq!(
+            e["id"],
+            json!("1374"),
+            "the incumbent sends the id as a string"
+        );
+        assert_eq!(e["startBlock"], json!(100));
+        assert_eq!(e["totalQueryFees"], json!("15"));
+    }
+
+    #[test]
+    fn a_number_arriving_as_a_string_is_still_a_number_where_one_is_expected() {
+        let r = json!({"allocation_count": "7", "created_at": "1700000000"});
+        assert_eq!(indexer(&r)["allocationCount"], json!(7));
+        assert_eq!(indexer(&r)["createdAt"], json!(1_700_000_000));
+    }
+
+    /// The arrays carry a count. Their length is the whole of what the frontend reads.
+    #[test]
+    fn a_sampled_call_return_decodes_to_a_decimal_string() {
+        assert_eq!(
+            decode_uint_word("0x000000000000000000000000000000000000000000000000000000000024ea00"),
+            Some("2419200".to_string())
+        );
+        assert_eq!(decode_uint_word("0x"), None);
+        assert_eq!(
+            decode_uint_word("not hex"),
+            None,
+            "a bad word is absent, never zero"
+        );
+    }
+
+    #[test]
+    fn the_nested_arrays_carry_the_counts_the_frontend_reads() {
+        let r = json!({"id": "0xabc", "curator_count": 2, "active_allocation_count": 3});
+        let d = deployment(&r, None);
+        assert_eq!(d["curatorSignals"].as_array().unwrap().len(), 2);
+        assert_eq!(d["indexerAllocations"].as_array().unwrap().len(), 3);
+        assert_eq!(d["curatorSignals"][0]["id"], json!("0xabc-0"));
+    }
+
+    #[test]
+    fn a_deployment_gains_its_thirty_day_fees_only_when_asked() {
+        let r = json!({"id": "0xabc", "signalled_tokens": "1"});
+        assert!(deployment(&r, None).get("queryFees30d").is_none());
+        assert_eq!(
+            deployment(&r, Some(&json!("42")))["queryFees30d"],
+            json!("42")
+        );
+    }
+
+    /// Locked stake is spoken for. Counting it as usable would flatter an indexer that has most of
+    /// its own stake committed elsewhere.
+    #[test]
+    fn locked_tokens_do_not_count_as_usable_own_stake() {
+        let free = json!({"staked_tokens": "1000000000000000000000000", "locked_tokens": "0",
+                          "delegated_tokens": "0", "indexing_reward_cut": 100000});
+        let locked = json!({"staked_tokens": "1000000000000000000000000",
+                            "locked_tokens": "900000000000000000000000",
+                            "delegated_tokens": "0", "indexing_reward_cut": 100000});
+        let a = derived_indexer_metrics(&free, 16.0);
+        let b = derived_indexer_metrics(&locked, 16.0);
+        assert_eq!(a["ownStakeRatio"], json!("1"));
+        assert_eq!(
+            b["ownStakeRatio"],
+            json!("1"),
+            "with no delegation both are wholly own-staked"
+        );
+        // Capacity is measured on the headline stake, which is what the contracts do.
+        assert_eq!(a["tokenCapacity"], b["tokenCapacity"]);
+    }
+
+    /// Delegating past capacity cannot improve the ratios; it dilutes.
+    #[test]
+    fn over_delegation_dilutes_rather_than_flatters() {
+        let within = json!({"staked_tokens": "100000000000000000000000", "locked_tokens": "0",
+                            "delegated_tokens": "800000000000000000000000", "indexing_reward_cut": 100000});
+        let beyond = json!({"staked_tokens": "100000000000000000000000", "locked_tokens": "0",
+                            "delegated_tokens": "3200000000000000000000000", "indexing_reward_cut": 100000});
+        let a = derived_indexer_metrics(&within, 16.0);
+        let b = derived_indexer_metrics(&beyond, 16.0);
+        assert_eq!(
+            a["overDelegationDilution"],
+            json!("0"),
+            "within capacity, no dilution"
+        );
+        assert!(
+            b["overDelegationDilution"]
+                .as_str()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap()
+                > 0.4,
+            "past capacity the dilution is real: {}",
+            b["overDelegationDilution"]
+        );
+        // Capacity counts delegation, but only up to own stake times the ratio. Delegating four
+        // times the cap buys exactly the cap.
+        assert_eq!(
+            a["tokenCapacity"],
+            json!("900000000000000000000000"),
+            "100k own + 800k delegated"
+        );
+        assert_eq!(
+            b["tokenCapacity"],
+            json!("1700000000000000000000000"),
+            "100k own + 1600k, the ceiling, not the 3200k delegated"
+        );
+    }
+
+    #[test]
+    fn an_indexer_with_no_stake_yields_zeroes_rather_than_a_division_by_zero() {
+        let empty = json!({"staked_tokens": "0", "locked_tokens": "0", "delegated_tokens": "0"});
+        let d = derived_indexer_metrics(&empty, 16.0);
+        for k in [
+            "ownStakeRatio",
+            "delegatedStakeRatio",
+            "overDelegationDilution",
+        ] {
+            assert_eq!(d[k], json!("0"), "{k}");
+        }
+        assert_eq!(d["tokenCapacity"], json!("0"));
+    }
+
+    #[test]
+    fn a_profile_carries_its_operators_and_both_allocation_lists() {
+        let row = json!({"id": "0xabc", "staked_tokens": "1", "delegated_tokens": "0"});
+        let ops = vec![json!({"operator": "0xop"})];
+        let active = vec![json!({"id": "0xa1", "subgraph_deployment": "0xdep"})];
+        let closed = vec![json!({"id": "0xc1", "subgraph_deployment": "0xdep", "poi": "0xpoi"})];
+        let d = indexer_detail(&row, &ops, &active, &closed, 16.0);
+        assert_eq!(d["account"]["operators"][0]["id"], json!("0xop"));
+        assert_eq!(
+            d["allocations"][0]["subgraphDeployment"]["id"],
+            json!("0xdep")
+        );
+        assert_eq!(d["closedAllocations"][0]["poi"], json!("0xpoi"));
+        assert!(
+            d["ownStakeRatio"].is_string(),
+            "the derived ratios are merged in"
+        );
+    }
 }
