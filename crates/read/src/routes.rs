@@ -395,6 +395,11 @@ pub async fn indexer(ctx: &ReadCtx, addr: &str) -> Result<Read, ApiError> {
             addr_or_400!(sql::indexer_operators_sql(addr), "address"),
         ),
         Part::rows(
+            "delegators",
+            NestId::Alloc,
+            addr_or_400!(sql::indexer_delegators_sql(addr, 100), "address"),
+        ),
+        Part::rows(
             "active",
             NestId::Alloc,
             addr_or_400!(sql::indexer_active_allocations_sql(addr), "address"),
@@ -429,12 +434,18 @@ pub async fn indexer(ctx: &ReadCtx, addr: &str) -> Result<Read, ApiError> {
                 .and_then(|r| r.as_f64())
                 .unwrap_or(16.0);
 
-            let shaped = crate::shape::indexer_detail(
+            let mut shaped = crate::shape::indexer_detail(
                 &row,
                 &arr("operators"),
                 &arr("active"),
                 &arr("closed"),
                 ratio,
+            );
+            shaped["delegators"] = serde_json::Value::Array(
+                arr("delegators")
+                    .iter()
+                    .map(crate::shape::delegator)
+                    .collect(),
             );
             Ok((serde_json::json!({ "indexer": shaped }), p))
         })
@@ -754,14 +765,25 @@ pub async fn payments(ctx: &ReadCtx, receiver: Option<&str>) -> Result<Read, Api
     .await
 }
 
+/// `/api/poi`: which deployments the network agrees on, and which it does not.
 pub async fn poi(ctx: &ReadCtx, deployment: Option<&str>, first: i64) -> Result<Read, ApiError> {
     let sql = addr_or_400!(sql::poi_allocations_sql(deployment, first), "deployment id");
+    let inner = rows_only(NestId::Alloc, sql, T_FOLD);
+    let fetch: Fetcher = Arc::new(move |gate, lane| {
+        let inner = inner.clone();
+        Box::pin(async move {
+            let (v, p) = inner(gate, lane).await?;
+            let rows = v.as_array().cloned().unwrap_or_default();
+            Ok((crate::shape::poi_overview(&rows), p))
+        })
+    });
+
     ctx.cached(
         "poi",
         NestId::Alloc,
-        serde_json::json!({"deployment": deployment, "first": first}),
+        serde_json::json!({ "deployment": deployment, "first": first }),
         CachePolicy::from_poll_interval(cadence::SLOW),
-        rows_only(NestId::Alloc, sql, T_FOLD),
+        fetch,
     )
     .await
 }

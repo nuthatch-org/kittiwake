@@ -608,6 +608,157 @@ pub fn indexer_detail(
     out
 }
 
+// ---------------------------------------------------------------------------------------------
+// Proof-of-indexing consensus
+// ---------------------------------------------------------------------------------------------
+
+pub const ZERO_POI: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+/// The consensus view across closed allocations.
+///
+/// **Consensus is weighted by stake, not by headcount.** Ten small indexers agreeing does not
+/// outvote one large one; what the network pays out on is stake, so that is what the percentage
+/// measures. A deployment where the majority stake agrees is at consensus even if most indexers
+/// disagree, and that is the honest reading of the incentive.
+///
+/// Allocations closed without a proof carry the all-zero POI. They are excluded rather than
+/// counted as disagreement: an indexer that closed without proving anything has not diverged, it
+/// has abstained.
+///
+/// Only the **latest epoch** decides a deployment's verdict. An old divergence that has since
+/// resolved is history, and reporting it as current would keep a fixed deployment flagged for ever.
+pub fn poi_overview(rows: &[Value]) -> Value {
+    use std::collections::BTreeMap;
+
+    let real: Vec<&Value> = rows
+        .iter()
+        .filter(|r| {
+            r.get("poi")
+                .and_then(|p| p.as_str())
+                .is_some_and(|p| p != ZERO_POI)
+        })
+        .collect();
+
+    let mut by_deployment: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
+    for a in &real {
+        let key = a
+            .get("subgraph_deployment")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        by_deployment.entry(key.to_string()).or_default().push(a);
+    }
+
+    let mut deployments = Vec::new();
+    let mut total_divergent = 0i64;
+    let mut consensus_weighted = 0.0f64;
+    let mut stake_weighted = 0.0f64;
+
+    for (deployment_id, allocs) in &by_deployment {
+        let latest_epoch = allocs
+            .iter()
+            .filter_map(|a| a.get("closed_at_epoch").and_then(|v| v.as_i64()))
+            .max()
+            .unwrap_or(0);
+        let latest: Vec<&&Value> = allocs
+            .iter()
+            .filter(|a| a.get("closed_at_epoch").and_then(|v| v.as_i64()) == Some(latest_epoch))
+            .collect();
+
+        // Stake behind each distinct proof in the latest epoch.
+        let mut stakes: BTreeMap<String, f64> = BTreeMap::new();
+        for a in &latest {
+            let poi = a
+                .get("poi")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            *stakes.entry(poi).or_insert(0.0) += grt(a, "allocated_tokens");
+        }
+        let consensus_poi = stakes
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(p, _)| p.clone());
+        let total_real: f64 = stakes.values().sum();
+        let consensus_stake = consensus_poi
+            .as_ref()
+            .and_then(|p| stakes.get(p))
+            .copied()
+            .unwrap_or(0.0);
+        let divergent = latest
+            .iter()
+            .filter(|a| a.get("poi").and_then(|v| v.as_str()).map(str::to_string) != consensus_poi)
+            .count() as i64;
+
+        let has_divergence = divergent > 0;
+        if has_divergence {
+            total_divergent += 1;
+        }
+        consensus_weighted += consensus_stake;
+        stake_weighted += total_real;
+
+        let unique: std::collections::BTreeSet<&str> = allocs
+            .iter()
+            .filter_map(|a| a.get("indexer").and_then(|v| v.as_str()))
+            .collect();
+        let latest_closed_at = allocs
+            .iter()
+            .filter_map(|a| a.get("closed_at").and_then(|v| v.as_i64()))
+            .max()
+            .unwrap_or(0);
+        let first = allocs[0];
+
+        deployments.push(json!({
+            "deploymentId": deployment_id,
+            "ipfsHash": deployment_id,
+            "signal": grt(first, "signalled_tokens"),
+            "stake": grt(first, "staked_tokens"),
+            "latestEpoch": latest_epoch,
+            "latestClosedAt": latest_closed_at,
+            "allocationCount": allocs.len(),
+            "uniqueIndexers": unique.len(),
+            "consensusPct": if total_real > 0.0 { (consensus_stake / total_real) * 100.0 } else { 0.0 },
+            "hasDivergence": has_divergence,
+            "divergentCount": divergent,
+            "hasRealPois": true,
+        }));
+    }
+
+    // Divergent deployments first, then by how much is at stake behind them.
+    deployments.sort_by(|a, b| {
+        let (da, db) = (a["hasDivergence"].as_bool(), b["hasDivergence"].as_bool());
+        db.cmp(&da).then(
+            b["allocationCount"]
+                .as_i64()
+                .cmp(&a["allocationCount"].as_i64()),
+        )
+    });
+
+    json!({
+        "summary": {
+            "totalAllocations": real.len(),
+            "deploymentsTracked": deployments.len(),
+            // No stake anywhere means nothing to disagree about, which is full consensus.
+            "overallConsensusRate": if stake_weighted > 0.0 {
+                (consensus_weighted / stake_weighted) * 100.0
+            } else {
+                100.0
+            },
+            "divergentDeployments": total_divergent,
+        },
+        "deployments": deployments,
+    })
+}
+
+/// One delegator of an indexer.
+pub fn delegator(r: &Value) -> Value {
+    json!({
+        "id": t(r, "id"),
+        "delegator": json!({ "id": t(r, "delegator") }),
+        "stakedTokens": s0(r, "staked_tokens"),
+        "shareAmount": s0(r, "share_amount"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -869,5 +1020,86 @@ mod tests {
             d["ownStakeRatio"].is_string(),
             "the derived ratios are merged in"
         );
+    }
+
+    /// Ten small indexers agreeing do not outvote one large one: the network pays on stake.
+    #[test]
+    fn consensus_is_weighted_by_stake_not_by_headcount() {
+        let big = |poi: &str, tokens: &str| {
+            json!({"subgraph_deployment": "0xdep", "poi": poi, "indexer": format!("0x{tokens}"),
+                   "allocated_tokens": tokens, "closed_at_epoch": 1, "closed_at": 100,
+                   "signalled_tokens": "0", "staked_tokens": "0"})
+        };
+        let rows = vec![
+            big("0xtruth", "9000000000000000000000"),
+            big("0xwrong", "100000000000000000000"),
+            big("0xwrong2", "100000000000000000000"),
+        ];
+        let out = poi_overview(&rows);
+        let d = &out["deployments"][0];
+        assert!(
+            d["consensusPct"].as_f64().unwrap() > 97.0,
+            "{}",
+            d["consensusPct"]
+        );
+        assert_eq!(
+            d["divergentCount"],
+            json!(2),
+            "two proofs disagree, by headcount"
+        );
+        assert!(d["hasDivergence"].as_bool().unwrap());
+    }
+
+    /// Closing without a proof is abstention, not disagreement.
+    #[test]
+    fn allocations_closed_without_a_proof_are_excluded_not_counted_against() {
+        let rows = vec![
+            json!({"subgraph_deployment": "0xdep", "poi": "0xtruth", "indexer": "0xa",
+                   "allocated_tokens": "1000", "closed_at_epoch": 1, "closed_at": 1,
+                   "signalled_tokens": "0", "staked_tokens": "0"}),
+            json!({"subgraph_deployment": "0xdep", "poi": ZERO_POI, "indexer": "0xb",
+                   "allocated_tokens": "1000", "closed_at_epoch": 1, "closed_at": 1,
+                   "signalled_tokens": "0", "staked_tokens": "0"}),
+        ];
+        let out = poi_overview(&rows);
+        assert_eq!(out["summary"]["totalAllocations"], json!(1));
+        assert_eq!(out["deployments"][0]["consensusPct"], json!(100.0));
+        assert_eq!(out["deployments"][0]["divergentCount"], json!(0));
+    }
+
+    /// A divergence that has since resolved is history. Judging on the latest epoch keeps a fixed
+    /// deployment from being flagged for ever.
+    #[test]
+    fn only_the_latest_epoch_decides_the_verdict() {
+        let at = |epoch: i64, poi: &str, who: &str| {
+            json!({"subgraph_deployment": "0xdep", "poi": poi, "indexer": who,
+                   "allocated_tokens": "1000", "closed_at_epoch": epoch, "closed_at": epoch,
+                   "signalled_tokens": "0", "staked_tokens": "0"})
+        };
+        let rows = vec![
+            at(1, "0xtruth", "0xa"),
+            at(1, "0xwrong", "0xb"),
+            at(2, "0xtruth", "0xa"),
+            at(2, "0xtruth", "0xb"),
+        ];
+        let out = poi_overview(&rows);
+        let d = &out["deployments"][0];
+        assert_eq!(d["latestEpoch"], json!(2));
+        assert!(
+            !d["hasDivergence"].as_bool().unwrap(),
+            "epoch 2 agrees; epoch 1 is history"
+        );
+        assert_eq!(
+            d["allocationCount"],
+            json!(4),
+            "the count still spans all epochs"
+        );
+    }
+
+    #[test]
+    fn nothing_at_stake_is_full_consensus_rather_than_none() {
+        let out = poi_overview(&[]);
+        assert_eq!(out["summary"]["overallConsensusRate"], json!(100.0));
+        assert_eq!(out["summary"]["deploymentsTracked"], json!(0));
     }
 }
