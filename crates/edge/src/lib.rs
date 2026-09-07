@@ -20,8 +20,6 @@ use axum::routing::get;
 use governor::clock::{Clock, DefaultClock};
 use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
-use kittiwake_cache::Store;
-use kittiwake_nest::NestGate;
 use kittiwake_read::ReadCtx;
 use kittiwake_types::{ApiError, Meta, NestId};
 
@@ -405,18 +403,15 @@ pub fn router(state: AppState) -> Router {
 /// Build the state the router needs.
 #[allow(clippy::too_many_arguments)]
 pub fn state(
-    gate: NestGate,
-    store: Store,
-    schema_version: u32,
     limits: Limits,
     metrics: Option<kittiwake_obs::PrometheusHandle>,
-    chain: Option<kittiwake_chain::Chain>,
     pool: Option<kittiwake_db::Pool>,
+    read: ReadCtx,
 ) -> AppState {
     AppState {
-        read: ReadCtx::new(gate, store, schema_version).with_chain(chain.clone()),
+        chain: read.chain.clone(),
+        read,
         ext: kittiwake_ext::Ext::default(),
-        chain,
         pool,
         limits: Arc::new(limits),
         metrics,

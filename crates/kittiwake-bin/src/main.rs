@@ -75,7 +75,6 @@ async fn main() -> anyhow::Result<()> {
 
     let cache_cfg = cfg.cache();
     let store = Store::new(cache_cfg.max_entries);
-    let read = ReadCtx::new(gate.clone(), store.clone(), cache_cfg.schema_version);
 
     let pool = match cfg.database_url.as_deref() {
         Some(url) => {
@@ -126,15 +125,13 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let state = kittiwake_edge::state(
-        gate.clone(),
-        store.clone(),
-        cache_cfg.schema_version,
-        limits,
-        metrics,
-        chain.clone(),
-        pool.clone(),
-    );
+    // One read context for the whole process. Building a second one for the warmer meant it cached
+    // answers computed without the chain client, and because it kept them warm the edge never took
+    // a cold path that would have filled them in - a supply block that was null for ever, silently.
+    let read = ReadCtx::new(gate.clone(), store.clone(), cache_cfg.schema_version)
+        .with_chain(chain.clone());
+
+    let state = kittiwake_edge::state(limits, metrics, pool.clone(), read.clone());
     let limits_handle = state.limits.clone();
 
     // Keyed rate-limit state grows with distinct callers; sweep the idle ones periodically so a
