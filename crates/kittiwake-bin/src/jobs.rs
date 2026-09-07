@@ -206,6 +206,31 @@ pub fn ingest_jobs(pool: Pool, ext: Ext, chain: Option<kittiwake_chain::Chain>) 
 
     {
         let pool = pool.clone();
+        jobs.push(
+            JobDef::every(
+                "ingest-rav",
+                mins(60),
+                Arc::new(move |ctx| {
+                    let pool = pool.clone();
+                    Box::pin(async move {
+                        // Never a backfill on the schedule. A backfill re-reads every collection
+                        // ever made, which is a different kind of run in cost and in duration, and
+                        // it belongs behind a deliberate invocation rather than on an hourly timer.
+                        kittiwake_ingest::rav::rav(&pool, &ctx.gate, ctx.lane, false)
+                            .await
+                            .map(|i| JobOutcome {
+                                rows_written: i.rows,
+                            })
+                            .map_err(|e| e.to_string())
+                    })
+                }),
+            )
+            .staggered(mins(23)),
+        );
+    }
+
+    {
+        let pool = pool.clone();
         jobs.push(JobDef::every(
             "ingest-disputes",
             mins(360),
@@ -271,6 +296,7 @@ mod tests {
             ("ingest-epochs", mins(10), mins(3)),
             ("ingest-delegations", mins(15), mins(8)),
             ("ingest-allocations", mins(60), mins(13)),
+            ("ingest-rav", mins(60), mins(23)),
             ("ingest-disputes", mins(360), Duration::ZERO),
             ("refresh", mins(5), Duration::ZERO),
             ("snapshot-network", mins(5), mins(2)),

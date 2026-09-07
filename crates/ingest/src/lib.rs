@@ -13,6 +13,7 @@ use kittiwake_types::NestId;
 
 pub mod live;
 pub mod liveness;
+pub mod rav;
 pub mod refresh;
 pub mod state;
 
