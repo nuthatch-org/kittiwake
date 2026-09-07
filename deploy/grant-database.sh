@@ -153,8 +153,12 @@ echo
 
 # The proof is not that it started. A wrong URL starts perfectly happily and serves "unavailable"
 # for ever, so check that the pool connects and a route that needs it answers with rows.
+# Scoped to this boot's PID, not to a time window. A window spans the previous start as well, so a
+# restart that happened a minute ago reports its warnings as if they were this one's - which is a
+# check that can only ever raise a false alarm, and a false alarm is how a real one gets ignored.
 echo "startup warnings about the database (want 0):"
-journalctl -u kittiwake --since "-1min" --no-pager | grep -c "no database_url" | sed 's/^/  /'
+journalctl -u kittiwake --no-pager "_PID=$(systemctl show kittiwake -p MainPID --value)" \
+  | grep -c "no database_url" | sed 's/^/  /'
 echo "indexers-enriched:"
 curl -fsS --max-time 20 'http://127.0.0.1:8080/api/indexers-enriched?first=3' \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); print("  rows:", len(d.get("data") or []), "served_from:", (d.get("provenance") or {}).get("served_from"))' \
