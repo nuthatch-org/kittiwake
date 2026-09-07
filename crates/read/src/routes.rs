@@ -264,7 +264,16 @@ pub async fn network_stats(ctx: &ReadCtx) -> Result<Read, ApiError> {
             // Three contract reads across two chains. Absent rather than partial when any fails:
             // a global supply computed from two of three figures is a plausible wrong number.
             let supply = match &chain {
-                Some(c) => c.grt_supply_breakdown().await.ok(),
+                Some(c) => match c.grt_supply_breakdown().await {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        // `.ok()` here cost an afternoon: the supply block went null every minute
+                        // and nothing said why. A failure worth reporting to the reader as an
+                        // absence is worth reporting to the operator as a line.
+                        tracing::warn!(error = %e, "grt supply breakdown unavailable");
+                        None
+                    }
+                },
                 None => None,
             };
 
@@ -588,6 +597,24 @@ pub async fn provisions_by_indexer(ctx: &ReadCtx, addr: &str) -> Result<Read, Ap
                 v
             };
 
+            // The service thawing period is a sampled contract call rather than an event, so the
+            // nest stores the raw ABI word and we decode it. One value serves both the minimum and
+            // the maximum, because the protocol has one.
+            let mut thawing: Option<String> = None;
+            {
+                let mut tspec = QuerySpec::read(NestId::Alloc, sql::MAX_THAWING_PERIOD_SQL)
+                    .with_timeout(T_QUICK);
+                tspec.lane = lane;
+                if let Ok(t) = gate.query_coalesced("alloc:max-thawing", tspec).await {
+                    thawing = t
+                        .rows
+                        .first()
+                        .and_then(|r| r.get("result"))
+                        .and_then(|v| v.as_str())
+                        .and_then(crate::shape::decode_uint_word);
+                }
+            }
+
             let mut totals: std::collections::HashMap<String, serde_json::Value> =
                 Default::default();
             if let Some(tsql) = sql::data_service_totals_sql(&services) {
@@ -611,7 +638,7 @@ pub async fn provisions_by_indexer(ctx: &ReadCtx, addr: &str) -> Result<Read, Ap
                         .get("data_service")
                         .and_then(|s| s.as_str())
                         .unwrap_or_default();
-                    crate::shape::provision_with_totals(r, totals.get(svc))
+                    crate::shape::provision_with_totals(r, totals.get(svc), thawing.as_deref())
                 })
                 .collect();
             Ok((

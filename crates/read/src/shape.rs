@@ -147,13 +147,28 @@ pub fn delegation_event(r: &Value) -> Value {
 ///
 /// The service-wide totals are not in this row - they are a fold over every provision to that
 /// service - so they are null here rather than a per-indexer figure wearing a network-wide name.
-pub fn provision_with_totals(r: &Value, totals: Option<&Value>) -> Value {
+pub fn provision_with_totals(r: &Value, totals: Option<&Value>, thawing: Option<&str>) -> Value {
     let mut out = provision(r);
     if let Some(tot) = totals {
         out["dataService"]["totalTokensProvisioned"] = s0(tot, "total_tokens_provisioned");
         out["dataService"]["totalTokensAllocated"] = s0(tot, "total_tokens_allocated");
     }
+    if let Some(t) = thawing {
+        out["dataService"]["minimumThawingPeriod"] = Value::String(t.to_string());
+        out["dataService"]["maximumThawingPeriod"] = Value::String(t.to_string());
+    }
     out
+}
+
+/// Decode a sampled `eth_call` return - a 32-byte big-endian word, hex encoded - as a decimal
+/// string. Returns `None` rather than zero on anything unexpected: a thawing period of zero would
+/// read as "no waiting period", which is a different and dangerous claim.
+pub fn decode_uint_word(hex: &str) -> Option<String> {
+    let h = hex.strip_prefix("0x").unwrap_or(hex);
+    if h.is_empty() || h.len() > 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u128::from_str_radix(h, 16).ok().map(|v| v.to_string())
 }
 
 pub fn provision(r: &Value) -> Value {
@@ -284,6 +299,20 @@ mod tests {
     }
 
     /// The arrays carry a count. Their length is the whole of what the frontend reads.
+    #[test]
+    fn a_sampled_call_return_decodes_to_a_decimal_string() {
+        assert_eq!(
+            decode_uint_word("0x000000000000000000000000000000000000000000000000000000000024ea00"),
+            Some("2419200".to_string())
+        );
+        assert_eq!(decode_uint_word("0x"), None);
+        assert_eq!(
+            decode_uint_word("not hex"),
+            None,
+            "a bad word is absent, never zero"
+        );
+    }
+
     #[test]
     fn the_nested_arrays_carry_the_counts_the_frontend_reads() {
         let r = json!({"id": "0xabc", "curator_count": 2, "active_allocation_count": 3});

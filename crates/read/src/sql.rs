@@ -384,6 +384,14 @@ pub fn data_service_totals_sql(addrs: &[String]) -> Option<String> {
     ))
 }
 
+/// The newest sampled `maxThawingPeriod` from HorizonStaking.
+///
+/// A sampled `eth_call` rather than an event, so the nest stores the raw ABI return in `result`
+/// and the caller decodes it. One value serves both the minimum and the maximum: the incumbent
+/// reports the same figure for each, because the protocol has one.
+pub const MAX_THAWING_PERIOD_SQL: &str =
+    "SELECT result FROM max_thawing_period WHERE NOT reverted ORDER BY block_number DESC LIMIT 1";
+
 pub const DATA_SERVICE_COUNTS_SQL: &str = "SELECT indexer, COUNT(DISTINCT data_service) AS n FROM lodestar_provisions WHERE tokens_provisioned > 0 GROUP BY 1";
 
 // ---------------------------------------------------------------------------------------------
