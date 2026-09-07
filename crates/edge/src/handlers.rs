@@ -171,7 +171,10 @@ pub async fn indexer_status(
                 .get("subgraph_deployment")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let s = statuses.get(dep);
+            // The indexer answers in `Qm…`; the nest answers in hex. Join on the form the
+            // indexer uses, or nothing matches and a healthy indexer reads as serving nothing.
+            let ipfs = kittiwake_read::shape::ipfs_or_id(dep);
+            let s = statuses.get(ipfs.as_str());
             match s {
                 None => missing += 1,
                 Some(s) if s.health != "healthy" => failed += 1,
@@ -185,7 +188,7 @@ pub async fn indexer_status(
             let take = |k: &str, d: serde_json::Value| a.get(k).cloned().unwrap_or(d);
             serde_json::json!({
                 "deploymentId": dep,
-                "ipfsHash": dep,
+                "ipfsHash": ipfs,
                 "displayName": serde_json::Value::Null,
                 "allocatedTokens": take("allocated_tokens", serde_json::json!("0")),
                 "signalledTokens": take("signalled_tokens", serde_json::json!("0")),

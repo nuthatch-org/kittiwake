@@ -3186,6 +3186,7 @@ name = "kittiwake-read"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "bs58",
  "chrono",
  "futures",
  "kittiwake-cache",

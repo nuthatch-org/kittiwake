@@ -203,7 +203,7 @@ pub fn deployment(r: &Value, fees_30d: Option<&Value>) -> Value {
     let id_str = id.as_str().unwrap_or_default().to_string();
     let mut out = json!({
         "id": id,
-        "ipfsHash": t(r, "id"),
+        "ipfsHash": ipfs_or_id(&id_str),
         "signalledTokens": s0(r, "signalled_tokens"),
         "stakedTokens": s0(r, "staked_tokens"),
         "queryFeesAmount": s0(r, "query_fees_amount"),
@@ -525,7 +525,7 @@ fn deployment_stub(r: &Value, with_stats: bool) -> Value {
     let id = t(r, "subgraph_deployment");
     let mut out = json!({
         "id": id.clone(),
-        "ipfsHash": id,
+        "ipfsHash": ipfs_or_id(id.as_str().unwrap_or_default()),
         "versions": json!([]),
     });
     if with_stats {
@@ -720,7 +720,7 @@ pub fn poi_overview(rows: &[Value]) -> Value {
 
         deployments.push(json!({
             "deploymentId": deployment_id,
-            "ipfsHash": deployment_id,
+            "ipfsHash": ipfs_or_id(deployment_id),
             "signal": grt(first, "signalled_tokens"),
             "stake": grt(first, "staked_tokens"),
             "latestEpoch": latest_epoch,
@@ -938,6 +938,38 @@ pub fn dips(
         "timeline": timeline,
         "lastConfiguredAt": timeline.last().map(|t| t["timestamp"].clone()),
     })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Deployment identifiers
+// ---------------------------------------------------------------------------------------------
+
+/// The `Qm…` IPFS hash for a subgraph deployment id.
+///
+/// The chain stores a deployment as a bare 32-byte hash; IPFS names the same bytes as a multihash,
+/// which is the two-byte prefix `0x1220` (sha2-256, 32 bytes long) followed by the hash, base58
+/// encoded. They are the same identifier in two dresses.
+///
+/// This matters beyond cosmetics. An indexer's status endpoint answers in `Qm…` and the nest
+/// answers in hex, so without the conversion the two never join - every allocation looks
+/// unserved, and a perfectly healthy indexer reads as serving nothing at all.
+pub fn deployment_ipfs_hash(hex_id: &str) -> Option<String> {
+    let h = hex_id.strip_prefix("0x").unwrap_or(hex_id);
+    if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(34);
+    bytes.push(0x12);
+    bytes.push(0x20);
+    for i in (0..64).step_by(2) {
+        bytes.push(u8::from_str_radix(&h[i..i + 2], 16).ok()?);
+    }
+    Some(bs58::encode(bytes).into_string())
+}
+
+/// The `Qm…` form when the id converts, the id itself otherwise. Never empty, never invented.
+pub fn ipfs_or_id(hex_id: &str) -> String {
+    deployment_ipfs_hash(hex_id).unwrap_or_else(|| hex_id.to_string())
 }
 
 #[cfg(test)]
@@ -1356,5 +1388,29 @@ mod tests {
             "Allocator issuance rate set"
         );
         assert_eq!(dips_step_label("something_new"), "something_new");
+    }
+
+    /// A real pair, taken from the incumbent's own POI output. Getting this wrong silently unjoins
+    /// every allocation from every status an indexer reports.
+    #[test]
+    fn a_deployment_id_converts_to_the_ipfs_hash_the_indexer_reports() {
+        assert_eq!(
+            deployment_ipfs_hash(
+                "0xdb0c77a3184bf017abafb7606794d77ff53d9a59a0bc1dc23f1a762bd1e631ff"
+            )
+            .as_deref(),
+            Some("Qmd5j2CeMs5NBUASQWjGbFmFpxGWhwKbgrTBZwV8hj65QJ")
+        );
+    }
+
+    #[test]
+    fn anything_that_is_not_a_deployment_id_is_left_alone() {
+        assert_eq!(deployment_ipfs_hash("0xdeadbeef"), None);
+        assert_eq!(deployment_ipfs_hash(""), None);
+        assert_eq!(
+            ipfs_or_id("0xdeadbeef"),
+            "0xdeadbeef",
+            "returned as-is, never blanked"
+        );
     }
 }
