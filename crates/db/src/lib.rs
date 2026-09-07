@@ -301,6 +301,54 @@ pub async fn delegation_exchange_rates(
     Ok(rows)
 }
 
+/// One entry in an indexer's "why did my APR change" trail, from Lodestar's own tables.
+///
+/// Two sources with nothing in common but a timestamp: delegations in and out, and the cuts the
+/// indexer set. Both move a delegator's return and neither explains the other, which is the point
+/// of showing them on one timeline.
+/// `(event_type, delegator, tokens_grt, timestamp)`
+pub type DelegationEventRow = (
+    String,
+    Option<String>,
+    Option<f64>,
+    chrono::DateTime<chrono::Utc>,
+);
+
+/// `(param_name, old_value, new_value, created_at)`
+pub type ParameterChangeRow = (String, Option<i64>, i64, chrono::DateTime<chrono::Utc>);
+
+pub struct ProvenanceRows {
+    pub delegations: Vec<DelegationEventRow>,
+    pub params: Vec<ParameterChangeRow>,
+}
+
+pub async fn provenance_rows(pool: &Pool, indexer: &str) -> Result<ProvenanceRows, DbError> {
+    let delegations = sqlx::query_as(
+        "SELECT event_type, delegator, tokens_grt::float8, timestamp \
+         FROM delegation_events WHERE indexer = $1 ORDER BY timestamp DESC LIMIT 30",
+    )
+    .bind(indexer)
+    .fetch_all(pool)
+    .await?;
+
+    // `DISTINCT ON` over the whole tuple, because the same change can be recorded in several
+    // epochs and the trail should show it once.
+    let params = sqlx::query_as(
+        "SELECT DISTINCT ON (param_name, old_value, new_value, epoch) \
+           param_name, old_value, new_value, created_at \
+         FROM parameter_changes WHERE indexer_address = $1 \
+         ORDER BY param_name, old_value, new_value, epoch, created_at DESC",
+    )
+    .bind(indexer)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(ProvenanceRows {
+        delegations,
+        params,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

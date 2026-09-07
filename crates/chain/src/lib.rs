@@ -22,6 +22,10 @@ pub const GRT_MAINNET: &str = "0xc944e90c64b2c07662a292be6244bdf05cda44a7";
 /// The L1 escrow holding GRT that has been bridged to L2. Counting both sides without subtracting
 /// it would double-count every bridged token.
 pub const L1_BRIDGE_ESCROW: &str = "0x36aff7001294dae4c2ed4fdefc478a00de77f090";
+/// HorizonStaking, the proxy that owns every delegation pool.
+pub const HORIZON_STAKING: &str = "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03";
+/// SubgraphService, which is the verifier a delegation pool is keyed by.
+pub const SUBGRAPH_SERVICE: &str = "0xb2bb92d0de618878e438b55d5846cfecd9301105";
 
 sol! {
     #[sol(rpc)]
@@ -33,6 +37,19 @@ sol! {
         /// "ineligible" reading is advisory and must not be reported as a live penalty.
         function getEligibilityValidation() external view returns (bool);
         function getLastOracleUpdateTime() external view returns (uint256);
+    }
+
+    #[sol(rpc)]
+    interface IHorizonStaking {
+        struct DelegationPool {
+            uint256 tokens;
+            uint256 shares;
+            uint256 tokensThawing;
+            uint256 sharesThawing;
+            uint256 thawingNonce;
+        }
+        function getDelegationPool(address serviceProvider, address verifier)
+            external view returns (DelegationPool memory);
     }
 
     #[sol(rpc)]
@@ -278,6 +295,30 @@ impl Chain {
     }
 
     /// The current Arbitrum block, used by the health endpoint to say whether the RPC is answering.
+    /// The live delegation pool for an indexer's SubgraphService provision.
+    ///
+    /// `tokens - tokensThawing` is the active, reward-earning capital, and the subtraction is exact
+    /// rather than approximate: the contract keeps fully-thawed-but-not-yet-withdrawn tokens inside
+    /// **both** figures until `withdraw()` fires, because there is no time-triggered transition at
+    /// `thawingUntil`. So the difference isolates exactly what earns, which is the on-chain analogue
+    /// of the nest's `delegated_tokens - delegated_thawing_tokens`, and the two should agree
+    /// block for block.
+    ///
+    /// `None` when the call reverts, which is what an indexer with no provision looks like.
+    pub async fn delegation_pool(&self, indexer: &str) -> Option<(f64, f64)> {
+        let provider =
+            alloy::providers::ProviderBuilder::new().connect_http(self.arbitrum.parse().ok()?);
+        let staking: alloy::primitives::Address = HORIZON_STAKING.parse().ok()?;
+        let verifier: alloy::primitives::Address = SUBGRAPH_SERVICE.parse().ok()?;
+        let who: alloy::primitives::Address = indexer.parse().ok()?;
+        let c = IHorizonStaking::new(staking, provider);
+        let pool = c.getDelegationPool(who, verifier).call().await.ok()?;
+        let wei = |v: alloy::primitives::U256| -> f64 {
+            v.to_string().parse::<f64>().unwrap_or(0.0) / 1e18
+        };
+        Some((wei(pool.tokens), wei(pool.tokensThawing)))
+    }
+
     pub async fn block_number(&self) -> Result<u64, ApiError> {
         let provider = self.arb()?;
         tokio::time::timeout(Duration::from_secs(8), provider.get_block_number())

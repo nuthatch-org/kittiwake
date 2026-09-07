@@ -2281,3 +2281,172 @@ mod rewards_history_tests {
         assert_eq!(h["rewards"].as_f64().unwrap(), 50.0);
     }
 }
+
+/// The trail behind a delegator's APR: money in and out, and the cuts the indexer set.
+///
+/// Newest first, the two sources interleaved by time. A parameter change where the old value equals
+/// the new one is dropped: the ingest records a row per epoch the parameter was seen in, so an
+/// unchanged cut would otherwise appear as an event every epoch for ever.
+pub fn provenance_events(
+    delegations: &[(String, Option<String>, Option<f64>, String)],
+    params: &[(String, Option<i64>, i64, String)],
+) -> Value {
+    let mut events: Vec<(String, Value)> = Vec::new();
+
+    for (event_type, delegator, tokens, ts) in delegations {
+        let kind = match event_type.as_str() {
+            "delegation" => "delegation",
+            "undelegation" => "undelegation",
+            "withdrawal" => "withdrawal",
+            _ => continue,
+        };
+        events.push((
+            ts.clone(),
+            json!({
+                "kind": kind,
+                "timestamp": ts,
+                "tokensGRT": tokens.map(num),
+                "delegator": delegator.as_ref().map(|d| d.to_lowercase()),
+                // ENS is resolved by the caller that has a mainnet RPC, not here.
+                "delegatorName": Value::Null,
+            }),
+        ));
+    }
+
+    for (name, old, new, ts) in params {
+        let kind = match name.as_str() {
+            "reward_cut" => "reward_cut",
+            "query_fee_cut" => "query_fee_cut",
+            _ => continue,
+        };
+        if *old == Some(*new) {
+            continue;
+        }
+        events.push((
+            ts.clone(),
+            json!({
+                "kind": kind,
+                "timestamp": ts,
+                "oldValue": old,
+                "newValue": new,
+            }),
+        ));
+    }
+
+    events.sort_by(|a, b| b.0.cmp(&a.0));
+    json!(events.into_iter().map(|(_, e)| e).collect::<Vec<_>>())
+}
+
+/// How far the nest's delegation figures have drifted from the chain's.
+///
+/// `tokens - thawing` on both sides, because the contract keeps fully-thawed-but-not-withdrawn
+/// tokens inside both figures until `withdraw()` fires. Any difference is indexing lag rather than
+/// a difference of meaning, which is why a drift within the tolerance reads as verified rather than
+/// as merely close.
+pub fn pool_reconciliation(
+    chain: Option<(f64, f64)>,
+    nest_delegated: f64,
+    nest_thawing: f64,
+) -> Value {
+    /// Half a percent. Wide enough for a block or two of lag, narrow enough that a real divergence
+    /// does not hide inside it.
+    const EPSILON: f64 = 0.005;
+
+    let Some((chain_tokens, chain_thawing)) = chain else {
+        return Value::Null;
+    };
+    let chain_active = chain_tokens - chain_thawing;
+    let nest_active = nest_delegated - nest_thawing;
+    let drift = chain_active - nest_active;
+    let drift_pct = if chain_active > 0.0 {
+        drift.abs() / chain_active
+    } else if nest_active > 0.0 {
+        1.0
+    } else {
+        0.0
+    };
+    json!({
+        "verified": drift_pct <= EPSILON,
+        "driftGRT": num(drift),
+        "driftPct": num(drift_pct),
+        "chain": { "tokens": num(chain_tokens), "thawing": num(chain_thawing), "active": num(chain_active) },
+        "subgraph": { "tokens": num(nest_delegated), "thawing": num(nest_thawing), "active": num(nest_active) },
+    })
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    #[test]
+    fn the_two_sources_interleave_newest_first() {
+        let out = provenance_events(
+            &[(
+                "delegation".into(),
+                Some("0xAA".into()),
+                Some(10.0),
+                "2026-09-01T00:00:00Z".into(),
+            )],
+            &[(
+                "reward_cut".into(),
+                Some(100_000),
+                200_000,
+                "2026-09-05T00:00:00Z".into(),
+            )],
+        );
+        let e = out.as_array().unwrap();
+        assert_eq!(e.len(), 2);
+        assert_eq!(e[0]["kind"], json!("reward_cut"));
+        assert_eq!(e[1]["kind"], json!("delegation"));
+        assert_eq!(e[1]["delegator"], json!("0xaa"));
+    }
+
+    /// The ingest records a row per epoch the parameter was seen in, so an unchanged cut would
+    /// otherwise appear on the timeline every epoch for ever.
+    #[test]
+    fn a_parameter_change_that_changed_nothing_is_not_an_event() {
+        let out = provenance_events(
+            &[],
+            &[(
+                "reward_cut".into(),
+                Some(100_000),
+                100_000,
+                "2026-09-05T00:00:00Z".into(),
+            )],
+        );
+        assert_eq!(out.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn an_unknown_kind_is_dropped_rather_than_guessed() {
+        let out = provenance_events(
+            &[("something_else".into(), None, None, "2026-09-01".into())],
+            &[("cooldown".into(), None, 1, "2026-09-01".into())],
+        );
+        assert_eq!(out.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_pool_within_half_a_percent_is_verified() {
+        let r = pool_reconciliation(Some((1000.0, 100.0)), 900.0, 0.0);
+        assert_eq!(r["verified"], json!(true));
+        assert_eq!(r["chain"]["active"].as_f64().unwrap(), 900.0);
+        assert_eq!(r["subgraph"]["active"].as_f64().unwrap(), 900.0);
+        assert_eq!(r["driftGRT"].as_f64().unwrap(), 0.0);
+    }
+
+    #[test]
+    fn a_real_divergence_is_not_verified() {
+        let r = pool_reconciliation(Some((1000.0, 0.0)), 500.0, 0.0);
+        assert_eq!(r["verified"], json!(false));
+        assert_eq!(r["driftGRT"].as_f64().unwrap(), 500.0);
+        assert_eq!(r["driftPct"].as_f64().unwrap(), 0.5);
+    }
+
+    /// A chain read that reverted is an absent reconciliation, not a drift of zero. Zero would
+    /// read as agreement.
+    #[test]
+    fn no_chain_reading_is_null_rather_than_agreement() {
+        assert_eq!(pool_reconciliation(None, 900.0, 0.0), Value::Null);
+    }
+}

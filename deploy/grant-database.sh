@@ -77,7 +77,7 @@ GRANT SELECT ON indexers, allocations, ipfs_metadata TO $ROLE;
 -- Read for the shadow run: the cursors, and the tables both systems will be writing, so the two
 -- can be compared from here rather than only as postgres.
 GRANT SELECT ON ingestion_state, epochs, delegation_events, disputes, network_snapshots,
-  rav_redemptions, indexer_snapshots, cron_runs TO $ROLE;
+  rav_redemptions, indexer_snapshots, cron_runs, parameter_changes TO $ROLE;
 
 GRANT INSERT, UPDATE ON ipfs_metadata TO $ROLE;
 GRANT INSERT ON cron_runs TO $ROLE;

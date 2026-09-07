@@ -273,9 +273,68 @@ pub async fn apr_provenance(
     Path(address): Path<String>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
-    Ok(envelope(
-        routes::apr_provenance(&st.read, &addr(&address)).await?,
-    ))
+    let a = addr(&address);
+    let read = routes::apr_provenance(&st.read, &a).await?;
+
+    // The nest's own view of the pool, which the chain reading is checked against.
+    let detail = read
+        .entry
+        .value
+        .get("indexer")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let grt = |k: &str| {
+        detail
+            .get(k)
+            .and_then(|v| v.as_str())
+            .and_then(|x| x.parse::<f64>().ok())
+            .unwrap_or(0.0)
+            / 1e18
+    };
+
+    // The chain reading and the two Postgres reads are independent, so they go together. A pool
+    // that reverts and a database that is absent each degrade their own half of the answer rather
+    // than the whole of it: the trail is still worth showing without the reconciliation, and the
+    // reconciliation without the trail.
+    let chain = match &st.chain {
+        Some(c) => c.delegation_pool(&a).await,
+        None => None,
+    };
+    let reconcile = kittiwake_read::shape::pool_reconciliation(
+        chain,
+        grt("delegated_tokens"),
+        grt("delegated_thawing_tokens"),
+    );
+
+    let events = match st.pool.as_ref() {
+        Some(pool) => match kittiwake_db::provenance_rows(pool, &a).await {
+            Ok(rows) => kittiwake_read::shape::provenance_events(
+                &rows
+                    .delegations
+                    .into_iter()
+                    .map(|(t, d, g, ts)| (t, d, g, ts.to_rfc3339()))
+                    .collect::<Vec<_>>(),
+                &rows
+                    .params
+                    .into_iter()
+                    .map(|(n, o, v, ts)| (n, o, v, ts.to_rfc3339()))
+                    .collect::<Vec<_>>(),
+            ),
+            Err(e) => {
+                tracing::warn!(err = %e, "apr provenance trail unavailable");
+                serde_json::json!([])
+            }
+        },
+        None => serde_json::json!([]),
+    };
+
+    let mut resp = axum::Json(serde_json::json!({
+        "data": { "reconcile": reconcile, "events": events },
+        "provenance": &read.meta,
+    }))
+    .into_response();
+    crate::no_store(resp.headers_mut());
+    Ok(resp)
 }
 
 /// Weekly points over the last two years, which is what the chart draws.
