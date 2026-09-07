@@ -17,12 +17,43 @@ service returns the same shape, ignoring the added `provenance` key.
 | 3 | the rest of the `/alloc` reads | same pattern, bulk-portable | to do |
 | 4 | `/gns`, `/dips`, `/dips-sepolia`, `/legacy-flows` reads | other nests, exercises multi-nest gate config | to do |
 | 5 | `/api/sql/*` | needs screening and receipts; independent of ingest | catalog and query done; named tier and receipts to do |
-| 6 | the seventeen ingest jobs | run both writing the same tables in shadow first, compare row deltas, then disable the platform crons | scheduler done, job bodies to do |
+| 6 | the seventeen crons | run both writing the same tables in shadow first, compare row deltas, then disable the platform crons | every data-plane job done; see the ledger below |
 | 7 | `/api/price`, `tvl`, `reo`, `indexer-node-health` | chain and third-party reads; the SSRF guard lands here | **done**; `ens`, `manifest`, `service-census`, `operator-preflight`, `delegate/recommend` remain |
 | 8 | `/api/studio/*` | sessions, deploy keys, IPFS, on-chain lifecycle | to do |
 | 9 | `/api/scuttlebutt/*` | streaming and moderation | to do |
 | 10 | the long tail | some of it droppable | to do |
 | 11 | frontend hooks | only now do the hooks change | to do |
+
+## The cron ledger
+
+Seventeen crons, and only nine of them were ever jobs this service should run. The count is worth
+writing out, because "eleven remaining" was the wrong number for weeks and it made the remaining
+work look larger and vaguer than it was.
+
+**Ported and running (9).** `refresh`, `ingest-epochs`, `ingest-delegations`, `ingest-allocations`,
+`ingest-disputes`, `snapshot-network`, `ingest-horizon-activity`, `refresh-chain-health`,
+`ingest-rav`. The four Postgres walkers plus `refresh`, `snapshot-network` and `ingest-rav` are
+behind `scheduler_enabled`, because turning them on makes this a second writer to tables the
+platform's crons still own. The other two write only tables of their own and run always.
+
+**Ported but needs a database (1).** `warm-ipfs`. It fills `ipfs_metadata`, which is also what
+`/api/subgraph-search` and `/api/subgraph-names` read. Not gated behind `scheduler_enabled` because
+both systems write the same document under the same CID and the upsert is idempotent - two writers
+racing to the same answer rather than to different ones.
+
+**Struck, because their delivery is gone (4).** `check-dips`, `check-dips-chain`,
+`check-nest-health` and `check-provider-liveness` all end in `sendToAddress` from `lib/apns.ts`.
+Push was discontinued on 2026-09-06, so all four detect a thing and then post it to nowhere. The
+detections are not all worthless - a DIPS allocation moving is genuinely interesting - but the nest
+one is now Foghorn's, which alerts to a webhook that works, and the provider one watches Dispatch,
+which is being removed. Anything worth keeping belongs in Foghorn, not here.
+
+**Struck with push (1).** `dispatch-notifications`.
+
+**Product layer, not data plane (2).** `reconcile-bounties` and `tap-provision` belong with the
+Dock. `tap-provision` additionally holds `TAP_SIGNER_PRIVATE_KEY` and *spends GRT*: porting it means
+putting a signing key on this box and having this service send transactions. That is a decision
+about custody, not a port, and it should not move before the Dock does.
 
 ## Discontinued, so not ported at all
 
