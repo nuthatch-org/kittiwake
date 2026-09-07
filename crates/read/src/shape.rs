@@ -972,6 +972,73 @@ pub fn ipfs_or_id(hex_id: &str) -> String {
     deployment_ipfs_hash(hex_id).unwrap_or_else(|| hex_id.to_string())
 }
 
+// ---------------------------------------------------------------------------------------------
+// The Horizon activity feed
+// ---------------------------------------------------------------------------------------------
+
+/// The cache key the activity job writes and the activity route reads.
+///
+/// In the service this replaces these were two separate stateless invocations, so the feed had to
+/// travel through Redis to get from one to the other. One process needs no such courier: the job
+/// writes into the same store the route reads, and three network round trips per request go away.
+pub const HORIZON_ACTIVITY_KEY: &str = "live:horizon-activity";
+
+fn delegation_activity_type(event_type: &str) -> &'static str {
+    match event_type {
+        "undelegation" => "undelegated",
+        "withdrawal" => "withdrawn",
+        _ => "delegated",
+    }
+}
+
+/// The newest twenty-five things to happen on HorizonStaking, delegations and provisions merged.
+pub fn horizon_activity(delegations: &[Value], provisions: &[Value]) -> Value {
+    let mut events: Vec<Value> = Vec::with_capacity(delegations.len() + provisions.len());
+
+    for e in delegations {
+        let ts = match e.get("timestamp") {
+            Some(Value::String(s)) => s.parse::<i64>().unwrap_or(0),
+            Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
+            _ => 0,
+        };
+        events.push(json!({
+            "id": format!("d-{}", e.get("id").and_then(|v| v.as_str()).unwrap_or_default()),
+            "type": delegation_activity_type(
+                e.get("eventType").and_then(|v| v.as_str()).unwrap_or_default()
+            ),
+            // Delegation events are folded by timestamp rather than by block, so the block is not
+            // in the answer. Zero, rather than a guess.
+            "block": 0,
+            "txHash": t(e, "txHash"),
+            "timestamp": ts,
+            "serviceProvider": t(e, "indexer"),
+            "delegator": t(e, "delegator"),
+            "tokensGRT": grt(e, "tokens"),
+        }));
+    }
+
+    for p in provisions {
+        events.push(json!({
+            "id": format!(
+                "p-{}-{}",
+                p.get("tx_hash").and_then(|v| v.as_str()).unwrap_or_default(),
+                p.get("log_index").and_then(|v| v.as_i64()).unwrap_or(0)
+            ),
+            "type": "provision",
+            "block": i0(p, "block_number"),
+            "txHash": t(p, "tx_hash"),
+            "timestamp": i0(p, "block_timestamp"),
+            "serviceProvider": t(p, "indexer"),
+            "verifier": t(p, "verifier"),
+            "tokensGRT": grt(p, "tokens"),
+        }));
+    }
+
+    events.sort_by_key(|e| std::cmp::Reverse(e["timestamp"].as_i64().unwrap_or(0)));
+    events.truncate(25);
+    Value::Array(events)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1412,5 +1479,51 @@ mod tests {
             "0xdeadbeef",
             "returned as-is, never blanked"
         );
+    }
+
+    #[test]
+    fn the_activity_feed_is_newest_first_and_capped() {
+        let delegations: Vec<Value> = (0..30)
+            .map(|i| {
+                json!({"id": format!("e{i}"), "eventType": "delegation", "indexer": "0xi",
+                            "delegator": "0xd", "tokens": "1000000000000000000",
+                            "timestamp": (1_700_000_000 + i).to_string(), "txHash": "0xt"})
+            })
+            .collect();
+        let out = horizon_activity(&delegations, &[]);
+        let arr = out.as_array().unwrap();
+        assert_eq!(
+            arr.len(),
+            25,
+            "the feed is capped, not truncated by the caller"
+        );
+        assert!(
+            arr[0]["timestamp"].as_i64().unwrap() > arr[1]["timestamp"].as_i64().unwrap(),
+            "newest first"
+        );
+        assert_eq!(arr[0]["tokensGRT"], json!(1.0));
+    }
+
+    #[test]
+    fn delegation_kinds_map_to_the_feeds_own_vocabulary() {
+        assert_eq!(delegation_activity_type("delegation"), "delegated");
+        assert_eq!(delegation_activity_type("undelegation"), "undelegated");
+        assert_eq!(delegation_activity_type("withdrawal"), "withdrawn");
+        assert_eq!(delegation_activity_type("something_new"), "delegated");
+    }
+
+    #[test]
+    fn provisions_and_delegations_interleave_by_time() {
+        let d = vec![
+            json!({"id": "e1", "eventType": "delegation", "indexer": "0xi",
+                            "delegator": "0xd", "tokens": "0", "timestamp": "100", "txHash": "0xa"}),
+        ];
+        let p = vec![json!({"tx_hash": "0xb", "log_index": 1, "block_number": 5,
+                            "block_timestamp": 200, "indexer": "0xi", "verifier": "0xv",
+                            "tokens": "0"})];
+        let out = horizon_activity(&d, &p);
+        let arr = out.as_array().unwrap();
+        assert_eq!(arr[0]["type"], json!("provision"), "the later event leads");
+        assert_eq!(arr[1]["type"], json!("delegated"));
     }
 }

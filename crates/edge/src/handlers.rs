@@ -715,3 +715,41 @@ pub async fn indexers_enriched(
     crate::no_store(resp.headers_mut());
     Ok(resp)
 }
+
+/// `/api/horizon/activity`: the newest events on HorizonStaking.
+///
+/// Served straight from what the activity job last wrote. If the job has not run yet the answer is
+/// an empty feed with its age, not a fabricated one and not an error: an empty list is honest, and
+/// the age says how much to trust it.
+pub async fn horizon_activity(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let entry = st
+        .read
+        .store
+        .get(kittiwake_read::shape::HORIZON_ACTIVITY_KEY)
+        .await;
+    let (data, meta) = match entry {
+        Some(e) => {
+            let meta = e.meta(kittiwake_types::ServedFrom::Cache, false);
+            ((*e.value).clone(), meta)
+        }
+        None => (
+            serde_json::json!([]),
+            kittiwake_types::Meta {
+                provenance: Default::default(),
+                served_from: kittiwake_types::ServedFrom::Cache,
+                stale: true,
+                age_seconds: 0,
+            },
+        ),
+    };
+    let mut resp =
+        axum::Json(serde_json::json!({ "data": data, "source": "nuthatch", "provenance": &meta }))
+            .into_response();
+    crate::no_store(resp.headers_mut());
+    Ok(resp)
+}

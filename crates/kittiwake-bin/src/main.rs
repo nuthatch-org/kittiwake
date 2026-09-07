@@ -146,13 +146,16 @@ async fn main() -> anyhow::Result<()> {
 
     let mut handles = Vec::new();
 
-    if cfg.warmer_enabled || cfg.scheduler_enabled {
+    {
         let recorder: Arc<dyn RunRecorder> = match &pool {
             Some(p) => Arc::new(PgRecorder(p.clone())),
             None => Arc::new(kittiwake_sched::NoopRecorder),
         };
         let mut scheduler = Scheduler::new(gate.clone(), recorder);
         let mut jobs: Vec<JobDef> = Vec::new();
+
+        // Always: these write nowhere but this process's own memory.
+        jobs.extend(jobs::live_jobs(store.clone()));
 
         if cfg.warmer_enabled {
             let warm_ctx = read.clone();
@@ -180,7 +183,8 @@ async fn main() -> anyhow::Result<()> {
                     jobs.extend(ingest);
                 }
                 None => tracing::warn!(
-                    "scheduler_enabled with no database_url: the ingest jobs have nowhere to write,                      so none were scheduled"
+                    "scheduler_enabled with no database_url: the ingest jobs have nowhere to \
+                     write, so none were scheduled"
                 ),
             }
         }

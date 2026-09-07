@@ -24,6 +24,45 @@ fn mins(n: u64) -> Duration {
 /// The offsets are the same ones the platform schedules encoded, kept so a comparison between the
 /// two systems is like for like: epochs at :03 past every ten minutes, delegations at :08 past
 /// every fifteen, allocations at :13 past the hour, and so on.
+/// Jobs that write only into this process's own memory.
+///
+/// Safe to run whenever the service is up, because nothing outside this process can see what they
+/// write. The distinction that matters is not "is it a cron" but "does it write to a store the
+/// other system also writes to" - and these do not.
+pub fn live_jobs(store: kittiwake_cache::Store) -> Vec<JobDef> {
+    let mut jobs = Vec::new();
+    {
+        // Every two minutes, as the platform schedule had it. Writes into the process's own store
+        // rather than Redis, because the route that reads it is in this process.
+        let store = store.clone();
+        jobs.push(
+            JobDef::every(
+                "ingest-horizon-activity",
+                Duration::from_secs(120),
+                Arc::new(move |ctx| {
+                    let store = store.clone();
+                    Box::pin(async move {
+                        kittiwake_ingest::live::horizon_activity(&store, &ctx.gate, ctx.lane)
+                            .await
+                            .map(|i| JobOutcome {
+                                rows_written: i.rows,
+                            })
+                            .map_err(|e| e.to_string())
+                    })
+                }),
+            )
+            .staggered(Duration::from_secs(30)),
+        );
+    }
+
+    jobs
+}
+
+/// Jobs that write to Lodestar's Postgres.
+///
+/// Gated behind `scheduler_enabled`, because turning them on makes this process a second writer to
+/// a database the platform's own crons are still writing. That is a decision, taken once, after a
+/// shadow run - not a default.
 pub fn ingest_jobs(pool: Pool, ext: Ext, chain: Option<kittiwake_chain::Chain>) -> Vec<JobDef> {
     let mut jobs = Vec::new();
 

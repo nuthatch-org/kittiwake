@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 chrono = "0.4.45"
 futures = "0.3.34"
+kittiwake-cache = { version = "0.1.0", path = "../cache" }
 kittiwake-chain = { version = "0.1.0", path = "../chain" }
 kittiwake-db = { version = "0.1.0", path = "../db" }
 kittiwake-nest = { version = "0.1.0", path = "../nest" }

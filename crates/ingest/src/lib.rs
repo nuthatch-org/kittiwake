@@ -11,6 +11,7 @@ use kittiwake_db::Pool;
 use kittiwake_nest::{Lane, NestGate, QuerySpec, SqlAnswer};
 use kittiwake_types::NestId;
 
+pub mod live;
 pub mod refresh;
 pub mod state;
 
