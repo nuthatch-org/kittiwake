@@ -630,6 +630,17 @@ pub const ZERO_POI: &str = "0x00000000000000000000000000000000000000000000000000
 pub fn poi_overview(rows: &[Value]) -> Value {
     use std::collections::BTreeMap;
 
+    /// The nest returns some integer columns as JSON strings and others as numbers, in the same
+    /// row. A bare `as_i64()` reads `"1374"` as absent, which collapsed every deployment into one
+    /// empty epoch group and reported perfect consensus across the whole network.
+    fn num(v: &Value, key: &str) -> Option<i64> {
+        match v.get(key)? {
+            Value::Number(n) => n.as_i64(),
+            Value::String(s) => s.parse().ok(),
+            _ => None,
+        }
+    }
+
     let real: Vec<&Value> = rows
         .iter()
         .filter(|r| {
@@ -656,12 +667,12 @@ pub fn poi_overview(rows: &[Value]) -> Value {
     for (deployment_id, allocs) in &by_deployment {
         let latest_epoch = allocs
             .iter()
-            .filter_map(|a| a.get("closed_at_epoch").and_then(|v| v.as_i64()))
+            .filter_map(|a| num(a, "closed_at_epoch"))
             .max()
             .unwrap_or(0);
         let latest: Vec<&&Value> = allocs
             .iter()
-            .filter(|a| a.get("closed_at_epoch").and_then(|v| v.as_i64()) == Some(latest_epoch))
+            .filter(|a| num(a, "closed_at_epoch") == Some(latest_epoch))
             .collect();
 
         // Stake behind each distinct proof in the latest epoch.
@@ -702,7 +713,7 @@ pub fn poi_overview(rows: &[Value]) -> Value {
             .collect();
         let latest_closed_at = allocs
             .iter()
-            .filter_map(|a| a.get("closed_at").and_then(|v| v.as_i64()))
+            .filter_map(|a| num(a, "closed_at"))
             .max()
             .unwrap_or(0);
         let first = allocs[0];
@@ -1093,6 +1104,22 @@ mod tests {
             d["allocationCount"],
             json!(4),
             "the count still spans all epochs"
+        );
+    }
+
+    /// The nest sends integers as strings on some columns and numbers on others, in the same row.
+    /// Reading only one form reported perfect consensus across the entire network.
+    #[test]
+    fn an_epoch_arriving_as_a_string_is_still_an_epoch() {
+        let as_string = json!({"subgraph_deployment": "0xdep", "poi": "0xa", "indexer": "0xi",
+                               "allocated_tokens": "1000", "closed_at_epoch": "1374",
+                               "closed_at": 100, "signalled_tokens": "0", "staked_tokens": "0"});
+        let out = poi_overview(&[as_string]);
+        assert_eq!(out["deployments"][0]["latestEpoch"], json!(1374));
+        assert_eq!(
+            out["deployments"][0]["consensusPct"],
+            json!(100.0),
+            "one proof, unopposed, is full consensus - not zero"
         );
     }
 
