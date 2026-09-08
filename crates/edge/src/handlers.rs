@@ -1048,8 +1048,15 @@ pub async fn subgraph_search(
         q.q.as_deref().unwrap_or(""),
     )
     .await?;
-    let mut resp =
-        axum::Json(serde_json::json!({ "data": hits, "source": "nuthatch" })).into_response();
+    // Names live in IPFS documents somebody has to have fetched first, so an empty result can mean
+    // "no such subgraph" or "not warmed yet", and only this figure separates them. Null until a
+    // warm run has finished in this process.
+    let mut resp = axum::Json(serde_json::json!({
+        "data": hits,
+        "source": "nuthatch",
+        "warmBacklog": kittiwake_read::search::warm_backlog(),
+    }))
+    .into_response();
     crate::no_store(resp.headers_mut());
     Ok(resp)
 }
