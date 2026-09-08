@@ -3173,6 +3173,7 @@ dependencies = [
  "kittiwake-cache",
  "kittiwake-types",
  "metrics",
+ "metrics-exporter-prometheus",
  "moka",
  "reqwest",
  "serde",

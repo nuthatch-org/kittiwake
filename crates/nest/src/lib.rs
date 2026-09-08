@@ -299,6 +299,13 @@ impl NestGate {
         let mut cron_permits = HashMap::new();
         for n in NestId::ALL {
             let p = cfg.permits_for(n);
+            // Registered here rather than on first use. A counter that springs into existence only
+            // once it is non-zero makes "nothing was refused" and "never wired up" the same absent
+            // line, and absence reads as health. The gauge puts the cap beside the refusals so the
+            // number can be judged without reading the config on the box.
+            metrics::counter!("nest_busy_total", "nest" => n.as_str()).increment(0);
+            metrics::counter!("nest_query_total", "nest" => n.as_str()).increment(0);
+            metrics::gauge!("nest_permits", "nest" => n.as_str()).set(p as f64);
             permits.insert(n, Arc::new(Semaphore::new(p)));
             cron_permits.insert(n, Arc::new(Semaphore::new(p.saturating_sub(1).max(1))));
         }
@@ -798,5 +805,40 @@ mod tests {
             .await
             .expect("archive is not an outage");
         assert!(body.stalled);
+    }
+}
+
+#[cfg(test)]
+mod metric_tests {
+    use super::*;
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    /// #6 asked whether `nest_busy_total` had gone to zero after the cutover, and the honest
+    /// answer from outside was that nobody could tell: the counter did not exist until something
+    /// refused, so a healthy service and an unwired one scraped identically. A local recorder
+    /// rather than the global one, so this does not depend on test ordering.
+    #[test]
+    fn every_nest_reports_a_zero_before_anything_has_been_refused() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            NestGate::new(NestConfig::new("http://nest.invalid")).unwrap();
+        });
+
+        let rendered = handle.render();
+        for n in NestId::ALL {
+            for metric in ["nest_busy_total", "nest_query_total", "nest_permits"] {
+                let line = format!("{metric}{{nest=\"{}\"}}", n.as_str());
+                assert!(
+                    rendered.contains(&line),
+                    "{line} is missing, so its absence would read as health:\n{rendered}"
+                );
+            }
+        }
+        // The cap the gate was built with, visible without reading the box's config.
+        assert!(
+            rendered.contains("nest_permits{nest=\"alloc\"} 4"),
+            "{rendered}"
+        );
     }
 }
