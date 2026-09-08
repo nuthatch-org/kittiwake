@@ -751,17 +751,22 @@ pub async fn price(
     budget!(st, peer, headers);
     let read = st
         .read
-        .cached_external("price", std::time::Duration::from_secs(60), kittiwake_types::ServedFrom::Chain, {
-            let ext = st.ext.clone();
-            std::sync::Arc::new(move || {
-                let ext = ext.clone();
-                Box::pin(async move {
-                    let (usd, change) = ext.grt_price().await?;
-                    // `price`, not `usd`: the callers were written against the incumbent.
-                    Ok(serde_json::json!({ "price": usd, "change24h": change }))
+        .cached_external(
+            "price",
+            std::time::Duration::from_secs(60),
+            kittiwake_types::ServedFrom::Chain,
+            {
+                let ext = st.ext.clone();
+                std::sync::Arc::new(move || {
+                    let ext = ext.clone();
+                    Box::pin(async move {
+                        let (usd, change) = ext.grt_price().await?;
+                        // `price`, not `usd`: the callers were written against the incumbent.
+                        Ok(serde_json::json!({ "price": usd, "change24h": change }))
+                    })
                 })
-            })
-        })
+            },
+        )
         .await?;
     Ok(envelope_root(read))
 }
@@ -775,16 +780,21 @@ pub async fn tvl(
     budget!(st, peer, headers);
     let read = st
         .read
-        .cached_external("tvl", std::time::Duration::from_secs(600), kittiwake_types::ServedFrom::Chain, {
-            let ext = st.ext.clone();
-            std::sync::Arc::new(move || {
-                let ext = ext.clone();
-                Box::pin(async move {
-                    let tvl = ext.arbitrum_tvl().await?;
-                    Ok(serde_json::json!({ "tvl": tvl }))
+        .cached_external(
+            "tvl",
+            std::time::Duration::from_secs(600),
+            kittiwake_types::ServedFrom::Chain,
+            {
+                let ext = st.ext.clone();
+                std::sync::Arc::new(move || {
+                    let ext = ext.clone();
+                    Box::pin(async move {
+                        let tvl = ext.arbitrum_tvl().await?;
+                        Ok(serde_json::json!({ "tvl": tvl }))
+                    })
                 })
-            })
-        })
+            },
+        )
         .await?;
     Ok(envelope_root(read))
 }
@@ -817,36 +827,42 @@ pub async fn reo(
     let route_key = format!("reo:{address}");
     let read = st
         .read
-        .cached_external_keyed("reo", &route_key, std::time::Duration::from_secs(300), kittiwake_types::ServedFrom::Chain, {
-            std::sync::Arc::new(move || {
-                let chain = chain.clone();
-                let address = address.clone();
-                Box::pin(async move {
-                    let e = chain.eligibility(&address).await?;
-                    // Under `status`, in the vocabulary the panel reads. `daysRemaining` is a
-                    // float because a partial day is the useful part of the answer.
-                    let expires_at = match (e.renewed_at, e.period_seconds) {
-                        (Some(r), Some(p)) if r > 0 => serde_json::json!(r + p),
-                        _ => serde_json::Value::Null,
-                    };
-                    Ok(serde_json::json!({ "status": {
-                        "address": address,
-                        "available": true,
-                        "isEligible": e.eligible,
-                        "status": if e.eligible { "eligible" } else { "ineligible" },
-                        "source": "oracle",
-                        "renewalTimestamp": e.renewed_at,
-                        "eligibilityPeriod": e.period_seconds,
-                        "expiresAt": expires_at,
-                        "daysRemaining": e.expires_in.map(|s| s as f64 / 86_400.0),
-                        // Ours to add: the oracle's own currency, which the incumbent cannot say.
-                        "oracleUpdatedAt": e.oracle_updated_at,
-                        "oracleStale": e.oracle_stale,
-                        "enforced": e.enforced,
-                    }}))
+        .cached_external_keyed(
+            "reo",
+            &route_key,
+            std::time::Duration::from_secs(300),
+            kittiwake_types::ServedFrom::Chain,
+            {
+                std::sync::Arc::new(move || {
+                    let chain = chain.clone();
+                    let address = address.clone();
+                    Box::pin(async move {
+                        let e = chain.eligibility(&address).await?;
+                        // Under `status`, in the vocabulary the panel reads. `daysRemaining` is a
+                        // float because a partial day is the useful part of the answer.
+                        let expires_at = match (e.renewed_at, e.period_seconds) {
+                            (Some(r), Some(p)) if r > 0 => serde_json::json!(r + p),
+                            _ => serde_json::Value::Null,
+                        };
+                        Ok(serde_json::json!({ "status": {
+                            "address": address,
+                            "available": true,
+                            "isEligible": e.eligible,
+                            "status": if e.eligible { "eligible" } else { "ineligible" },
+                            "source": "oracle",
+                            "renewalTimestamp": e.renewed_at,
+                            "eligibilityPeriod": e.period_seconds,
+                            "expiresAt": expires_at,
+                            "daysRemaining": e.expires_in.map(|s| s as f64 / 86_400.0),
+                            // Ours to add: the oracle's own currency, which the incumbent cannot say.
+                            "oracleUpdatedAt": e.oracle_updated_at,
+                            "oracleStale": e.oracle_stale,
+                            "enforced": e.enforced,
+                        }}))
+                    })
                 })
-            })
-        })
+            },
+        )
         .await?;
     Ok(envelope_root(read))
 }
