@@ -306,16 +306,24 @@ pub async fn delegation_exchange_rates(
 /// Two sources with nothing in common but a timestamp: delegations in and out, and the cuts the
 /// indexer set. Both move a delegator's return and neither explains the other, which is the point
 /// of showing them on one timeline.
+/// Nullability mirrors lodestar's `scripts/schema.sql`, which owns these tables: a tuple that
+/// asserts more than the DDL does fails at decode time, in production, as #24 did.
+///
 /// `(event_type, delegator, tokens_grt, timestamp)`
 pub type DelegationEventRow = (
-    String,
+    Option<String>,
     Option<String>,
     Option<f64>,
-    chrono::DateTime<chrono::Utc>,
+    Option<chrono::DateTime<chrono::Utc>>,
 );
 
 /// `(param_name, old_value, new_value, created_at)`
-pub type ParameterChangeRow = (String, Option<i64>, i64, chrono::DateTime<chrono::Utc>);
+pub type ParameterChangeRow = (
+    String,
+    Option<f64>,
+    Option<f64>,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
 
 pub struct ProvenanceRows {
     pub delegations: Vec<DelegationEventRow>,
@@ -335,7 +343,7 @@ pub async fn provenance_rows(pool: &Pool, indexer: &str) -> Result<ProvenanceRow
     // epochs and the trail should show it once.
     let params = sqlx::query_as(
         "SELECT DISTINCT ON (param_name, old_value, new_value, epoch) \
-           param_name, old_value, new_value, created_at \
+           param_name, old_value::float8, new_value::float8, created_at \
          FROM parameter_changes WHERE indexer_address = $1 \
          ORDER BY param_name, old_value, new_value, epoch, created_at DESC",
     )

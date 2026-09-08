@@ -306,31 +306,45 @@ pub async fn apr_provenance(
         grt("delegated_thawing_tokens"),
     );
 
+    // An event the platform recorded without a timestamp cannot be placed on a timeline, so it is
+    // dropped rather than dated to now.
+    let mut trail = None;
     let events = match st.pool.as_ref() {
         Some(pool) => match kittiwake_db::provenance_rows(pool, &a).await {
             Ok(rows) => kittiwake_read::shape::provenance_events(
                 &rows
                     .delegations
                     .into_iter()
-                    .map(|(t, d, g, ts)| (t, d, g, ts.to_rfc3339()))
+                    .filter_map(|(t, d, g, ts)| Some((t?, d, g, ts?.to_rfc3339())))
                     .collect::<Vec<_>>(),
                 &rows
                     .params
                     .into_iter()
-                    .map(|(n, o, v, ts)| (n, o, v, ts.to_rfc3339()))
+                    .filter_map(|(n, o, v, ts)| Some((n, o, v, ts?.to_rfc3339())))
                     .collect::<Vec<_>>(),
             ),
             Err(e) => {
                 tracing::warn!(err = %e, "apr provenance trail unavailable");
+                trail = Some("unavailable");
                 serde_json::json!([])
             }
         },
-        None => serde_json::json!([]),
+        None => {
+            trail = Some("no-database");
+            serde_json::json!([])
+        }
     };
+
+    // A trail that could not be read is still an empty array, because lodestar's contract check
+    // asserts `data.events` is one; the reason it is empty goes in the parity-ignored provenance.
+    let mut provenance = serde_json::to_value(&read.meta).unwrap_or(serde_json::Value::Null);
+    if let (Some(why), Some(obj)) = (trail, provenance.as_object_mut()) {
+        obj.insert("trail".into(), serde_json::json!(why));
+    }
 
     let mut resp = axum::Json(serde_json::json!({
         "data": { "reconcile": reconcile, "events": events },
-        "provenance": &read.meta,
+        "provenance": provenance,
     }))
     .into_response();
     crate::no_store(resp.headers_mut());

@@ -2599,7 +2599,7 @@ mod rewards_history_tests {
 /// unchanged cut would otherwise appear as an event every epoch for ever.
 pub fn provenance_events(
     delegations: &[(String, Option<String>, Option<f64>, String)],
-    params: &[(String, Option<i64>, i64, String)],
+    params: &[(String, Option<f64>, Option<f64>, String)],
 ) -> Value {
     let mut events: Vec<(String, Value)> = Vec::new();
 
@@ -2629,7 +2629,7 @@ pub fn provenance_events(
             "query_fee_cut" => "query_fee_cut",
             _ => continue,
         };
-        if *old == Some(*new) {
+        if old == new {
             continue;
         }
         events.push((
@@ -2637,8 +2637,8 @@ pub fn provenance_events(
             json!({
                 "kind": kind,
                 "timestamp": ts,
-                "oldValue": old,
-                "newValue": new,
+                "oldValue": old.map(num),
+                "newValue": new.map(num),
             }),
         ));
     }
@@ -2699,8 +2699,8 @@ mod provenance_tests {
             )],
             &[(
                 "reward_cut".into(),
-                Some(100_000),
-                200_000,
+                Some(100_000.0),
+                Some(200_000.0),
                 "2026-09-05T00:00:00Z".into(),
             )],
         );
@@ -2719,19 +2719,49 @@ mod provenance_tests {
             &[],
             &[(
                 "reward_cut".into(),
-                Some(100_000),
-                100_000,
+                Some(100_000.0),
+                Some(100_000.0),
                 "2026-09-05T00:00:00Z".into(),
             )],
         );
         assert_eq!(out.as_array().unwrap().len(), 0);
     }
 
+    /// `new_value` is nullable in the platform's schema, so a cut set to nothing is a real row.
+    /// Two nulls are not a change, by the same rule that two equal numbers are not.
+    #[test]
+    fn a_null_value_is_a_change_but_two_nulls_are_not() {
+        let to_null = provenance_events(
+            &[],
+            &[(
+                "reward_cut".into(),
+                Some(100_000.0),
+                None,
+                "2026-09-05T00:00:00Z".into(),
+            )],
+        );
+        let e = to_null.as_array().unwrap();
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0]["oldValue"], json!(100_000.0));
+        assert_eq!(e[0]["newValue"], json!(null));
+
+        let both_null = provenance_events(
+            &[],
+            &[(
+                "reward_cut".into(),
+                None,
+                None,
+                "2026-09-05T00:00:00Z".into(),
+            )],
+        );
+        assert_eq!(both_null.as_array().unwrap().len(), 0);
+    }
+
     #[test]
     fn an_unknown_kind_is_dropped_rather_than_guessed() {
         let out = provenance_events(
             &[("something_else".into(), None, None, "2026-09-01".into())],
-            &[("cooldown".into(), None, 1, "2026-09-01".into())],
+            &[("cooldown".into(), None, Some(1.0), "2026-09-01".into())],
         );
         assert_eq!(out.as_array().unwrap().len(), 0);
     }
