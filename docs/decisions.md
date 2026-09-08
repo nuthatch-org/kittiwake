@@ -8,6 +8,34 @@ Newest first.
 
 ---
 
+## 2026-09-08: the TAP signing key comes to the box, under a fixed GRT ceiling
+
+`tap-provision` reads claimed bounties, checks `PaymentsEscrow.getBalance` and **deposits GRT**
+where the balance is under 1 GRT, using `TAP_SIGNER_PRIVATE_KEY`. It was held out of the migration
+because that is a custody question rather than a port (#11). The answer is yes: the key comes to
+Nuremberg and this service signs.
+
+**The ceiling is 1,000 GRT a month, with a 50 GRT daily burst limit.** The monthly figure is the
+budget - $20 at $0.0194967, the price `/api/price` served on 2026-09-08. The daily figure is not a
+thirtieth of it; it is there to stop a bad `getBalance` read spending the month in an afternoon. A
+per-run cap wants the deposit size and the run cadence, which are still in the Node implementation.
+
+**The ceiling is denominated in GRT, and nothing may recompute it from a live price.** A cap of
+"$20" enforced against a feed widens exactly when the feed reads low, which is the failure it
+exists to prevent. The feed in question was reporting `stale: true` at the moment this was written.
+When the price moves enough to matter, a human edits the number here and the reasoning above it
+stays visible.
+
+The key loads through systemd `LoadCredential=` rather than the `EnvironmentFile=` the rest of the
+config uses. That is a second mechanism for one value, and worth it: an environment variable is
+readable from `/proc/<pid>/environ` and is inherited by every child, in a process that also serves
+two public HTTP surfaces.
+
+**This unparks `indexing-status`.** The 2026-09-07 entry below holds it on Next because its serving
+probe signs TAP receipts against funded escrow, "the same custody question as `tap-provision` (#11)
+in different clothes". That question is now answered, so the route is portable and belongs in #23
+rather than in this file as an exception.
+
 ## 2026-09-07: the rewrite list and the parity table must be one thing
 
 **The failure.** Thirty-six routes moved to this service. Eight of them shipped with the wrong
@@ -46,6 +74,8 @@ run is ~170 requests from one address against a 120-a-minute limit and it was tr
 it helped build.
 
 ## 2026-09-07: `indexing-status` stays on Next
+
+> **Superseded 2026-09-08.** The custody question was answered yes; see the entry at the top.
 
 The other seven broken ports were finished the same day. This one was not, deliberately.
 

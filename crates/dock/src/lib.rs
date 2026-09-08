@@ -262,6 +262,49 @@ mod session_tests {
         );
     }
 
+    /// The fixtures above are synthetic, so nothing here has yet met the live secret. This one
+    /// does, and is skipped unless both variables are set: a production cookie must not enter the
+    /// repository.
+    ///
+    ///     DOCK_SESSION_SECRET=... DOCK_SESSION_TOKEN=... \
+    ///       cargo test -p kittiwake-dock a_production_cookie -- --nocapture
+    #[test]
+    fn a_production_cookie_validates_against_the_production_secret() {
+        let (Ok(raw), Ok(token)) = (
+            std::env::var("DOCK_SESSION_SECRET"),
+            std::env::var("DOCK_SESSION_TOKEN"),
+        ) else {
+            eprintln!("skipped: set DOCK_SESSION_SECRET and DOCK_SESSION_TOKEN");
+            return;
+        };
+
+        let secret = Secret::new(&raw).expect("the production secret is shorter than 32 bytes");
+        let (payload, _) = token
+            .rsplit_once(':')
+            .expect("token is not address:issued_at:sig");
+        let (address, issued) = payload
+            .rsplit_once(':')
+            .expect("token is not address:issued_at:sig");
+        let issued_at: i64 = issued
+            .parse()
+            .expect("the token's timestamp is not a number");
+
+        // The clock is taken from the token so this tests the signature rather than how long ago
+        // the cookie happened to be captured.
+        assert_eq!(
+            parse_session(&secret, &token, issued_at + 1),
+            Ok(address.to_string())
+        );
+
+        let mut tampered = token.clone();
+        let last = tampered.pop().unwrap();
+        tampered.push(if last == 'a' { 'b' } else { 'a' });
+        assert_eq!(
+            parse_session(&secret, &tampered, issued_at + 1),
+            Err(SessionError::BadSignature)
+        );
+    }
+
     #[test]
     fn a_session_expires_after_seven_days_and_not_before() {
         let just_inside = 1_757_000_000 + SESSION_TTL_SECS;
