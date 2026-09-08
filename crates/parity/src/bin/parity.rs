@@ -74,6 +74,11 @@ fn routes() -> Vec<Route> {
         both(&format!("/api/indexing-status/{D}")),
         both(&format!("/api/subgraph-curation/{D}")),
         both(&format!("/api/subgraph-history/{D}")),
+        // A fourth, and the same lesson a second time. `/api/poi` was in this table only in its
+        // overview form, so nothing compared the `?deployment=` form, and it shipped answering the
+        // overview shape with no `epochs` while `/poi/[deployment]` threw on `epochs.reduce`
+        // (kittiwake#27). A route with two shapes needs a row per shape.
+        both(&format!("/api/poi?deployment={D}")),
         both("/api/chain-lag"),
         both("/api/dropped-chains"),
         both("/api/price"),
