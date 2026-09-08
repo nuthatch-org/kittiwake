@@ -37,7 +37,11 @@ pub async fn refresh(
     now: i64,
 ) -> Result<Ingested, IngestError> {
     let week_ago = now - 7 * 86_400;
+    // Ninety days, not thirty. `rolling_apy` filters to its own window, so the wider fetch still
+    // gives a correct 30-day figure; fetching thirty and dividing by a ninety-day year understates
+    // it threefold, which is worse than the dash it would replace.
     let month_ago = now - 30 * 86_400;
+    let quarter_ago = now - 90 * 86_400;
 
     // Six reads. Each is coalesced on its own statement by the gate, and all of them draw from the
     // background lane, so a page view never waits behind this job.
@@ -84,7 +88,7 @@ pub async fn refresh(
     let closed = page(
         gate,
         NestId::Alloc,
-        sql::closed_allocations_since_sql(month_ago),
+        sql::closed_allocations_since_sql(quarter_ago),
         lane,
         "closed allocations",
     )
@@ -95,6 +99,25 @@ pub async fn refresh(
         sql::DATA_SERVICE_COUNTS_SQL.into(),
         lane,
         "data services",
+    )
+    .await?;
+    // The pool's exchange rate as it stood a month and a quarter ago, summed from the ledger. This
+    // is the primary APY source and the closed-allocation figure is the fallback, which is the
+    // order the handler being replaced used.
+    let rates_30 = page(
+        gate,
+        NestId::Alloc,
+        sql::exchange_rates_as_of_sql(month_ago),
+        lane,
+        "exchange rates 30d",
+    )
+    .await?;
+    let rates_90 = page(
+        gate,
+        NestId::Alloc,
+        sql::exchange_rates_as_of_sql(quarter_ago),
+        lane,
+        "exchange rates 90d",
     )
     .await?;
 
@@ -170,6 +193,21 @@ pub async fn refresh(
 
     // The oracle, when a chain is configured. Without one, every indexer scores the neutral 50 on
     // the largest-weighted dimension, which is honest: we did not check.
+    // The ledger's pool figure already excludes thawing, so the thawing argument is zero here and
+    // not in the current-rate call below.
+    let rates_at = |rows: &[serde_json::Value]| -> HashMap<String, f64> {
+        rows.iter()
+            .filter_map(|r| {
+                let id = s(r, "indexer")?.to_lowercase();
+                let rate =
+                    rw::pool_exchange_rate(grt(s(r, "pool_tokens")), 0.0, grt(s(r, "pool_shares")));
+                (rate > 0.0).then_some((id, rate))
+            })
+            .collect()
+    };
+    let rate_30 = rates_at(&rates_30.rows);
+    let rate_90 = rates_at(&rates_90.rows);
+
     let ids: Vec<String> = indexers.rows.iter().filter_map(|r| s(r, "id")).collect();
     let (eligibility, oracle) = match chain {
         Some(c) => {
@@ -188,6 +226,7 @@ pub async fn refresh(
     let _ = oracle;
 
     let mut rows = Vec::with_capacity(indexers.rows.len());
+    let mut apys: Vec<(String, Option<f64>, Option<f64>)> = Vec::with_capacity(indexers.rows.len());
     for r in &indexers.rows {
         let Some(id) = s(r, "id").map(|v| v.to_lowercase()) else {
             continue;
@@ -225,10 +264,25 @@ pub async fn refresh(
             delegated_ratio,
         );
 
-        let rolling = closed_by_indexer
-            .get(&id)
-            .map(|c| rw::rolling_apy(c, delegated, 30.0, now))
-            .filter(|v| *v > 0.0);
+        // Growth of the pool's exchange rate first, closed allocations as the fallback. That is
+        // the order the handler being replaced used, and the two measure different things: the
+        // first is what a share actually gained, the second what was paid out.
+        let current_rate = rw::pool_exchange_rate(delegated, thawing, shares);
+        let apy = |window: f64, historical: &HashMap<String, f64>| -> Option<f64> {
+            historical
+                .get(&id)
+                .map(|h| rw::exchange_rate_apy(current_rate, *h, window))
+                .filter(|v| *v > 0.0)
+                .or_else(|| {
+                    closed_by_indexer
+                        .get(&id)
+                        .map(|c| rw::rolling_apy(c, delegated, window, now))
+                        .filter(|v| *v > 0.0)
+                })
+        };
+        let rolling = apy(30.0, &rate_30);
+        let rolling_90 = apy(90.0, &rate_90);
+        apys.push((id.clone(), rolling, rolling_90));
 
         let (delegations_7d, undelegations_7d, net_flow) =
             flow_by_indexer.get(&id).copied().unwrap_or((0, 0, 0.0));
@@ -290,7 +344,7 @@ pub async fn refresh(
             rewards_earned: grt(s(r, "rewards_earned")),
             query_fees: grt(s(r, "query_fees_collected")),
             allocation_count: i(r, "allocation_count").unwrap_or(0),
-            exchange_rate: rw::pool_exchange_rate(delegated, thawing, shares),
+            exchange_rate: current_rate,
             data_services: services_by_indexer.get(&id).copied().unwrap_or(0),
             reo_status: match reo {
                 sc::Reo::Eligible => "eligible",
@@ -301,6 +355,7 @@ pub async fn refresh(
     }
 
     write_rows(pool, &rows).await?;
+    kittiwake_db::write_rolling_apy(pool, &apys).await?;
     crate::state::touch(pool, "indexers").await?;
     Ok(Ingested {
         rows: rows.len() as u64,

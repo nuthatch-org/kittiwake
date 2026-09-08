@@ -72,6 +72,50 @@ pub async fn record_cron_run(
     Ok(())
 }
 
+/// Where the two rolling APYs live.
+///
+/// Ours, not the platform's: `indexers` is lodestar's table and this service only reads it, so a
+/// column there would be a schema change in another repository (#31). A side table joined on read
+/// costs one join and stays reversible.
+pub async fn ensure_rolling_apy_table(pool: &Pool) -> Result<(), DbError> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS indexer_rolling_apy ( \
+           indexer_address TEXT PRIMARY KEY, \
+           rolling_apy_30d NUMERIC, \
+           rolling_apy_90d NUMERIC, \
+           computed_at TIMESTAMPTZ NOT NULL )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Replace every indexer's pair. Written by the refresh job in the same pass that writes the
+/// directory row, so the two cannot drift by more than one run.
+pub async fn write_rolling_apy(
+    pool: &Pool,
+    rows: &[(String, Option<f64>, Option<f64>)],
+) -> Result<u64, DbError> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let done = sqlx::query(
+        "INSERT INTO indexer_rolling_apy (indexer_address, rolling_apy_30d, rolling_apy_90d, computed_at) \
+         SELECT * FROM UNNEST($1::text[], $2::float8[], $3::float8[]) AS t, LATERAL (SELECT NOW()) AS n(now) \
+         ON CONFLICT (indexer_address) DO UPDATE SET \
+         rolling_apy_30d = EXCLUDED.rolling_apy_30d, \
+         rolling_apy_90d = EXCLUDED.rolling_apy_90d, \
+         computed_at = NOW()",
+    )
+    .bind(rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|r| r.1).collect::<Vec<_>>())
+    .bind(rows.iter().map(|r| r.2).collect::<Vec<_>>())
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(done)
+}
+
 /// The indexer every directory read leaves out.
 ///
 /// Defined here rather than beside the nest SQL because both readers need it and only one of them
@@ -82,7 +126,7 @@ pub const INDEXERS_EXCLUDED: &str = "0xb43b2cccceada5292732a8c58ae134adefce09bb"
 ///
 /// Numerics are read as text on purpose: `NUMERIC` holds values an `f64` does not, and a balance
 /// that is subtly wrong on the way out is no better than one that was wrong going in.
-#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+#[derive(Debug, Clone, Default, sqlx::FromRow, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnrichedIndexer {
     pub address: String,
@@ -103,6 +147,8 @@ pub struct EnrichedIndexer {
     pub net_flow_grt_7d: Option<String>,
     pub query_fees_collected_grt: Option<String>,
     pub rewards_earned_grt: Option<String>,
+    pub rolling_apy_30d: Option<String>,
+    pub rolling_apy_90d: Option<String>,
     pub distinct_data_services: Option<i32>,
     pub reo_status: Option<String>,
     pub last_updated: Option<chrono::DateTime<chrono::Utc>>,
@@ -114,9 +160,11 @@ pub const ENRICHED_INDEXERS_SQL: &str = "SELECT address, url, geo_hash, self_sta
          allocated_grt::text, reward_cut::text, effective_cut::text, delegator_apr::text, \
          delegation_capacity_pct::text, score::text, score_grade, allocation_count, \
          delegations_in_7d, undelegations_in_7d, net_flow_grt_7d::text, distinct_data_services, \
-         reo_status, last_updated, query_fees_collected_grt::text, rewards_earned_grt::text \
-         FROM indexers WHERE address <> $2 \
-         ORDER BY score DESC NULLS LAST, self_stake_grt DESC LIMIT $1";
+         reo_status, last_updated, query_fees_collected_grt::text, rewards_earned_grt::text, \
+         a.rolling_apy_30d::text, a.rolling_apy_90d::text \
+         FROM indexers i LEFT JOIN indexer_rolling_apy a ON a.indexer_address = i.address \
+         WHERE i.address <> $2 \
+         ORDER BY i.score DESC NULLS LAST, i.self_stake_grt DESC LIMIT $1";
 
 /// The directory rows the refresh job writes, read back for `/api/indexers-enriched`.
 pub async fn enriched_indexers(pool: &Pool, limit: i64) -> Result<Vec<EnrichedIndexer>, DbError> {
@@ -395,11 +443,30 @@ mod directory_tests {
     #[test]
     fn the_directory_read_excludes_the_blocked_indexer() {
         assert!(
-            ENRICHED_INDEXERS_SQL.contains("WHERE address <> $2"),
+            ENRICHED_INDEXERS_SQL.contains("WHERE i.address <> $2"),
             "{ENRICHED_INDEXERS_SQL}"
         );
         assert_eq!(INDEXERS_EXCLUDED.len(), 42);
         assert!(INDEXERS_EXCLUDED.starts_with("0x"));
+    }
+
+    /// The names lodestar destructures off the wire. A rename here is a breaking change there and
+    /// nothing else in this repository would notice: `enriched-normalise.ts` reads these exact
+    /// keys, and the cutover already proved that a silent rename renders a table of dashes.
+    #[test]
+    fn the_row_serialises_under_the_names_the_frontend_reads() {
+        let v = serde_json::to_value(EnrichedIndexer::default()).unwrap();
+        for key in [
+            "address",
+            "selfStakeGrt",
+            "netFlowGrt7d",
+            "queryFeesCollectedGrt",
+            "rewardsEarnedGrt",
+            "rollingApy30d",
+            "rollingApy90d",
+        ] {
+            assert!(v.get(key).is_some(), "{key} is not on the wire: {v}");
+        }
     }
 
     /// The refresh job writes these and this read did not ask for them, which is the whole of why
@@ -411,6 +478,8 @@ mod directory_tests {
             "rewards_earned_grt",
             "net_flow_grt_7d",
             "delegation_capacity_pct",
+            "rolling_apy_30d",
+            "rolling_apy_90d",
         ] {
             assert!(
                 ENRICHED_INDEXERS_SQL.contains(column),
