@@ -688,7 +688,10 @@ fn poi_epoch_group(epoch: i64, allocs: &[&Value]) -> Value {
         .map(|a| {
             let poi = poi_of(a);
             let zero = is_zero_poi(&poi);
-            let addr = a.get("indexer").and_then(|v| v.as_str()).unwrap_or_default();
+            let addr = a
+                .get("indexer")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
             json!({
                 "indexer": addr,
                 "name": short_addr(addr),
@@ -1586,10 +1589,20 @@ mod tests {
         let rows = vec![alloc("0xtruth", "0xa", "1000000000000000000", 5)];
         let out = poi_deployment_detail(&rows).expect("one proved allocation is a detail page");
 
-        for key in ["deploymentId", "ipfsHash", "signal", "stake", "totalAllocations", "epochs"] {
+        for key in [
+            "deploymentId",
+            "ipfsHash",
+            "signal",
+            "stake",
+            "totalAllocations",
+            "epochs",
+        ] {
             assert!(!out[key].is_null(), "the page destructures {key}");
         }
-        assert!(out["epochs"].is_array(), "epochs is what the page reduces over");
+        assert!(
+            out["epochs"].is_array(),
+            "epochs is what the page reduces over"
+        );
         assert!(
             out.get("deployments").is_none() && out.get("summary").is_none(),
             "this is not the overview wearing a filter"
