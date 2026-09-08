@@ -46,6 +46,13 @@ fn routes() -> Vec<Route> {
         both("/api/network-stats"),
         both("/api/epochs?count=5"),
         both("/api/indexers?first=10"),
+        // Excused from value comparison, not from shape: both sides read the same table,
+        // but the envelope and the field names are ours. See `Excused::ValuesOnly`.
+        Route {
+            path: "/api/indexers-enriched",
+            incumbent_at: "/indexers",
+            ours_at: "/data",
+        },
         both("/api/curators?first=10"),
         both("/api/token-metrics?count=5"),
         Route {
@@ -547,7 +554,7 @@ fn compared_paths() -> Vec<String> {
 #[cfg(test)]
 mod coverage {
     use super::compared_paths;
-    use kittiwake_parity::coverage::{UNCHECKED, served_paths};
+    use kittiwake_parity::coverage::{Excused, UNCHECKED, served_paths};
 
     /// **The check that was missing.** Every route the edge serves is either compared here or
     /// excused in writing. On 2026-09-07 three deployment routes went into the production rewrite
@@ -557,7 +564,11 @@ mod coverage {
     #[test]
     fn every_route_the_edge_serves_is_compared_or_excused() {
         let compared = compared_paths();
-        let excused: Vec<&str> = UNCHECKED.iter().map(|(p, _)| *p).collect();
+        let excused: Vec<&str> = UNCHECKED
+            .iter()
+            .filter(|(_, how, _)| *how == Excused::Entirely)
+            .map(|(p, _, _)| *p)
+            .collect();
 
         let mut unchecked = Vec::new();
         for path in served_paths() {
@@ -575,6 +586,26 @@ mod coverage {
             unchecked.is_empty(),
             "these routes are served but never compared, and nothing would notice if they broke:\n  {}\n\nAdd them to `routes()`, or to `UNCHECKED` with the reason.",
             unchecked.join("\n  ")
+        );
+    }
+
+    /// The other half of the same rule, and the one that was missing. An exclusion argued on data
+    /// grounds excuses the values and not the shape, so the route must still be in the table.
+    /// Without this the enum is a comment, and a comment is what was there on 2026-09-07.
+    #[test]
+    fn a_route_excused_only_its_values_is_still_compared_for_shape() {
+        let compared = compared_paths();
+        let missing: Vec<&str> = UNCHECKED
+            .iter()
+            .filter(|(_, how, _)| *how == Excused::ValuesOnly)
+            .map(|(p, _, _)| *p)
+            .filter(|p| !compared.contains(&p.to_string()))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "excused from comparing values, and then not compared at all:\n  {}\n\nAdd them to `routes()`, or mark them `Excused::Entirely` and say why.",
+            missing.join("\n  ")
         );
     }
 }
