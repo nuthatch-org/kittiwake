@@ -72,6 +72,12 @@ pub async fn record_cron_run(
     Ok(())
 }
 
+/// The indexer every directory read leaves out.
+///
+/// Defined here rather than beside the nest SQL because both readers need it and only one of them
+/// had it: `/api/indexers` filtered this address while `/api/indexers-enriched` served it.
+pub const INDEXERS_EXCLUDED: &str = "0xb43b2cccceada5292732a8c58ae134adefce09bb";
+
 /// One row of the directory, as the refresh job left it.
 ///
 /// Numerics are read as text on purpose: `NUMERIC` holds values an `f64` does not, and a balance
@@ -95,24 +101,30 @@ pub struct EnrichedIndexer {
     pub delegations_in_7d: Option<i32>,
     pub undelegations_in_7d: Option<i32>,
     pub net_flow_grt_7d: Option<String>,
+    pub query_fees_collected_grt: Option<String>,
+    pub rewards_earned_grt: Option<String>,
     pub distinct_data_services: Option<i32>,
     pub reo_status: Option<String>,
     pub last_updated: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// The directory rows the refresh job writes, read back for `/api/indexers-enriched`.
-pub async fn enriched_indexers(pool: &Pool, limit: i64) -> Result<Vec<EnrichedIndexer>, DbError> {
-    let rows = sqlx::query_as::<_, EnrichedIndexer>(
-        "SELECT address, url, geo_hash, self_stake_grt::text, delegated_grt::text, \
+/// The directory read. Held as a constant so the exclusion below can be asserted without a
+/// database: it was missing here for the whole of the cutover while `/api/indexers` had it.
+pub const ENRICHED_INDEXERS_SQL: &str = "SELECT address, url, geo_hash, self_stake_grt::text, delegated_grt::text, \
          allocated_grt::text, reward_cut::text, effective_cut::text, delegator_apr::text, \
          delegation_capacity_pct::text, score::text, score_grade, allocation_count, \
          delegations_in_7d, undelegations_in_7d, net_flow_grt_7d::text, distinct_data_services, \
-         reo_status, last_updated \
-         FROM indexers ORDER BY score DESC NULLS LAST, self_stake_grt DESC LIMIT $1",
-    )
-    .bind(limit)
-    .fetch_all(pool)
-    .await?;
+         reo_status, last_updated, query_fees_collected_grt::text, rewards_earned_grt::text \
+         FROM indexers WHERE address <> $2 \
+         ORDER BY score DESC NULLS LAST, self_stake_grt DESC LIMIT $1";
+
+/// The directory rows the refresh job writes, read back for `/api/indexers-enriched`.
+pub async fn enriched_indexers(pool: &Pool, limit: i64) -> Result<Vec<EnrichedIndexer>, DbError> {
+    let rows = sqlx::query_as::<_, EnrichedIndexer>(ENRICHED_INDEXERS_SQL)
+        .bind(limit)
+        .bind(INDEXERS_EXCLUDED)
+        .fetch_all(pool)
+        .await?;
     Ok(rows)
 }
 
@@ -370,5 +382,40 @@ mod tests {
             format!("{CRON_RUN_PREFIX}refresh-chain-health"),
             "kittiwake:refresh-chain-health"
         );
+    }
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::*;
+
+    /// `/api/indexers` filtered this address and `/api/indexers-enriched` did not, so the enriched
+    /// directory served an indexer the dashboard deliberately hides. Both readers take the
+    /// constant from here now; this pins the clause that was missing.
+    #[test]
+    fn the_directory_read_excludes_the_blocked_indexer() {
+        assert!(
+            ENRICHED_INDEXERS_SQL.contains("WHERE address <> $2"),
+            "{ENRICHED_INDEXERS_SQL}"
+        );
+        assert_eq!(INDEXERS_EXCLUDED.len(), 42);
+        assert!(INDEXERS_EXCLUDED.starts_with("0x"));
+    }
+
+    /// The refresh job writes these and this read did not ask for them, which is the whole of why
+    /// Fees rendered as a dash on every row of the directory.
+    #[test]
+    fn the_columns_the_refresh_job_writes_are_actually_read_back() {
+        for column in [
+            "query_fees_collected_grt",
+            "rewards_earned_grt",
+            "net_flow_grt_7d",
+            "delegation_capacity_pct",
+        ] {
+            assert!(
+                ENRICHED_INDEXERS_SQL.contains(column),
+                "{column} is written by the refresh job and never selected"
+            );
+        }
     }
 }
