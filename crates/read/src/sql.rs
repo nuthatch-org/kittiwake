@@ -19,7 +19,7 @@ pub fn clamp(v: i64, lo: i64, hi: i64) -> i64 {
 
 /// Our own indexer, excluded from the public directory so the dashboard does not advertise its
 /// operator to its readers.
-pub const INDEXERS_EXCLUDED: &str = "0xb43b2cccceada5292732a8c58ae134adefce09bb";
+pub use kittiwake_db::INDEXERS_EXCLUDED;
 
 /// The columns a caller may sort the directory by, and the column each maps to. An allowlist
 /// rather than a passthrough, because this value lands in an ORDER BY.
