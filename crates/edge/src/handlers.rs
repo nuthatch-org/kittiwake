@@ -1039,15 +1039,40 @@ pub async fn subgraph_search(
     let pool = st
         .pool
         .as_ref()
-        .ok_or_else(|| ApiError::Unavailable("no database is configured".into()))?;
-    let hits = kittiwake_read::search::search(
-        pool,
-        &st.ipfs,
-        &st.read.gate,
-        kittiwake_nest::Lane::Read,
-        q.q.as_deref().unwrap_or(""),
-    )
-    .await?;
+        .ok_or_else(|| ApiError::Unavailable("no database is configured".into()))?
+        .clone();
+
+    // A name search costs ten nest queries across two nests to return ten rows, and a search box
+    // asks the same question on every keystroke and every back-button. The key is the trimmed,
+    // lowercased query, so it is caller-controlled; the store is a bounded LRU and the read budget
+    // already caps how fast anyone can mint keys.
+    let query = q.q.unwrap_or_default();
+    let key = query.trim().to_lowercase();
+    let (ipfs, gate) = (st.ipfs.clone(), st.read.gate.clone());
+    let read = st
+        .read
+        .cached_external_keyed(
+            "subgraph-search",
+            &key,
+            std::time::Duration::from_secs(60),
+            std::sync::Arc::new(move || {
+                let (pool, ipfs, gate, query) =
+                    (pool.clone(), ipfs.clone(), gate.clone(), query.clone());
+                Box::pin(async move {
+                    let hits = kittiwake_read::search::search(
+                        &pool,
+                        &ipfs,
+                        &gate,
+                        kittiwake_nest::Lane::Read,
+                        &query,
+                    )
+                    .await?;
+                    Ok(serde_json::json!(hits))
+                })
+            }),
+        )
+        .await?;
+    let hits = (*read.entry.value).clone();
     // Names live in IPFS documents somebody has to have fetched first, so an empty result can mean
     // "no such subgraph" or "not warmed yet", and only this figure separates them. Null until a
     // warm run has finished in this process.
@@ -1057,6 +1082,15 @@ pub async fn subgraph_search(
         "warmBacklog": kittiwake_read::search::warm_backlog(),
     }))
     .into_response();
+    // In a header rather than the body: the body is compared against the incumbent's and this is
+    // ours to say.
+    resp.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-kittiwake-served-from"),
+        axum::http::HeaderValue::from_static(match read.meta.served_from {
+            kittiwake_types::ServedFrom::Cache => "cache",
+            _ => "nest",
+        }),
+    );
     crate::no_store(resp.headers_mut());
     Ok(resp)
 }
