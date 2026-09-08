@@ -217,30 +217,51 @@ pub mod coverage {
     /// because axum does not expose them and a test that cannot see the truth is decoration.
     const ROUTER: &str = include_str!("../../edge/src/lib.rs");
 
+    /// How completely a route is excused.
+    ///
+    /// The distinction is the one that cost the dashboard a day on 2026-09-07. An exclusion argued
+    /// on **data** grounds does not reach the **shape**: the envelope and the field names are this
+    /// service's own choice whatever table the rows came from, and they are precisely what a
+    /// consumer destructures.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Excused {
+        /// Nothing to compare against, or the harness cannot make the request at all.
+        Entirely,
+        /// Values prove nothing, so only the shape is compared. A route excused this way must
+        /// still appear in the harness table, and a test below asserts it.
+        ValuesOnly,
+    }
+
     /// Routes the harness deliberately does not compare, each with the reason.
     ///
     /// Every entry here is a thing somebody chose. Empty would be better; a long list is a smell.
-    pub const UNCHECKED: &[(&str, &str)] = &[
+    pub const UNCHECKED: &[(&str, Excused, &str)] = &[
         (
             "/api/whoami",
+            Excused::Entirely,
             "a diagnostic that reports the caller's own address, so it has no incumbent to match",
         ),
         (
             "/api/sql/query",
+            Excused::Entirely,
             "POST with a body; the harness only issues GETs",
         ),
         (
             "/api/indexer-node-health",
+            Excused::Entirely,
             "probes a third party's endpoint, so the answer depends on that host rather than on us",
         ),
         (
             "/api/subgraph-names",
+            Excused::Entirely,
             "POST with a body; the harness only issues GETs",
         ),
         (
             "/api/indexers-enriched",
-            "reads rows the platform's own crons write, so both sides read the same table and a \
-             match proves nothing about this service",
+            Excused::ValuesOnly,
+            "reads rows the platform's own crons write, so both sides read the same table and \
+             matching values prove nothing about this service - but the envelope and the field \
+             names are ours, and a rename is what broke the dashboard on 2026-09-07",
         ),
     ];
 
@@ -300,10 +321,10 @@ mod coverage_tests {
 
     #[test]
     fn nothing_is_excused_twice_or_without_a_reason() {
-        for (path, why) in UNCHECKED {
+        for (path, _, why) in UNCHECKED {
             assert!(!why.trim().is_empty(), "{path} is excused without a reason");
             assert_eq!(
-                UNCHECKED.iter().filter(|(p, _)| p == path).count(),
+                UNCHECKED.iter().filter(|(p, _, _)| p == path).count(),
                 1,
                 "{path} is listed twice"
             );
@@ -315,7 +336,7 @@ mod coverage_tests {
     #[test]
     fn every_excuse_is_for_a_route_that_exists() {
         let served = served_paths();
-        for (path, _) in UNCHECKED {
+        for (path, _, _) in UNCHECKED {
             assert!(
                 served.contains(&path.to_string()),
                 "{path} is excused from comparison but the router does not serve it"
