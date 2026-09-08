@@ -844,15 +844,31 @@ pub async fn payments(ctx: &ReadCtx, receiver: Option<&str>) -> Result<Read, Api
 }
 
 /// `/api/poi`: which deployments the network agrees on, and which it does not.
+///
+/// **Two shapes, one route.** Without `deployment` this is the overview, `{ summary, deployments }`.
+/// With one it is that deployment's proof history, `{ deploymentId, ipfsHash, signal, stake,
+/// totalAllocations, uniqueIndexers, epochs }`, which is what `/poi/[deployment]` destructures.
+///
+/// The filter used to be applied to the SQL and then thrown at `poi_overview` regardless, so the
+/// detail form answered 200 with the overview shape, no `epochs`, and the page died on
+/// `detail.epochs.reduce(...)` (kittiwake#27).
 pub async fn poi(ctx: &ReadCtx, deployment: Option<&str>, first: i64) -> Result<Read, ApiError> {
     let sql = addr_or_400!(sql::poi_allocations_sql(deployment, first), "deployment id");
+    let detail = deployment.is_some();
     let inner = rows_only(NestId::Alloc, sql, T_FOLD);
     let fetch: Fetcher = Arc::new(move |gate, lane| {
         let inner = inner.clone();
         Box::pin(async move {
             let (v, p) = inner(gate, lane).await?;
             let rows = v.as_array().cloned().unwrap_or_default();
-            Ok((crate::shape::poi_overview(&rows), p))
+            let shaped = if detail {
+                // A deployment nobody has closed a proved allocation against is a 404, not an empty
+                // detail page pretending the deployment exists.
+                crate::shape::poi_deployment_detail(&rows).ok_or(ApiError::NotFound)?
+            } else {
+                crate::shape::poi_overview(&rows)
+            };
+            Ok((shaped, p))
         })
     });
 

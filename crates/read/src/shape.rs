@@ -614,6 +614,168 @@ pub fn indexer_detail(
 
 pub const ZERO_POI: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
+/// The nest returns some integer columns as JSON strings and others as numbers, in the same row.
+/// A bare `as_i64()` reads `"1374"` as absent, which collapsed every deployment into one empty
+/// epoch group and reported perfect consensus across the whole network.
+fn poi_int(v: &Value, key: &str) -> Option<i64> {
+    match v.get(key)? {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn is_zero_poi(poi: &str) -> bool {
+    poi == ZERO_POI
+}
+
+/// The nest carries no indexer metadata, so every name here is the shortened address. The TS side
+/// falls back to exactly this for any indexer without a display name, so the two agree.
+fn short_addr(addr: &str) -> String {
+    if addr.len() <= 10 {
+        return addr.to_string();
+    }
+    format!("{}...{}", &addr[..6], &addr[addr.len() - 4..])
+}
+
+/// One epoch's worth of proofs for a single deployment.
+///
+/// Consensus is the proof with the most stake behind it, and the percentage is stake-weighted for
+/// the same reason as in `poi_overview`. Two things are deliberately not the same:
+///
+/// **Zero POIs are kept.** An allocation closed without a proof is listed rather than dropped. It
+/// is neither consensus nor divergent - it abstained - but the detail page is where you go to find
+/// out that an indexer closed without proving anything, so hiding it there would defeat the page.
+///
+/// **Every epoch is grouped, not only the latest.** The overview reports a deployment's current
+/// verdict, so an old divergence that has since resolved would keep it flagged for ever. The detail
+/// page is the history, so it keeps them all.
+fn poi_epoch_group(epoch: i64, allocs: &[&Value]) -> Value {
+    use std::collections::BTreeMap;
+
+    let poi_of = |a: &Value| {
+        a.get("poi")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let real: Vec<&&Value> = allocs.iter().filter(|a| !is_zero_poi(&poi_of(a))).collect();
+    let zero_count = allocs.len() - real.len();
+
+    let mut stakes: BTreeMap<String, f64> = BTreeMap::new();
+    for a in &real {
+        *stakes.entry(poi_of(a)).or_insert(0.0) += grt(a, "allocated_tokens");
+    }
+
+    let consensus_poi = stakes
+        .iter()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(p, _)| p.clone());
+    let total_real_stake: f64 = stakes.values().sum();
+    let consensus_stake = consensus_poi
+        .as_ref()
+        .and_then(|p| stakes.get(p))
+        .copied()
+        .unwrap_or(0.0);
+    let divergent_count = real
+        .iter()
+        .filter(|a| Some(poi_of(a)) != consensus_poi)
+        .count();
+
+    let mut indexers: Vec<Value> = allocs
+        .iter()
+        .map(|a| {
+            let poi = poi_of(a);
+            let zero = is_zero_poi(&poi);
+            let addr = a
+                .get("indexer")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            json!({
+                "indexer": addr,
+                "name": short_addr(addr),
+                "poi": poi,
+                "stake": grt(a, "allocated_tokens"),
+                "isZeroPoi": zero,
+                "isConsensus": !zero && Some(&poi) == consensus_poi.as_ref(),
+            })
+        })
+        .collect();
+
+    // Real proofs first, then the largest stake, with the abstentions last.
+    indexers.sort_by(|a, b| {
+        let (za, zb) = (a["isZeroPoi"].as_bool(), b["isZeroPoi"].as_bool());
+        za.cmp(&zb).then(
+            b["stake"]
+                .as_f64()
+                .partial_cmp(&a["stake"].as_f64())
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
+
+    json!({
+        "epoch": epoch,
+        "consensusPoi": consensus_poi,
+        "totalRealStake": total_real_stake,
+        "consensusStake": consensus_stake,
+        "consensusPct": if total_real_stake > 0.0 { (consensus_stake / total_real_stake) * 100.0 } else { 0.0 },
+        "realCount": real.len(),
+        "zeroCount": zero_count,
+        "divergentCount": divergent_count,
+        "indexers": indexers,
+    })
+}
+
+/// `/api/poi?deployment=…`: one deployment's proof history, epoch by epoch.
+///
+/// **This is a different shape from `poi_overview`, and that is the whole point.** The route applied
+/// the deployment filter and then ran the overview shaper over the filtered rows, so it answered
+/// `{ deployments, summary }` for both forms. `/poi/[deployment]` on the dashboard opens with
+/// `detail.epochs.reduce(...)`, got no `epochs`, and rendered "Something went wrong" (kittiwake#27).
+///
+/// `None` when there is nothing to show, which the route turns into a 404 rather than an empty page.
+pub fn poi_deployment_detail(rows: &[Value]) -> Option<Value> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let first = rows.first()?;
+
+    let mut by_epoch: BTreeMap<i64, Vec<&Value>> = BTreeMap::new();
+    for a in rows {
+        by_epoch
+            .entry(poi_int(a, "closed_at_epoch").unwrap_or(0))
+            .or_default()
+            .push(a);
+    }
+
+    let mut epochs: Vec<Value> = by_epoch
+        .iter()
+        .map(|(epoch, allocs)| poi_epoch_group(*epoch, allocs))
+        // An epoch of nothing but abstentions says nothing about consensus, so it is not a row.
+        .filter(|g| g["realCount"].as_u64().unwrap_or(0) > 0)
+        .collect();
+    epochs.sort_by_key(|g| std::cmp::Reverse(g["epoch"].as_i64().unwrap_or(0)));
+
+    let deployment_id = first
+        .get("subgraph_deployment")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let unique: BTreeSet<&str> = rows
+        .iter()
+        .filter_map(|a| a.get("indexer").and_then(|v| v.as_str()))
+        .collect();
+
+    Some(json!({
+        "deploymentId": deployment_id,
+        "ipfsHash": ipfs_or_id(deployment_id),
+        "signal": grt(first, "signalled_tokens"),
+        "stake": grt(first, "staked_tokens"),
+        "totalAllocations": rows.len(),
+        "uniqueIndexers": unique.len(),
+        "epochs": epochs,
+    }))
+}
+
 /// The consensus view across closed allocations.
 ///
 /// **Consensus is weighted by stake, not by headcount.** Ten small indexers agreeing does not
@@ -629,17 +791,6 @@ pub const ZERO_POI: &str = "0x00000000000000000000000000000000000000000000000000
 /// resolved is history, and reporting it as current would keep a fixed deployment flagged for ever.
 pub fn poi_overview(rows: &[Value]) -> Value {
     use std::collections::BTreeMap;
-
-    /// The nest returns some integer columns as JSON strings and others as numbers, in the same
-    /// row. A bare `as_i64()` reads `"1374"` as absent, which collapsed every deployment into one
-    /// empty epoch group and reported perfect consensus across the whole network.
-    fn num(v: &Value, key: &str) -> Option<i64> {
-        match v.get(key)? {
-            Value::Number(n) => n.as_i64(),
-            Value::String(s) => s.parse().ok(),
-            _ => None,
-        }
-    }
 
     let real: Vec<&Value> = rows
         .iter()
@@ -667,12 +818,12 @@ pub fn poi_overview(rows: &[Value]) -> Value {
     for (deployment_id, allocs) in &by_deployment {
         let latest_epoch = allocs
             .iter()
-            .filter_map(|a| num(a, "closed_at_epoch"))
+            .filter_map(|a| poi_int(a, "closed_at_epoch"))
             .max()
             .unwrap_or(0);
         let latest: Vec<&&Value> = allocs
             .iter()
-            .filter(|a| num(a, "closed_at_epoch") == Some(latest_epoch))
+            .filter(|a| poi_int(a, "closed_at_epoch") == Some(latest_epoch))
             .collect();
 
         // Stake behind each distinct proof in the latest epoch.
@@ -713,7 +864,7 @@ pub fn poi_overview(rows: &[Value]) -> Value {
             .collect();
         let latest_closed_at = allocs
             .iter()
-            .filter_map(|a| num(a, "closed_at"))
+            .filter_map(|a| poi_int(a, "closed_at"))
             .max()
             .unwrap_or(0);
         let first = allocs[0];
@@ -1420,6 +1571,165 @@ mod tests {
         let out = poi_overview(&[]);
         assert_eq!(out["summary"]["overallConsensusRate"], json!(100.0));
         assert_eq!(out["summary"]["deploymentsTracked"], json!(0));
+    }
+
+    // ── The deployment detail (kittiwake#27) ──────────────────────────────────────────────────
+
+    fn alloc(poi: &str, indexer: &str, tokens: &str, epoch: i64) -> Value {
+        json!({"subgraph_deployment": "0xdep", "poi": poi, "indexer": indexer,
+               "allocated_tokens": tokens, "closed_at_epoch": epoch, "closed_at": 100,
+               "signalled_tokens": "2000000000000000000", "staked_tokens": "3000000000000000000"})
+    }
+
+    /// The regression itself. The route filtered by deployment and then ran `poi_overview` anyway,
+    /// so the detail form answered the overview shape with no `epochs`, and `/poi/[deployment]`
+    /// died on `detail.epochs.reduce(...)`.
+    #[test]
+    fn the_detail_is_a_different_shape_from_the_overview() {
+        let rows = vec![alloc("0xtruth", "0xa", "1000000000000000000", 5)];
+        let out = poi_deployment_detail(&rows).expect("one proved allocation is a detail page");
+
+        for key in [
+            "deploymentId",
+            "ipfsHash",
+            "signal",
+            "stake",
+            "totalAllocations",
+            "epochs",
+        ] {
+            assert!(!out[key].is_null(), "the page destructures {key}");
+        }
+        assert!(
+            out["epochs"].is_array(),
+            "epochs is what the page reduces over"
+        );
+        assert!(
+            out.get("deployments").is_none() && out.get("summary").is_none(),
+            "this is not the overview wearing a filter"
+        );
+        assert_eq!(out["signal"], json!(2.0), "wei to GRT, from the first row");
+        assert_eq!(out["totalAllocations"], json!(1));
+    }
+
+    #[test]
+    fn a_deployment_with_no_proofs_is_a_404_not_an_empty_page() {
+        assert!(poi_deployment_detail(&[]).is_none());
+    }
+
+    /// Newest first, because the page reads top-down as history.
+    #[test]
+    fn epochs_come_back_newest_first() {
+        let rows = vec![
+            alloc("0xtruth", "0xa", "1000000000000000000", 3),
+            alloc("0xtruth", "0xb", "1000000000000000000", 9),
+            alloc("0xtruth", "0xc", "1000000000000000000", 7),
+        ];
+        let out = poi_deployment_detail(&rows).unwrap();
+        let epochs: Vec<i64> = out["epochs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["epoch"].as_i64().unwrap())
+            .collect();
+        assert_eq!(epochs, vec![9, 7, 3]);
+    }
+
+    /// The overview reports only the latest epoch, because a resolved divergence should not keep a
+    /// deployment flagged for ever. The detail page is the history, so it keeps them all.
+    #[test]
+    fn the_detail_keeps_old_epochs_that_the_overview_drops() {
+        let rows = vec![
+            alloc("0xold", "0xa", "1000000000000000000", 1),
+            alloc("0xdiverged", "0xb", "1000000000000000000", 1),
+            alloc("0xnow", "0xa", "1000000000000000000", 2),
+        ];
+        let out = poi_deployment_detail(&rows).unwrap();
+        assert_eq!(out["epochs"].as_array().unwrap().len(), 2);
+        let old = &out["epochs"][1];
+        assert_eq!(old["epoch"], json!(1));
+        assert_eq!(
+            old["divergentCount"],
+            json!(1),
+            "the history keeps the divergence"
+        );
+    }
+
+    /// An abstention is not a disagreement, but the detail page is exactly where you go to find out
+    /// that someone closed without proving anything, so it is listed rather than dropped.
+    #[test]
+    fn a_zero_poi_is_listed_but_is_neither_consensus_nor_divergent() {
+        let rows = vec![
+            alloc("0xtruth", "0xa", "9000000000000000000", 1),
+            alloc(ZERO_POI, "0xb", "1000000000000000000", 1),
+        ];
+        let out = poi_deployment_detail(&rows).unwrap();
+        let g = &out["epochs"][0];
+        assert_eq!(g["realCount"], json!(1));
+        assert_eq!(g["zeroCount"], json!(1));
+        assert_eq!(g["divergentCount"], json!(0), "abstaining is not diverging");
+        assert_eq!(
+            g["consensusPct"],
+            json!(100.0),
+            "and it does not dilute consensus"
+        );
+
+        let listed = g["indexers"].as_array().unwrap();
+        assert_eq!(listed.len(), 2, "both are shown");
+        assert_eq!(listed[1]["isZeroPoi"], json!(true), "abstentions sort last");
+        assert_eq!(listed[1]["isConsensus"], json!(false));
+        assert_eq!(listed[0]["isConsensus"], json!(true));
+    }
+
+    /// An epoch where everybody abstained says nothing about consensus, so it is not a row.
+    #[test]
+    fn an_epoch_of_nothing_but_abstentions_is_not_a_row() {
+        let rows = vec![alloc(ZERO_POI, "0xa", "1000000000000000000", 1)];
+        let out = poi_deployment_detail(&rows).unwrap();
+        assert_eq!(out["epochs"].as_array().unwrap().len(), 0);
+        assert_eq!(out["totalAllocations"], json!(1), "but it still happened");
+    }
+
+    /// The nest sends `closed_at_epoch` as a string on some rows and a number on others. Reading it
+    /// with a bare `as_i64()` collapsed every allocation into one epoch group.
+    #[test]
+    fn an_epoch_sent_as_a_string_groups_with_the_same_epoch_sent_as_a_number() {
+        let mut as_string = alloc("0xtruth", "0xb", "1000000000000000000", 0);
+        as_string["closed_at_epoch"] = json!("4");
+        let rows = vec![alloc("0xtruth", "0xa", "1000000000000000000", 4), as_string];
+        let out = poi_deployment_detail(&rows).unwrap();
+        assert_eq!(
+            out["epochs"].as_array().unwrap().len(),
+            1,
+            "one epoch, not two"
+        );
+        assert_eq!(out["epochs"][0]["realCount"], json!(2));
+    }
+
+    #[test]
+    fn an_indexer_without_metadata_is_named_by_its_shortened_address() {
+        let rows = vec![alloc(
+            "0xtruth",
+            "0x1234567890abcdef1234567890abcdef12345678",
+            "1000000000000000000",
+            1,
+        )];
+        let out = poi_deployment_detail(&rows).unwrap();
+        assert_eq!(
+            out["epochs"][0]["indexers"][0]["name"],
+            json!("0x1234...5678")
+        );
+    }
+
+    #[test]
+    fn unique_indexers_counts_the_indexer_once_across_epochs() {
+        let rows = vec![
+            alloc("0xtruth", "0xa", "1000000000000000000", 1),
+            alloc("0xtruth", "0xa", "1000000000000000000", 2),
+            alloc("0xtruth", "0xb", "1000000000000000000", 2),
+        ];
+        let out = poi_deployment_detail(&rows).unwrap();
+        assert_eq!(out["uniqueIndexers"], json!(2));
+        assert_eq!(out["totalAllocations"], json!(3));
     }
 
     /// A target sitting at zero must still appear. A panel that hides it cannot show that DIPS is
