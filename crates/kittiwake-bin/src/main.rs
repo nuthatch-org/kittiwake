@@ -176,6 +176,9 @@ async fn main() -> anyhow::Result<()> {
             kittiwake_db::ensure_chain_health_tables(p)
                 .await
                 .context("creating the chain-health tables")?;
+            kittiwake_db::ensure_rolling_apy_table(p)
+                .await
+                .context("creating the rolling-APY table")?;
         }
         jobs.extend(jobs::live_jobs(
             store.clone(),

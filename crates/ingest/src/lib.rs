@@ -27,6 +27,14 @@ pub enum IngestError {
     Refused(String),
 }
 
+impl From<kittiwake_db::DbError> for IngestError {
+    fn from(e: kittiwake_db::DbError) -> Self {
+        match e {
+            kittiwake_db::DbError::Sqlx(e) => Self::Db(e),
+        }
+    }
+}
+
 /// One page of rows from a nest, with the truncation check every caller would otherwise forget.
 pub(crate) async fn page(
     gate: &NestGate,
