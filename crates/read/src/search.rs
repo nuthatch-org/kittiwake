@@ -562,6 +562,29 @@ pub struct Warmed {
     pub remaining: usize,
 }
 
+/// What the last warm run left undone, so a search can answer "not yet" rather than "no".
+///
+/// `-1` until a run has finished, which is not the same as zero: a process that restarted a minute
+/// ago knows nothing about the backlog, and reporting nought would be a confident wrong answer.
+static BACKLOG: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+/// `None` when no warm run has completed in this process.
+pub fn warm_backlog() -> Option<u64> {
+    match BACKLOG.load(std::sync::atomic::Ordering::Relaxed) {
+        n if n < 0 => None,
+        n => Some(n as u64),
+    }
+}
+
+fn record(warmed: &Warmed) {
+    BACKLOG.store(
+        warmed.remaining as i64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    metrics::gauge!("ipfs_warm_remaining").set(warmed.remaining as f64);
+    metrics::counter!("ipfs_warm_fetched_total").increment(warmed.fetched as u64);
+}
+
 /// Fill the IPFS cache that search reads: every live subgraph's metadata document, and every
 /// signalled or staked deployment's manifest.
 ///
@@ -602,7 +625,9 @@ pub async fn warm(
         .filter_map(|r| deployment_ipfs_hash(r.get("id")?.as_str()?))
         .collect();
     if want_json.is_empty() && want_text.is_empty() {
-        return Ok(Warmed::default());
+        let warmed = Warmed::default();
+        record(&warmed);
+        return Ok(warmed);
     }
 
     let all: Vec<String> = want_json.iter().chain(want_text.iter()).cloned().collect();
@@ -650,10 +675,12 @@ pub async fn warm(
         .await;
 
     let fetched = take_json + take_text;
-    Ok(Warmed {
+    let warmed = Warmed {
         fetched,
         remaining: total - fetched,
-    })
+    };
+    record(&warmed);
+    Ok(warmed)
 }
 
 #[cfg(test)]
@@ -711,5 +738,30 @@ mod tests {
     #[test]
     fn quoting_lowercases_and_separates() {
         assert_eq!(quoted(&["0xAB".into(), "0xCD".into()]), "'0xab', '0xcd'");
+    }
+}
+
+#[cfg(test)]
+mod backlog_tests {
+    use super::*;
+
+    /// The only test that touches `BACKLOG`, so the initial read is safe to assert.
+    ///
+    /// The distinction is the whole point of the field: a process a minute old knows nothing about
+    /// the backlog, and answering nought would tell a searcher that everything is warmed when the
+    /// truth is that nobody has looked. #8.
+    #[test]
+    fn the_backlog_is_unknown_until_a_run_finishes_and_not_zero() {
+        assert_eq!(warm_backlog(), None, "a fresh process must not claim zero");
+        record(&Warmed {
+            fetched: 3,
+            remaining: 7,
+        });
+        assert_eq!(warm_backlog(), Some(7));
+        record(&Warmed {
+            fetched: 7,
+            remaining: 0,
+        });
+        assert_eq!(warm_backlog(), Some(0), "zero after a run is a real answer");
     }
 }
