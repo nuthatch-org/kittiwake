@@ -120,18 +120,24 @@ impl ReadCtx {
         &self,
         route: &'static str,
         poll: Duration,
+        fresh_from: ServedFrom,
         fetch: ExternalFetcher,
     ) -> Result<Read, ApiError> {
-        self.cached_external_keyed(route, route, poll, fetch).await
+        self.cached_external_keyed(route, route, poll, fresh_from, fetch)
+            .await
     }
 
     /// As [`Self::cached_external`], but with a per-subject key: one entry per indexer rather than
     /// one for the whole route.
+    /// `fresh_from` is where a *miss* gets its answer. A hit reports `Cache`, because it came from
+    /// the cache: this path used to answer `Chain` in all three branches, so `/api/price` claimed
+    /// to have just read the chain while serving a value minutes old.
     pub async fn cached_external_keyed(
         &self,
         route: &'static str,
         subject: &str,
         poll: Duration,
+        fresh_from: ServedFrom,
         fetch: ExternalFetcher,
     ) -> Result<Read, ApiError> {
         let policy = CachePolicy::from_poll_interval(poll);
@@ -145,7 +151,7 @@ impl ReadCtx {
         if let Some(entry) = self.store.get(&key).await {
             match classify(entry.age(), &policy) {
                 Freshness::Fresh => {
-                    let meta = entry.meta(ServedFrom::Chain, false);
+                    let meta = entry.meta(ServedFrom::Cache, false);
                     return Ok(Read { entry, meta });
                 }
                 Freshness::Stale => {
@@ -159,7 +165,7 @@ impl ReadCtx {
                                 .await;
                         }
                     });
-                    let meta = entry.meta(ServedFrom::Chain, true);
+                    let meta = entry.meta(ServedFrom::Cache, true);
                     return Ok(Read { entry, meta });
                 }
                 Freshness::Expired => {}
@@ -171,7 +177,7 @@ impl ReadCtx {
             .store
             .insert(key, Entry::new(value, Provenance::default()))
             .await;
-        let meta = entry.meta(ServedFrom::Chain, false);
+        let meta = entry.meta(fresh_from, false);
         Ok(Read { entry, meta })
     }
 

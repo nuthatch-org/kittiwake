@@ -751,7 +751,7 @@ pub async fn price(
     budget!(st, peer, headers);
     let read = st
         .read
-        .cached_external("price", std::time::Duration::from_secs(60), {
+        .cached_external("price", std::time::Duration::from_secs(60), kittiwake_types::ServedFrom::Chain, {
             let ext = st.ext.clone();
             std::sync::Arc::new(move || {
                 let ext = ext.clone();
@@ -775,7 +775,7 @@ pub async fn tvl(
     budget!(st, peer, headers);
     let read = st
         .read
-        .cached_external("tvl", std::time::Duration::from_secs(600), {
+        .cached_external("tvl", std::time::Duration::from_secs(600), kittiwake_types::ServedFrom::Chain, {
             let ext = st.ext.clone();
             std::sync::Arc::new(move || {
                 let ext = ext.clone();
@@ -817,7 +817,7 @@ pub async fn reo(
     let route_key = format!("reo:{address}");
     let read = st
         .read
-        .cached_external_keyed("reo", &route_key, std::time::Duration::from_secs(300), {
+        .cached_external_keyed("reo", &route_key, std::time::Duration::from_secs(300), kittiwake_types::ServedFrom::Chain, {
             std::sync::Arc::new(move || {
                 let chain = chain.clone();
                 let address = address.clone();
@@ -1055,6 +1055,7 @@ pub async fn subgraph_search(
             "subgraph-search",
             &key,
             std::time::Duration::from_secs(60),
+            kittiwake_types::ServedFrom::Nest,
             std::sync::Arc::new(move || {
                 let (pool, ipfs, gate, query) =
                     (pool.clone(), ipfs.clone(), gate.clone(), query.clone());
@@ -1086,10 +1087,7 @@ pub async fn subgraph_search(
     // ours to say.
     resp.headers_mut().insert(
         axum::http::HeaderName::from_static("x-kittiwake-served-from"),
-        axum::http::HeaderValue::from_static(match read.meta.served_from {
-            kittiwake_types::ServedFrom::Cache => "cache",
-            _ => "nest",
-        }),
+        axum::http::HeaderValue::from_static(read.meta.served_from.as_str()),
     );
     crate::no_store(resp.headers_mut());
     Ok(resp)
