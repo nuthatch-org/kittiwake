@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,3 +23,23 @@ jobs:
       - run: cargo clippy --all-targets --all-features
       # No network and no database: every test runs against an in-process mock nest.
       - run: cargo test --all
+
+  release:
+    # The binary a deploy installs, so `deploy/install.sh` stops depending on whoever's laptop has
+    # a working Docker. Built in bookworm rather than on the runner for the reason
+    # `deploy/build-linux.sh` gives: glibc is forward compatible and not backward, the box is 2.39,
+    # and building against exactly 2.39 leaves no margin at all.
+    if: github.event_name != 'pull_request'
+    needs: check
+    runs-on: ubuntu-latest
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bin kittiwake
+      - run: objdump -T target/release/kittiwake | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -3
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kittiwake-linux-x86_64
+          path: target/release/kittiwake
+          retention-days: 30
