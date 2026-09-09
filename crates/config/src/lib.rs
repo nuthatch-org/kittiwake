@@ -115,6 +115,11 @@ pub struct Config {
     /// Ethereum mainnet JSON-RPC. Optional: three public endpoints are tried in order when unset,
     /// which is acceptable here because ENS is not a protocol figure.
     pub mainnet_rpc_url: Option<String>,
+    /// The Dock's BountyBoard, on Arbitrum. Absent means `reconcile-bounties` does not run, which
+    /// is right: with no board there is nothing to reconcile against, and guessing an address
+    /// would be worse than not looking. Deployed per environment, unlike the protocol contracts,
+    /// which is why it is configuration and not a constant.
+    pub bounty_board_address: Option<String>,
     #[serde(default = "default_db_max_conns")]
     pub database_max_connections: u32,
     #[serde(default)]
@@ -215,6 +220,7 @@ mod tests {
             edge_secret: None,
             arbitrum_rpc_url: None,
             mainnet_rpc_url: None,
+            bounty_board_address: None,
             database_max_connections: 16,
             cache: None,
             limits: None,

@@ -52,6 +52,22 @@ sol! {
             external view returns (DelegationPool memory);
     }
 
+    /// The Dock's bounty board. Read-only here: this service reconciles the cache against the
+    /// chain and never posts, claims or refunds, so nothing below needs a key.
+    #[sol(rpc)]
+    interface IBountyBoard {
+        struct Bounty {
+            address developer;
+            bytes32 deploymentId;
+            uint256 amount;
+            uint256 postedAt;
+            uint256 expiresAt;
+            address winner;
+            bool settled;
+        }
+        function getBounty(uint256 bountyId) external view returns (Bounty memory);
+    }
+
     #[sol(rpc)]
     interface IERC20 {
         function totalSupply() external view returns (uint256);
@@ -329,6 +345,29 @@ impl Chain {
         Some((wei(pool.tokens), wei(pool.tokensThawing)))
     }
 
+    /// One bounty's on-chain state, from the board at `board`.
+    ///
+    /// The board's address is configuration rather than a constant: it is the Dock's own contract
+    /// and it is deployed per environment, unlike the protocol addresses above.
+    ///
+    /// The three fields returned are the whole of what decides a cached bounty's status. The rest
+    /// of the struct - developer, amount, deployment - is written once when the bounty is posted
+    /// and reconciliation has no business rewriting it.
+    pub async fn bounty(&self, board: &str, id: u64) -> Result<ChainBounty, ApiError> {
+        let addr = Address::from_str(board.trim())
+            .map_err(|_| ApiError::Internal(format!("bad bounty board address: {board}")))?;
+        let c = IBountyBoard::new(addr, self.arb()?);
+        let b = tokio::time::timeout(Duration::from_secs(8), c.getBounty(U256::from(id)).call())
+            .await
+            .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
+            .map_err(|e| ApiError::Unavailable(format!("getBounty({id}): {e}")))?;
+        Ok(ChainBounty {
+            settled: b.settled,
+            winner: format!("{:#x}", b.winner),
+            expires_at: b.expiresAt.to::<u64>(),
+        })
+    }
+
     pub async fn block_number(&self) -> Result<u64, ApiError> {
         let provider = self.arb()?;
         tokio::time::timeout(Duration::from_secs(8), provider.get_block_number())
@@ -336,6 +375,20 @@ impl Chain {
             .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
             .map_err(|e| ApiError::Unavailable(format!("arbitrum rpc: {e}")))
     }
+}
+
+/// The part of a bounty's on-chain state that decides its cached status.
+///
+/// `expires_at` is zero when the bounty never expires, which the contract uses as its sentinel and
+/// which is why this is a `u64` rather than an `Option`: zero is the contract's own spelling of
+/// "no expiry" and translating it here would put the same fact in two shapes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainBounty {
+    pub settled: bool,
+    /// Lowercase `0x…`. The zero address means no winner.
+    pub winner: String,
+    /// Unix seconds, or 0 for no expiry.
+    pub expires_at: u64,
 }
 
 /// GRT in circulation across both chains, in whole GRT.

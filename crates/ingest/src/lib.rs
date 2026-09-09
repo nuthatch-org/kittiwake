@@ -11,6 +11,7 @@ use kittiwake_db::Pool;
 use kittiwake_nest::{Lane, NestGate, QuerySpec, SqlAnswer};
 use kittiwake_types::NestId;
 
+pub mod bounties;
 pub mod live;
 pub mod liveness;
 pub mod rav;

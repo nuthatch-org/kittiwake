@@ -55,11 +55,11 @@ None of the eight was in the parity harness, which is the defect the routes were
 
 ## The cron ledger
 
-Seventeen crons, and only ten of them were ever jobs this service should run.
+Seventeen crons, of which eleven are now jobs here.
 
-**Ported and running (10).** `refresh`, `ingest-epochs`, `ingest-delegations`,
+**Ported and running (11).** `refresh`, `ingest-epochs`, `ingest-delegations`,
 `ingest-allocations`, `ingest-disputes`, `snapshot-network`, `ingest-horizon-activity`,
-`refresh-chain-health`, `ingest-rav`, `warm-ipfs`.
+`refresh-chain-health`, `ingest-rav`, `warm-ipfs`, `reconcile-bounties`.
 
 Of those, the shared-Postgres writers are behind `scheduler_enabled` and **gated by the grant as
 well as the flag** - the role has no write on the platform's ingest tables, so an accidental flip
@@ -72,10 +72,15 @@ run first. The rest write only their own tables or this process's memory and run
 post it nowhere. The nest watch is Foghorn's now; the DIPS watch is worth rehoming there
 (nightswatchhq/foghorn#2); the provider watch goes with Dispatch.
 
-**Product layer, not data plane (2).** `reconcile-bounties` and `tap-provision` belong with the
-Dock. `tap-provision` holds `TAP_SIGNER_PRIVATE_KEY` and **spends GRT**: porting it means putting a
-signing key on this box and having this service send transactions, which is a decision about
-custody rather than a port. #11
+**Product layer, not data plane (1).** `tap-provision` holds `TAP_SIGNER_PRIVATE_KEY` and **spends
+GRT**: porting it means putting a signing key on this box and having this service send
+transactions, which is a decision about custody rather than a port. Settled on 2026-09-08 - the key
+comes to the box under a fixed GRT ceiling - and it moves with the Dock. #11
+
+`reconcile-bounties` was the other one, and was in this group only by association. It reads the
+BountyBoard contract and corrects `sync_bounties`; there is no key and nothing is spent. Ported
+2026-09-09, every ten minutes on the nine, behind `scheduler_enabled` and a `SELECT, UPDATE` grant
+on that one table. #30
 
 ## Discontinued, so not ported at all
 
