@@ -20,6 +20,7 @@ kittiwake-nest = { version = "0.1.0", path = "../nest" }
 kittiwake-obs = { version = "0.1.0", path = "../obs" }
 kittiwake-read = { version = "0.1.0", path = "../read" }
 kittiwake-score = { version = "0.1.0", path = "../score" }
+kittiwake-scuttle = { version = "0.1.0", path = "../scuttle" }
 kittiwake-sqlplay = { version = "0.1.0", path = "../sqlplay" }
 kittiwake-ssrf = { version = "0.1.0", path = "../ssrf" }
 kittiwake-types = { version = "0.1.0", path = "../types" }
