@@ -8,6 +8,27 @@ Newest first.
 
 ---
 
+## 2026-09-09: the parameter trail is written before the row it is compared against
+
+`refresh` detects a change in an indexer's cut by comparing the incoming value against the one
+already in `indexers`, so the two writes are ordered and the order is a choice with a losing side.
+
+Detect, insert the history, then upsert. If the upsert fails after the history has landed, the next
+run reads the same previous row, re-detects the same change and writes it a second time - and
+`provenance_rows` already collapses that with `DISTINCT ON (param_name, old_value, new_value,
+epoch)`, so the reader never sees it. The other order loses the change permanently: once the upsert
+has succeeded there is nothing left to compare against, and a cut that moved is simply never
+recorded by anyone. A duplicate the reader already dedupes beats a silence nothing can recover.
+
+The trail takes `INSERT` and nothing else. A recorded change is a thing that happened. Repairing bad
+history - which 2026-09-07 left behind, and `deploy/repair-parameter-changes.sh` cleans up - is a
+deliberate act by a person at a superuser prompt, not a privilege a daemon carries about with it.
+
+`parameter_changes_written_total` and `parameter_changes_failed_total` are both registered at zero
+every run. The failure this whole episode consisted of was a writer that stopped while every log
+said the service was healthy, and a counter that only exists once it fires makes silence look like
+health. Same lesson as chain liveness, below, and as `nest_busy_total` before it.
+
 ## 2026-09-08: the TAP signing key comes to the box, under a fixed GRT ceiling
 
 `tap-provision` reads claimed bounties, checks `PaymentsEscrow.getBalance` and **deposits GRT**

@@ -357,12 +357,166 @@ pub async fn refresh(
         });
     }
 
+    // The parameter trail, recorded before the upsert overwrites the row it is compared against.
+    //
+    // The order is deliberate. Detect, insert the history, then upsert. If the upsert then fails,
+    // the next run reads the same previous row, re-detects the same change and writes it twice -
+    // and `provenance_rows`' `DISTINCT ON (param_name, old_value, new_value, epoch)` collapses the
+    // duplicate on the way out. The other order loses the change for ever: once the upsert has
+    // landed there is nothing left to compare against, and a cut that moved is simply never
+    // recorded. A duplicate the reader already dedupes beats a silence nothing can recover.
+    let epoch = i(&net, "current_epoch").map(|e| e as i32);
+    let previous = previous_cuts(pool).await?;
+    let changes = detect_changes(&previous, &rows, epoch);
+    record_parameter_changes(pool, &changes).await;
+
     write_rows(pool, &rows).await?;
     kittiwake_db::write_rolling_apy(pool, &apys).await?;
     crate::state::touch(pool, "indexers").await?;
     Ok(Ingested {
         rows: rows.len() as u64,
     })
+}
+
+// ---------------------------------------------------------------------------------------------
+// The parameter trail
+// ---------------------------------------------------------------------------------------------
+//
+// `parameter_changes` is what `/api/apr-provenance` shows when it explains why an indexer's APR
+// moved. The platform wrote it from `src/lib/ingest/indexers.ts`; `refresh` was ported and the
+// write was not carried across, so the table had no writer between the cutover and #47. A frozen
+// history and a live one look identical from outside - the route answers 200 with a populated
+// array either way - which is why it went unnoticed for two days.
+
+/// One recorded movement in an indexer's cuts. Values are PPM, which is what the protocol uses and
+/// what the table has held since 2023 - including through the few hours in which the column it is
+/// compared against did not. See #48.
+struct ParamChange {
+    indexer: String,
+    param: &'static str,
+    old: f64,
+    new: f64,
+    epoch: Option<i32>,
+}
+
+/// The cuts as they stood before this run.
+///
+/// Cast to `float8` in the statement rather than decoded as `NUMERIC`. The values are integral PPM
+/// and an `f64` holds every one of them exactly, so the alternative is a decimal crate for a column
+/// that has never had a fractional part. It is also the cast `provenance_rows` already uses to read
+/// the same numbers back out.
+async fn previous_cuts(
+    pool: &Pool,
+) -> Result<HashMap<String, (Option<f64>, Option<f64>)>, IngestError> {
+    let rows: Vec<(String, Option<f64>, Option<f64>)> =
+        sqlx::query_as("SELECT address, reward_cut::float8, query_fee_cut::float8 FROM indexers")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(a, reward, fee)| (a.to_lowercase(), (reward, fee)))
+        .collect())
+}
+
+/// Which cuts moved since the last run.
+///
+/// **Compared as numbers, never as text.** The legacy carries a comment about exactly this: a
+/// `NUMERIC` arrives from Postgres as a string, so a raw `!==` is true for `"880000"` against
+/// `880000` and records a no-op change on every single refresh. Reading the column as `float8`
+/// makes that mistake unavailable rather than merely avoided.
+///
+/// **An indexer we have not seen before records nothing.** First sight is not a change, and writing
+/// one would date every indexer's parameters to whenever we happened to start looking. Likewise a
+/// null previous value, which means "never recorded" rather than "was zero".
+fn detect_changes(
+    prev: &HashMap<String, (Option<f64>, Option<f64>)>,
+    rows: &[Row],
+    epoch: Option<i32>,
+) -> Vec<ParamChange> {
+    let mut out = Vec::new();
+    for r in rows {
+        let Some((prev_reward, prev_fee)) = prev.get(&r.id) else {
+            continue;
+        };
+        for (param, before, after) in [
+            ("reward_cut", *prev_reward, r.reward_cut),
+            ("query_fee_cut", *prev_fee, r.query_fee_cut),
+        ] {
+            let Some(before) = before else { continue };
+            if before != after {
+                out.push(ParamChange {
+                    indexer: r.id.clone(),
+                    param,
+                    old: before,
+                    new: after,
+                    epoch,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Write the trail, and count it whether or not it worked.
+///
+/// A history table that will not take a row must not stop the directory being refreshed, so a
+/// failure is logged rather than propagated - which is what the legacy did too. What the legacy did
+/// not do is count it. Both counters are registered at zero on every run, because the failure this
+/// whole issue describes is a writer that stopped while every log said the service was healthy, and
+/// a counter that only exists once it fires makes silence look like health. Same lesson as #40.
+async fn record_parameter_changes(pool: &Pool, changes: &[ParamChange]) {
+    metrics::counter!("parameter_changes_written_total").increment(0);
+    metrics::counter!("parameter_changes_failed_total").increment(0);
+
+    match write_parameter_changes(pool, changes).await {
+        Ok(()) => {
+            metrics::counter!("parameter_changes_written_total").increment(changes.len() as u64);
+            if !changes.is_empty() {
+                tracing::info!(count = changes.len(), "recorded parameter changes");
+            }
+        }
+        Err(e) => {
+            metrics::counter!("parameter_changes_failed_total").increment(1);
+            tracing::warn!(
+                error = %e,
+                count = changes.len(),
+                "the parameter trail could not be written; the directory refresh continues without it"
+            );
+        }
+    }
+}
+
+async fn write_parameter_changes(pool: &Pool, changes: &[ParamChange]) -> Result<(), sqlx::Error> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO parameter_changes (indexer_address, param_name, old_value, new_value, epoch) \
+         SELECT * FROM UNNEST($1::text[], $2::text[], $3::numeric[], $4::numeric[], $5::int[])",
+    )
+    .bind(
+        changes
+            .iter()
+            .map(|c| c.indexer.clone())
+            .collect::<Vec<String>>(),
+    )
+    .bind(
+        changes
+            .iter()
+            .map(|c| c.param.to_string())
+            .collect::<Vec<String>>(),
+    )
+    .bind(changes.iter().map(|c| c.old).collect::<Vec<f64>>())
+    .bind(changes.iter().map(|c| c.new).collect::<Vec<f64>>())
+    .bind(
+        changes
+            .iter()
+            .map(|c| c.epoch)
+            .collect::<Vec<Option<i32>>>(),
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Ask the oracle about every indexer, a few at a time.
@@ -479,6 +633,126 @@ async fn write_rows(pool: &Pool, rows: &[Row]) -> Result<(), sqlx::Error> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A row carrying only the two fields the trail compares. Everything else is inert here.
+    fn row(id: &str, reward_cut: f64, query_fee_cut: f64) -> Row {
+        Row {
+            id: id.to_string(),
+            url: None,
+            geohash: None,
+            self_stake: 0.0,
+            delegated: 0.0,
+            allocated: 0.0,
+            provisioned: 0.0,
+            reward_cut,
+            query_fee_cut,
+            effective_cut: 0.0,
+            delegator_apr: 0.0,
+            capacity_pct: 0.0,
+            last_param_update: 0,
+            score: 0,
+            grade: String::new(),
+            delegations_7d: 0,
+            undelegations_7d: 0,
+            net_flow: 0.0,
+            rewards_earned: 0.0,
+            query_fees: 0.0,
+            allocation_count: 0,
+            exchange_rate: 0.0,
+            data_services: 0,
+            reo_status: "unknown",
+        }
+    }
+
+    fn prev(
+        pairs: &[(&str, Option<f64>, Option<f64>)],
+    ) -> HashMap<String, (Option<f64>, Option<f64>)> {
+        pairs
+            .iter()
+            .map(|(a, r, q)| (a.to_string(), (*r, *q)))
+            .collect()
+    }
+
+    #[test]
+    fn a_cut_that_moved_is_recorded_with_both_sides_and_the_epoch() {
+        let changes = detect_changes(
+            &prev(&[("0xaa", Some(880_000.0), Some(100_000.0))]),
+            &[row("0xaa", 900_000.0, 100_000.0)],
+            Some(1376),
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].param, "reward_cut");
+        assert_eq!(changes[0].old, 880_000.0);
+        assert_eq!(changes[0].new, 900_000.0);
+        assert_eq!(changes[0].epoch, Some(1376));
+    }
+
+    /// The bug the legacy carries a comment about, and which it had once in production: Postgres
+    /// hands back a `NUMERIC` as a string, so `"880000" !== 880000` is true and a no-op change is
+    /// recorded on every refresh. Reading the column as `float8` is what stops it, and this pins
+    /// the outcome rather than the mechanism.
+    #[test]
+    fn an_unchanged_cut_records_nothing_however_many_times_it_is_refreshed() {
+        let previous = prev(&[("0xaa", Some(880_000.0), Some(1_000_000.0))]);
+        for _ in 0..3 {
+            assert!(
+                detect_changes(&previous, &[row("0xaa", 880_000.0, 1_000_000.0)], Some(1))
+                    .is_empty()
+            );
+        }
+    }
+
+    /// The two cuts move independently and both are recorded when both do.
+    #[test]
+    fn both_cuts_moving_is_two_rows_and_not_one() {
+        let changes = detect_changes(
+            &prev(&[("0xaa", Some(0.0), Some(0.0))]),
+            &[row("0xaa", 500_000.0, 250_000.0)],
+            None,
+        );
+        let mut names: Vec<_> = changes.iter().map(|c| c.param).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["query_fee_cut", "reward_cut"]);
+        assert!(changes.iter().all(|c| c.epoch.is_none()));
+    }
+
+    /// First sight of an indexer is not a change. Recording one would date every indexer's
+    /// parameters to whenever this service happened to start looking at them.
+    #[test]
+    fn an_indexer_with_no_previous_row_records_nothing() {
+        assert!(detect_changes(&prev(&[]), &[row("0xnew", 100_000.0, 0.0)], Some(1)).is_empty());
+    }
+
+    /// A null previous value is "never recorded", not "was zero", so it is not a movement from
+    /// zero to whatever the protocol says today.
+    #[test]
+    fn a_null_previous_value_is_not_a_change_from_zero() {
+        let changes = detect_changes(
+            &prev(&[("0xaa", None, Some(0.0))]),
+            &[row("0xaa", 900_000.0, 250_000.0)],
+            Some(1),
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].param, "query_fee_cut");
+    }
+
+    /// #47's unit trap, pinned. Both sides are PPM after #48, so the boundary that produced 191
+    /// phantom `x -> x * 10_000` rows on 2026-09-07 cannot be crossed again by this code: an
+    /// indexer on a 100% cut compares 1,000,000 against 1,000,000 and records nothing. If the
+    /// column ever reverts to percent, this test is what fails.
+    #[test]
+    fn a_hundred_percent_cut_is_a_million_on_both_sides_and_moves_nothing() {
+        assert!(
+            detect_changes(
+                &prev(&[("0xaa", Some(1_000_000.0), Some(1_000_000.0))]),
+                &[row("0xaa", 1_000_000.0, 1_000_000.0)],
+                Some(1376),
+            )
+            .is_empty()
+        );
+    }
+
     /// The issuance constant is load-bearing and differs from the one used for the displayed
     /// percentage. Pinned here so the discrepancy cannot be closed by accident in one place only.
     #[test]
