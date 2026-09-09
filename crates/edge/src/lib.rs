@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub mod handlers;
+pub mod openapi;
 
 use axum::Router;
 use axum::extract::{ConnectInfo, State};
@@ -500,6 +501,21 @@ async fn post_sql_named(
     Ok(resp)
 }
 
+/// `GET /openapi.json`: the API described on its own terms.
+///
+/// Deliberately outside `/api/`, so it is not itself an entry in the document it serves and does
+/// not need a summary describing the thing you are already reading.
+async fn get_openapi() -> Response {
+    let mut resp = axum::Json(openapi::document(env!("CARGO_PKG_VERSION"))).into_response();
+    // Generated from the router at compile time, so it is exactly as fresh as the binary and there
+    // is nothing for a cache to get wrong.
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("public, max-age=300"),
+    );
+    resp
+}
+
 /// Liveness: is this process answering. Deliberately says nothing about the nests, because a
 /// process that is up and a service that is correct are different questions.
 async fn get_health(State(st): State<AppState>) -> Response {
@@ -564,6 +580,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(get_health))
         .route("/ready", get(get_ready))
         .route("/metrics", get(get_metrics))
+        .route("/openapi.json", get(get_openapi))
         // The directory and the network
         .route("/api/indexers", get(handlers::indexers))
         .route("/api/indexer/{address}", get(handlers::indexer))
