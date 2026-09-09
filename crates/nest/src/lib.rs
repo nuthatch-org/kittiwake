@@ -280,6 +280,13 @@ struct GateInner {
     ready_cache: moka::future::Cache<NestId, Result<ReadyBody, NestError>>,
 }
 
+/// The inner lane: one permit narrower than the nest admits, so a background job can never take
+/// the last slot from a user who is waiting. Never zero, because a one-permit nest still has to be
+/// usable by the jobs that feed it.
+fn cron_width(permits: usize) -> usize {
+    permits.saturating_sub(1).max(1)
+}
+
 /// The admission gate. Cheap to clone; every clone shares the same permits.
 #[derive(Clone)]
 pub struct NestGate {
@@ -307,7 +314,7 @@ impl NestGate {
             metrics::counter!("nest_query_total", "nest" => n.as_str()).increment(0);
             metrics::gauge!("nest_permits", "nest" => n.as_str()).set(p as f64);
             permits.insert(n, Arc::new(Semaphore::new(p)));
-            cron_permits.insert(n, Arc::new(Semaphore::new(p.saturating_sub(1).max(1))));
+            cron_permits.insert(n, Arc::new(Semaphore::new(cron_width(p))));
         }
 
         Ok(Self {
@@ -333,6 +340,25 @@ impl NestGate {
 
     pub fn config(&self) -> &NestConfig {
         &self.inner.cfg
+    }
+
+    /// How many queries to this nest may usefully be in flight at once on this lane.
+    ///
+    /// This is the number a caller fanning out should use, and the reason it exists is #43: a
+    /// hardcoded `buffer_unordered(4)` against a two-permit nest does not go four at a time, it
+    /// queues by construction and then blames the nest. Asking for more slots than the gate holds
+    /// buys nothing and costs a `nest_gate_timeout_total` when the queue outlasts
+    /// `read_queue_timeout`.
+    ///
+    /// It is a width, not a reservation. Nothing is held by calling it, and by the time the caller
+    /// acts on it another task may have taken a permit - which is fine, because the gate is still
+    /// the thing that admits. This only stops us queueing on purpose.
+    pub fn lane_width(&self, nest: NestId, lane: Lane) -> usize {
+        let p = self.inner.cfg.permits_for(nest);
+        match lane {
+            Lane::Read => p.max(1),
+            Lane::Cron => cron_width(p),
+        }
     }
 
     /// Permits currently free for a nest. Exposed for metrics and tests, not for decisions.
