@@ -268,6 +268,11 @@ mod session_tests {
     ///
     ///     DOCK_SESSION_SECRET=... DOCK_SESSION_TOKEN=... \
     ///       cargo test -p kittiwake-dock a_production_cookie -- --nocapture
+    ///
+    /// **A skip here is not a pass**, and in CI it is always a skip. The check #12 actually asks
+    /// for is `cargo run -p kittiwake-dock --bin verify-session`, which exits non-zero when it is
+    /// unconfigured and so cannot be mistaken for a green run. It also makes the third assertion
+    /// this one does not: that the signature covers the *payload* and not only itself.
     #[test]
     fn a_production_cookie_validates_against_the_production_secret() {
         let (Ok(raw), Ok(token)) = (
