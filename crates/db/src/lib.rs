@@ -583,3 +583,158 @@ pub async fn update_bounty_status(
     .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod schema_coverage {
+    //! Every Postgres table this service names must exist in `db/schema.sql`.
+    //!
+    //! `ipfs_metadata` was missing from that file for the whole of the day the schema moved here
+    //! (#31), and nothing noticed. It was missed because it had never been in the file the move
+    //! copied - it lives in lodestar's `migrations/` directory - and the compile-time query check
+    //! could not catch it, because every statement touching that table is a runtime `sqlx::query`
+    //! rather than a macro. Two absences agreeing is not a confirmation.
+    //!
+    //! So this reads the source, pulls the table names out of every `sqlx::query` literal, and
+    //! checks each against the schema. It covers exactly the statements the macro cannot.
+
+    const SCHEMA: &str = include_str!("../../../db/schema.sql");
+    const SOURCES: &[(&str, &str)] = &[
+        ("crates/db/src/lib.rs", include_str!("lib.rs")),
+        (
+            "crates/ingest/src/lib.rs",
+            include_str!("../../ingest/src/lib.rs"),
+        ),
+        (
+            "crates/ingest/src/rav.rs",
+            include_str!("../../ingest/src/rav.rs"),
+        ),
+        (
+            "crates/ingest/src/refresh.rs",
+            include_str!("../../ingest/src/refresh.rs"),
+        ),
+        (
+            "crates/ingest/src/state.rs",
+            include_str!("../../ingest/src/state.rs"),
+        ),
+        (
+            "crates/ingest/src/live.rs",
+            include_str!("../../ingest/src/live.rs"),
+        ),
+        (
+            "crates/ext/src/lib.rs",
+            include_str!("../../ext/src/lib.rs"),
+        ),
+        (
+            "crates/read/src/search.rs",
+            include_str!("../../read/src/search.rs"),
+        ),
+    ];
+
+    /// Words that follow `FROM` and are not Postgres tables: SQL's own, and the short aliases
+    /// these statements use.
+    const NOT_A_TABLE: &[&str] = &[
+        "unnest", "lateral", "select", "insert", "update", "delete", "set", "from", "where", "t",
+        "n", "e", "f", "o", "a", "c", "i", "d",
+    ];
+
+    /// A nest table rather than a Postgres one. The nest owns its own schema and this file does
+    /// not describe it: `lodestar_*` are the mounted views, and `__` is nuthatch's separator
+    /// between a contract and its event.
+    fn is_nest_table(t: &str) -> bool {
+        t.starts_with("lodestar_")
+            || t.contains("__")
+            || t == "subgraph_current"
+            || t == "deployment_subgraphs"
+    }
+
+    fn tables_in(src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        // This module is excluded from its own scan: its prose contains the words it looks for,
+        // and a check that trips over its own explanation is no use to anybody. Only this one -
+        // truncating at the first `#[cfg(test)]` would cut off real statements that happen to sit
+        // below an earlier test module, which is how the first version of this managed to find
+        // nothing in half the file.
+        let mut rest = match src.find("mod schema_coverage {") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        while let Some(i) = rest.find("sqlx::query") {
+            rest = &rest[i + "sqlx::query".len()..];
+            let window = &rest[..rest.len().min(4000)];
+            // The statement, reassembled from the literals in this call. Only literals that look
+            // like SQL, so a doc comment sitting inside the window cannot contribute a "table".
+            let mut sql = String::new();
+            for (n, part) in window.split('"').enumerate() {
+                if n % 2 == 1 {
+                    let upper = part.to_uppercase();
+                    if ["SELECT", "INSERT", "UPDATE", "DELETE", "WITH", "FROM"]
+                        .iter()
+                        .any(|k| upper.contains(k))
+                    {
+                        sql.push(' ');
+                        sql.push_str(part);
+                    }
+                }
+            }
+            let words: Vec<String> = sql
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .filter(|w| !w.is_empty())
+                .map(|w| w.to_lowercase())
+                .collect();
+            for (n, w) in words.iter().enumerate() {
+                if matches!(w.as_str(), "from" | "into" | "update" | "join")
+                    && let Some(next) = words.get(n + 1)
+                    && !NOT_A_TABLE.contains(&next.as_str())
+                    && !is_nest_table(next)
+                {
+                    out.push(next.clone());
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn every_table_a_statement_names_is_in_the_schema() {
+        let declared: Vec<String> = SCHEMA
+            .split("CREATE TABLE IF NOT EXISTS ")
+            .skip(1)
+            .filter_map(|s| s.split_whitespace().next())
+            .map(|s| s.trim_end_matches('(').to_lowercase())
+            .collect();
+        assert!(
+            declared.len() > 15,
+            "the schema did not parse: {declared:?}"
+        );
+
+        let mut missing = Vec::new();
+        for (path, src) in SOURCES {
+            for t in tables_in(src) {
+                if !declared.contains(&t) {
+                    missing.push(format!("{t}  ({path})"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these tables are used and not declared in db/schema.sql:\n  {}\n\n\
+             Add them, or the next person to build a database from that file gets one that cannot \
+             answer.",
+            missing.join("\n  ")
+        );
+    }
+
+    /// If the extraction breaks, the assertion above passes vacuously.
+    #[test]
+    fn the_extraction_finds_the_tables_we_know_are_there() {
+        let found = tables_in(SOURCES[0].1);
+        for expected in ["cron_runs", "indexer_rolling_apy", "sync_bounties"] {
+            assert!(
+                found.contains(&expected.to_string()),
+                "did not find {expected} in {found:?}"
+            );
+        }
+    }
+}
