@@ -8,6 +8,33 @@ Newest first.
 
 ---
 
+## 2026-09-09: the chain probe waits eight seconds, and the coverage difference is now moot
+
+The incumbent's `fetchIndexerDeployments` allowed three seconds; this one allows eight. That made us
+see 44 chains against their 32, and 36 sampled indexers on `arbitrum-one` against their 29 - a
+visible difference between two dashboards, which is what #7 was opened about.
+
+**Eight stays, and here is the number that decides it.** Measured against production on 2026-09-09:
+of the 44 chains this probe sees, **thirteen are served by two indexers or fewer**. A chain with two
+indexers loses its whole sample the moment one of them is slow, so a shorter budget does not sharpen
+the reading - it deletes the chain. A chain served only by nodes that take four seconds to answer is
+still a chain, and reporting nothing about it is a worse answer than reporting it late.
+
+The cost is bounded and sits on no request path: the probe runs from a background job, ten at a
+time, and nothing waits on it. The timeout is now its own named constant rather than inherited from
+the client's default, which is set for the price and TVL APIs on exactly the opposite argument - a
+slow third party must never be why an indexer table is late. The two numbers agreeing today is a
+coincidence and should not become a coupling.
+
+**The comparison the issue worried about no longer exists.** `/api/chain-lag` on the frozen
+incumbent answers `{"data": null}`: its chain-health cron is descheduled and its cache is empty.
+There is one dashboard now, so nobody is putting the two figures side by side and wondering.
+
+**The sample ordering is already in line.** The scored order the incumbent used is what
+`History::Db` reads, and production has a database. The by-stake ordering is the in-memory
+fallback's only, it exists so that a missing database means a worse sample rather than no panel at
+all, and the code says so where it happens.
+
 ## 2026-09-09: the money is not checked at compile time, and that is the right way round
 
 `.sqlx/` is committed and CI runs with `SQLX_OFFLINE`, so fourteen statements are now checked

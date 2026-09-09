@@ -175,6 +175,18 @@ pub struct ProbeResult {
     pub error: Option<String>,
 }
 
+/// How long an indexer's own `/status` endpoint gets to answer.
+///
+/// **Eight seconds, deliberately, against the incumbent's three.** Measured on 2026-09-09: of the
+/// 44 chains this probe sees, **thirteen are served by two indexers or fewer**. A chain with two
+/// indexers loses its entire sample if one of them is slow, so a shorter budget does not sharpen
+/// the reading, it deletes the chain - and a chain served only by nodes that take four seconds to
+/// answer is still a chain.
+///
+/// The cost is bounded and is not on any request path: the probe runs from a background job, ten
+/// at a time, and nothing waits on it. See #7 and `docs/decisions.md`.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// The standard status query. Asked of the indexer's own endpoint, which is unauthenticated by
 /// design: an indexer that hides it cannot be checked by anyone, including its delegators.
 const STATUS_QUERY: &str = r#"{"query":"{ indexingStatuses { subgraph health synced chains { network chainHeadBlock { number } latestBlock { number } } } }"}"#;
@@ -206,6 +218,11 @@ impl Ext {
             .http
             .post(checked)
             .header("content-type", "application/json")
+            // Explicit rather than inherited. The client's own eight seconds is set for the price
+            // and TVL APIs, where the argument is the opposite one - a slow third party must never
+            // be why an indexer table is late. The two numbers coinciding today is a coincidence,
+            // and one of them changing should not silently change the other. #7
+            .timeout(PROBE_TIMEOUT)
             .body(STATUS_QUERY)
             .send()
             .await;
