@@ -29,14 +29,11 @@
 --
 -- WHAT IS NOT HERE
 --
--- The Dock's own tables - `studio_subgraphs`, `studio_deploy_keys`, the alert tables - are still
--- in lodestar's `scripts/migrate-studio*.sql`, because the Dock has not moved (#16). The one
--- exception is `sync_bounties`, which is below, because `reconcile-bounties` writes it from here
--- (#30) and a statement checked at compile time needs the table to exist. When the Dock ports, the
--- rest come with it.
+-- The Dock's tables are here because Kittiwake now owns their routes. `sync_bounties` is declared
+-- below with the other durable write-side state, where the reconciliation job can keep its chain
+-- cache honest.
 --
--- `scuttlebutt_messages` and `scuttlebutt_bans` are in lodestar's `migrations/009_scuttlebutt.sql`
--- and come across with #17. Nothing here touches them.
+-- `scuttlebutt_messages` and `scuttlebutt_bans` are declared below with their rewrite (#17).
 --
 -- `deployment_daily`, `indexer_qos_score` and `qos_daily` are the QoS oracle's, which
 -- `migrations/020_drop_qos_oracle.sql` retired. Nothing here has ever read them and they are not
@@ -436,16 +433,35 @@ CREATE INDEX IF NOT EXISTS idx_ipfs_metadata_display_name
   ON ipfs_metadata (LOWER(json->>'displayName'))
   WHERE json ? 'displayName';
 
--- ── On loan from the Dock ─────────────────────────────────────────────────────
+-- ── The Dock ──────────────────────────────────────────────────────────────────
 --
--- `sync_bounties` is the Dock's table and `nightswatchhq/lodestar`'s `scripts/migrate-studio.sql`
--- is still its definition. It is repeated here because `reconcile-bounties` writes it from this
--- service (#30) and a statement checked at compile time needs the table to exist in the schema the
--- check runs against.
---
--- Two definitions is the very thing #31 is about, so this one is temporary and says so: when the
--- Dock ports (#16) the studio tables move here and lodestar's copy goes. Until then the two must
--- agree, and this is the copy that decides whether the Rust compiles.
+-- These are the current Studio tables, including the three later publication columns. Kittiwake
+-- owns their routes now, so this is the one schema a fresh deployment must receive.
+
+CREATE TABLE IF NOT EXISTS studio_subgraphs (
+  id                             SERIAL PRIMARY KEY,
+  owner_address                  TEXT NOT NULL,
+  slug                           TEXT NOT NULL UNIQUE,
+  display_name                   TEXT,
+  description                    TEXT,
+  deployment_id                  TEXT,
+  network                        TEXT,
+  published_subgraph_id          TEXT,
+  version_label                  TEXT,
+  last_published_deployment_id   TEXT,
+  created_at                     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at                     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_studio_subgraphs_owner ON studio_subgraphs(owner_address);
+
+CREATE TABLE IF NOT EXISTS studio_deploy_keys (
+  id             SERIAL PRIMARY KEY,
+  owner_address  TEXT NOT NULL UNIQUE,
+  key_hash       TEXT NOT NULL,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_used_at   TIMESTAMPTZ
+);
 
 CREATE TABLE IF NOT EXISTS sync_bounties (
   id                 SERIAL PRIMARY KEY,

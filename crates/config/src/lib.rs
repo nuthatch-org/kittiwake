@@ -91,6 +91,28 @@ pub struct LimitSettings {
     pub exempt_ips: Vec<String>,
 }
 
+/// The product surface is deliberately opt-in.  A process that has the read-side configuration
+/// but not the session key must not accidentally start accepting half-configured Dock requests.
+#[derive(Clone, Deserialize)]
+pub struct StudioSettings {
+    pub session_secret: String,
+    #[serde(default = "default_ipfs_url")]
+    pub ipfs_url: String,
+}
+
+impl std::fmt::Debug for StudioSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StudioSettings")
+            .field("session_secret", &"<redacted>")
+            .field("ipfs_url", &self.ipfs_url)
+            .finish()
+    }
+}
+
+fn default_ipfs_url() -> String {
+    "https://api.thegraph.com/ipfs".to_string()
+}
+
 fn default_sql_per_min() -> u32 {
     10
 }
@@ -132,6 +154,8 @@ pub struct Config {
     /// like the edge and shares one rate-limit bucket. Set it here and in the proxy that fronts
     /// this service, and nowhere else.
     pub edge_secret: Option<String>,
+    #[serde(default)]
+    pub studio: Option<StudioSettings>,
     /// Turns the in-process scheduler on. Off by default so a second instance, or a staging box,
     /// cannot start writing to the same Postgres behind your back.
     #[serde(default)]
@@ -218,6 +242,7 @@ mod tests {
             },
             database_url: None,
             edge_secret: None,
+            studio: None,
             arbitrum_rpc_url: None,
             mainnet_rpc_url: None,
             bounty_board_address: None,

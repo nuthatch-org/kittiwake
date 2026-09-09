@@ -140,12 +140,32 @@ async fn main() -> anyhow::Result<()> {
              sends real traffic here."
         );
     }
+    let studio = cfg
+        .studio
+        .as_ref()
+        .map(|s| {
+            kittiwake_dock::Secret::new(&s.session_secret)
+                .map(|secret| kittiwake_edge::Studio {
+                    secret,
+                    bounty_board_address: cfg.bounty_board_address.clone(),
+                })
+                .map_err(|e| anyhow::anyhow!("invalid studio session secret: {e}"))
+        })
+        .transpose()?;
+    let ipfs = kittiwake_ext::Ipfs::new(
+        cfg.studio
+            .as_ref()
+            .map(|s| s.ipfs_url.as_str())
+            .unwrap_or(kittiwake_ext::THEGRAPH_IPFS),
+    );
     let state = kittiwake_edge::state(
         limits,
         metrics,
         pool.clone(),
         read.clone(),
         cfg.edge_secret.clone(),
+        studio,
+        ipfs,
     );
     let limits_handle = state.limits.clone();
 

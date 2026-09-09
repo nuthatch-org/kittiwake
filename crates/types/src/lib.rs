@@ -159,6 +159,8 @@ pub enum ApiError {
     BadRequest(String),
     #[error("not found")]
     NotFound,
+    #[error("unauthorized")]
+    Unauthorized,
     #[error("dependency unavailable: {0}")]
     Unavailable(String),
     #[error("internal error")]
@@ -176,6 +178,7 @@ impl ApiError {
             ApiError::RateLimited { .. } => 429,
             ApiError::BadRequest(_) => 400,
             ApiError::NotFound => 404,
+            ApiError::Unauthorized => 401,
             ApiError::Unavailable(_) => 503,
             ApiError::Internal(_) => 500,
         }
@@ -192,6 +195,7 @@ impl ApiError {
             ApiError::RateLimited { .. } => "rate_limited",
             ApiError::BadRequest(_) => "bad_request",
             ApiError::NotFound => "not_found",
+            ApiError::Unauthorized => "unauthorized",
             ApiError::Unavailable(_) => "unavailable",
             ApiError::Internal(_) => "internal",
         }

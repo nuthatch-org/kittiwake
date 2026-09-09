@@ -237,6 +237,51 @@ pub mod coverage {
     /// Every entry here is a thing somebody chose. Empty would be better; a long list is a smell.
     pub const UNCHECKED: &[(&str, Excused, &str)] = &[
         (
+            "/api/studio/auth",
+            Excused::Entirely,
+            "session cookies and wallet signatures make the frozen public incumbent unsuitable as a fixture; covered by Dock compatibility tests",
+        ),
+        (
+            "/api/studio/bounties",
+            Excused::Entirely,
+            "mutates shared Postgres and its public rows are live state, so parity must run against the isolated Dock integration database",
+        ),
+        (
+            "/api/studio/bounties/{id}",
+            Excused::Entirely,
+            "reads BountyBoard and reconciles live shared-Postgres state, so it requires the Dock integration fixture",
+        ),
+        (
+            "/api/studio/deploy-key",
+            Excused::Entirely,
+            "returns a secret exactly once and cannot be compared against a frozen deployment",
+        ),
+        (
+            "/api/studio/metadata",
+            Excused::Entirely,
+            "authenticated IPFS writes create content-addressed live state and require the Dock integration fixture",
+        ),
+        (
+            "/api/studio/node",
+            Excused::Entirely,
+            "deploy-key-authenticated JSON-RPC mutates shared Studio state and requires the Dock integration fixture",
+        ),
+        (
+            "/api/studio/ipfs/{*path}",
+            Excused::Entirely,
+            "deploy-key-authenticated IPFS writes are streaming live state and require an isolated upstream fixture",
+        ),
+        (
+            "/api/studio/subgraphs",
+            Excused::Entirely,
+            "authenticated shared-Postgres mutations require the Dock integration fixture rather than the public parity target",
+        ),
+        (
+            "/api/studio/subgraphs/{id}",
+            Excused::Entirely,
+            "authenticated shared-Postgres mutations require the Dock integration fixture rather than the public parity target",
+        ),
+        (
             "/api/whoami",
             Excused::Entirely,
             "a diagnostic that reports the caller's own address, so it has no incumbent to match",
