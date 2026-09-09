@@ -122,6 +122,11 @@ pub async fn epochs(pool: &Pool, gate: &NestGate, lane: Lane) -> Result<Ingested
     let highest = ids.iter().copied().max().unwrap_or(0);
     let highest_block = starts.iter().copied().max().unwrap_or(0);
 
+    // Deliberately not `query!`. Every amount here is wei carried as a decimal string and cast to
+    // `numeric` by Postgres, which keeps all of it; a wei figure does not fit an `f64` and two
+    // rows differing in the last few digits are exactly the pair somebody is trying to tell apart.
+    // The macro would want the `bigdecimal` feature or `float8` parameters, and the second rounds
+    // the money to buy a compile-time check. #2.
     sqlx::query(
         "INSERT INTO epochs (id, start_block, end_block, stake_deposited, signalled_tokens, \
          total_rewards, total_indexer_rewards, total_delegator_rewards, total_query_fees, \
@@ -203,6 +208,11 @@ pub async fn delegation_events(
         times.push(i(r, "timestamp").unwrap_or(0));
     }
 
+    // Deliberately not `query!`. Every amount here is wei carried as a decimal string and cast to
+    // `numeric` by Postgres, which keeps all of it; a wei figure does not fit an `f64` and two
+    // rows differing in the last few digits are exactly the pair somebody is trying to tell apart.
+    // The macro would want the `bigdecimal` feature or `float8` parameters, and the second rounds
+    // the money to buy a compile-time check. #2.
     sqlx::query(
         "INSERT INTO delegation_events (id, event_type, delegator, indexer, tokens_grt, timestamp) \
          SELECT id, kind, delegator, indexer, tokens / 1e18, to_timestamp(ts) \
@@ -299,6 +309,11 @@ pub async fn allocations(
         statuses.push(s(r, "status").unwrap_or_default());
     }
 
+    // Deliberately not `query!`. Every amount here is wei carried as a decimal string and cast to
+    // `numeric` by Postgres, which keeps all of it; a wei figure does not fit an `f64` and two
+    // rows differing in the last few digits are exactly the pair somebody is trying to tell apart.
+    // The macro would want the `bigdecimal` feature or `float8` parameters, and the second rounds
+    // the money to buy a compile-time check. #2.
     sqlx::query(
         "INSERT INTO allocations (id, indexer_address, deployment_id, allocated_tokens_grt, signal_at_open, \
          created_epoch, closed_epoch, created_at, closed_at, poi, indexing_rewards_grt, query_fees_grt, status) \
@@ -403,6 +418,11 @@ pub async fn disputes(pool: &Pool, gate: &NestGate, lane: Lane) -> Result<Ingest
         closed.push(i(r, "resolved_at").unwrap_or(0));
     }
 
+    // Deliberately not `query!`. Every amount here is wei carried as a decimal string and cast to
+    // `numeric` by Postgres, which keeps all of it; a wei figure does not fit an `f64` and two
+    // rows differing in the last few digits are exactly the pair somebody is trying to tell apart.
+    // The macro would want the `bigdecimal` feature or `float8` parameters, and the second rounds
+    // the money to buy a compile-time check. #2.
     sqlx::query(
         "INSERT INTO disputes (id, dispute_type, indexer_address, fisherman, allocation_id, deployment_id, \
          status, tokens_slashed_grt, tokens_burned_grt, created_at, closed_at, push_notified) \
@@ -458,6 +478,10 @@ pub async fn network_snapshot(
         ));
     };
 
+    // Deliberately not `query!`. The five totals are wei carried as decimal strings and cast to
+    // `numeric` by Postgres, which keeps every digit; a wei figure does not fit an `f64`. The
+    // macro would want the `bigdecimal` feature or a `float8` parameter, and the second rounds the
+    // protocol's own totals to buy a compile-time check. #2.
     sqlx::query(
         "INSERT INTO network_snapshots (total_staked, total_delegated, total_signalled, total_allocated, \
          total_supply_grt, indexer_count, active_indexer_count, delegator_count, active_delegator_count, \

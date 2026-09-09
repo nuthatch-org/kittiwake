@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT last_epoch, last_block, last_id FROM ingestion_state WHERE key = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "last_epoch",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "ingestion_state",
+            "name": "last_epoch"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "last_block",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "ingestion_state",
+            "name": "last_block"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "last_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "ingestion_state",
+            "name": "last_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "ac4eeb140896da98c660091dd2556b048bea82d8d6546980f73f07e40116812f"
+}

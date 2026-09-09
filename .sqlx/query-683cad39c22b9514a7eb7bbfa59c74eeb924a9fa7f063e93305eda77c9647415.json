@@ -1,0 +1,62 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT network, head, head_first_seen_at, last_checked_at FROM chain_head_records",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "network",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "chain_head_records",
+            "name": "network"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "head",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "chain_head_records",
+            "name": "head"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "head_first_seen_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "chain_head_records",
+            "name": "head_first_seen_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "last_checked_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "chain_head_records",
+            "name": "last_checked_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "683cad39c22b9514a7eb7bbfa59c74eeb924a9fa7f063e93305eda77c9647415"
+}

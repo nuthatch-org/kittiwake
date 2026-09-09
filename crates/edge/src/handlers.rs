@@ -315,7 +315,7 @@ pub async fn apr_provenance(
                 &rows
                     .delegations
                     .into_iter()
-                    .filter_map(|(t, d, g, ts)| Some((t?, d, g, ts?.to_rfc3339())))
+                    .filter_map(|(t, d, g, ts)| Some((t?, Some(d), g, ts?.to_rfc3339())))
                     .collect::<Vec<_>>(),
                 &rows
                     .params

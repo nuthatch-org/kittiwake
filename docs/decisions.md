@@ -8,6 +8,40 @@ Newest first.
 
 ---
 
+## 2026-09-09: the money is not checked at compile time, and that is the right way round
+
+`.sqlx/` is committed and CI runs with `SQLX_OFFLINE`, so fourteen statements are now checked
+against a real schema when they compile rather than when the job next fires. Fifteen are not, and
+the line between them is deliberate.
+
+**Anything carrying wei stays a runtime `sqlx::query`.** Those statements bind decimal strings and
+let Postgres cast to `numeric`, which keeps every digit; a wei figure does not fit an `f64`, and two
+collections differing in the last few places are exactly the pair somebody is trying to tell apart.
+`query!` would want either the `bigdecimal` feature or a `float8` parameter, and the second rounds
+the protocol's own totals in order to buy a green tick. That is a bad trade at any price. It rules
+out the epoch, delegation, allocation, dispute, snapshot and RAV inserts - which is most of the
+ingest path, and was not what #2 expected.
+
+**So does anything binding `Vec<Option<String>>`.** An indexer with no URL is an ordinary row, and
+`text[]` cannot express a per-element null to the macro, which insists on `&[String]`. Padding the
+gaps with empty strings to satisfy it would write `""` where the schema says `NULL` and the
+directory would lose the difference between "no URL" and "an empty URL".
+
+Every one of those carries a comment saying which case it is. Checking what can be checked honestly
+beats checking everything dishonestly, and an unchecked statement that says why is a decision rather
+than an omission.
+
+**It found one thing immediately.** `DelegationEventRow` declared `delegator` as
+`Option<String>`; the DDL has `delegator TEXT NOT NULL`. It decoded perfectly well, because an
+`Option` accepts a non-null, which is precisely why nothing found it until something read the
+schema. That is the same class as the four wrongly-typed columns #31 records, and the argument for
+this work in one line.
+
+`deploy/sqlx-prepare.sh` builds a throwaway Postgres from lodestar's DDL rather than pointing at
+production, so compiling needs no credentials and the schema being checked against is a thing in a
+repository. It reads that DDL from a sibling checkout, which makes the split ownership in #31
+visible instead of working around it.
+
 ## 2026-09-09: the parameter trail is written before the row it is compared against
 
 `refresh` detects a change in an indexer's cut by comparing the incoming value against the one

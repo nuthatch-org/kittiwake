@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO indexer_chains (address, chains, captured_at) VALUES ($1, $2, $3) ON CONFLICT (address) DO UPDATE SET chains = EXCLUDED.chains, captured_at = EXCLUDED.captured_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e0c458883ab2fe02b6fd17415b95214dd836bf83c5be5ea7a67f0732d7070b91"
+}

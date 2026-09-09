@@ -247,6 +247,17 @@ async fn upsert(pool: &Pool, rows: &[Collection]) -> Result<usize, IngestError> 
     let tokens: Vec<String> = rows.iter().map(|c| c.tokens.clone()).collect();
     let times: Vec<i64> = rows.iter().map(|c| c.block_timestamp).collect();
 
+    // Deliberately not `query!`, and the reason is the amounts.
+    //
+    // `tokens` is a wei figure carried as a decimal string, because a wei amount does not fit an
+    // `f64` and two collections differing in the last few digits are exactly the pair somebody is
+    // trying to tell apart. Binding it as text and letting Postgres cast to `numeric` keeps every
+    // digit. The compile-time macro would want either the `bigdecimal` feature or a `float8`
+    // parameter, and the second of those quietly rounds the money. `allocation_id` is nullable per
+    // element as well, which `text[]` cannot express to the macro.
+    //
+    // So this statement stays checked at run time, which is the honest outcome: pretending to
+    // check it would cost precision to buy a green tick. #2.
     sqlx::query(
         "INSERT INTO rav_redemptions \
          (id, indexer_address, payer, allocation_id, deployment_id, tokens_grt, source, \

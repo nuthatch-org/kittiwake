@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT value, computed_at FROM live_answers WHERE key = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "value",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "live_answers",
+            "name": "value"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "computed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "live_answers",
+            "name": "computed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "c1a20cf32e78858a5aac23a50bc0e35b9598c33524f4348538c4e9fea5fc662b"
+}

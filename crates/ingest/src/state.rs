@@ -35,10 +35,11 @@ pub struct State {
 }
 
 pub async fn get(pool: &Pool, key: &str) -> Result<State, sqlx::Error> {
-    let row: Option<State> = sqlx::query_as(
+    let row = sqlx::query_as!(
+        State,
         "SELECT last_epoch, last_block, last_id FROM ingestion_state WHERE key = $1",
+        self::key(key)
     )
-    .bind(self::key(key))
     .fetch_optional(pool)
     .await?;
     Ok(row.unwrap_or_default())
@@ -53,7 +54,7 @@ pub async fn set(
     last_block: Option<i32>,
     last_id: Option<&str>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO ingestion_state (key, last_epoch, last_block, last_id, updated_at) \
          VALUES ($1, $2, $3, $4, NOW()) \
          ON CONFLICT (key) DO UPDATE SET \
@@ -61,11 +62,11 @@ pub async fn set(
          last_block = COALESCE(EXCLUDED.last_block, ingestion_state.last_block), \
          last_id = COALESCE(EXCLUDED.last_id, ingestion_state.last_id), \
          updated_at = NOW()",
+        self::key(key),
+        last_epoch,
+        last_block,
+        last_id
     )
-    .bind(self::key(key))
-    .bind(last_epoch)
-    .bind(last_block)
-    .bind(last_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -73,11 +74,11 @@ pub async fn set(
 
 /// Say "I ran and there was nothing to do", without moving any cursor.
 pub async fn touch(pool: &Pool, key: &str) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO ingestion_state (key, updated_at) VALUES ($1, NOW()) \
          ON CONFLICT (key) DO UPDATE SET updated_at = NOW()",
+        self::key(key)
     )
-    .bind(self::key(key))
     .execute(pool)
     .await?;
     Ok(())
