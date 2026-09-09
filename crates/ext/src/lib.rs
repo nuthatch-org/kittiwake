@@ -614,6 +614,67 @@ impl Ipfs {
         }
         res.text().await.map_err(|e| e.to_string())
     }
+
+    /// Put one JSON document through the IPFS API and return the CID it actually assigned.
+    /// Metadata is content-addressed, so accepting an upstream response without a CID would be
+    /// reporting a publication that nobody can subsequently resolve.
+    pub async fn add_json(&self, value: &serde_json::Value) -> Result<String, String> {
+        let part = reqwest::multipart::Part::text(value.to_string())
+            .mime_str("application/json")
+            .map_err(|e| e.to_string())?
+            .file_name("metadata.json");
+        let form = reqwest::multipart::Form::new().part("file", part);
+        let response: serde_json::Value = self
+            .http
+            .post(format!("{}/api/v0/add", self.endpoint))
+            .query(&[("pin", "true")])
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .error_for_status()
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+        response
+            .get("Hash")
+            .and_then(|v| v.as_str())
+            .filter(|s| s.starts_with("Qm"))
+            .map(str::to_string)
+            .ok_or_else(|| "IPFS add answered without a CIDv0 Hash".to_string())
+    }
+
+    /// Forward a graph-cli IPFS API request after the edge has authenticated its deploy key.
+    /// Authentication is intentionally not forwarded: the upstream is our configured IPFS node,
+    /// not a second authority for the caller's Studio key.
+    pub async fn proxy(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: Option<&str>,
+        body: bytes::Bytes,
+        content_type: Option<&str>,
+    ) -> Result<(u16, bytes::Bytes, Option<String>), String> {
+        let mut url = format!("{}/{}", self.endpoint, path.trim_start_matches('/'));
+        if let Some(q) = query.filter(|q| !q.is_empty()) {
+            url.push('?');
+            url.push_str(q);
+        }
+        let mut request = self.http.request(method, url).body(body);
+        if let Some(ct) = content_type {
+            request = request.header("content-type", ct);
+        }
+        let response = request.send().await.map_err(|e| e.to_string())?;
+        let status = response.status().as_u16();
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+        Ok((status, bytes, ct))
+    }
 }
 
 /// What the cache holds for one CID.

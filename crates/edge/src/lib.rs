@@ -87,6 +87,8 @@ pub struct AppState {
     pub read: ReadCtx,
     pub ext: kittiwake_ext::Ext,
     pub ipfs: kittiwake_ext::Ipfs,
+    /// Present only when the Dock has its independently managed session secret.
+    pub studio: Option<Studio>,
     /// The secret the edge proxy presents. Absent means no request is ever trusted to name a client
     /// other than the one that connected - safe, and wrong once traffic arrives through Vercel.
     pub edge_secret: Option<Arc<str>>,
@@ -98,6 +100,12 @@ pub struct AppState {
     pub limits: Arc<Limits>,
     pub metrics: Option<kittiwake_obs::PrometheusHandle>,
     pub started: std::time::Instant,
+}
+
+#[derive(Clone)]
+pub struct Studio {
+    pub secret: kittiwake_dock::Secret,
+    pub bounty_board_address: Option<String>,
 }
 
 /// The client's address.
@@ -646,6 +654,41 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/price", get(handlers::price))
         .route("/api/tvl", get(handlers::tvl))
+        // The Dock. These are deliberately individual registrations: the parity extractor sees
+        // the real public surface, and a new route cannot wander into a rewrite unchecked.
+        .route(
+            "/api/studio/auth",
+            get(handlers::studio_auth_get)
+                .post(handlers::studio_auth_post)
+                .delete(handlers::studio_auth_delete),
+        )
+        .route(
+            "/api/studio/subgraphs",
+            get(handlers::studio_subgraphs_get).post(handlers::studio_subgraphs_post),
+        )
+        .route(
+            "/api/studio/subgraphs/{id}",
+            axum::routing::patch(handlers::studio_subgraph_patch)
+                .delete(handlers::studio_subgraph_delete),
+        )
+        .route(
+            "/api/studio/deploy-key",
+            get(handlers::studio_deploy_key_get).post(handlers::studio_deploy_key_post),
+        )
+        .route("/api/studio/metadata", post(handlers::studio_metadata_post))
+        .route("/api/studio/node", post(handlers::studio_node_post))
+        .route(
+            "/api/studio/ipfs/{*path}",
+            get(handlers::studio_ipfs_proxy).post(handlers::studio_ipfs_proxy),
+        )
+        .route(
+            "/api/studio/bounties",
+            get(handlers::studio_bounties_get).post(handlers::studio_bounties_post),
+        )
+        .route(
+            "/api/studio/bounties/{id}",
+            axum::routing::patch(handlers::studio_bounty_patch),
+        )
         // The public SQL surface
         .route("/api/sql/catalog", get(get_sql_catalog))
         .route("/api/sql/query", post(post_sql_query))
@@ -663,12 +706,15 @@ pub fn state(
     pool: Option<kittiwake_db::Pool>,
     read: ReadCtx,
     edge_secret: Option<String>,
+    studio: Option<Studio>,
+    ipfs: kittiwake_ext::Ipfs,
 ) -> AppState {
     AppState {
         chain: read.chain.clone(),
         read,
         ext: kittiwake_ext::Ext::default(),
-        ipfs: kittiwake_ext::Ipfs::default(),
+        ipfs,
+        studio,
         edge_secret: edge_secret.map(|s| Arc::from(s.as_str())),
         pool,
         limits: Arc::new(limits),

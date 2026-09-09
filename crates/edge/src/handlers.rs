@@ -7,13 +7,43 @@
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{ConnectInfo, Path, Query, State};
-use axum::http::HeaderMap;
+use axum::extract::{ConnectInfo, OriginalUri, Path, Query, State};
+use axum::http::{HeaderMap, HeaderValue, Method, header};
 use axum::response::{IntoResponse, Response};
 use kittiwake_read::routes;
 use kittiwake_types::ApiError;
 
 use crate::{AppState, ErrorResponse, client_ip, envelope, envelope_root};
+
+fn dock(st: &AppState) -> Result<&crate::Studio, ErrorResponse> {
+    st.studio
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("the Dock is not configured".into()).into())
+}
+
+fn session(st: &AppState, headers: &HeaderMap) -> Result<String, ErrorResponse> {
+    let token = headers
+        .get(header::COOKIE)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|all| {
+            all.split(';')
+                .map(str::trim)
+                .find_map(|part| part.strip_prefix("studio_session="))
+        })
+        .ok_or(ApiError::Unauthorized)?;
+    kittiwake_dock::parse_session(&dock(st)?.secret, token, now())
+        .map_err(|_| ApiError::Unauthorized.into())
+}
+
+fn pool(st: &AppState) -> Result<&kittiwake_db::Pool, ErrorResponse> {
+    st.pool
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("no database is configured".into()).into())
+}
+
+fn db_err(e: kittiwake_db::DbError) -> ErrorResponse {
+    ApiError::Unavailable(format!("database: {e}")).into()
+}
 
 /// Seconds since the epoch, for the "since" windows.
 fn now() -> i64 {
@@ -795,6 +825,447 @@ pub async fn indexing_status(
         fetched_at: out.entry.fetched_at,
     });
     Ok(envelope(out))
+}
+
+// ---------------------------------------------------------------------------------------------
+// The Dock
+// ---------------------------------------------------------------------------------------------
+
+pub async fn studio_auth_get(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let address = session(&st, &headers).ok();
+    let mut r = axum::Json(serde_json::json!({"address": address})).into_response();
+    crate::no_store(r.headers_mut());
+    r
+}
+
+pub async fn studio_auth_post(
+    State(st): State<AppState>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Result<Response, ErrorResponse> {
+    let address = body
+        .get("address")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::BadRequest("Missing address, message, or signature".into()))?;
+    let message = body
+        .get("message")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::BadRequest("Missing address, message, or signature".into()))?;
+    let signature = body
+        .get("signature")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ApiError::BadRequest("Missing address, message, or signature".into()))?;
+    kittiwake_dock::verify_sign_in(address, message, signature, now())
+        .map_err(|_| ApiError::Unauthorized)?;
+    let token = kittiwake_dock::create_session(&dock(&st)?.secret, address, now());
+    let mut r = axum::Json(serde_json::json!({"address": address.to_lowercase()})).into_response();
+    r.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&format!(
+            "studio_session={token}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Lax",
+            kittiwake_dock::SESSION_TTL_SECS
+        ))
+        .unwrap(),
+    );
+    crate::no_store(r.headers_mut());
+    Ok(r)
+}
+
+pub async fn studio_auth_delete() -> Response {
+    let mut r = axum::Json(serde_json::json!({"ok": true})).into_response();
+    r.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_static(
+            "studio_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax",
+        ),
+    );
+    crate::no_store(r.headers_mut());
+    r
+}
+
+pub async fn studio_subgraphs_get(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    let owner = session(&st, &headers)?;
+    let rows = kittiwake_db::list_studio_subgraphs(pool(&st)?, &owner)
+        .await
+        .map_err(db_err)?;
+    Ok(axum::Json(serde_json::json!({"subgraphs": rows})).into_response())
+}
+
+pub async fn studio_subgraphs_post(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Result<Response, ErrorResponse> {
+    let owner = session(&st, &headers)?;
+    let slug = body
+        .get("slug")
+        .and_then(|v| v.as_str())
+        .filter(|s| valid_slug(s))
+        .ok_or_else(|| {
+            ApiError::BadRequest(
+                "slug must be org/name using lowercase letters, numbers, and hyphens".into(),
+            )
+        })?;
+    if kittiwake_db::studio_subgraph_by_slug(pool(&st)?, slug)
+        .await
+        .map_err(db_err)?
+        .is_some()
+    {
+        return Err(ApiError::BadRequest("Slug already taken".into()).into());
+    }
+    let display = body.get("displayName").and_then(|v| v.as_str());
+    let row = kittiwake_db::create_studio_subgraph(pool(&st)?, &owner, slug, display)
+        .await
+        .map_err(db_err)?;
+    Ok((
+        axum::http::StatusCode::CREATED,
+        axum::Json(serde_json::json!({"subgraph": row})),
+    )
+        .into_response())
+}
+
+pub async fn studio_subgraph_patch(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Result<Response, ErrorResponse> {
+    let owner = session(&st, &headers)?;
+    let id = id
+        .parse::<i32>()
+        .map_err(|_| ApiError::BadRequest("Invalid id".into()))?;
+    kittiwake_db::patch_studio_subgraph(
+        pool(&st)?,
+        kittiwake_db::StudioSubgraphPatch {
+            id,
+            owner: &owner,
+            display_name: body.get("display_name").and_then(|v| v.as_str()),
+            description: body.get("description").and_then(|v| v.as_str()),
+            published_id: body.get("published_subgraph_id").and_then(|v| v.as_str()),
+            version_label: body.get("version_label").and_then(|v| v.as_str()),
+            last_deployment: body
+                .get("last_published_deployment_id")
+                .and_then(|v| v.as_str()),
+        },
+    )
+    .await
+    .map_err(db_err)?;
+    Ok(axum::Json(serde_json::json!({"ok":true})).into_response())
+}
+pub async fn studio_subgraph_delete(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, ErrorResponse> {
+    let owner = session(&st, &headers)?;
+    let id = id
+        .parse::<i32>()
+        .map_err(|_| ApiError::BadRequest("Invalid id".into()))?;
+    kittiwake_db::delete_studio_subgraph(pool(&st)?, id, &owner)
+        .await
+        .map_err(db_err)?;
+    Ok(axum::Json(serde_json::json!({"ok":true})).into_response())
+}
+
+fn valid_slug(s: &str) -> bool {
+    let mut p = s.split('/');
+    let ok = |x: &str| {
+        !x.is_empty()
+            && x.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    p.next().is_some_and(ok) && p.next().is_some_and(ok) && p.next().is_none()
+}
+
+pub async fn studio_deploy_key_get(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    let owner = session(&st, &headers)?;
+    let key = kittiwake_db::deploy_key(pool(&st)?, &owner)
+        .await
+        .map_err(db_err)?;
+    Ok(axum::Json(serde_json::json!({"hasKey":key.is_some(),"createdAt":key.as_ref().map(|k|k.created_at),"lastUsedAt":key.as_ref().and_then(|k|k.last_used_at)})).into_response())
+}
+pub async fn studio_deploy_key_post(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    let owner = session(&st, &headers)?;
+    let key = kittiwake_dock::generate_deploy_key();
+    kittiwake_db::replace_deploy_key(pool(&st)?, &owner, &kittiwake_dock::hash_key(&key))
+        .await
+        .map_err(db_err)?;
+    Ok(axum::Json(serde_json::json!({"key":key})).into_response())
+}
+
+pub async fn studio_metadata_post(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Result<Response, ErrorResponse> {
+    session(&st, &headers)?;
+    let display = body
+        .get("displayName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let description = body
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let label = body
+        .get("versionLabel")
+        .and_then(|v| v.as_str())
+        .unwrap_or("v0.0.1");
+    let subgraph_doc = serde_json::json!({"description":description,"displayName":display,"image":"","codeRepository":"","website":""});
+    let version_doc = serde_json::json!({"label":label,"description":""});
+    let (sub, version) = tokio::try_join!(
+        st.ipfs.add_json(&subgraph_doc),
+        st.ipfs.add_json(&version_doc)
+    )
+    .map_err(|e| ApiError::Unavailable(format!("IPFS upload: {e}")))?;
+    let sub_bytes = kittiwake_read::shape::ipfs_hash_to_bytes32(&sub)
+        .ok_or_else(|| ApiError::Internal("IPFS returned an invalid CID".into()))?;
+    let version_bytes = kittiwake_read::shape::ipfs_hash_to_bytes32(&version)
+        .ok_or_else(|| ApiError::Internal("IPFS returned an invalid CID".into()))?;
+    Ok(axum::Json(serde_json::json!({"subgraphMetaHash":sub,"versionMetaHash":version,"subgraphMetaBytes32":sub_bytes,"versionMetaBytes32":version_bytes})).into_response())
+}
+
+fn bearer(headers: &HeaderMap) -> Result<&str, ErrorResponse> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or(ApiError::Unauthorized.into())
+}
+
+/// The deliberately small graph-node dialect `graph deploy` speaks to.  There is no private
+/// graph-node here: the deploy is published to the network by the wallet flow, and this endpoint
+/// only authenticates the CLI and remembers the CID it uploaded.
+pub async fn studio_node_post(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Result<Response, ErrorResponse> {
+    let owner =
+        kittiwake_db::deploy_key_owner(pool(&st)?, &kittiwake_dock::hash_key(bearer(&headers)?))
+            .await
+            .map_err(db_err)?
+            .ok_or(ApiError::Unauthorized)?;
+    let id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    if body.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
+        return Ok(rpc_error(-32600, "Invalid JSON-RPC request"));
+    }
+    let method = body.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    if !matches!(method, "subgraph_create" | "subgraph_deploy") {
+        return Ok(rpc_error(-32601, &format!("Method not allowed: {method}")));
+    }
+    let params = body.get("params").unwrap_or(&serde_json::Value::Null);
+    let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if name.is_empty() {
+        return Ok(rpc_error(-32602, "Missing subgraph name"));
+    }
+    let sub = kittiwake_db::studio_subgraph_by_slug(pool(&st)?, name)
+        .await
+        .map_err(db_err)?;
+    let Some(sub) = sub else {
+        return Ok(rpc_error(
+            -32602,
+            &format!("Subgraph {name:?} not registered"),
+        ));
+    };
+    if sub.owner_address != owner {
+        return Ok(rpc_error(-32602, "Not your subgraph"));
+    }
+    if method == "subgraph_deploy" {
+        if let Some(cid) = params
+            .get("ipfs_hash")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+        {
+            kittiwake_db::update_studio_deployment(
+                pool(&st)?,
+                name,
+                cid,
+                params.get("network").and_then(|v| v.as_str()),
+            )
+            .await
+            .map_err(db_err)?;
+        }
+        let base = format!("https://thegraph.com/explorer/subgraphs/{name}");
+        return Ok(axum::Json(serde_json::json!({"jsonrpc":"2.0","result":{"errors":[],"warnings":[],"playground":base,"queries":base,"subscriptions":base},"id":id})).into_response());
+    }
+    Ok(axum::Json(serde_json::json!({"jsonrpc":"2.0","result":null,"id":id})).into_response())
+}
+fn rpc_error(code: i32, message: &str) -> Response {
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        axum::Json(
+            serde_json::json!({"jsonrpc":"2.0","error":{"code":code,"message":message},"id":null}),
+        ),
+    )
+        .into_response()
+}
+
+pub async fn studio_ipfs_proxy(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    body: bytes::Bytes,
+) -> Result<Response, ErrorResponse> {
+    kittiwake_db::deploy_key_owner(pool(&st)?, &kittiwake_dock::hash_key(bearer(&headers)?))
+        .await
+        .map_err(db_err)?
+        .ok_or(ApiError::Unauthorized)?;
+    let (status, bytes, content_type) = st
+        .ipfs
+        .proxy(
+            reqwest::Method::from_bytes(method.as_str().as_bytes())
+                .map_err(|_| ApiError::BadRequest("unsupported IPFS method".into()))?,
+            &path,
+            uri.query(),
+            body,
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+        )
+        .await
+        .map_err(|e| ApiError::Unavailable(format!("IPFS: {e}")))?;
+    let mut response = (
+        axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
+        bytes,
+    )
+        .into_response();
+    if let Some(ct) = content_type.and_then(|v| HeaderValue::from_str(&v).ok()) {
+        response.headers_mut().insert(header::CONTENT_TYPE, ct);
+    }
+    crate::no_store(response.headers_mut());
+    Ok(response)
+}
+
+#[derive(serde::Deserialize)]
+pub struct BountyQuery {
+    pub deployment: Option<String>,
+}
+pub async fn studio_bounties_get(
+    State(st): State<AppState>,
+    Query(q): Query<BountyQuery>,
+) -> Result<Response, ErrorResponse> {
+    let b = kittiwake_db::list_bounties(pool(&st)?, q.deployment.as_deref())
+        .await
+        .map_err(db_err)?;
+    Ok(axum::Json(serde_json::json!({"bounties":b})).into_response())
+}
+pub async fn studio_bounties_post(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Result<Response, ErrorResponse> {
+    let owner = session(&st, &headers)?;
+    let deployment = body
+        .get("deployment_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("deployment_id and amount_grt are required".into()))?;
+    let amount = body
+        .get("amount_grt")
+        .and_then(|v| v.as_str())
+        .filter(|s| s.parse::<f64>().is_ok_and(|n| n > 0.0))
+        .ok_or_else(|| ApiError::BadRequest("amount_grt must be a positive number".into()))?;
+    let subgraph_id = match body.get("slug").and_then(|v| v.as_str()) {
+        Some(s) => kittiwake_db::studio_subgraph_by_slug(pool(&st)?, s)
+            .await
+            .map_err(db_err)?
+            .filter(|x| x.owner_address == owner)
+            .map(|x| x.id),
+        None => None,
+    };
+    let expires = body
+        .get("expires_at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
+    let b = kittiwake_db::create_bounty(
+        pool(&st)?,
+        kittiwake_db::NewBounty {
+            deployment,
+            subgraph_id,
+            developer: &owner,
+            amount,
+            message: body.get("message").and_then(|v| v.as_str()),
+            expires_at: expires,
+            chain_id: body.get("chain_bounty_id").and_then(|v| v.as_str()),
+            tx: body.get("post_tx_hash").and_then(|v| v.as_str()),
+        },
+    )
+    .await
+    .map_err(db_err)?;
+    Ok((
+        axum::http::StatusCode::CREATED,
+        axum::Json(serde_json::json!({"bounty":b})),
+    )
+        .into_response())
+}
+
+fn bounty_status(state: &kittiwake_chain::ChainBounty, now: u64) -> (&'static str, Option<String>) {
+    let winner = state.winner.to_lowercase();
+    let won = winner != "0x0000000000000000000000000000000000000000";
+    if state.settled {
+        return if won {
+            ("claimed", Some(winner))
+        } else if state.expires_at > 0 && now > state.expires_at {
+            ("expired", None)
+        } else {
+            ("cancelled", None)
+        };
+    }
+    if state.expires_at > 0 && now > state.expires_at {
+        ("expired", None)
+    } else {
+        ("open", None)
+    }
+}
+pub async fn studio_bounty_patch(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, ErrorResponse> {
+    let id = id
+        .parse::<i32>()
+        .map_err(|_| ApiError::BadRequest("Invalid id".into()))?;
+    let bounty = kittiwake_db::bounty(pool(&st)?, id)
+        .await
+        .map_err(db_err)?
+        .ok_or(ApiError::NotFound)?;
+    let chain = st
+        .chain
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("no Arbitrum RPC is configured".into()))?;
+    let board = dock(&st)?
+        .bounty_board_address
+        .as_deref()
+        .ok_or_else(|| ApiError::Unavailable("BountyBoard is not configured".into()))?;
+    let chain_id = bounty
+        .chain_bounty_id
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest("Bounty has no on-chain id to reconcile".into()))?
+        .parse()
+        .map_err(|_| ApiError::BadRequest("Bounty has an invalid on-chain id".into()))?;
+    let wanted = chain.bounty(board, chain_id).await?;
+    let (status, claimed_by) = bounty_status(&wanted, now() as u64);
+    if bounty.status != status || bounty.claimed_by.as_deref() != claimed_by.as_deref() {
+        kittiwake_db::update_bounty_status(pool(&st)?, id, status, claimed_by.as_deref())
+            .await
+            .map_err(db_err)?;
+    }
+    Ok(
+        axum::Json(serde_json::json!({"ok":true,"status":status,"claimedBy":claimed_by}))
+            .into_response(),
+    )
 }
 
 #[derive(serde::Deserialize)]

@@ -187,6 +187,193 @@ pub async fn enriched_indexers(pool: &Pool, limit: i64) -> Result<Vec<EnrichedIn
 }
 
 // ---------------------------------------------------------------------------------------------
+// Dock: the existing Studio tables
+// ---------------------------------------------------------------------------------------------
+
+/// These are Lodestar's tables, not a new schema.  Keeping the row names in their wire form is
+/// intentional: the frontend used the Postgres-shaped JSON before this service existed.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct StudioSubgraph {
+    pub id: i32,
+    pub owner_address: String,
+    pub slug: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub deployment_id: Option<String>,
+    pub network: Option<String>,
+    pub published_subgraph_id: Option<String>,
+    pub version_label: Option<String>,
+    pub last_published_deployment_id: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct DeployKey {
+    pub key_hash: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct SyncBounty {
+    pub id: i32,
+    pub deployment_id: String,
+    pub subgraph_id: Option<i32>,
+    pub developer_address: String,
+    pub amount_grt: String,
+    pub message: Option<String>,
+    pub status: String,
+    pub claimed_by: Option<String>,
+    pub claimed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub chain_bounty_id: Option<String>,
+    pub post_tx_hash: Option<String>,
+}
+
+/// The editable, owner-scoped fields of a Studio subgraph. `None` means leave the stored value
+/// alone, matching the incumbent PATCH contract.
+pub struct StudioSubgraphPatch<'a> {
+    pub id: i32,
+    pub owner: &'a str,
+    pub display_name: Option<&'a str>,
+    pub description: Option<&'a str>,
+    pub published_id: Option<&'a str>,
+    pub version_label: Option<&'a str>,
+    pub last_deployment: Option<&'a str>,
+}
+
+/// The values the developer supplies when opening a sync bounty. The database owns status and
+/// timestamps, so neither can be smuggled in through this request.
+pub struct NewBounty<'a> {
+    pub deployment: &'a str,
+    pub subgraph_id: Option<i32>,
+    pub developer: &'a str,
+    pub amount: &'a str,
+    pub message: Option<&'a str>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub chain_id: Option<&'a str>,
+    pub tx: Option<&'a str>,
+}
+
+pub async fn list_studio_subgraphs(
+    pool: &Pool,
+    owner: &str,
+) -> Result<Vec<StudioSubgraph>, DbError> {
+    Ok(sqlx::query_as(
+        "SELECT * FROM studio_subgraphs WHERE owner_address = $1 ORDER BY created_at DESC",
+    )
+    .bind(owner.to_lowercase())
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn studio_subgraph_by_slug(
+    pool: &Pool,
+    slug: &str,
+) -> Result<Option<StudioSubgraph>, DbError> {
+    Ok(
+        sqlx::query_as("SELECT * FROM studio_subgraphs WHERE slug = $1")
+            .bind(slug)
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
+pub async fn create_studio_subgraph(
+    pool: &Pool,
+    owner: &str,
+    slug: &str,
+    display_name: Option<&str>,
+) -> Result<StudioSubgraph, DbError> {
+    Ok(sqlx::query_as("INSERT INTO studio_subgraphs (owner_address, slug, display_name) VALUES ($1, $2, $3) RETURNING *")
+        .bind(owner.to_lowercase()).bind(slug).bind(display_name).fetch_one(pool).await?)
+}
+
+pub async fn update_studio_deployment(
+    pool: &Pool,
+    slug: &str,
+    deployment: &str,
+    network: Option<&str>,
+) -> Result<(), DbError> {
+    sqlx::query("UPDATE studio_subgraphs SET deployment_id = $1, network = $2, updated_at = NOW() WHERE slug = $3")
+        .bind(deployment).bind(network).bind(slug).execute(pool).await?;
+    Ok(())
+}
+
+pub async fn patch_studio_subgraph(
+    pool: &Pool,
+    patch: StudioSubgraphPatch<'_>,
+) -> Result<(), DbError> {
+    sqlx::query("UPDATE studio_subgraphs SET display_name = COALESCE($1, display_name), description = COALESCE($2, description), published_subgraph_id = COALESCE($3, published_subgraph_id), version_label = COALESCE($4, version_label), last_published_deployment_id = COALESCE($5, last_published_deployment_id), updated_at = NOW() WHERE id = $6 AND owner_address = $7")
+        .bind(patch.display_name).bind(patch.description).bind(patch.published_id).bind(patch.version_label).bind(patch.last_deployment).bind(patch.id).bind(patch.owner.to_lowercase()).execute(pool).await?;
+    Ok(())
+}
+
+pub async fn delete_studio_subgraph(pool: &Pool, id: i32, owner: &str) -> Result<(), DbError> {
+    sqlx::query("DELETE FROM studio_subgraphs WHERE id = $1 AND owner_address = $2")
+        .bind(id)
+        .bind(owner.to_lowercase())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn deploy_key(pool: &Pool, owner: &str) -> Result<Option<DeployKey>, DbError> {
+    Ok(sqlx::query_as("SELECT key_hash, created_at, last_used_at FROM studio_deploy_keys WHERE owner_address = $1").bind(owner.to_lowercase()).fetch_optional(pool).await?)
+}
+
+pub async fn replace_deploy_key(pool: &Pool, owner: &str, hash: &str) -> Result<(), DbError> {
+    sqlx::query("INSERT INTO studio_deploy_keys (owner_address, key_hash) VALUES ($1, $2) ON CONFLICT (owner_address) DO UPDATE SET key_hash = EXCLUDED.key_hash, created_at = NOW(), last_used_at = NULL")
+        .bind(owner.to_lowercase()).bind(hash).execute(pool).await?;
+    Ok(())
+}
+
+pub async fn deploy_key_owner(pool: &Pool, hash: &str) -> Result<Option<String>, DbError> {
+    let owner: Option<(String,)> =
+        sqlx::query_as("SELECT owner_address FROM studio_deploy_keys WHERE key_hash = $1")
+            .bind(hash)
+            .fetch_optional(pool)
+            .await?;
+    if owner.is_some() {
+        sqlx::query("UPDATE studio_deploy_keys SET last_used_at = NOW() WHERE key_hash = $1")
+            .bind(hash)
+            .execute(pool)
+            .await?;
+    }
+    Ok(owner.map(|r| r.0))
+}
+
+pub async fn list_bounties(
+    pool: &Pool,
+    deployment: Option<&str>,
+) -> Result<Vec<SyncBounty>, DbError> {
+    let sql = if deployment.is_some() {
+        "SELECT * FROM sync_bounties WHERE deployment_id = $1 ORDER BY created_at DESC"
+    } else {
+        "SELECT * FROM sync_bounties WHERE status IN ('open', 'claimed', 'expired') ORDER BY CASE status WHEN 'open' THEN 0 WHEN 'claimed' THEN 1 ELSE 2 END, amount_grt::numeric DESC, created_at DESC LIMIT 100"
+    };
+    let mut q = sqlx::query_as(sql);
+    if let Some(d) = deployment {
+        q = q.bind(d);
+    };
+    Ok(q.fetch_all(pool).await?)
+}
+
+pub async fn create_bounty(pool: &Pool, bounty: NewBounty<'_>) -> Result<SyncBounty, DbError> {
+    Ok(sqlx::query_as("INSERT INTO sync_bounties (deployment_id, subgraph_id, developer_address, amount_grt, message, expires_at, chain_bounty_id, post_tx_hash) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *")
+        .bind(bounty.deployment).bind(bounty.subgraph_id).bind(bounty.developer.to_lowercase()).bind(bounty.amount).bind(bounty.message).bind(bounty.expires_at).bind(bounty.chain_id).bind(bounty.tx).fetch_one(pool).await?)
+}
+
+pub async fn bounty(pool: &Pool, id: i32) -> Result<Option<SyncBounty>, DbError> {
+    Ok(sqlx::query_as("SELECT * FROM sync_bounties WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?)
+}
+
+// ---------------------------------------------------------------------------------------------
 // Chain health: head history and per-indexer chain sets
 // ---------------------------------------------------------------------------------------------
 

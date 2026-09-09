@@ -19,7 +19,13 @@ database_max_connections = 16
 
 # The Dock's BountyBoard, on Arbitrum. Absent means `reconcile-bounties` does not run, which is the
 # right answer: with no board there is nothing to reconcile against.
-# bounty_board_address = "0x..." 
+# bounty_board_address = "0x..."
+
+# The Dock remains unavailable unless this is set. The session secret must be the incumbent's
+# exact value during the cutover, so existing studio_session cookies survive it.
+# [studio]
+# session_secret = "a-random-secret-at-least-32-characters-long"
+# ipfs_url = "https://api.thegraph.com/ipfs"
 
 [nest]
 # Required. There is no second source.

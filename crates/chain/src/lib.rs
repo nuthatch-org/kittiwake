@@ -73,6 +73,7 @@ sol! {
         function totalSupply() external view returns (uint256);
         function balanceOf(address account) external view returns (uint256);
     }
+
 }
 
 /// The oracle's network-wide state. None of this varies by indexer.

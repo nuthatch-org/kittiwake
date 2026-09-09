@@ -38,6 +38,42 @@ pub const WITHHELD: &[(&str, &str)] = &[
         "a diagnostic that reports the caller's own address back to them; it describes the request \
          rather than the protocol",
     ),
+    (
+        "/api/studio/auth",
+        "a session- and wallet-signature-scoped product route, not a public protocol read",
+    ),
+    (
+        "/api/studio/bounties",
+        "the Dock's shared write-side state; reads and mutations belong to signed-in Studio users",
+    ),
+    (
+        "/api/studio/bounties/{id}",
+        "reconciles one shared bounty against its on-chain state",
+    ),
+    (
+        "/api/studio/deploy-key",
+        "mints an account secret and must not be advertised as anonymous API access",
+    ),
+    (
+        "/api/studio/ipfs/{*path}",
+        "a deploy-key-authenticated IPFS proxy, not a public IPFS gateway",
+    ),
+    (
+        "/api/studio/metadata",
+        "uploads metadata to IPFS for a signed-in Studio user",
+    ),
+    (
+        "/api/studio/node",
+        "a deploy-key-authenticated graph-cli compatibility endpoint",
+    ),
+    (
+        "/api/studio/subgraphs",
+        "lists and mutates the signed-in Studio user's subgraphs",
+    ),
+    (
+        "/api/studio/subgraphs/{id}",
+        "mutates one signed-in Studio user's subgraph",
+    ),
 ];
 
 /// One published operation.
