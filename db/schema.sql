@@ -34,6 +34,13 @@
 -- exception is `sync_bounties`, which is below, because `reconcile-bounties` writes it from here
 -- (#30) and a statement checked at compile time needs the table to exist. When the Dock ports, the
 -- rest come with it.
+--
+-- `scuttlebutt_messages` and `scuttlebutt_bans` are in lodestar's `migrations/009_scuttlebutt.sql`
+-- and come across with #17. Nothing here touches them.
+--
+-- `deployment_daily`, `indexer_qos_score` and `qos_daily` are the QoS oracle's, which
+-- `migrations/020_drop_qos_oracle.sql` retired. Nothing here has ever read them and they are not
+-- worth carrying into a file that describes what this service needs.
 
 CREATE TABLE IF NOT EXISTS ingestion_state (
   key        TEXT PRIMARY KEY,
@@ -398,6 +405,36 @@ ALTER TABLE notification_log OWNER TO lodestar;
 ALTER TABLE device_tokens OWNER TO lodestar;
 ALTER TABLE cron_runs OWNER TO lodestar;
 ALTER TABLE servability_rounds OWNER TO lodestar;
+
+-- ── The IPFS document cache ───────────────────────────────────────────────────
+--
+-- This table was missed when the schema moved (#31, #57), and it matters: `warm-ipfs` writes it and
+-- name and address search read it, so a database built from this file alone came up without the one
+-- table `/api/subgraph-search` cannot answer a single question without.
+--
+-- It was missed because it was never in `scripts/schema.sql`. It lives in lodestar's `migrations/`
+-- directory, which the move did not look at - and the compile-time check did not catch the gap
+-- because every statement touching this table is a runtime `sqlx::query` in `crates/ext`, so
+-- nothing was checking it against anything. Two absences agreeing is not a confirmation.
+--
+-- A CID is its content, so a row never goes stale. A row with `error` set and `json` null is a
+-- fetch that failed and is retried an hour later. `text` is for documents that are not JSON: a
+-- deployment's manifest is YAML at the deployment's own CID.
+
+CREATE TABLE IF NOT EXISTS ipfs_metadata (
+  cid        TEXT PRIMARY KEY,
+  json       JSONB,
+  error      TEXT,
+  fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE ipfs_metadata ADD COLUMN IF NOT EXISTS text TEXT;
+
+-- Name search over what has been fetched. #43 measured the sequential scan behind it at 20 ms over
+-- 26,775 rows, so this index is not what makes that route slow; do not go looking for a trigram
+-- index on the strength of the route's latency.
+CREATE INDEX IF NOT EXISTS idx_ipfs_metadata_display_name
+  ON ipfs_metadata (LOWER(json->>'displayName'))
+  WHERE json ? 'displayName';
 
 -- ── On loan from the Dock ─────────────────────────────────────────────────────
 --
