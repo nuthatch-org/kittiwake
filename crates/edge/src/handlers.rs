@@ -705,16 +705,96 @@ pub async fn subgraph_history(
     ))
 }
 
+/// `/api/indexing-status/<deployment>`: who is serving this deployment, and can anyone.
+///
+/// Two nest reads for the allocated set, then two probes against every indexer that published a
+/// URL. The rules that turn those into an answer are in `kittiwake_read::indexing_status`, tested
+/// on their own; this is the wiring. #23.
 pub async fn indexing_status(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(hash): Path<String>,
 ) -> Result<Response, ErrorResponse> {
+    use kittiwake_read::indexing_status as is;
+
     budget!(st, peer, headers);
-    Ok(envelope(
-        routes::deployment_status(&st.read, &deployment_id(&hash)).await?,
-    ))
+    let dep = deployment_id(&hash);
+    let read = routes::deployment_status(&st.read, &dep).await?;
+
+    let deployment = read
+        .entry
+        .value
+        .get("deployment")
+        .cloned()
+        .unwrap_or_default();
+    let rows = read
+        .entry
+        .value
+        .get("allocations")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let text = |v: &serde_json::Value, k: &str| -> Option<String> {
+        v.get(k).and_then(|x| x.as_str()).map(str::to_string)
+    };
+    let allocations: Vec<is::Allocated> = rows
+        .iter()
+        .filter_map(|r| {
+            Some(is::Allocated {
+                indexer_id: text(r, "indexer")?,
+                indexer_name: None,
+                url: text(r, "url").filter(|u| !u.trim().is_empty()),
+                allocated_tokens: text(r, "allocated_tokens").unwrap_or_else(|| "0".into()),
+            })
+        })
+        .collect();
+
+    let ipfs_hash = kittiwake_read::shape::ipfs_or_id(&dep);
+    // No receipt: the TAP key is not on this box yet, so the probe is receipt-less and reads
+    // "the gate is up" rather than "the thing behind it works". That is the weaker of the two
+    // readings and the Next handler falls back to exactly the same one when no signer is
+    // configured, so this is the current behaviour rather than a regression. #11.
+    let indexers = is::probe_all(&st.ext, &allocations, &ipfs_hash, None).await;
+
+    let servability = is::assess_servability(&indexers, None);
+    // One round, because the round store is not here yet. `apply_persistence` renders a lone dead
+    // round as `rechecking`, which is the safe direction and what the handler being replaced does
+    // whenever its own store is unavailable. It can never render `dead` from one round.
+    let round = is::Round {
+        probed_at: chrono::Utc::now().to_rfc3339(),
+        serving_operators: servability.effective_serving_operators,
+        serving_indexers: servability.serving_indexer_count,
+        gateway_verdict: None,
+    };
+    let rendered = is::apply_persistence(&[round], is::DEFAULT_DEAD_ROUNDS);
+
+    let body = is::shape(
+        &is::Deployment {
+            id: dep.clone(),
+            ipfs_hash,
+            display_name: None,
+            signalled_tokens: text(&deployment, "signalled_tokens").unwrap_or_else(|| "0".into()),
+            staked_tokens: text(&deployment, "staked_tokens").unwrap_or_else(|| "0".into()),
+            total_allocations: deployment
+                .get("allocations")
+                .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
+                .unwrap_or(allocations.len() as i64),
+        },
+        &indexers,
+        &servability,
+        &rendered,
+    );
+    let mut out = read;
+    // The provenance and age carry over: they describe where the allocated set came from, which is
+    // still true. The probes are ours and are dated by `probedAt` inside the payload.
+    out.entry = std::sync::Arc::new(kittiwake_cache::Entry {
+        value: std::sync::Arc::new(body),
+        provenance: out.entry.provenance.clone(),
+        fetched_at: out.entry.fetched_at,
+    });
+    Ok(envelope(out))
 }
 
 #[derive(serde::Deserialize)]

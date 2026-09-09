@@ -242,6 +242,167 @@ impl Ext {
     }
 }
 
+/// One indexer's answer about one deployment, and what it cost to get it.
+///
+/// Raw on purpose. Deciding what a 403 of HTML means is [`kittiwake_read::indexing_status`]'s job,
+/// and this crate cannot ask it: `read` depends on `ext` and not the other way round. So the
+/// evidence comes back here and the judgement is made where the rules and their tests live.
+#[derive(Debug, Clone, Default)]
+pub struct HttpOutcome {
+    pub status: Option<u16>,
+    pub content_type: String,
+    pub body: String,
+    /// Set when no response arrived at all: `timeout`, or the transport's own words. A response
+    /// that arrived and was disliked leaves this `None` and fills in the three above.
+    pub error: Option<String>,
+    pub attempts: u32,
+    pub elapsed_ms: u64,
+}
+
+/// A retry budget for the serving probe, and only for the absence of a response.
+///
+/// `broken` is load-bearing: against a deployment with one allocated indexer it is the whole
+/// "effectively dead" verdict. So a transport failure gets exactly one more go after a short pause,
+/// while a response of any kind is classified once - there is nothing to learn by asking an
+/// endpoint to repeat an answer it has already given.
+const PROBE_RETRY_PAUSE: Duration = Duration::from_millis(300);
+
+impl Ext {
+    /// Ask one indexer about one deployment, rather than about everything it serves.
+    ///
+    /// `probe_indexer` above asks for the whole list, which is right for the chain-health sweep and
+    /// wrong here: an indexer serving two thousand deployments would send two thousand statuses to
+    /// answer a question about one of them.
+    /// Returns the raw `indexingStatuses[0]` rather than a parsed struct. `IndexingStatus` above
+    /// is the chain-health sweep's shape and is serialised straight onto `/api/indexer-status`;
+    /// widening it to carry `fatalError` and the rest would change that route's payload to suit a
+    /// different one. The caller parses what it needs.
+    pub async fn deployment_status(
+        &self,
+        base_url: &str,
+        ipfs_hash: &str,
+    ) -> Option<serde_json::Value> {
+        let url = format!("{}/status", base_url.trim_end_matches('/'));
+        // The registry is writable by anyone, so the URL is guarded before it is fetched. Without
+        // this an indexer can register `http://169.254.169.254/` and have us read our own cloud
+        // metadata for them.
+        let checked = kittiwake_ssrf::check_resolved(&url).await.ok()?;
+        // Interpolated rather than bound, so the hash is checked first. A deployment id is base58
+        // or hex and nothing else; anything with a quote in it never reaches the query.
+        if !ipfs_hash
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'x' || b == b'X')
+        {
+            return None;
+        }
+        let body = format!(
+            r#"{{"query":"{{ indexingStatuses(subgraphs: [\"{ipfs_hash}\"]) {{ subgraph health synced entityCount fatalError {{ message }} nonFatalErrors {{ message }} chains {{ network chainHeadBlock {{ number }} latestBlock {{ number }} }} }} }}"}}"#
+        );
+        let res = self
+            .http
+            .post(checked)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .ok()?;
+        if !res.status().is_success() {
+            return None;
+        }
+        let json: serde_json::Value = res.json().await.ok()?;
+        json.pointer("/data/indexingStatuses")?
+            .as_array()?
+            .first()
+            .cloned()
+    }
+
+    /// Ask the paid query path whether it answers, and bring back what it said.
+    ///
+    /// `receipt` is a signed TAP receipt when one is available. With it, the probe gets past the
+    /// payment gate and can see deployment-level failures - the only way to tell "the gate is up"
+    /// from "the gate is up and the thing behind it is broken". Without it the reading is weaker
+    /// and still worth having, which is what the handler falls back to when no key is configured.
+    pub async fn probe_serving(
+        &self,
+        base_url: &str,
+        ipfs_hash: &str,
+        receipt: Option<&str>,
+        timeout: Duration,
+    ) -> HttpOutcome {
+        let began = std::time::Instant::now();
+        let elapsed = |b: std::time::Instant| b.elapsed().as_millis() as u64;
+        let url = format!(
+            "{}/subgraphs/id/{}",
+            base_url.trim_end_matches('/'),
+            ipfs_hash
+        );
+
+        let checked = match kittiwake_ssrf::check_resolved(&url).await {
+            Ok(u) => u,
+            Err(refusal) => {
+                return HttpOutcome {
+                    error: Some(refusal.to_string()),
+                    attempts: 0,
+                    elapsed_ms: elapsed(began),
+                    ..Default::default()
+                };
+            }
+        };
+
+        let mut attempts = 0;
+        let mut last_error = String::from("no attempt was made");
+        for round in 0..2u32 {
+            if round > 0 {
+                tokio::time::sleep(PROBE_RETRY_PAUSE).await;
+            }
+            attempts += 1;
+            let mut req = self
+                .http
+                .post(checked.clone())
+                .header("content-type", "application/json")
+                .timeout(timeout)
+                .body(r#"{"query":"{ _meta { block { number } } }"}"#);
+            if let Some(r) = receipt {
+                req = req.header("TAP-Receipt", r);
+            }
+            match req.send().await {
+                Ok(res) => {
+                    let status = res.status().as_u16();
+                    let content_type = res
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let body = res.text().await.unwrap_or_default();
+                    // An answer, of whatever kind. Asking again would only get the same one.
+                    return HttpOutcome {
+                        status: Some(status),
+                        content_type,
+                        body,
+                        error: None,
+                        attempts,
+                        elapsed_ms: elapsed(began),
+                    };
+                }
+                Err(e) => {
+                    last_error = if e.is_timeout() {
+                        "timeout".to_string()
+                    } else {
+                        e.to_string()
+                    };
+                }
+            }
+        }
+        HttpOutcome {
+            error: Some(last_error),
+            attempts,
+            elapsed_ms: elapsed(began),
+            ..Default::default()
+        }
+    }
+}
+
 fn failed(url: String, began: std::time::Instant, why: String) -> ProbeResult {
     ProbeResult {
         url,
