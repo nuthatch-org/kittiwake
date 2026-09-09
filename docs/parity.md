@@ -38,6 +38,49 @@ consumer that parses it, and would otherwise look like a trivial difference.
 A wider type is not a break. Returning `{string, null}` where they only ever returned a string is a
 superset and safe; narrowing to only-null is not.
 
+## Two differences from the subgraph that are deliberate
+
+Both measured against production, both certain to be reported as regressions by whoever compares
+revenue across the cutover if they are not written down first. Neither is a bug and neither is
+going to be fixed. #9
+
+**Seventy-five collections with no allocation.** `escrow__escrow_collected` carries 71,567 rows;
+71,492 of them pair with a `subgraph_service__query_fees_collected` event on transaction, payer,
+service provider and amount. The remaining 75 are collections for a data service that is **not**
+SubgraphService, so no query-fee event exists to carry an allocation id.
+
+When #9 was written the nest did not index GraphTallyCollector's own `PaymentCollected`, and the
+plan was to join on it once nuthatch#1078 landed. **It has landed** - `tally__payment_collected` is
+in the staking nest - and the join was measured before being written:
+
+| | |
+|---|---:|
+| orphaned collections | 75 |
+| of those, named by a `PaymentCollected` row | **75** |
+| distinct `collectionId`s among them | 10 |
+| of those ten, resolving to a real allocation | **0** |
+| distinct data services involved | 5 |
+
+So the join is available and buys nothing. It would populate `allocation_id` with an id that
+matches no allocation, `deployment_id` would stay null exactly as it is today, nothing rendered
+would change, and the ingest would pay a second nest read on every page for the privilege. **Do not
+add it.** If a future data service starts issuing collection ids that *are* allocations, the figure
+to re-measure is the last row of that table.
+
+**Nine rows the subgraph drops.** The same query leaves nine collections with neither a fee event
+nor a `PaymentCollected` row, and they are one payer and one receiver:
+`0xd4b1775640d9c4ba2ce5bf2b3201b35c4031aa47` collecting to
+`0x35917c0eb91d2e21bef40940d028940484230c06`. The subgraph drops them because no escrow account
+keyed `(payer, collector, receiver)` was ever funded. They are real collections and we keep them.
+**Do not "fix" the nine.**
+
+The two figures come from two populations and the arithmetic closes in both. Within
+GraphTallyCollector's own collections: **71,567 total, 71,492 paired with a fee event, 75 not**.
+Across every collector: **84 unpaired, of which 75 carry a `PaymentCollected` row** - the tally
+ones - **and 9 do not**, those nine being the other collector's and the ones the subgraph drops.
+Nothing is unaccounted for, which is the property worth having when somebody asks why two revenue
+figures differ.
+
 ## Where it stands
 
 **2026-09-07: 20 matching, 0 breaking.** Every route the harness covers returns the shape the
