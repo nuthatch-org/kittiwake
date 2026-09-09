@@ -35,6 +35,37 @@ There is one dashboard now, so nobody is putting the two figures side by side an
 fallback's only, it exists so that a missing database means a worse sample rather than no panel at
 all, and the code says so where it happens.
 
+## 2026-09-09: this repository owns the schema
+
+`db/schema.sql` is authoritative. It moved here from `nightswatchhq/lodestar`'s
+`scripts/schema.sql`, and a new column is added here and nowhere else.
+
+The tables are read on nearly every route and, since the crons were ported, written by this service
+and no other. A repository that is to hold no server code (#29) cannot go on owning the schema of a
+database it does not write to.
+
+**It was never only tidiness.** #24 was a live 200-with-an-empty-array, and diagnosing it meant
+reading the authoritative column types out of another repository - which turned up four wrongly
+typed columns where the issue had recorded two. None was visible from inside this one, because the
+truth about the columns was a file somewhere else. #2 made the queries check themselves against the
+schema at compile time; that check now runs against a file in the repository whose code it checks,
+which is the half that was missing.
+
+The move proved its own case on the first run. The copied file predated #4, and
+`cargo sqlx prepare` refused it: `column "last_timestamp" does not exist`.
+
+**`deploy/sqlx-prepare.sh` no longer needs a sibling checkout.** Until now it read the DDL from
+`../lodestar`, so whether the compile-time check could run at all depended on somebody else's
+working tree being present and current.
+
+**One table is duplicated on purpose and says so.** `sync_bounties` is the Dock's, and lodestar's
+`migrate-studio*.sql` is still its definition, but `reconcile-bounties` writes it from here (#30)
+and a statement checked at compile time needs the table to exist in the schema the check runs
+against. Two definitions is precisely what this entry is against, so that one is temporary, carries
+a comment naming the issue that removes it (#16), and is the copy that decides whether the Rust
+compiles. The rest of the Dock's tables come across when the Dock does.
+
+
 ## 2026-09-09: the money is not checked at compile time, and that is the right way round
 
 `.sqlx/` is committed and CI runs with `SQLX_OFFLINE`, so fourteen statements are now checked
