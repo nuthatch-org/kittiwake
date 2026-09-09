@@ -42,6 +42,36 @@
 -- `migrations/020_drop_qos_oracle.sql` retired. Nothing here has ever read them and they are not
 -- worth carrying into a file that describes what this service needs.
 
+-- ── Dock ─────────────────────────────────────────────────────────────────────
+--
+-- A Studio owner's subgraphs. `slug` is the address the frontend routes on, so it is unique across
+-- owners rather than within one. #16
+CREATE TABLE IF NOT EXISTS studio_subgraphs (
+  id             SERIAL PRIMARY KEY,
+  owner_address  TEXT NOT NULL,
+  slug           TEXT NOT NULL UNIQUE,
+  display_name   TEXT,
+  description    TEXT,
+  deployment_id  TEXT,
+  network        TEXT,
+  published_subgraph_id TEXT,
+  version_label  TEXT,
+  last_published_deployment_id TEXT,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_studio_subgraphs_owner ON studio_subgraphs(owner_address);
+
+-- One deploy credential per owner. The plaintext is shown exactly once and only this SHA-256 digest
+-- is retained, so a database read is not also a deploy-authority leak.
+CREATE TABLE IF NOT EXISTS studio_deploy_keys (
+  id             SERIAL PRIMARY KEY,
+  owner_address  TEXT NOT NULL UNIQUE,
+  key_hash       TEXT NOT NULL,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_used_at   TIMESTAMPTZ
+);
+
 CREATE TABLE IF NOT EXISTS ingestion_state (
   key        TEXT PRIMARY KEY,
   last_epoch INTEGER,

@@ -257,6 +257,51 @@ pub mod coverage {
             "POST with a body; the harness only issues GETs",
         ),
         (
+            "/api/studio/auth",
+            Excused::Entirely,
+            "signs a wallet in; exercising it against production would mint sessions",
+        ),
+        (
+            "/api/studio/deploy-key",
+            Excused::Entirely,
+            "reports and mints a deploy credential, and the harness holds no session",
+        ),
+        (
+            "/api/studio/subgraphs",
+            Excused::Entirely,
+            "one owner's own subgraphs, behind a session the harness does not have",
+        ),
+        (
+            "/api/studio/subgraphs/{id}",
+            Excused::Entirely,
+            "PATCH and DELETE of one owner's own subgraph",
+        ),
+        (
+            "/api/studio/bounties",
+            Excused::Entirely,
+            "the board changes as bounties are posted and claimed, so two calls a second apart legitimately differ",
+        ),
+        (
+            "/api/studio/bounties/{id}",
+            Excused::Entirely,
+            "PATCH that writes the chain's answer back to the cache",
+        ),
+        (
+            "/api/studio/metadata",
+            Excused::Entirely,
+            "POST that pins to IPFS; comparing it would pin twice",
+        ),
+        (
+            "/api/studio/node",
+            Excused::Entirely,
+            "JSON-RPC over POST behind a deploy key, and a comparison would record a deployment",
+        ),
+        (
+            "/api/studio/ipfs/{*path}",
+            Excused::Entirely,
+            "a pass-through to IPFS behind a deploy key; its shape is IPFS's and not ours",
+        ),
+        (
             "/api/sql/receipt",
             Excused::Entirely,
             "POST with a body, and it signs what it returns; the harness only issues GETs and must not mint receipts against production",

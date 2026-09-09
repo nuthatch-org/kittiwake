@@ -114,6 +114,31 @@ impl std::fmt::Debug for ScuttleSettings {
     }
 }
 
+/// The Dock: sessions, deploy keys and the IPFS endpoint `graph deploy` uploads through.
+#[derive(Clone, Deserialize)]
+pub struct DockSettings {
+    /// The incumbent's `SESSION_SECRET`, unchanged. A different value here signs every logged-in
+    /// user out at cutover, which is #12.
+    pub session_secret: String,
+    /// The IPFS API `studio/ipfs` proxies to and `studio/metadata` uploads through. Defaults to
+    /// The Graph's public endpoint, which is what the incumbent falls back to.
+    #[serde(default = "default_graph_ipfs")]
+    pub ipfs_url: String,
+}
+
+fn default_graph_ipfs() -> String {
+    "https://api.thegraph.com/ipfs".to_string()
+}
+
+impl std::fmt::Debug for DockSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DockSettings")
+            .field("session_secret", &"<redacted>")
+            .field("ipfs_url", &self.ipfs_url)
+            .finish()
+    }
+}
+
 /// The key that signs SQL receipts. Absent means this deployment issues none, which is a valid
 /// posture rather than a misconfiguration: a reader can still sign an answer themselves with
 /// `tattler attest-named` and their own key. #19
@@ -177,6 +202,8 @@ pub struct Config {
     pub scuttle: Option<ScuttleSettings>,
     #[serde(default)]
     pub receipt: Option<ReceiptSettings>,
+    #[serde(default)]
+    pub dock: Option<DockSettings>,
     /// Turns the in-process scheduler on. Off by default so a second instance, or a staging box,
     /// cannot start writing to the same Postgres behind your back.
     #[serde(default)]
@@ -216,6 +243,13 @@ impl Config {
                 "nest.origin must be a URL, got {:?}",
                 self.nest.origin
             )));
+        }
+        if let Some(dock) = &self.dock
+            && dock.session_secret.len() < 32
+        {
+            return Err(ConfigError::Invalid(
+                "dock.session_secret must be at least 32 characters".into(),
+            ));
         }
         if let Some(receipt) = &self.receipt {
             // Checked here so a deployment that means to issue receipts finds out at boot rather
@@ -290,6 +324,7 @@ mod tests {
             edge_secret: None,
             scuttle: None,
             receipt: None,
+            dock: None,
             arbitrum_rpc_url: None,
             mainnet_rpc_url: None,
             bounty_board_address: None,
