@@ -27,7 +27,8 @@
 #   ALL on those three tables.
 #
 # It does NOT grant write on the tables the platform's crons own - indexers, epochs,
-# delegation_events, allocations, disputes, network_snapshots, rav_redemptions, ingestion_state.
+# delegation_events, allocations, disputes, network_snapshots, rav_redemptions, ingestion_state,
+# and parameter_changes, which takes INSERT only because a recorded change is append-only.
 # Those are what `scheduler_enabled` gates, and until that decision is taken deliberately (after a
 # shadow run) the database should refuse the write as well as the flag. Two locks on a one-way door
 # is not paranoia; it means an accidental flag flip fails loudly instead of quietly becoming a
@@ -122,6 +123,11 @@ if [ "${GRANT_WRITER:-0}" = "1" ]; then
   psql -d "$DB" <<SQL
 GRANT INSERT, UPDATE, DELETE ON indexers, indexer_snapshots, epochs, delegation_events,
   allocations, disputes, network_snapshots, rav_redemptions, ingestion_state TO $ROLE;
+-- INSERT and nothing else on the parameter trail. The refresh job appends a row when an indexer's
+-- cut moves (#47); a row already there is a thing that happened, and nothing in normal operation
+-- should edit or remove one. Repairing bad history is a deliberate act by a human at a superuser
+-- prompt, not a privilege this role carries about with it.
+GRANT INSERT ON parameter_changes TO $ROLE;
 SQL
 else
   echo "writes on the platform's ingest tables NOT granted; re-run with GRANT_WRITER=1 when the"
