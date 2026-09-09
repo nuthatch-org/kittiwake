@@ -101,7 +101,7 @@ default that reaches the network: an unset nest origin is a startup failure, not
 answers every protocol route with an error for a week.
 
 ```sh
-cargo test          # 44 tests, no network or database needed
+cargo test          # the whole suite, no network or database needed
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -114,6 +114,7 @@ cargo clippy --all-targets -- -D warnings
 | `GET /metrics` | Prometheus |
 | `GET /api/network-stats`, `/api/indexers`, `/api/epochs` | nest-backed reads |
 | `GET /api/sql/catalog`, `POST /api/sql/query` | the public SQL surface over five allowlisted datasets |
+| `GET /openapi.json` | the published API, generated from the router |
 
 Every data response carries provenance in the body and in headers: `x-kittiwake-served-from`,
 `x-kittiwake-as-of`, `x-kittiwake-sealed-through`, `x-kittiwake-stale`, `x-kittiwake-age`.
@@ -122,6 +123,26 @@ Every data response also says `Cache-Control: no-store`. That is not an oversigh
 cached rewritten external origins by upstream `Cache-Control` since April 2026, and letting it hold
 protocol figures past their freshness budget would hand our staleness model to somebody else's
 cache.
+
+## Published on its own terms
+
+`GET /openapi.json` describes the API. The set of paths in it is **generated from the router** by
+the same compile-time source read the parity harness uses, so the document cannot describe a route
+that does not exist or omit one that does. A served route is either summarised or listed in
+`WITHHELD` with a written reason, and the build fails if it is neither.
+
+Not everything is published. `/api/sql/query` takes arbitrary SQL and the named tier at
+`/api/sql/named` answers the same questions with a name and typed arguments, so that is the one
+described. The moderation routes are withheld for the same class of reason.
+
+`kittiwake-mcp` puts the same surface in front of a model, over stdio. It proxies the public API
+rather than re-implementing the handlers, so rate limits, provenance and the withholding decision
+above have one implementation between them.
+
+```sh
+cargo build --release --bin kittiwake-mcp
+KITTIWAKE_API_URL=https://api.lodestar-dashboard.com ./target/release/kittiwake-mcp
+```
 
 ## The rules this service keeps
 
@@ -156,7 +177,11 @@ crates/
   sqlplay/  public SQL: allowlist and screening
   sched/    the ingest scheduler
   warmer/   keeping the expensive folds hot
+  dock/     the Studio session scheme, pinned against the tokens the incumbent minted
+  scuttle/  the anonymous room: tripcodes, moderation, and the broadcast fan-out
   edge/     axum router, budgets, headers, error mapping
+  bench/    cold and warm latency, measured apart and reported apart
+  mcp/      the MCP server, a second consumer of the published API
   kittiwake-bin/  wiring and shutdown
 ```
 
