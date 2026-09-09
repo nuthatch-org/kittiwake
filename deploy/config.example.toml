@@ -58,3 +58,10 @@ exempt_ips = []
 # already issued is signed by a public key nobody can look up any more.
 # [receipt]
 # issuer_key = "..."
+
+# The Dock: Studio sessions, deploy keys, and the IPFS endpoint `graph deploy` uploads through.
+# `session_secret` must be the incumbent's SESSION_SECRET unchanged, or every logged-in user is
+# signed out at cutover. See kittiwake#12.
+# [dock]
+# session_secret = "..."
+# ipfs_url = "https://api.thegraph.com/ipfs"

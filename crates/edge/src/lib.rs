@@ -90,6 +90,7 @@ pub struct AppState {
     pub scuttle: Option<Scuttle>,
     /// The key SQL receipts are signed with. Absent means this deployment issues none.
     pub receipt_key: Option<Arc<ed25519_dalek::SigningKey>>,
+    pub dock: Option<Dock>,
     /// The secret the edge proxy presents. Absent means no request is ever trusted to name a client
     /// other than the one that connected - safe, and wrong once traffic arrives through Vercel.
     pub edge_secret: Option<Arc<str>>,
@@ -101,6 +102,15 @@ pub struct AppState {
     pub limits: Arc<Limits>,
     pub metrics: Option<kittiwake_obs::PrometheusHandle>,
     pub started: std::time::Instant,
+}
+
+#[derive(Clone)]
+pub struct Dock {
+    pub session_secret: kittiwake_dock::Secret,
+    pub ipfs: kittiwake_ext::Ipfs,
+    /// The BountyBoard, from configuration rather than from the chain client, because it is
+    /// deployed per environment unlike the protocol contracts.
+    pub bounty_board: Option<Arc<str>>,
 }
 
 #[derive(Clone)]
@@ -821,6 +831,41 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sql/query", post(post_sql_query))
         .route("/api/sql/named", get(get_sql_named).post(post_sql_named))
         .route("/api/sql/receipt", post(post_sql_receipt))
+        // The Dock. Session-scoped and owner-scoped rather than public reads, which is why none of
+        // it appears in the published document. #16
+        .route(
+            "/api/studio/auth",
+            get(handlers::studio_session)
+                .post(handlers::studio_sign_in)
+                .delete(handlers::studio_sign_out),
+        )
+        .route(
+            "/api/studio/deploy-key",
+            get(handlers::studio_deploy_key).post(handlers::studio_new_deploy_key),
+        )
+        .route(
+            "/api/studio/subgraphs",
+            get(handlers::studio_subgraphs).post(handlers::studio_create_subgraph),
+        )
+        .route(
+            "/api/studio/subgraphs/{id}",
+            axum::routing::patch(handlers::studio_patch_subgraph)
+                .delete(handlers::studio_delete_subgraph),
+        )
+        .route(
+            "/api/studio/bounties",
+            get(handlers::studio_bounties).post(handlers::studio_create_bounty),
+        )
+        .route(
+            "/api/studio/bounties/{id}",
+            axum::routing::patch(handlers::studio_reconcile_bounty),
+        )
+        .route("/api/studio/metadata", post(handlers::studio_metadata))
+        .route("/api/studio/node", post(handlers::studio_node))
+        .route(
+            "/api/studio/ipfs/{*path}",
+            get(handlers::studio_ipfs).post(handlers::studio_ipfs),
+        )
         // Scuttlebutt is deliberately separate from the provenance envelope routes above: messages
         // are primary user data in Postgres, not a view of a sealed protocol nest.
         .route(
@@ -859,6 +904,7 @@ pub fn state(
     edge_secret: Option<String>,
     scuttle: Option<Scuttle>,
     receipt_key: Option<Arc<ed25519_dalek::SigningKey>>,
+    dock: Option<Dock>,
 ) -> AppState {
     AppState {
         chain: read.chain.clone(),
@@ -867,6 +913,7 @@ pub fn state(
         ipfs: kittiwake_ext::Ipfs::default(),
         scuttle,
         receipt_key,
+        dock,
         edge_secret: edge_secret.map(|s| Arc::from(s.as_str())),
         pool,
         limits: Arc::new(limits),
@@ -923,6 +970,99 @@ async fn get_whoami(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── The Dock ─────────────────────────────────────────────────────────────
+
+    /// A slug is the address the frontend routes on, so anything that is not exactly `org/name` in
+    /// lowercase has to be refused rather than normalised into something plausible.
+    #[test]
+    fn a_slug_is_two_lowercase_parts_and_nothing_else() {
+        for good in ["acme/uniswap-v3", "a/b", "org-1/name-2", "0x/9"] {
+            assert!(crate::handlers::valid_slug(good), "{good} is a valid slug");
+        }
+        for bad in [
+            "",
+            "acme",
+            "acme/",
+            "/uniswap",
+            "Acme/uniswap",
+            "acme/Uniswap",
+            "acme/uni swap",
+            "acme/uni_swap",
+            "acme/a/b",
+            "../etc/passwd",
+            "acme/uniswap!",
+        ] {
+            assert!(
+                !crate::handlers::valid_slug(bad),
+                "{bad:?} is not a valid slug"
+            );
+        }
+    }
+
+    /// The column is text, and it is compared as a number by the board query. Anything that is not
+    /// a positive finite number would sort unpredictably and mean nothing on screen.
+    #[test]
+    fn a_bounty_amount_is_a_positive_number_however_it_arrives() {
+        let amount = |v: serde_json::Value| crate::handlers::bounty_amount(&v);
+        assert_eq!(amount(serde_json::json!(100)), Some("100".to_string()));
+        assert_eq!(amount(serde_json::json!("2.5")), Some("2.5".to_string()));
+        assert_eq!(amount(serde_json::json!(" 7 ")), Some("7".to_string()));
+        for refused in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!("nought"),
+            serde_json::json!("inf"),
+            serde_json::json!("NaN"),
+            serde_json::json!(""),
+            serde_json::Value::Null,
+            serde_json::json!({"amount": 1}),
+        ] {
+            assert_eq!(amount(refused.clone()), None, "{refused} is not an amount");
+        }
+    }
+
+    /// The session cookie is the whole of the Dock's authorisation, so every owner-scoped route is
+    /// exactly as strong as this is.
+    #[test]
+    fn a_studio_session_names_an_address_or_nobody() {
+        let secret =
+            kittiwake_dock::Secret::new("a-studio-session-secret-of-adequate-length").unwrap();
+        let other = kittiwake_dock::Secret::new("a-different-secret-of-adequate-length!!").unwrap();
+        let token = kittiwake_dock::create_session(&secret, "0xAbCd", NOW);
+        let named = |h: &HeaderMap| crate::handlers::studio_address(&secret, h, NOW);
+
+        // The address comes back lowercased, because that is what every owner column stores.
+        assert_eq!(
+            named(&cookie(&format!("{}={token}", kittiwake_dock::COOKIE_NAME))).as_deref(),
+            Some("0xabcd")
+        );
+        assert_eq!(named(&HeaderMap::new()), None);
+        assert_eq!(named(&cookie("studio_session=")), None);
+        assert_eq!(
+            named(&cookie(&format!("studio_sessionish={token}"))),
+            None,
+            "a cookie whose name merely starts the same must not sign anybody in"
+        );
+        assert_eq!(
+            named(&cookie(&format!(
+                "{}={}",
+                kittiwake_dock::COOKIE_NAME,
+                kittiwake_dock::create_session(&other, "0xAbCd", NOW)
+            ))),
+            None,
+            "a token signed with another secret is not a session"
+        );
+        assert_eq!(
+            crate::handlers::studio_address(
+                &secret,
+                &cookie(&format!("{}={token}", kittiwake_dock::COOKIE_NAME)),
+                NOW + kittiwake_dock::SESSION_TTL_SECS + 1
+            ),
+            None,
+            "an expired session stays expired"
+        );
+    }
 
     // ── SQL receipts ─────────────────────────────────────────────────────────
 

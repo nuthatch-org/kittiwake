@@ -43,6 +43,46 @@ pub const WITHHELD: &[(&str, &str)] = &[
         "issues a signed receipt and is a POST; this document describes GET operations, and a \
          receipt is obtained by asking for one rather than by reading a path",
     ),
+    // The Dock. Every one of these belongs to whoever is signed in or holds a deploy key, so
+    // publishing them would describe a private surface as a public read. #16
+    (
+        "/api/studio/auth",
+        "signs a wallet in and out; it is an authentication surface rather than a public read",
+    ),
+    (
+        "/api/studio/deploy-key",
+        "mints and reports a deploy credential belonging to one signed-in owner",
+    ),
+    (
+        "/api/studio/subgraphs",
+        "one owner's own registered subgraphs, and registering another",
+    ),
+    (
+        "/api/studio/subgraphs/{id}",
+        "edits or deletes one owner's own subgraph",
+    ),
+    (
+        "/api/studio/bounties",
+        "the open bounty board is public to read and POSTs a bounty for the signed-in developer; \
+         this document describes GET operations and the pair belongs together",
+    ),
+    (
+        "/api/studio/bounties/{id}",
+        "reconciles one bounty against the chain, which is a write rather than a read",
+    ),
+    (
+        "/api/studio/metadata",
+        "pins subgraph metadata to IPFS on behalf of the signed-in owner",
+    ),
+    (
+        "/api/studio/node",
+        "graph-node's JSON-RPC as `graph deploy` expects it, behind a deploy key; it is a CLI \
+         protocol rather than part of this API",
+    ),
+    (
+        "/api/studio/ipfs/{*path}",
+        "proxies the IPFS API behind a deploy key, and its shape is IPFS's rather than ours",
+    ),
     (
         "/api/scuttlebutt/admin/login",
         "validates a moderation credential; it is not a public data operation",

@@ -585,6 +585,329 @@ pub async fn update_bounty_status(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Dock deploy keys
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct DeployKeyStatus {
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+pub async fn deploy_key_status(
+    pool: &Pool,
+    owner: &str,
+) -> Result<Option<DeployKeyStatus>, DbError> {
+    Ok(sqlx::query_as(
+        "SELECT created_at, last_used_at FROM studio_deploy_keys WHERE owner_address = $1",
+    )
+    .bind(owner.to_lowercase())
+    .fetch_optional(pool)
+    .await?)
+}
+
+pub async fn upsert_deploy_key(pool: &Pool, owner: &str, key_hash: &str) -> Result<(), DbError> {
+    sqlx::query("INSERT INTO studio_deploy_keys (owner_address, key_hash) VALUES ($1, $2) \
+                 ON CONFLICT (owner_address) DO UPDATE SET key_hash = EXCLUDED.key_hash, created_at = NOW(), last_used_at = NULL")
+        .bind(owner.to_lowercase()).bind(key_hash).execute(pool).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Dock subgraphs and bounties
+// ---------------------------------------------------------------------------------------------
+
+/// Columns named rather than `SELECT *`, so a column added to the table does not silently change
+/// the shape of a response the frontend is written against. A macro rather than a `const` because
+/// sqlx 0.9 will only take a literal, which is what stops a query being assembled at run time.
+macro_rules! subgraph_columns {
+    () => {
+        "id, owner_address, slug, display_name, description, deployment_id, network, \
+         published_subgraph_id, version_label, last_published_deployment_id, created_at, updated_at"
+    };
+}
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct StudioSubgraph {
+    pub id: i32,
+    pub owner_address: String,
+    pub slug: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub deployment_id: Option<String>,
+    pub network: Option<String>,
+    pub published_subgraph_id: Option<String>,
+    pub version_label: Option<String>,
+    pub last_published_deployment_id: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub async fn list_subgraphs(pool: &Pool, owner: &str) -> Result<Vec<StudioSubgraph>, DbError> {
+    Ok(sqlx::query_as(concat!(
+        "SELECT ",
+        subgraph_columns!(),
+        " FROM studio_subgraphs WHERE owner_address = $1 ORDER BY created_at DESC"
+    ))
+    .bind(owner.to_lowercase())
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn subgraph_by_slug(pool: &Pool, slug: &str) -> Result<Option<StudioSubgraph>, DbError> {
+    Ok(sqlx::query_as(concat!(
+        "SELECT ",
+        subgraph_columns!(),
+        " FROM studio_subgraphs WHERE slug = $1"
+    ))
+    .bind(slug)
+    .fetch_optional(pool)
+    .await?)
+}
+
+pub async fn create_subgraph(
+    pool: &Pool,
+    owner: &str,
+    slug: &str,
+    display_name: Option<&str>,
+) -> Result<StudioSubgraph, DbError> {
+    Ok(sqlx::query_as(concat!(
+        "INSERT INTO studio_subgraphs (owner_address, slug, display_name) VALUES ($1, $2, $3) \
+         RETURNING ",
+        subgraph_columns!()
+    ))
+    .bind(owner.to_lowercase())
+    .bind(slug)
+    .bind(display_name)
+    .fetch_one(pool)
+    .await?)
+}
+
+pub async fn update_subgraph_deployment(
+    pool: &Pool,
+    slug: &str,
+    deployment_id: &str,
+    network: Option<&str>,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "UPDATE studio_subgraphs SET deployment_id = $2, network = $3, updated_at = NOW() \
+         WHERE slug = $1",
+    )
+    .bind(slug)
+    .bind(deployment_id)
+    .bind(network)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// What a `PATCH` on one subgraph is allowed to change.
+///
+/// Three shapes rather than a free-form column list: the incumbent branches on which key is present
+/// in the body, and making that a type means a caller cannot reach a column by naming it.
+pub enum SubgraphPatch<'a> {
+    Meta {
+        display_name: Option<&'a str>,
+        description: Option<&'a str>,
+    },
+    Published {
+        subgraph_id: &'a str,
+        version_label: Option<&'a str>,
+        last_deployment: Option<&'a str>,
+    },
+    Version {
+        version_label: Option<&'a str>,
+        last_deployment: Option<&'a str>,
+    },
+}
+
+/// Every arm carries `owner_address` in the WHERE clause, so a patch for somebody else's subgraph
+/// updates no rows rather than being refused after a separate ownership read.
+pub async fn patch_subgraph(
+    pool: &Pool,
+    id: i32,
+    owner: &str,
+    patch: SubgraphPatch<'_>,
+) -> Result<bool, DbError> {
+    let owner = owner.to_lowercase();
+    let done = match patch {
+        SubgraphPatch::Meta {
+            display_name,
+            description,
+        } => sqlx::query(
+            "UPDATE studio_subgraphs SET display_name = $3, description = $4, updated_at = NOW() \
+                 WHERE id = $1 AND owner_address = $2",
+        )
+        .bind(id)
+        .bind(&owner)
+        .bind(display_name)
+        .bind(description)
+        .execute(pool)
+        .await?,
+        SubgraphPatch::Published {
+            subgraph_id,
+            version_label,
+            last_deployment,
+        } => {
+            sqlx::query(
+                "UPDATE studio_subgraphs SET published_subgraph_id = $3, version_label = $4, \
+                 last_published_deployment_id = $5, updated_at = NOW() \
+                 WHERE id = $1 AND owner_address = $2",
+            )
+            .bind(id)
+            .bind(&owner)
+            .bind(subgraph_id)
+            .bind(version_label)
+            .bind(last_deployment)
+            .execute(pool)
+            .await?
+        }
+        SubgraphPatch::Version {
+            version_label,
+            last_deployment,
+        } => {
+            sqlx::query(
+                "UPDATE studio_subgraphs SET version_label = $3, \
+                 last_published_deployment_id = $4, updated_at = NOW() \
+                 WHERE id = $1 AND owner_address = $2",
+            )
+            .bind(id)
+            .bind(&owner)
+            .bind(version_label)
+            .bind(last_deployment)
+            .execute(pool)
+            .await?
+        }
+    };
+    Ok(done.rows_affected() == 1)
+}
+
+pub async fn delete_subgraph(pool: &Pool, id: i32, owner: &str) -> Result<bool, DbError> {
+    let done = sqlx::query("DELETE FROM studio_subgraphs WHERE id = $1 AND owner_address = $2")
+        .bind(id)
+        .bind(owner.to_lowercase())
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected() == 1)
+}
+
+/// The owner a deploy key belongs to, and a note that it was used.
+///
+/// The lookup is by hash, so a database read never yields a usable key. `last_used_at` is written
+/// on the way past because a key nobody can date is a key nobody can safely revoke.
+pub async fn owner_by_key_hash(pool: &Pool, key_hash: &str) -> Result<Option<String>, DbError> {
+    let found: Option<(String,)> =
+        sqlx::query_as("SELECT owner_address FROM studio_deploy_keys WHERE key_hash = $1")
+            .bind(key_hash)
+            .fetch_optional(pool)
+            .await?;
+    if found.is_some() {
+        sqlx::query("UPDATE studio_deploy_keys SET last_used_at = NOW() WHERE key_hash = $1")
+            .bind(key_hash)
+            .execute(pool)
+            .await?;
+    }
+    Ok(found.map(|(owner,)| owner))
+}
+
+macro_rules! bounty_columns {
+    () => {
+        "id, deployment_id, subgraph_id, developer_address, amount_grt, message, status, \
+         claimed_by, claimed_at, created_at, expires_at, chain_bounty_id, post_tx_hash"
+    };
+}
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct SyncBounty {
+    pub id: i32,
+    pub deployment_id: String,
+    pub subgraph_id: Option<i32>,
+    pub developer_address: String,
+    pub amount_grt: String,
+    pub message: Option<String>,
+    pub status: String,
+    pub claimed_by: Option<String>,
+    pub claimed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub chain_bounty_id: Option<String>,
+    pub post_tx_hash: Option<String>,
+}
+
+/// Filtered by deployment, or the open board. `amount_grt` is text in the table and sorted as a
+/// number here, or "9" outranks "10".
+pub async fn list_bounties(
+    pool: &Pool,
+    deployment_id: Option<&str>,
+) -> Result<Vec<SyncBounty>, DbError> {
+    let rows = match deployment_id {
+        Some(deployment) => {
+            sqlx::query_as(concat!(
+                "SELECT ",
+                bounty_columns!(),
+                " FROM sync_bounties WHERE deployment_id = $1 ORDER BY created_at DESC"
+            ))
+            .bind(deployment)
+            .fetch_all(pool)
+            .await?
+        }
+        None => {
+            sqlx::query_as(concat!(
+                "SELECT ",
+                bounty_columns!(),
+                " FROM sync_bounties WHERE status IN ('open', 'claimed', 'expired') \
+                 ORDER BY CASE status WHEN 'open' THEN 0 WHEN 'claimed' THEN 1 ELSE 2 END, \
+                 amount_grt::numeric DESC, created_at DESC LIMIT 100"
+            ))
+            .fetch_all(pool)
+            .await?
+        }
+    };
+    Ok(rows)
+}
+
+pub struct NewBounty<'a> {
+    pub deployment_id: &'a str,
+    pub subgraph_id: Option<i32>,
+    pub developer_address: &'a str,
+    pub amount_grt: &'a str,
+    pub message: Option<&'a str>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub chain_bounty_id: Option<&'a str>,
+    pub post_tx_hash: Option<&'a str>,
+}
+
+pub async fn create_bounty(pool: &Pool, new: NewBounty<'_>) -> Result<SyncBounty, DbError> {
+    Ok(sqlx::query_as(concat!(
+        "INSERT INTO sync_bounties (deployment_id, subgraph_id, developer_address, amount_grt, \
+         message, expires_at, chain_bounty_id, post_tx_hash) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING ",
+        bounty_columns!()
+    ))
+    .bind(new.deployment_id)
+    .bind(new.subgraph_id)
+    .bind(new.developer_address.to_lowercase())
+    .bind(new.amount_grt)
+    .bind(new.message)
+    .bind(new.expires_at)
+    .bind(new.chain_bounty_id)
+    .bind(new.post_tx_hash)
+    .fetch_one(pool)
+    .await?)
+}
+
+pub async fn bounty(pool: &Pool, id: i32) -> Result<Option<SyncBounty>, DbError> {
+    Ok(sqlx::query_as(concat!(
+        "SELECT ",
+        bounty_columns!(),
+        " FROM sync_bounties WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?)
+}
+
+// ---------------------------------------------------------------------------------------------
 // Scuttlebutt
 // ---------------------------------------------------------------------------------------------
 
@@ -760,7 +1083,15 @@ mod schema_coverage {
         };
         while let Some(i) = rest.find("sqlx::query") {
             rest = &rest[i + "sqlx::query".len()..];
-            let window = &rest[..rest.len().min(4000)];
+            // Back the window off to a word boundary. Cutting mid-identifier invents a table:
+            // a window ending at `UPDATE scu` reported `scu` as missing from the schema, which is
+            // a failure about this function rather than about the database.
+            let cut = rest.len().min(4000);
+            let window = &rest[..cut];
+            let window = match window.rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+                Some(i) if cut == 4000 => &window[..=i],
+                _ => window,
+            };
             // The statement, reassembled from the literals in this call. Only literals that look
             // like SQL, so a doc comment sitting inside the window cannot contribute a "table".
             let mut sql = String::new();
@@ -807,6 +1138,14 @@ mod schema_coverage {
         assert!(
             declared.len() > 15,
             "the schema did not parse: {declared:?}"
+        );
+
+        // If the extraction stops finding statements, every assertion below passes vacuously and
+        // the check quietly becomes decoration.
+        let found: usize = SOURCES.iter().map(|(_, src)| tables_in(src).len()).sum();
+        assert!(
+            found > 20,
+            "only {found} tables extracted; the scan is broken"
         );
 
         let mut missing = Vec::new();

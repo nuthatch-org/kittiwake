@@ -162,6 +162,12 @@ async fn main() -> anyhow::Result<()> {
                 .expect("receipt.issuer_key was accepted by configuration");
             Arc::new(ed25519_dalek::SigningKey::from_bytes(&bytes))
         }),
+        cfg.dock.as_ref().map(|d| kittiwake_edge::Dock {
+            session_secret: kittiwake_dock::Secret::new(&d.session_secret)
+                .expect("dock.session_secret was accepted by configuration"),
+            ipfs: kittiwake_ext::Ipfs::new(&d.ipfs_url),
+            bounty_board: cfg.bounty_board_address.as_deref().map(Arc::from),
+        }),
     );
     let limits_handle = state.limits.clone();
 

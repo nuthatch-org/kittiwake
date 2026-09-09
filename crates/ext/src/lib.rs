@@ -593,6 +593,39 @@ impl Ipfs {
         }
     }
 
+    /// The endpoint this client talks to, for a caller that has to proxy rather than fetch.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Add a JSON document and pin it, returning its CIDv0.
+    ///
+    /// The only write this service makes to IPFS. It is here rather than beside the Dock's routes
+    /// because the endpoint, the timeout and the user agent are already decided once here, and a
+    /// second client would be a second set of them. #16
+    pub async fn add_json(&self, value: &serde_json::Value) -> Result<String, String> {
+        let body = serde_json::to_vec(value).map_err(|e| e.to_string())?;
+        let part = reqwest::multipart::Part::bytes(body)
+            .file_name("metadata.json")
+            .mime_str("application/json")
+            .map_err(|e| e.to_string())?;
+        let res = self
+            .http
+            .post(format!("{}/api/v0/add?pin=true", self.endpoint))
+            .multipart(reqwest::multipart::Form::new().part("file", part))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !res.status().is_success() {
+            return Err(format!("IPFS add answered {}", res.status()));
+        }
+        let body: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+        body.get("Hash")
+            .and_then(|h| h.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| "IPFS add returned no Hash".to_string())
+    }
+
     /// The IPFS API's `cat`, which The Graph's endpoint serves on POST rather than GET.
     pub async fn cat(&self, cid: &str) -> Result<String, String> {
         let url = format!("{}/api/v0/cat", self.endpoint);
