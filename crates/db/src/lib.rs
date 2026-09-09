@@ -156,8 +156,16 @@ pub struct EnrichedIndexer {
 
 /// The directory read. Held as a constant so the exclusion below can be asserted without a
 /// database: it was missing here for the whole of the cutover while `/api/indexers` had it.
+///
+/// `reward_cut` is stored in PPM and served as a percentage. The `CASE` is not only a
+/// transition guard: the column genuinely holds both units, seven rows the platform wrote
+/// and this service no longer updates being the PPM ones, and without it they reach the
+/// dashboard as a cut of 549000%. It can go when #47 settles who owns the column.
 pub const ENRICHED_INDEXERS_SQL: &str = "SELECT address, url, geo_hash, self_stake_grt::text, delegated_grt::text, \
-         allocated_grt::text, reward_cut::text, effective_cut::text, delegator_apr::text, \
+         allocated_grt::text, \
+         (CASE WHEN reward_cut > 100 THEN reward_cut / 10000.0 ELSE reward_cut END)::text \
+           AS reward_cut, \
+         effective_cut::text, delegator_apr::text, \
          delegation_capacity_pct::text, score::text, score_grade, allocation_count, \
          delegations_in_7d, undelegations_in_7d, net_flow_grt_7d::text, distinct_data_services, \
          reo_status, last_updated, query_fees_collected_grt::text, rewards_earned_grt::text, \
@@ -448,6 +456,20 @@ mod directory_tests {
         );
         assert_eq!(INDEXERS_EXCLUDED.len(), 42);
         assert!(INDEXERS_EXCLUDED.starts_with("0x"));
+    }
+
+    /// The column holds PPM and the wire carries a percentage, and for now it holds both units at
+    /// once: seven rows the platform wrote and this service no longer updates are still in PPM.
+    /// Without the guard they reach the dashboard as a cut of 549000%.
+    #[test]
+    fn a_cut_reaches_the_wire_as_a_percentage_whichever_unit_it_is_stored_in() {
+        assert!(
+            ENRICHED_INDEXERS_SQL.contains("CASE WHEN reward_cut > 100"),
+            "{ENRICHED_INDEXERS_SQL}"
+        );
+        assert!(ENRICHED_INDEXERS_SQL.contains("reward_cut / 10000.0"));
+        // Named, or the row arrives as an unlabelled column and serde drops it.
+        assert!(ENRICHED_INDEXERS_SQL.contains("AS reward_cut"));
     }
 
     /// The names lodestar destructures off the wire. A rename here is a breaking change there and

@@ -330,8 +330,11 @@ pub async fn refresh(
             delegated,
             allocated,
             provisioned,
-            reward_cut: reward_cut_ppm / 10_000.0,
-            query_fee_cut: query_fee_cut_ppm / 10_000.0,
+            // PPM, which is what the protocol uses, what `parameter_changes` holds across 4,136
+            // rows, and what the platform wrote here before the cutover. The directory read
+            // divides by ten thousand so the wire is unchanged. #47.
+            reward_cut: reward_cut_ppm,
+            query_fee_cut: query_fee_cut_ppm,
             effective_cut: apr.effective_cut * 100.0,
             delegator_apr: rolling.unwrap_or(apr.apr),
             capacity_pct: capacity.utilization_percent,
