@@ -143,7 +143,12 @@ pub fn live_jobs(store: kittiwake_cache::Store, pool: Option<Pool>, ext: Ext) ->
 /// Gated behind `scheduler_enabled`, because turning them on makes this process a second writer to
 /// a database the platform's own crons are still writing. That is a decision, taken once, after a
 /// shadow run - not a default.
-pub fn ingest_jobs(pool: Pool, ext: Ext, chain: Option<kittiwake_chain::Chain>) -> Vec<JobDef> {
+pub fn ingest_jobs(
+    pool: Pool,
+    ext: Ext,
+    chain: Option<kittiwake_chain::Chain>,
+    bounty_board: Option<String>,
+) -> Vec<JobDef> {
     let mut jobs = Vec::new();
 
     {
@@ -323,6 +328,42 @@ pub fn ingest_jobs(pool: Pool, ext: Ext, chain: Option<kittiwake_chain::Chain>) 
         );
     }
 
+    // The seventeenth cron, and the last one outside the product layer. It reads the chain and
+    // writes `sync_bounties`; no signing key and nothing spent, which is the whole difference
+    // between this and `tap-provision`. #30.
+    //
+    // Both halves are required, and the job simply does not exist without them. A board address
+    // with no RPC cannot be read, and an RPC with no board has nothing to read - either way the
+    // honest thing is not to schedule a job that would log a failure every ten minutes.
+    if let (Some(chain), Some(board)) = (chain.clone(), bounty_board) {
+        jobs.push(
+            JobDef::every(
+                "reconcile-bounties",
+                mins(10),
+                Arc::new(move |_ctx| {
+                    let pool = pool.clone();
+                    let chain = chain.clone();
+                    let board = board.clone();
+                    Box::pin(async move {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        kittiwake_ingest::bounties::reconcile(&pool, &chain, &board, now)
+                            .await
+                            .map(|i| JobOutcome {
+                                rows_written: i.rows,
+                            })
+                            .map_err(|e| e.to_string())
+                    })
+                }),
+            )
+            // The platform ran it on the ten-minute boundary, which is `refresh`'s. Nine is the
+            // only offset whose six firings are all free; see the schedule test below.
+            .staggered(mins(9)),
+        );
+    }
+
     jobs
 }
 
@@ -349,6 +390,7 @@ mod tests {
             ("snapshot-network", 5, 2),
             ("warm-ipfs", 10, 4),
             ("refresh-chain-health", 30, 6),
+            ("reconcile-bounties", 10, 9),
         ];
         let fires = |period: u64, offset: u64| -> Vec<u64> {
             (0..60)
@@ -385,6 +427,7 @@ mod tests {
             ("warm", mins(1), Duration::ZERO),
             ("warm-ipfs", mins(10), mins(4)),
             ("refresh-chain-health", mins(30), mins(6)),
+            ("reconcile-bounties", mins(10), mins(9)),
         ];
         for (i, a) in names_and_offsets.iter().enumerate() {
             for b in names_and_offsets.iter().skip(i + 1) {

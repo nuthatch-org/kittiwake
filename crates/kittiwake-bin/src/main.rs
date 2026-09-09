@@ -206,8 +206,12 @@ async fn main() -> anyhow::Result<()> {
         if cfg.scheduler_enabled {
             match &pool {
                 Some(p) => {
-                    let ingest =
-                        jobs::ingest_jobs(p.clone(), kittiwake_ext::Ext::default(), chain.clone());
+                    let ingest = jobs::ingest_jobs(
+                        p.clone(),
+                        kittiwake_ext::Ext::default(),
+                        chain.clone(),
+                        cfg.bounty_board_address.clone(),
+                    );
                     tracing::info!(count = ingest.len(), "ingest jobs scheduled");
                     jobs.extend(ingest);
                 }

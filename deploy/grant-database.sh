@@ -18,8 +18,11 @@
 # WHAT IT GRANTS, AND WHAT IT DELIBERATELY DOES NOT
 #
 #   SELECT on the protocol tables the read routes actually read - named, not ALL TABLES. The Dock's
-#     sessions and bounties, push_subscriptions and the Scuttlebutt tables are user data that no
-#     route here touches, and they are deliberately left out.
+#     sessions, push_subscriptions and the Scuttlebutt tables are user data that no route here
+#     touches, and they are deliberately left out.
+#   SELECT and UPDATE on sync_bounties, under the writer flag. `reconcile-bounties` corrects the
+#     cached status of a bounty against the BountyBoard contract (#30). No INSERT and no DELETE:
+#     the Dock creates and removes bounties, this service only ever says a stored one is wrong.
 #   INSERT and UPDATE on ipfs_metadata, because warm-ipfs fills it and both systems write the same
 #     document under the same CID, so they race to the same answer.
 #   INSERT on cron_runs, because every job records its run there under a `kittiwake:` prefix.
@@ -128,6 +131,11 @@ GRANT INSERT, UPDATE, DELETE ON indexers, indexer_snapshots, epochs, delegation_
 -- should edit or remove one. Repairing bad history is a deliberate act by a human at a superuser
 -- prompt, not a privilege this role carries about with it.
 GRANT INSERT ON parameter_changes TO $ROLE;
+-- The bounty cache. SELECT and UPDATE, nothing else: `reconcile-bounties` reads the BountyBoard
+-- contract and corrects a status the UI's best-effort PATCH never received - an indexer claiming
+-- through Arbiscan, a developer cancelling directly. Creating and deleting bounties stays with the
+-- Dock, so this role cannot do either even by accident.
+GRANT SELECT, UPDATE ON sync_bounties TO $ROLE;
 SQL
 else
   echo "writes on the platform's ingest tables NOT granted; re-run with GRANT_WRITER=1 when the"

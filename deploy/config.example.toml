@@ -12,6 +12,15 @@ warmer_enabled = true
 # database_url = "postgresql://lodestar:...@127.0.0.1:5433/lodestar?sslmode=require"
 database_max_connections = 16
 
+# Arbitrum One JSON-RPC. Required for the eligibility oracle, the supply reads and the bounty
+# reconciliation; the routes that need it report unavailable without it rather than reaching for a
+# public endpoint that would throttle under the directory's fan-out.
+# arbitrum_rpc_url = "https://arb1.example/..."
+
+# The Dock's BountyBoard, on Arbitrum. Absent means `reconcile-bounties` does not run, which is the
+# right answer: with no board there is nothing to reconcile against.
+# bounty_board_address = "0x..." 
+
 [nest]
 # Required. There is no second source.
 origin = "https://nuthatch.example.sslip.io"

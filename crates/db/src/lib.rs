@@ -510,3 +510,51 @@ mod directory_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Sync bounties
+// ---------------------------------------------------------------------------------------------
+
+/// `(id, chain_bounty_id, status, claimed_by)` for every bounty worth asking the chain about.
+pub type ReconcilableBounty = (i32, String, String, Option<String>);
+
+/// The bounties whose cached status could still be wrong.
+///
+/// `cancelled` and `expired` are terminal on-chain and are left out: nothing moves them back, so
+/// asking about them every ten minutes would be RPC calls spent to confirm what cannot change.
+/// `claimed` stays in because the winner recorded against it may be the studio session's address
+/// rather than the indexer's.
+pub async fn reconcilable_bounties(pool: &Pool) -> Result<Vec<ReconcilableBounty>, DbError> {
+    let rows = sqlx::query_as(
+        "SELECT id, chain_bounty_id, status, claimed_by FROM sync_bounties \
+         WHERE status IN ('open', 'claimed') AND chain_bounty_id IS NOT NULL \
+         ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Bring one cached bounty into line with the chain.
+///
+/// `claimed_at` is set only on the transition into `claimed` and cleared otherwise, which is what
+/// the handler being replaced did. It is our own observation time rather than the block's: the
+/// contract records no claim timestamp, and inventing one from the block would be a more precise
+/// lie than the honest "this is when we noticed".
+pub async fn update_bounty_status(
+    pool: &Pool,
+    id: i32,
+    status: &str,
+    claimed_by: Option<&str>,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "UPDATE sync_bounties SET status = $2, claimed_by = $3, \
+         claimed_at = CASE WHEN $2 = 'claimed' THEN NOW() ELSE NULL END WHERE id = $1",
+    )
+    .bind(id)
+    .bind(status)
+    .bind(claimed_by)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
