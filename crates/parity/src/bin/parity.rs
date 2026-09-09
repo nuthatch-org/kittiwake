@@ -72,6 +72,11 @@ fn routes() -> Vec<Route> {
         both("/api/subgraph-search?q=uniswap"),
         both("/api/grt-flow"),
         both("/api/sql/catalog"),
+        // The named tier's `GET`, which is the list of what may be asked. Its `POST` rides on the
+        // same path and is not compared - the harness only issues GETs, the same limitation
+        // `/api/sql/query` is excused for - so what this proves is that the catalogue of named
+        // queries has the shape a consumer destructures, and not that running one agrees.
+        both("/api/sql/named"),
         both(&format!("/api/rewards-history?address={A}")),
         both(&format!("/api/apr-provenance/{A}")),
         both(&format!("/api/indexer-stake-history/{A}")),

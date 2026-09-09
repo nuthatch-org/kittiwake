@@ -6,6 +6,8 @@
 //! references. It was built to face the public. This screening is a cheap first pass so obvious
 //! nonsense never crosses the network; where the two disagree, the nest wins.
 
+pub mod named;
+
 use kittiwake_types::NestId;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;

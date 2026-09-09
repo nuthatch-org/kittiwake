@@ -410,6 +410,96 @@ async fn post_sql_query(
     Ok(resp)
 }
 
+/// `GET /api/sql/named`: what may be asked.
+///
+/// The statement is returned beside the name, deliberately. A name is stable and a statement is
+/// what the nest actually answered, and a receipt over an answer wants the second.
+async fn get_sql_named() -> Response {
+    axum::Json(serde_json::json!({
+        "queries": kittiwake_sqlplay::named::NAMED_QUERIES,
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct NamedCall {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    args: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `POST /api/sql/named`: ask one of them.
+///
+/// The caller sends a name and typed arguments, never SQL. That is the whole difference between
+/// this and `/api/sql/query`: the free-form tier bounds the cost of a question, and this one bounds
+/// which questions exist. #19
+async fn post_sql_named(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<NamedCall>,
+) -> Result<Response, ErrorResponse> {
+    st.limits.check(
+        &st.limits.sql,
+        client_ip(peer, &headers, st.edge_secret.as_deref()),
+    )?;
+
+    // Errors as prompts. A refusal that only says "no" leaves a caller guessing, and guessing at an
+    // endpoint is how you get a thousand probing requests.
+    let Some(query) = kittiwake_sqlplay::named::find_named_query(&body.name) else {
+        let allowed: Vec<&str> = kittiwake_sqlplay::named::NAMED_QUERIES
+            .iter()
+            .map(|q| q.name)
+            .collect();
+        return Err(ApiError::BadRequest(format!(
+            "no query named {:?}; allowed: {}",
+            body.name,
+            allowed.join(", ")
+        ))
+        .into());
+    };
+
+    let sql = kittiwake_sqlplay::named::render(query, &body.args)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    // A declared query naming a dataset nobody exposes is our bug rather than the caller's, and a
+    // test asserts it cannot happen - so this arm is a 500 and says so plainly.
+    let dataset = kittiwake_sqlplay::find_dataset(query.dataset).ok_or_else(|| {
+        tracing::error!(
+            query = query.name,
+            dataset = query.dataset,
+            "named query targets an unknown dataset"
+        );
+        ApiError::Internal("this query is misconfigured".into())
+    })?;
+
+    let spec = kittiwake_nest::QuerySpec::read(dataset.nest, sql.clone())
+        .with_timeout(Duration::from_secs(6));
+    let answer = st.read.gate.query(&spec).await.map_err(ApiError::from)?;
+
+    let meta = Meta {
+        provenance: answer.provenance.clone(),
+        served_from: kittiwake_types::ServedFrom::Nest,
+        stale: false,
+        age_seconds: 0,
+    };
+    let mut resp = axum::Json(serde_json::json!({
+        "query": query.name,
+        "dataset": dataset.id,
+        // Returned so the caller can see exactly what was run, and so a receipt over this answer
+        // can record the statement rather than only the name.
+        "sql": sql,
+        "count": answer.count,
+        "rows": answer.rows,
+        "provenance": &meta,
+    }))
+    .into_response();
+    provenance_headers(resp.headers_mut(), &meta);
+    no_store(resp.headers_mut());
+    Ok(resp)
+}
+
 /// Liveness: is this process answering. Deliberately says nothing about the nests, because a
 /// process that is up and a service that is correct are different questions.
 async fn get_health(State(st): State<AppState>) -> Response {
@@ -542,6 +632,7 @@ pub fn router(state: AppState) -> Router {
         // The public SQL surface
         .route("/api/sql/catalog", get(get_sql_catalog))
         .route("/api/sql/query", post(post_sql_query))
+        .route("/api/sql/named", get(get_sql_named).post(post_sql_named))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(tower_http::catch_panic::CatchPanicLayer::new())
         .with_state(state)
