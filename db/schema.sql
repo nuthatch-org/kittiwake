@@ -429,6 +429,47 @@ CREATE TABLE IF NOT EXISTS sync_bounties (
 CREATE INDEX IF NOT EXISTS idx_sync_bounties_deployment ON sync_bounties(deployment_id);
 CREATE INDEX IF NOT EXISTS idx_sync_bounties_status     ON sync_bounties(status);
 
+-- ── Scuttlebutt ───────────────────────────────────────────────────────────────
+--
+-- The anonymous room. From lodestar's `migrations/009_scuttlebutt.sql`, brought across with the
+-- rewrite (#17) - the messages and the bans are the part of that feature which has to outlive a
+-- restart, and everything else about it does not need a store at all.
+--
+-- **Raw addresses are never stored.** `ip_hash` is an HMAC of the address under a server pepper:
+-- enough to ban a repeat offender, useless as personal data if the table ever leaks. A change to
+-- the pepper silently unbans everybody, which is why `kittiwake_scuttle` pins the hash against the
+-- implementation it replaces.
+
+CREATE TABLE IF NOT EXISTS scuttlebutt_messages (
+  id            BIGSERIAL PRIMARY KEY,
+  room          TEXT        NOT NULL DEFAULT 'main',
+  name          TEXT,                       -- display name without the tripcode; NULL is Anonymous
+  tripcode      TEXT,                       -- "!a8Df2xQ1z"; NULL when no #secret was given
+  body          TEXT        NOT NULL,
+  ip_hash       TEXT        NOT NULL,       -- HMAC(address, pepper); never the address
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted       BOOLEAN     NOT NULL DEFAULT false,
+  deleted_at    TIMESTAMPTZ,
+  delete_reason TEXT
+);
+
+-- History is read newest-first within a room, with keyset pagination on the id.
+CREATE INDEX IF NOT EXISTS idx_sb_msg_room_id ON scuttlebutt_messages (room, id DESC);
+
+CREATE TABLE IF NOT EXISTS scuttlebutt_bans (
+  id         BIGSERIAL PRIMARY KEY,
+  ip_hash    TEXT,                          -- ban by address hash...
+  tripcode   TEXT,                          -- ...and/or by tripcode
+  reason     TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TIMESTAMPTZ,                   -- NULL is permanent
+  -- A ban with neither target bans nobody, and would sit in the list looking as though it did.
+  CONSTRAINT sb_ban_target CHECK (ip_hash IS NOT NULL OR tripcode IS NOT NULL)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sb_ban_iphash   ON scuttlebutt_bans (ip_hash);
+CREATE INDEX IF NOT EXISTS idx_sb_ban_tripcode ON scuttlebutt_bans (tripcode);
+
 -- ── Ours, and only ours ───────────────────────────────────────────────────────
 --
 -- The four tables this service created for itself. Nothing else reads or writes them, which is
