@@ -76,7 +76,10 @@ const IN_LIST_CHUNK: usize = 100;
 /// Run a query once per chunk of ids and concatenate the rows.
 ///
 /// Chunks go out concurrently but bounded, because they all draw on one nest and the point of the
-/// gate is that we never ask it for more than it admits.
+/// gate is that we never ask it for more than it admits. The width comes from the gate rather than
+/// from a constant: this was `buffer_unordered(4)` against a `gns` nest holding two permits, which
+/// does not run four at a time, it queues two of them by construction and occasionally times out
+/// waiting for a slot that was never going to exist. See #43.
 async fn ask_chunked<F>(
     gate: &NestGate,
     nest: NestId,
@@ -91,9 +94,10 @@ where
         return Ok(Vec::new());
     }
     let sqls: Vec<String> = ids.chunks(IN_LIST_CHUNK).map(&build).collect();
+    let width = gate.lane_width(nest, lane);
     let results: Vec<Result<Vec<serde_json::Value>, ApiError>> =
         futures::stream::iter(sqls.into_iter().map(|sql| ask(gate, nest, sql, lane)))
-            .buffer_unordered(4)
+            .buffer_unordered(width)
             .collect()
             .await;
     let mut rows = Vec::new();
@@ -261,17 +265,27 @@ async fn hits_for_deployments(
         return Ok(Vec::new());
     }
 
-    let (figures, meta) = tokio::join!(
-        ask_chunked(gate, NestId::Alloc, lane, &ids, |chunk| format!(
+    // Rank on the figures alone, then hydrate only what survives the truncation.
+    //
+    // These two used to run together under a `join!`, which read as the obvious thing and was the
+    // whole of #43's seven seconds. The ordering key is `signalled_tokens` and nothing else; the
+    // subgraph metadata decides only what a surviving row is *called*. So a search for "uniswap",
+    // which matches 434 deployments and returns ten, was asking the GNS nest about all 434 and then
+    // fetching up to 868 IPFS documents to name rows it was about to discard. The cost scaled with
+    // the candidate count instead of the result count, which is why "graphprotocol" answered in
+    // 0.17 s and "uniswap" took seven.
+    //
+    // Sequencing them costs one round trip against the alloc nest. Hydrating ten rows instead of
+    // 434 saves rather more than that.
+    let figures = ask_chunked(gate, NestId::Alloc, lane, &ids, |chunk| {
+        format!(
             "SELECT id, CAST(signalled_tokens AS VARCHAR) AS signalled_tokens, \
              CAST(staked_tokens AS VARCHAR) AS staked_tokens FROM lodestar_deployments \
              WHERE id IN ({})",
             quoted(chunk)
-        )),
-        subgraph_metadata_for_deployments(pool, ipfs, gate, lane, &ids),
-    );
-    let figures = figures?;
-    let meta = meta?;
+        )
+    })
+    .await?;
 
     let mut by_id: BTreeMap<String, (String, String)> = BTreeMap::new();
     for f in &figures {
@@ -306,6 +320,9 @@ async fn hits_for_deployments(
         )
     });
     ordered.truncate(limit);
+
+    // Only now, and only for the rows a reader will actually see.
+    let meta = subgraph_metadata_for_deployments(pool, ipfs, gate, lane, &ordered).await?;
 
     Ok(ordered
         .into_iter()
@@ -686,6 +703,159 @@ pub async fn warm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #43. The GNS nest and the IPFS documents behind it must be asked about the rows a reader
+    /// will see, not about every candidate the ranking considered.
+    ///
+    /// A name search matching 434 deployments returns ten. Hydrating all 434 before truncating was
+    /// up to 868 IPFS document lookups for ten names, and it is the reason a cold `?q=uniswap` cost
+    /// seven seconds while `?q=graphprotocol`, which matches few, cost 0.17. The assertion is on
+    /// the statement the nest actually receives, because that is the thing that was wrong; a test
+    /// of the ordering alone would have passed throughout.
+    #[tokio::test]
+    async fn only_the_rows_that_survive_truncation_are_hydrated() {
+        use std::sync::{Arc, Mutex};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
+
+        const CANDIDATES: usize = 250;
+        const LIMIT: usize = 10;
+
+        struct Nest(Arc<Mutex<Vec<(String, String)>>>);
+
+        impl Respond for Nest {
+            fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+                let path = req.url.path().to_string();
+                if path.ends_with("/ready") {
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "ready": true, "lag_blocks": 0, "tip": 1, "last_block": 1,
+                        "sealed_through": 1, "stalled": false
+                    }));
+                }
+                let q = req
+                    .url
+                    .query_pairs()
+                    .find(|(k, _)| k == "q")
+                    .map(|(_, v)| v.to_string())
+                    .unwrap_or_default();
+                self.0.lock().unwrap().push((path.clone(), q.clone()));
+
+                // The alloc nest returns a signal figure for every id it was asked about, so the
+                // ranking has something to order by. The GNS nest returns nothing, which keeps the
+                // IPFS half out of the test - and out of the pool, which is not connected.
+                // Signal derived from the id itself, so the ranking is global rather than per
+                // chunk. Deriving it from the row's position within its chunk makes each chunk's
+                // own tail win, which is a property of the fixture and not of the code.
+                let rows: Vec<serde_json::Value> = if path.starts_with("/alloc") {
+                    ids_in(&q)
+                        .into_iter()
+                        .map(|id| {
+                            let signal = u64::from_str_radix(&id[48..], 16).unwrap_or(0);
+                            serde_json::json!({
+                                "id": id,
+                                "signalled_tokens": signal.to_string(),
+                                "staked_tokens": "0",
+                            })
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "count": rows.len(), "rows": rows,
+                    "provenance": {"as_of": 1, "sealed_through": 1, "source": "mock"}
+                }))
+            }
+        }
+
+        /// The quoted ids in an `IN (...)` list, which is what the fan-out width and the
+        /// truncation both show up in.
+        fn ids_in(sql: &str) -> Vec<String> {
+            sql.split('\'')
+                .skip(1)
+                .step_by(2)
+                .filter(|s| is_id(s))
+                .map(|s| s.to_string())
+                .collect()
+        }
+
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("GET"))
+            .respond_with(Nest(seen.clone()))
+            .mount(&server)
+            .await;
+
+        let mut cfg = kittiwake_nest::NestConfig::new(server.uri());
+        for n in kittiwake_types::NestId::ALL {
+            cfg.base_paths.insert(n, format!("/{}", n.as_str()));
+        }
+        let gate = NestGate::new(cfg).unwrap();
+
+        // Never connected to: the GNS nest answers with no rows, so no document is ever wanted and
+        // `json_docs` returns before it reads the cache.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("a lazy pool needs no server");
+        let ipfs = Ipfs::new("http://127.0.0.1:1");
+
+        let ids: Vec<String> = (0..CANDIDATES).map(|n| format!("{n:064x}")).collect();
+        let hits = hits_for_deployments(&pool, &ipfs, &gate, Lane::Read, &ids, LIMIT)
+            .await
+            .expect("the mock nest answers");
+        assert_eq!(hits.len(), LIMIT);
+
+        let seen = seen.lock().unwrap();
+        let asked = |prefix: &str| -> Vec<String> {
+            seen.iter()
+                .filter(|(p, _)| p.starts_with(prefix))
+                .flat_map(|(_, q)| ids_in(q))
+                .collect()
+        };
+
+        // Ranking needs every candidate, so the alloc nest sees all of them.
+        assert_eq!(
+            asked("/alloc").len(),
+            CANDIDATES,
+            "the ranking must consider every candidate"
+        );
+
+        // Naming needs only the survivors. This is the assertion the old shape failed.
+        let named = asked("/gns");
+        assert_eq!(
+            named.len(),
+            LIMIT,
+            "the gns nest was asked about {} deployments to name {LIMIT}",
+            named.len()
+        );
+
+        // And they are the right ten: the mock ranks by position, so the highest ids win.
+        let mut expected: Vec<String> = ids[CANDIDATES - LIMIT..].to_vec();
+        expected.sort();
+        let mut named = named;
+        named.sort();
+        assert_eq!(named, expected);
+    }
+
+    /// A fan-out asks the gate how wide the lane is rather than guessing. The inner lane is one
+    /// narrower so a background job cannot take the last permit from a waiting reader, and it never
+    /// reaches zero.
+    #[test]
+    fn a_lane_is_as_wide_as_the_nest_admits_and_the_inner_one_is_narrower() {
+        let mut cfg = kittiwake_nest::NestConfig::new("http://example.invalid");
+        cfg.permits.insert(NestId::Alloc, 4);
+        cfg.permits.insert(NestId::Gns, 2);
+        cfg.permits.insert(NestId::Dips, 1);
+        let gate = NestGate::new(cfg).unwrap();
+
+        assert_eq!(gate.lane_width(NestId::Alloc, Lane::Read), 4);
+        assert_eq!(gate.lane_width(NestId::Alloc, Lane::Cron), 3);
+        // The nest #43 is about: four slots were being asked of a gate holding two.
+        assert_eq!(gate.lane_width(NestId::Gns, Lane::Read), 2);
+        assert_eq!(gate.lane_width(NestId::Gns, Lane::Cron), 1);
+        // A one-permit nest still has to be usable by the jobs that feed it.
+        assert_eq!(gate.lane_width(NestId::Dips, Lane::Cron), 1);
+    }
 
     #[test]
     fn the_zero_metadata_hash_is_no_document_rather_than_a_cid() {
