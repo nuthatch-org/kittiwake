@@ -96,7 +96,30 @@ pub struct IndexerStatus {
     pub blocks_behind: Option<i64>,
     /// The head this indexer's lag was measured against, once reconciled against its peers.
     pub network_chain_head: Option<i64>,
+    /// Whether graph-node answered at all. Decides which keys the payload carries: an indexer that
+    /// said nothing gets the five fields we knew before asking, and not a row of nulls.
+    pub answered: bool,
     pub serve_probe: Option<ServeProbe>,
+    /// How that verdict was reached. A transport failure that never got a response and an edge
+    /// answering 403 HTML both collapse to `broken`, and they point at different culprits.
+    pub serve_probe_detail: Option<ProbeDetail>,
+}
+
+/// The evidence behind one `serve_probe`, as the panel receives it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeDetail {
+    pub probe: ServeProbe,
+    /// `guard` - refused before a request was made; `transport` - no response arrived;
+    /// `response` - one arrived and was classified.
+    pub cause: &'static str,
+    pub error: Option<String>,
+    pub status: Option<u16>,
+    pub content_type: Option<String>,
+    /// Whether a receipt was attached, which decides which classifier read the response.
+    pub paid: bool,
+    pub attempts: u32,
+    pub elapsed_ms: u64,
 }
 
 impl IndexerStatus {
@@ -126,7 +149,9 @@ impl IndexerStatus {
             sync_progress: None,
             blocks_behind: None,
             network_chain_head: None,
+            answered: false,
             serve_probe: None,
+            serve_probe_detail: None,
         }
     }
 
@@ -138,13 +163,14 @@ impl IndexerStatus {
         )
     }
 
-    /// The tri-state the page colours by. `failed` outranks the sync gap.
-    pub fn health_class(&self) -> &'static str {
-        match self.state {
-            SyncState::Failed => "failed",
-            SyncState::Synced => "healthy",
-            _ => "unhealthy",
-        }
+    /// graph-node's own `health`, passed through rather than derived.
+    ///
+    /// It is **not** a restatement of the sync state and the two disagree routinely: the incumbent
+    /// serves `status: "syncing"` beside `health: "healthy"` for an indexer that is simply behind.
+    /// Deriving this from the gap - which the first version of this module did - would have moved
+    /// every catching-up indexer out of `healthyCount` and changed a number the panel shows.
+    pub fn reported_health(&self) -> Option<&str> {
+        self.health.as_deref()
     }
 }
 
@@ -158,6 +184,7 @@ pub fn build_indexer_status(
 ) -> IndexerStatus {
     let mut out = IndexerStatus::unreachable(indexer_id, indexer_name, url, allocated_tokens);
     let Some(s) = raw else { return out };
+    out.answered = true;
 
     let head = s.chain_head_block.filter(|n| *n > 0);
     let latest = s.latest_block;
@@ -1012,5 +1039,721 @@ mod tests {
         assert_eq!(dead_rounds_threshold(Some("nonsense")), DEFAULT_DEAD_ROUNDS);
         assert_eq!(dead_rounds_threshold(None), DEFAULT_DEAD_ROUNDS);
         assert_eq!(dead_rounds_threshold(Some("5")), 5);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Gathering the evidence
+// ---------------------------------------------------------------------------------------------
+
+/// How many indexers are probed at once.
+///
+/// Each one is two requests to a stranger's endpoint, and the slow ones are the point rather than
+/// the exception: an indexer that takes five seconds to say nothing is exactly the reading wanted.
+/// Eight keeps a hundred-allocation deployment inside a sensible wall clock without opening a
+/// hundred sockets to the outside world at once.
+pub const PROBE_CONCURRENCY: usize = 8;
+
+/// How long one probe may take before it is called a timeout.
+pub const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One allocation, as the nest reports it.
+#[derive(Debug, Clone)]
+pub struct Allocated {
+    pub indexer_id: String,
+    pub indexer_name: Option<String>,
+    pub url: Option<String>,
+    pub allocated_tokens: String,
+}
+
+/// Parse graph-node's `indexingStatuses[0]` into the fields that decide a verdict.
+pub fn parse_raw_status(v: &serde_json::Value) -> RawStatus {
+    let chain = v
+        .get("chains")
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first());
+    // graph-node sends block numbers as strings, and has been known to send them as numbers.
+    // Reading only one of the two spellings is how a head silently becomes `None` and an indexer
+    // silently becomes "synced by its own flag".
+    let block = |k: &str| -> Option<i64> {
+        let n = chain?.get(k)?.get("number")?;
+        n.as_i64().or_else(|| n.as_str()?.parse().ok())
+    };
+    RawStatus {
+        health: v.get("health").and_then(|h| h.as_str()).map(str::to_string),
+        synced: v.get("synced").and_then(|s| s.as_bool()),
+        chain_head_block: block("chainHeadBlock"),
+        latest_block: block("latestBlock"),
+        network: chain
+            .and_then(|c| c.get("network"))
+            .and_then(|n| n.as_str())
+            .map(str::to_string),
+        entity_count: v
+            .get("entityCount")
+            .and_then(|e| e.as_str())
+            .map(str::to_string),
+        fatal_error: v
+            .pointer("/fatalError/message")
+            .and_then(|m| m.as_str())
+            .map(str::to_string),
+        non_fatal_errors: v
+            .get("nonFatalErrors")
+            .and_then(|e| e.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e.get("message")?.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Turn one indexer's two probes into a verdict.
+fn fold_one(
+    alloc: &Allocated,
+    status: Option<serde_json::Value>,
+    serve: Option<&kittiwake_ext::HttpOutcome>,
+    paid: bool,
+) -> IndexerStatus {
+    let raw = status.as_ref().map(parse_raw_status);
+    let mut out = build_indexer_status(
+        alloc.indexer_id.clone(),
+        alloc.indexer_name.clone(),
+        alloc.url.clone().unwrap_or_default(),
+        alloc.allocated_tokens.clone(),
+        raw.as_ref(),
+    );
+    if let Some(o) = serve {
+        let (probe, cause) = match o.status {
+            // No response at all. `broken` when we tried and failed, because a serving path that
+            // will not answer is not serving; `unreachable` is for never having asked, which is
+            // what the SSRF guard causes.
+            None if o.attempts == 0 => (ServeProbe::Unreachable, "guard"),
+            None => (ServeProbe::Broken, "transport"),
+            Some(code) => {
+                let p = if paid {
+                    probe_from_paid(classify_paid_response(code, &o.content_type, &o.body))
+                } else {
+                    classify_serve_response(code, &o.content_type, &o.body)
+                };
+                (p, "response")
+            }
+        };
+        out.serve_probe = Some(probe);
+        out.serve_probe_detail = Some(ProbeDetail {
+            probe,
+            cause,
+            error: o.error.clone(),
+            status: o.status,
+            content_type: (!o.content_type.is_empty()).then(|| o.content_type.clone()),
+            paid,
+            attempts: o.attempts,
+            elapsed_ms: o.elapsed_ms,
+        });
+    }
+    out
+}
+
+/// Probe every allocated indexer and fold the answers into one verdict for the deployment.
+///
+/// An allocation with no registered URL is `unreachable` without a request being made. That is not
+/// the same as a failure and is counted separately, because an indexer that never published an
+/// endpoint has not been asked anything.
+pub async fn probe_all(
+    ext: &kittiwake_ext::Ext,
+    allocations: &[Allocated],
+    ipfs_hash: &str,
+    receipt: Option<&str>,
+) -> Vec<IndexerStatus> {
+    use futures::StreamExt;
+
+    // Cloned rather than borrowed, for the reason `search::json_docs` records: a stream of futures
+    // over borrowed items is not `Send` for every lifetime, and axum needs the whole handler
+    // future to be. The compiler's word for it is "implementation of `FnOnce` is not general
+    // enough", which does not obviously mean that.
+    let (with_url, without_url): (Vec<Allocated>, Vec<Allocated>) = allocations
+        .iter()
+        .cloned()
+        .partition(|a| a.url.as_deref().is_some_and(|u| !u.trim().is_empty()));
+
+    let probed: Vec<IndexerStatus> =
+        futures::stream::iter(with_url.into_iter().map(|a| async move {
+            let url = a.url.clone().unwrap_or_default();
+            // Together rather than one after the other: they ask different questions of the same host
+            // and the slow one should not be waited for twice.
+            let (status, serve) = tokio::join!(
+                ext.deployment_status(&url, ipfs_hash),
+                ext.probe_serving(&url, ipfs_hash, receipt, PROBE_TIMEOUT),
+            );
+            fold_one(&a, status, Some(&serve), receipt.is_some())
+        }))
+        .buffer_unordered(PROBE_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut all = probed;
+    all.extend(without_url.into_iter().map(|a| {
+        IndexerStatus::unreachable(
+            a.indexer_id,
+            a.indexer_name,
+            String::new(),
+            a.allocated_tokens,
+        )
+    }));
+    // Deterministic, so two identical rounds render identically and a diff between them means
+    // something changed rather than that the futures finished in a different order.
+    all.sort_by(|a, b| a.indexer_id.cmp(&b.indexer_id));
+    reconcile_to_network_head(all)
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    #[test]
+    fn a_string_block_number_and_a_numeric_one_read_the_same() {
+        let as_text = serde_json::json!({
+            "health": "healthy", "synced": true,
+            "chains": [{"network": "mainnet", "chainHeadBlock": {"number": "100"}, "latestBlock": {"number": "90"}}]
+        });
+        let as_number = serde_json::json!({
+            "health": "healthy", "synced": true,
+            "chains": [{"network": "mainnet", "chainHeadBlock": {"number": 100}, "latestBlock": {"number": 90}}]
+        });
+        let a = parse_raw_status(&as_text);
+        let b = parse_raw_status(&as_number);
+        assert_eq!(a.chain_head_block, Some(100));
+        assert_eq!(b.chain_head_block, Some(100));
+        assert_eq!(a.latest_block, b.latest_block);
+    }
+
+    /// Reading only one spelling would leave the head `None`, and the verdict would fall back to
+    /// graph-node's own `synced` flag - which is the thing this module exists not to trust.
+    #[test]
+    fn a_missing_head_falls_back_to_the_flag_which_is_why_both_spellings_matter() {
+        let v = serde_json::json!({"health": "healthy", "synced": true, "chains": []});
+        let raw = parse_raw_status(&v);
+        assert!(raw.chain_head_block.is_none());
+        assert_eq!(
+            build_indexer_status("0xa", None, "u", "0", Some(&raw)).state,
+            SyncState::Synced,
+            "with nothing to measure, the flag is all there is"
+        );
+    }
+
+    #[test]
+    fn a_fatal_error_and_the_non_fatal_list_are_both_read() {
+        let v = serde_json::json!({
+            "health": "failed",
+            "fatalError": {"message": "handler panicked"},
+            "nonFatalErrors": [{"message": "a"}, {"message": "b"}],
+            "entityCount": "1234",
+            "chains": []
+        });
+        let raw = parse_raw_status(&v);
+        assert_eq!(raw.fatal_error.as_deref(), Some("handler panicked"));
+        assert_eq!(raw.non_fatal_errors, ["a", "b"]);
+        assert_eq!(raw.entity_count.as_deref(), Some("1234"));
+    }
+
+    /// A transport failure is `broken`: a serving path that will not answer is not serving.
+    /// `unreachable` is reserved for never having asked, which the SSRF guard causes.
+    #[test]
+    fn no_response_is_broken_when_we_tried_and_unreachable_when_we_did_not() {
+        let a = Allocated {
+            indexer_id: "0xa".into(),
+            indexer_name: None,
+            url: Some("http://x".into()),
+            allocated_tokens: "0".into(),
+        };
+        let tried = kittiwake_ext::HttpOutcome {
+            error: Some("timeout".into()),
+            attempts: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_one(&a, None, Some(&tried), false).serve_probe,
+            Some(ServeProbe::Broken)
+        );
+        let refused = kittiwake_ext::HttpOutcome {
+            error: Some("resolves to a private address".into()),
+            attempts: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_one(&a, None, Some(&refused), false).serve_probe,
+            Some(ServeProbe::Unreachable)
+        );
+    }
+
+    /// Whether a receipt was attached decides which classifier reads the response, and the two
+    /// disagree on exactly the case the paid probe exists for.
+    #[test]
+    fn the_same_response_reads_differently_with_and_without_a_receipt() {
+        let a = Allocated {
+            indexer_id: "0xa".into(),
+            indexer_name: None,
+            url: Some("http://x".into()),
+            allocated_tokens: "0".into(),
+        };
+        let errors = kittiwake_ext::HttpOutcome {
+            status: Some(200),
+            content_type: "application/json".into(),
+            body: r#"{"data":null,"errors":[{"message":"BadResponse"}]}"#.into(),
+            attempts: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            fold_one(&a, None, Some(&errors), false).serve_probe,
+            Some(ServeProbe::AlivePaid),
+            "unpaid: the query stack answered, which is all we can tell"
+        );
+        assert_eq!(
+            fold_one(&a, None, Some(&errors), true).serve_probe,
+            Some(ServeProbe::Broken),
+            "paid: past the gate and still not answering"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The answer, as the panel reads it
+// ---------------------------------------------------------------------------------------------
+
+/// One indexer, on the wire.
+///
+/// Keys whose value is unknown are **omitted rather than sent as null**, because the handler being
+/// replaced leaves them `undefined` and `JSON.stringify` drops the key. An indexer that never
+/// answered carries the five things we knew before asking plus its probe verdict, which is what
+/// the frozen incumbent serves and what the parity harness compares against. `indexerName` is the
+/// exception: it is an explicit null there, so it is an explicit null here.
+fn indexer_json(i: &IndexerStatus) -> serde_json::Value {
+    fn put(o: &mut serde_json::Map<String, serde_json::Value>, k: &str, v: serde_json::Value) {
+        o.insert(k.to_string(), v);
+    }
+    /// Insert only when there is something to say. This is the whole mechanism: `None` leaves the
+    /// key off, exactly as `undefined` does on the other side.
+    fn maybe(
+        o: &mut serde_json::Map<String, serde_json::Value>,
+        k: &str,
+        v: Option<serde_json::Value>,
+    ) {
+        if let Some(v) = v {
+            o.insert(k.to_string(), v);
+        }
+    }
+
+    let mut o = serde_json::Map::new();
+    put(&mut o, "indexerId", i.indexer_id.clone().into());
+    put(&mut o, "indexerName", serde_json::json!(i.indexer_name));
+    put(&mut o, "url", i.url.clone().into());
+    put(&mut o, "allocatedTokens", i.allocated_tokens.clone().into());
+    put(&mut o, "status", i.state.as_str().into());
+    if let Some(p) = i.serve_probe {
+        put(&mut o, "serveProbe", serde_json::json!(p));
+        put(&mut o, "servable", i.servable().into());
+    }
+    maybe(
+        &mut o,
+        "serveProbeDetail",
+        i.serve_probe_detail.as_ref().map(|d| serde_json::json!(d)),
+    );
+    if !i.answered {
+        return serde_json::Value::Object(o);
+    }
+
+    maybe(&mut o, "health", i.health.clone().map(Into::into));
+    maybe(&mut o, "synced", i.synced.map(Into::into));
+    maybe(&mut o, "chainHeadBlock", i.chain_head_block.map(Into::into));
+    maybe(&mut o, "latestBlock", i.latest_block.map(Into::into));
+    maybe(
+        &mut o,
+        "networkChainHead",
+        i.network_chain_head.map(Into::into),
+    );
+    maybe(&mut o, "network", i.network.clone().map(Into::into));
+    maybe(
+        &mut o,
+        "entityCount",
+        i.entity_count.clone().map(Into::into),
+    );
+    // An object, not a string: the panel reads `.message`, and a bare string would be a shape
+    // change dressed up as a value change.
+    maybe(
+        &mut o,
+        "fatalError",
+        i.fatal_error
+            .as_ref()
+            .map(|m| serde_json::json!({ "message": m })),
+    );
+    maybe(
+        &mut o,
+        "nonFatalErrors",
+        (!i.non_fatal_errors.is_empty()).then(|| serde_json::json!(i.non_fatal_errors)),
+    );
+    put(&mut o, "nonFatalErrorCount", i.non_fatal_error_count.into());
+    maybe(&mut o, "syncProgress", i.sync_progress.map(Into::into));
+    maybe(&mut o, "blocksBehind", i.blocks_behind.map(Into::into));
+    serde_json::Value::Object(o)
+}
+
+/// The whole payload for `/api/indexing-status/<deployment>`.
+///
+/// `total_allocations` is what the nest counted, which can exceed `indexers.len()` because the
+/// allocation query is capped. Reporting `indexers.len()` for both would quietly turn a truncation
+/// into a smaller network.
+#[derive(Debug, Clone, Default)]
+pub struct Deployment {
+    pub id: String,
+    pub ipfs_hash: String,
+    /// A name lives in an IPFS document and this route fetches none, so it is normally `None`.
+    pub display_name: Option<String>,
+    pub signalled_tokens: String,
+    pub staked_tokens: String,
+    /// What the nest counted, which can exceed the allocations returned: the query is capped.
+    pub total_allocations: i64,
+}
+
+pub fn shape(
+    dep: &Deployment,
+    indexers: &[IndexerStatus],
+    servability: &Servability,
+    rendered: &RenderedServability,
+) -> serde_json::Value {
+    let count = |f: fn(&IndexerStatus) -> bool| indexers.iter().filter(|i| f(i)).count();
+    serde_json::json!({
+        "deploymentId": dep.id,
+        "ipfsHash": dep.ipfs_hash,
+        // Null rather than absent, and null rather than the hash. A name lives in an IPFS document
+        // and this route does not fetch one; inventing the hash as a display name would put an
+        // unreadable string where the panel expects something a human chose.
+        "displayName": dep.display_name,
+        "signalledTokens": dep.signalled_tokens,
+        "stakedTokens": dep.staked_tokens,
+        "indexers": indexers.iter().map(indexer_json).collect::<Vec<_>>(),
+        "totalIndexers": indexers.len(),
+        "totalAllocations": dep.total_allocations,
+        // `synced`/`failed`/`unreachable` are ours, from the block gap. `healthy`/`unhealthy` are
+        // graph-node's own word and overlap with them freely: an indexer catching up is `syncing`
+        // and `healthy` at the same time, which is what the incumbent serves.
+        "syncedCount": count(|i| i.state == SyncState::Synced),
+        "healthyCount": count(|i| i.reported_health() == Some("healthy")),
+        "unhealthyCount": count(|i| i.reported_health() == Some("unhealthy")),
+        "failedCount": count(|i| i.state == SyncState::Failed),
+        "unreachableCount": count(|i| i.state == SyncState::Unreachable),
+        "servability": servability,
+        "servabilityRendered": rendered,
+        // The gateway probe left with the API key, so no new round has a witness. Null rather than
+        // omitted, because the panel distinguishes "the gateway disagreed" from "nobody asked".
+        "gatewayVerdict": serde_json::Value::Null,
+    })
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+
+    fn dep(total_allocations: i64) -> Deployment {
+        Deployment {
+            id: "0xdep".into(),
+            ipfs_hash: "Qmdep".into(),
+            display_name: None,
+            signalled_tokens: "1".into(),
+            staked_tokens: "2".into(),
+            total_allocations,
+        }
+    }
+
+    /// An indexer that answered. `answered` is what decides whether the payload carries the
+    /// status fields at all, so a fixture that leaves it false is testing the wrong shape.
+    fn one(id: &str, state: SyncState, probe: Option<ServeProbe>) -> IndexerStatus {
+        let mut s = IndexerStatus::unreachable(id, None, "http://x", "100");
+        s.state = state;
+        s.serve_probe = probe;
+        s.answered = true;
+        s
+    }
+
+    /// `synced`/`failed`/`unreachable` are ours, from the block gap. `healthy`/`unhealthy` are
+    /// graph-node's own word, and the two sets overlap freely.
+    ///
+    /// Measured against the frozen incumbent on 2026-09-09, which serves an indexer with
+    /// `status: "syncing"` and `health: "healthy"` in the same object. An earlier version of this
+    /// module derived `health` from the sync gap, which would have moved every catching-up indexer
+    /// out of `healthyCount` and quietly changed a number the panel shows.
+    #[test]
+    fn health_is_graph_nodes_word_and_overlaps_the_sync_state() {
+        let mut catching_up = one("0xb", SyncState::Syncing, Some(ServeProbe::AlivePaid));
+        catching_up.health = Some("healthy".into());
+        let mut wobbly = one("0xc", SyncState::Synced, Some(ServeProbe::AlivePaid));
+        wobbly.health = Some("unhealthy".into());
+        let mut broken = one("0xd", SyncState::Failed, Some(ServeProbe::Broken));
+        broken.health = Some("failed".into());
+        // Never asked, so graph-node said nothing: neither healthy nor unhealthy.
+        let silent = one("0xe", SyncState::Unreachable, None);
+
+        let indexers = vec![catching_up, wobbly, broken, silent];
+        let v = assess_servability(&indexers, None);
+        let r = apply_persistence(&[], 3);
+        let out = shape(&dep(9), &indexers, &v, &r);
+
+        assert_eq!(out["syncedCount"], 1, "0xc is at the head");
+        assert_eq!(out["failedCount"], 1);
+        assert_eq!(out["unreachableCount"], 1);
+        assert_eq!(out["healthyCount"], 1, "0xb, syncing and healthy at once");
+        assert_eq!(
+            out["unhealthyCount"], 1,
+            "0xc, synced and unhealthy at once"
+        );
+        assert_eq!(out["totalIndexers"], 4);
+        // The nest counted nine; the allocation query returned four. Reporting four for both would
+        // turn a truncation into a smaller network.
+        assert_eq!(out["totalAllocations"], 9);
+    }
+
+    /// An indexer that said nothing carries the five things we knew before asking, plus its probe
+    /// verdict. Not a row of nulls: the handler being replaced early-returns before it has any of
+    /// the status fields to report, and the frozen incumbent's payload is the same shape.
+    #[test]
+    fn an_indexer_that_never_answered_carries_only_what_we_knew_before_asking() {
+        let mut silent = IndexerStatus::unreachable("0xa", None, "", "100");
+        silent.serve_probe = Some(ServeProbe::Unreachable);
+        let out = shape(
+            &dep(1),
+            &[silent],
+            &assess_servability(&[], None),
+            &apply_persistence(&[], 3),
+        );
+        let mut keys: Vec<String> = out["indexers"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "allocatedTokens",
+                "indexerId",
+                "indexerName",
+                "servable",
+                "serveProbe",
+                "status",
+                "url"
+            ]
+        );
+    }
+
+    /// Absent rather than null, because the handler being replaced leaves them `undefined` and
+    /// `JSON.stringify` drops the key. The frozen incumbent's payload for a healthy indexer has
+    /// neither, and the harness compares shape.
+    #[test]
+    fn a_healthy_indexer_carries_no_error_keys_at_all() {
+        let clean = one("0xa", SyncState::Synced, Some(ServeProbe::AlivePaid));
+        let out = shape(
+            &dep(1),
+            &[clean],
+            &assess_servability(&[], None),
+            &apply_persistence(&[], 3),
+        );
+        let keys: Vec<&String> = out["indexers"][0].as_object().unwrap().keys().collect();
+        assert!(!keys.iter().any(|k| *k == "nonFatalErrors"), "{keys:?}");
+        assert_eq!(out["indexers"][0]["fatalError"], serde_json::Value::Null);
+        assert_eq!(out["indexers"][0]["nonFatalErrorCount"], 0);
+    }
+
+    #[test]
+    fn a_missing_name_is_null_rather_than_the_hash() {
+        let out = shape(
+            &dep(0),
+            &[],
+            &assess_servability(&[], None),
+            &apply_persistence(&[], 3),
+        );
+        assert!(out["displayName"].is_null());
+        assert!(out["gatewayVerdict"].is_null());
+    }
+
+    /// The panel reads `fatalError.message`; a bare string would be a shape change wearing the
+    /// clothes of a value change, which is how eight routes shipped wrong in the first place.
+    #[test]
+    fn a_fatal_error_is_an_object_with_a_message() {
+        let mut i = one("0xa", SyncState::Failed, None);
+        i.fatal_error = Some("handler panicked".into());
+        let out = shape(
+            &dep(1),
+            &[i],
+            &assess_servability(&[], None),
+            &apply_persistence(&[], 3),
+        );
+        assert_eq!(
+            out["indexers"][0]["fatalError"]["message"],
+            "handler panicked"
+        );
+    }
+
+    /// The key sets, pinned against what the frozen incumbent actually served on 2026-09-09 for
+    /// `Qmbsc6XQWbiv4DfLVfaNciScqYLyDWUYjWzrFBbzzmRsMB`.
+    ///
+    /// This is the check that matters for #23, because the harness compares shape and eight routes
+    /// once shipped a 200 of the wrong one. Reading the TypeScript and believing it is how that
+    /// happened; these lists were copied off the wire.
+    #[test]
+    fn the_payload_carries_exactly_the_keys_the_incumbent_serves() {
+        let mut full = one("0xa", SyncState::Syncing, Some(ServeProbe::AlivePaid));
+        full.health = Some("healthy".into());
+        full.synced = Some(false);
+        full.chain_head_block = Some(100);
+        full.latest_block = Some(90);
+        full.network_chain_head = Some(100);
+        full.network = Some("mainnet".into());
+        full.entity_count = Some("12".into());
+        full.sync_progress = Some(90.0);
+        full.blocks_behind = Some(10);
+        full.serve_probe_detail = Some(ProbeDetail {
+            probe: ServeProbe::AlivePaid,
+            cause: "response",
+            error: None,
+            status: Some(402),
+            content_type: Some("application/json".into()),
+            paid: true,
+            attempts: 1,
+            elapsed_ms: 257,
+        });
+
+        let v = assess_servability(&[full.clone()], None);
+        let out = shape(&dep(2), &[full], &v, &apply_persistence(&[], 3));
+
+        let mut top: Vec<String> = out.as_object().unwrap().keys().cloned().collect();
+        top.sort();
+        assert_eq!(
+            top,
+            [
+                "deploymentId",
+                "displayName",
+                "failedCount",
+                "gatewayVerdict",
+                "healthyCount",
+                "indexers",
+                "ipfsHash",
+                "servability",
+                "servabilityRendered",
+                "signalledTokens",
+                "stakedTokens",
+                "syncedCount",
+                "totalAllocations",
+                "totalIndexers",
+                "unhealthyCount",
+                "unreachableCount"
+            ]
+        );
+
+        let mut keys: Vec<String> = out["indexers"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "allocatedTokens",
+                "blocksBehind",
+                "chainHeadBlock",
+                "entityCount",
+                "health",
+                "indexerId",
+                "indexerName",
+                "latestBlock",
+                "network",
+                "networkChainHead",
+                "nonFatalErrorCount",
+                "servable",
+                "serveProbe",
+                "serveProbeDetail",
+                "status",
+                "syncProgress",
+                "synced",
+                "url"
+            ]
+        );
+
+        let mut detail: Vec<String> = out["indexers"][0]["serveProbeDetail"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        detail.sort();
+        assert_eq!(
+            detail,
+            [
+                "attempts",
+                "cause",
+                "contentType",
+                "elapsedMs",
+                "error",
+                "paid",
+                "probe",
+                "status"
+            ]
+        );
+
+        let mut sv: Vec<String> = out["servability"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        sv.sort();
+        assert_eq!(
+            sv,
+            [
+                "dominantOperatorShare",
+                "effectiveServingOperators",
+                "effectivelyDead",
+                "recovering",
+                "servingIndexerCount"
+            ]
+        );
+
+        let mut r: Vec<String> = out["servabilityRendered"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        r.sort();
+        assert_eq!(
+            r,
+            ["deadStreak", "effectivelyDead", "k", "probedAt", "state"]
+        );
+    }
+
+    /// A single dead round must render `rechecking`, never `dead`. This is the payload-level
+    /// statement of the rule, so a future refactor cannot satisfy the unit test and still put the
+    /// frightening word on the page.
+    #[test]
+    fn one_bad_round_never_reaches_the_wire_as_dead() {
+        let indexers = vec![one("0xa", SyncState::Syncing, Some(ServeProbe::Broken))];
+        let v = assess_servability(&indexers, None);
+        assert!(v.effectively_dead, "the instantaneous read is dead");
+
+        let now = Round {
+            probed_at: "2026-09-09T00:00:00Z".into(),
+            serving_operators: v.effective_serving_operators,
+            serving_indexers: v.serving_indexer_count,
+            gateway_verdict: None,
+        };
+        let r = apply_persistence(&[now], 3);
+        let out = shape(&dep(1), &indexers, &v, &r);
+        assert_eq!(out["servabilityRendered"]["state"], "rechecking");
+        assert_eq!(out["servabilityRendered"]["effectivelyDead"], false);
+        assert_eq!(
+            out["servability"]["effectivelyDead"], true,
+            "the raw read is still reported"
+        );
     }
 }
