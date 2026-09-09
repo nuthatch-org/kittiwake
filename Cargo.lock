@@ -3264,6 +3264,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kittiwake-scuttle"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "hex",
+ "hmac 0.12.1",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+]
+
+[[package]]
 name = "kittiwake-sqlplay"
 version = "0.1.0"
 dependencies = [
