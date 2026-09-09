@@ -9,6 +9,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # The `query!` macros check themselves against `.sqlx/`, which is committed, so CI needs no
+  # database. Without this they would try to reach one and the build would fail with a confusing
+  # message about DATABASE_URL rather than a clear one about the cache. A query changed without
+  # `cargo sqlx prepare` being re-run fails here, which is the point. #2
+  SQLX_OFFLINE: "true"
 
 jobs:
   check:

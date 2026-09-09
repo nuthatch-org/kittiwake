@@ -1,0 +1,59 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT event_type, delegator, tokens_grt::float8 AS tokens_grt, timestamp FROM delegation_events WHERE indexer = $1 ORDER BY timestamp DESC LIMIT 30",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "event_type",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "delegation_events",
+            "name": "event_type"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "delegator",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "delegation_events",
+            "name": "delegator"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "tokens_grt",
+        "type_info": "Float8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "timestamp",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "delegation_events",
+            "name": "timestamp"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      null,
+      true
+    ]
+  },
+  "hash": "47188c65ad6a8e8c8512b3aacd8c7ad810089dbaddc6e0de586e617027a330fd"
+}

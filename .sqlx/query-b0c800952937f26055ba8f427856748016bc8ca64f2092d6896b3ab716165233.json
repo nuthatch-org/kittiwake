@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO ingestion_state (key, updated_at) VALUES ($1, NOW()) ON CONFLICT (key) DO UPDATE SET updated_at = NOW()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b0c800952937f26055ba8f427856748016bc8ca64f2092d6896b3ab716165233"
+}

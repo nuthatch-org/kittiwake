@@ -57,16 +57,16 @@ pub async fn record_cron_run(
     rows_affected: i64,
     error: Option<&str>,
 ) -> Result<(), DbError> {
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO cron_runs (step, started_at, duration_ms, rows_affected, success, error_message) \
          VALUES ($1, $2, $3, $4, $5, $6)",
+        format!("{CRON_RUN_PREFIX}{step}"),
+        started_at,
+        duration.as_millis() as i32,
+        rows_affected as i32,
+        success,
+        error
     )
-    .bind(format!("{CRON_RUN_PREFIX}{step}"))
-    .bind(started_at)
-    .bind(duration.as_millis() as i32)
-    .bind(rows_affected as i32)
-    .bind(success)
-    .bind(error)
     .execute(pool)
     .await?;
     Ok(())
@@ -99,17 +99,19 @@ pub async fn write_rolling_apy(
     if rows.is_empty() {
         return Ok(0);
     }
-    let done = sqlx::query(
+    let done = sqlx::query!(
         "INSERT INTO indexer_rolling_apy (indexer_address, rolling_apy_30d, rolling_apy_90d, computed_at) \
          SELECT * FROM UNNEST($1::text[], $2::float8[], $3::float8[]) AS t, LATERAL (SELECT NOW()) AS n(now) \
          ON CONFLICT (indexer_address) DO UPDATE SET \
          rolling_apy_30d = EXCLUDED.rolling_apy_30d, \
          rolling_apy_90d = EXCLUDED.rolling_apy_90d, \
          computed_at = NOW()",
+        // Positional, and the nulls must be kept. Collapsing `None` out of either array with a
+        // `filter_map` would shift every later row's APY onto the wrong indexer.
+        &rows.iter().map(|r| r.0.clone()).collect::<Vec<String>>(),
+        &rows.iter().map(|r| r.1).collect::<Vec<Option<f64>>>() as &[Option<f64>],
+        &rows.iter().map(|r| r.2).collect::<Vec<Option<f64>>>() as &[Option<f64>]
     )
-    .bind(rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>())
-    .bind(rows.iter().map(|r| r.1).collect::<Vec<_>>())
-    .bind(rows.iter().map(|r| r.2).collect::<Vec<_>>())
     .execute(pool)
     .await?
     .rows_affected();
@@ -239,19 +241,21 @@ pub async fn ensure_chain_health_tables(pool: &Pool) -> Result<(), DbError> {
 pub type ChainHeadRow = (String, i64, i64, i64);
 
 pub async fn chain_head_records(pool: &Pool) -> Result<Vec<ChainHeadRow>, DbError> {
-    let rows: Vec<(
-        String,
-        i64,
-        chrono::DateTime<chrono::Utc>,
-        chrono::DateTime<chrono::Utc>,
-    )> = sqlx::query_as(
-        "SELECT network, head, head_first_seen_at, last_checked_at FROM chain_head_records",
+    let rows = sqlx::query!(
+        "SELECT network, head, head_first_seen_at, last_checked_at FROM chain_head_records"
     )
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(n, h, f, l)| (n, h, f.timestamp_millis(), l.timestamp_millis()))
+        .map(|r| {
+            (
+                r.network,
+                r.head,
+                r.head_first_seen_at.timestamp_millis(),
+                r.last_checked_at.timestamp_millis(),
+            )
+        })
         .collect())
 }
 
@@ -262,17 +266,17 @@ pub async fn upsert_chain_head_records(pool: &Pool, rows: &[ChainHeadRow]) -> Re
             .unwrap_or_else(chrono::Utc::now);
         let checked =
             chrono::DateTime::from_timestamp_millis(*checked_ms).unwrap_or_else(chrono::Utc::now);
-        written += sqlx::query(
+        written += sqlx::query!(
             "INSERT INTO chain_head_records (network, head, head_first_seen_at, last_checked_at) \
              VALUES ($1, $2, $3, $4) \
              ON CONFLICT (network) DO UPDATE SET head = EXCLUDED.head, \
                head_first_seen_at = EXCLUDED.head_first_seen_at, \
                last_checked_at = EXCLUDED.last_checked_at",
+            network,
+            head,
+            first_seen,
+            checked
         )
-        .bind(network)
-        .bind(head)
-        .bind(first_seen)
-        .bind(checked)
         .execute(pool)
         .await?
         .rows_affected();
@@ -282,11 +286,10 @@ pub async fn upsert_chain_head_records(pool: &Pool, rows: &[ChainHeadRow]) -> Re
 
 /// The chain set each indexer was last seen serving.
 pub async fn indexer_chains(pool: &Pool) -> Result<Vec<(String, Vec<String>)>, DbError> {
-    let rows: Vec<(String, Vec<String>)> =
-        sqlx::query_as("SELECT address, chains FROM indexer_chains")
-            .fetch_all(pool)
-            .await?;
-    Ok(rows)
+    let rows = sqlx::query!("SELECT address, chains FROM indexer_chains")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|r| (r.address, r.chains)).collect())
 }
 
 pub async fn upsert_indexer_chains(
@@ -296,14 +299,14 @@ pub async fn upsert_indexer_chains(
 ) -> Result<u64, DbError> {
     let mut written = 0;
     for (address, chains) in rows {
-        written += sqlx::query(
+        written += sqlx::query!(
             "INSERT INTO indexer_chains (address, chains, captured_at) VALUES ($1, $2, $3) \
              ON CONFLICT (address) DO UPDATE SET chains = EXCLUDED.chains, \
                captured_at = EXCLUDED.captured_at",
+            address,
+            chains,
+            now
         )
-        .bind(address)
-        .bind(chains)
-        .bind(now)
         .execute(pool)
         .await?
         .rows_affected();
@@ -317,12 +320,12 @@ pub async fn put_live_answer(
     key: &str,
     value: &serde_json::Value,
 ) -> Result<(), DbError> {
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO live_answers (key, value, computed_at) VALUES ($1, $2, NOW()) \
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, computed_at = NOW()",
+        key,
+        value
     )
-    .bind(key)
-    .bind(value)
     .execute(pool)
     .await?;
     Ok(())
@@ -333,12 +336,13 @@ pub async fn get_live_answer(
     pool: &Pool,
     key: &str,
 ) -> Result<Option<(serde_json::Value, chrono::DateTime<chrono::Utc>)>, DbError> {
-    let row: Option<(serde_json::Value, chrono::DateTime<chrono::Utc>)> =
-        sqlx::query_as("SELECT value, computed_at FROM live_answers WHERE key = $1")
-            .bind(key)
-            .fetch_optional(pool)
-            .await?;
-    Ok(row)
+    let row = sqlx::query!(
+        "SELECT value, computed_at FROM live_answers WHERE key = $1",
+        key
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| (r.value, r.computed_at)))
 }
 
 /// Each indexer's delegation exchange rate, one point per day, newest snapshot per day.
@@ -353,20 +357,29 @@ pub async fn delegation_exchange_rates(
     if indexers.is_empty() {
         return Ok(Vec::new());
     }
-    let rows: Vec<(String, chrono::NaiveDate, f64)> = sqlx::query_as(
+    // The three `!` overrides assert non-null on columns Postgres can only describe as nullable.
+    // `indexer_address` is `NOT NULL` in the DDL but sits under a `DISTINCT ON`, and the other two
+    // are expressions; the `IS NOT NULL` in the `WHERE` is what makes the rate claim true. An
+    // assertion the query itself does not enforce would be a decode panic in production, so the
+    // filter and the override belong together.
+    let rows = sqlx::query!(
         "SELECT DISTINCT ON (indexer_address, snapshot_at::date) \
-           indexer_address, snapshot_at::date AS snapshot_date, \
-           delegation_exchange_rate::float8 \
+           indexer_address AS \"indexer_address!\", \
+           snapshot_at::date AS \"snapshot_date!\", \
+           delegation_exchange_rate::float8 AS \"rate!\" \
          FROM indexer_snapshots \
          WHERE indexer_address = ANY($1) AND snapshot_at >= $2 \
            AND delegation_exchange_rate IS NOT NULL \
          ORDER BY indexer_address, snapshot_at::date, snapshot_at DESC",
+        indexers,
+        since
     )
-    .bind(indexers)
-    .bind(since)
     .fetch_all(pool)
     .await?;
-    Ok(rows)
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.indexer_address, r.snapshot_date, r.rate))
+        .collect())
 }
 
 /// One entry in an indexer's "why did my APR change" trail, from Lodestar's own tables.
@@ -378,9 +391,14 @@ pub async fn delegation_exchange_rates(
 /// asserts more than the DDL does fails at decode time, in production, as #24 did.
 ///
 /// `(event_type, delegator, tokens_grt, timestamp)`
+///
+/// `delegator` was `Option<String>` until the compile-time check contradicted it: the DDL has
+/// `delegator TEXT NOT NULL`, so the tuple was claiming a nullability the table does not have. It
+/// decoded fine - an `Option` accepts a non-null - which is exactly why nothing found it until
+/// something read the schema. The other three are genuinely nullable and stay so.
 pub type DelegationEventRow = (
     Option<String>,
-    Option<String>,
+    String,
     Option<f64>,
     Option<chrono::DateTime<chrono::Utc>>,
 );
@@ -399,25 +417,32 @@ pub struct ProvenanceRows {
 }
 
 pub async fn provenance_rows(pool: &Pool, indexer: &str) -> Result<ProvenanceRows, DbError> {
-    let delegations = sqlx::query_as(
-        "SELECT event_type, delegator, tokens_grt::float8, timestamp \
+    let delegations: Vec<DelegationEventRow> = sqlx::query!(
+        "SELECT event_type, delegator, tokens_grt::float8 AS tokens_grt, timestamp \
          FROM delegation_events WHERE indexer = $1 ORDER BY timestamp DESC LIMIT 30",
+        indexer
     )
-    .bind(indexer)
     .fetch_all(pool)
-    .await?;
+    .await?
+    .into_iter()
+    .map(|r| (r.event_type, r.delegator, r.tokens_grt, r.timestamp))
+    .collect();
 
     // `DISTINCT ON` over the whole tuple, because the same change can be recorded in several
     // epochs and the trail should show it once.
-    let params = sqlx::query_as(
+    let params: Vec<ParameterChangeRow> = sqlx::query!(
         "SELECT DISTINCT ON (param_name, old_value, new_value, epoch) \
-           param_name, old_value::float8, new_value::float8, created_at \
+           param_name AS \"param_name!\", old_value::float8 AS old_value, \
+           new_value::float8 AS new_value, created_at \
          FROM parameter_changes WHERE indexer_address = $1 \
          ORDER BY param_name, old_value, new_value, epoch, created_at DESC",
+        indexer
     )
-    .bind(indexer)
     .fetch_all(pool)
-    .await?;
+    .await?
+    .into_iter()
+    .map(|r| (r.param_name, r.old_value, r.new_value, r.created_at))
+    .collect();
 
     Ok(ProvenanceRows {
         delegations,

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO indexer_rolling_apy (indexer_address, rolling_apy_30d, rolling_apy_90d, computed_at) SELECT * FROM UNNEST($1::text[], $2::float8[], $3::float8[]) AS t, LATERAL (SELECT NOW()) AS n(now) ON CONFLICT (indexer_address) DO UPDATE SET rolling_apy_30d = EXCLUDED.rolling_apy_30d, rolling_apy_90d = EXCLUDED.rolling_apy_90d, computed_at = NOW()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Float8Array",
+        "Float8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cdfb262a7f1eec8c3ea477b51faebe90cef087fd400d3afce107f3e44f5f7ea9"
+}

@@ -490,29 +490,17 @@ async fn write_parameter_changes(pool: &Pool, changes: &[ParamChange]) -> Result
     if changes.is_empty() {
         return Ok(());
     }
-    sqlx::query(
+    sqlx::query!(
         "INSERT INTO parameter_changes (indexer_address, param_name, old_value, new_value, epoch) \
-         SELECT * FROM UNNEST($1::text[], $2::text[], $3::numeric[], $4::numeric[], $5::int[])",
-    )
-    .bind(
-        changes
-            .iter()
-            .map(|c| c.indexer.clone())
-            .collect::<Vec<String>>(),
-    )
-    .bind(
-        changes
-            .iter()
-            .map(|c| c.param.to_string())
-            .collect::<Vec<String>>(),
-    )
-    .bind(changes.iter().map(|c| c.old).collect::<Vec<f64>>())
-    .bind(changes.iter().map(|c| c.new).collect::<Vec<f64>>())
-    .bind(
-        changes
-            .iter()
-            .map(|c| c.epoch)
-            .collect::<Vec<Option<i32>>>(),
+         SELECT * FROM UNNEST($1::text[], $2::text[], $3::float8[]::numeric[], $4::float8[]::numeric[], $5::int[])",
+        // Declared `float8[]` and cast to `numeric[]` in the statement. The values are integral PPM
+        // held exactly in an `f64`; binding them as numeric would want a decimal type for a column
+        // that never has a fractional part, and the cast keeps the stored type unchanged.
+        &changes.iter().map(|c| c.indexer.clone()).collect::<Vec<String>>(),
+        &changes.iter().map(|c| c.param.to_string()).collect::<Vec<String>>(),
+        &changes.iter().map(|c| c.old).collect::<Vec<f64>>() as &[f64],
+        &changes.iter().map(|c| c.new).collect::<Vec<f64>>() as &[f64],
+        &changes.iter().map(|c| c.epoch).collect::<Vec<Option<i32>>>() as &[Option<i32>]
     )
     .execute(pool)
     .await?;
@@ -572,6 +560,11 @@ async fn write_rows(pool: &Pool, rows: &[Row]) -> Result<(), sqlx::Error> {
     let col = |f: fn(&Row) -> f64| rows.iter().map(f).collect::<Vec<f64>>();
     let icol = |f: fn(&Row) -> i64| rows.iter().map(|r| f(r) as i32).collect::<Vec<i32>>();
 
+    // Deliberately not `query!`. `url` and `geo_hash` are `Vec<Option<String>>`: an indexer with no
+    // URL is a normal row, and a null inside an array is a thing `text[]` cannot express to the
+    // macro, which insists on `&[String]`. Filling the gaps with empty strings to satisfy a
+    // compile-time check would write "" where the schema says NULL, and the directory would stop
+    // being able to tell "no URL" from "an empty URL". #2.
     sqlx::query(
         "INSERT INTO indexers (address, url, geo_hash, self_stake_grt, delegated_grt, allocated_grt, \
          provisioned_grt, reward_cut, query_fee_cut, effective_cut, delegator_apr, \

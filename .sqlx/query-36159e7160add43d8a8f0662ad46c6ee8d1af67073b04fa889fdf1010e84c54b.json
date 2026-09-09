@@ -1,0 +1,54 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT ON (param_name, old_value, new_value, epoch) param_name AS \"param_name!\", old_value::float8 AS old_value, new_value::float8 AS new_value, created_at FROM parameter_changes WHERE indexer_address = $1 ORDER BY param_name, old_value, new_value, epoch, created_at DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "param_name!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "parameter_changes",
+            "name": "param_name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "old_value",
+        "type_info": "Float8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "new_value",
+        "type_info": "Float8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "parameter_changes",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      true
+    ]
+  },
+  "hash": "36159e7160add43d8a8f0662ad46c6ee8d1af67073b04fa889fdf1010e84c54b"
+}

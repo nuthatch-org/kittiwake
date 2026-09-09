@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT address, chains FROM indexer_chains",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "address",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "indexer_chains",
+            "name": "address"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "chains",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "indexer_chains",
+            "name": "chains"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "8ee00589d6de61cd7b8d736bca73e7cf6a9b8824ccf488000ab0a83ed4d9b29a"
+}

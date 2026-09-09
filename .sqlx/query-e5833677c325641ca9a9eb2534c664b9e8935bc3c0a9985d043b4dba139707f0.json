@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO parameter_changes (indexer_address, param_name, old_value, new_value, epoch) SELECT * FROM UNNEST($1::text[], $2::text[], $3::float8[]::numeric[], $4::float8[]::numeric[], $5::int[])",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray",
+        "Float8Array",
+        "Float8Array",
+        "Int4Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e5833677c325641ca9a9eb2534c664b9e8935bc3c0a9985d043b4dba139707f0"
+}

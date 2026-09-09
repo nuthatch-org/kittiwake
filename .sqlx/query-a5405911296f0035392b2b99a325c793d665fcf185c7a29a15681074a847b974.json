@@ -1,0 +1,43 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT ON (indexer_address, snapshot_at::date) indexer_address AS \"indexer_address!\", snapshot_at::date AS \"snapshot_date!\", delegation_exchange_rate::float8 AS \"rate!\" FROM indexer_snapshots WHERE indexer_address = ANY($1) AND snapshot_at >= $2 AND delegation_exchange_rate IS NOT NULL ORDER BY indexer_address, snapshot_at::date, snapshot_at DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "indexer_address!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "indexer_snapshots",
+            "name": "indexer_address"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "snapshot_date!",
+        "type_info": "Date",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "rate!",
+        "type_info": "Float8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "a5405911296f0035392b2b99a325c793d665fcf185c7a29a15681074a847b974"
+}
