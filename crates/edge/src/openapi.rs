@@ -39,6 +39,11 @@ pub const WITHHELD: &[(&str, &str)] = &[
          rather than the protocol",
     ),
     (
+        "/api/sql/receipt",
+        "issues a signed receipt and is a POST; this document describes GET operations, and a \
+         receipt is obtained by asking for one rather than by reading a path",
+    ),
+    (
         "/api/scuttlebutt/admin/login",
         "validates a moderation credential; it is not a public data operation",
     ),

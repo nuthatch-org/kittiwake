@@ -88,6 +88,8 @@ pub struct AppState {
     pub ext: kittiwake_ext::Ext,
     pub ipfs: kittiwake_ext::Ipfs,
     pub scuttle: Option<Scuttle>,
+    /// The key SQL receipts are signed with. Absent means this deployment issues none.
+    pub receipt_key: Option<Arc<ed25519_dalek::SigningKey>>,
     /// The secret the edge proxy presents. Absent means no request is ever trusted to name a client
     /// other than the one that connected - safe, and wrong once traffic arrives through Vercel.
     pub edge_secret: Option<Arc<str>>,
@@ -512,6 +514,163 @@ async fn post_sql_named(
     Ok(resp)
 }
 
+/// `POST /api/sql/receipt`: a declared query, answered and signed.
+///
+/// Named queries only. A receipt over arbitrary SQL attests to an answer nobody can agree the
+/// question for; a declared one pinned to a block means the same thing to both parties next year,
+/// which is the reason the named tier exists. #19
+async fn post_sql_receipt(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<NamedCall>,
+) -> Result<Response, ErrorResponse> {
+    st.limits.check(
+        &st.limits.sql,
+        client_ip(peer, &headers, st.edge_secret.as_deref()),
+    )?;
+
+    let Some(key) = st.receipt_key.clone() else {
+        return Err(ApiError::Unavailable(
+            "this deployment does not issue receipts; sign the answer yourself with `tattler \
+             attest-named` and your own key"
+                .into(),
+        )
+        .into());
+    };
+
+    let Some(query) = kittiwake_sqlplay::named::find_named_query(&body.name) else {
+        let allowed: Vec<&str> = kittiwake_sqlplay::named::NAMED_QUERIES
+            .iter()
+            .map(|q| q.name)
+            .collect();
+        return Err(ApiError::BadRequest(format!(
+            "receipts are issued for declared queries only; allowed: {}",
+            allowed.join(", ")
+        ))
+        .into());
+    };
+
+    let sql = kittiwake_sqlplay::named::render(query, &body.args)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let dataset = kittiwake_sqlplay::find_dataset(query.dataset).ok_or_else(|| {
+        tracing::error!(
+            query = query.name,
+            dataset = query.dataset,
+            "named query targets an unknown dataset"
+        );
+        ApiError::Internal("this query is misconfigured".into())
+    })?;
+
+    // The block the answer is pinned to has to come from the caller's own argument. Reading it off
+    // the nest's tip instead would pin the receipt to whatever the tip happened to be, which is the
+    // one thing a replaying verifier cannot reproduce.
+    let as_of_block = receipt_pin(&body.args).ok_or_else(|| {
+        ApiError::BadRequest(
+            "this query has no `before_block` argument to pin the answer to".into(),
+        )
+    })?;
+
+    let spec = kittiwake_nest::QuerySpec::read(dataset.nest, sql.clone())
+        .with_timeout(Duration::from_secs(6));
+    let answer = st.read.gate.query(&spec).await.map_err(ApiError::from)?;
+
+    // A truncated or degraded answer is not the answer. Signing one puts our name on a partial
+    // result presented as complete, which is the single thing a receipt must never do.
+    if answer.provenance.truncated || answer.provenance.degraded {
+        return Err(ApiError::BadRequest(
+            "the answer was truncated or served from a degraded set of tables, so it will not be \
+             signed; narrow the query"
+                .into(),
+        )
+        .into());
+    }
+    let Some(sealed_through) = answer.provenance.sealed_through.filter(|s| *s >= 0) else {
+        return Err(ApiError::Unavailable(
+            "the nest reported no sealed_through, so reproducibility cannot be established".into(),
+        )
+        .into());
+    };
+
+    let rows = answer.rows.clone();
+    let receipt_body = receipt_body(
+        &rows,
+        &answer.provenance,
+        dataset.id,
+        sql,
+        as_of_block,
+        sealed_through as u64,
+        query.name,
+        &body.args,
+    )
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    // `issue` refuses rather than signs when the body and the rows disagree, or when the answer
+    // leaned on unsealed tip data. Either is our fault and neither is the caller's.
+    let receipt =
+        tattler::issue(receipt_body, rows, &key).map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let mut resp = axum::Json(receipt).into_response();
+    no_store(resp.headers_mut());
+    Ok(resp)
+}
+
+/// The receipt body, assembled from one answer.
+///
+/// Separated from the handler so a test can build the same body and hand it to tattler's own
+/// verifier. A receipt this service issues that tattler will not verify is worse than no receipt,
+/// and nothing about the handler's shape would reveal it.
+#[allow(clippy::too_many_arguments)]
+fn receipt_body(
+    rows: &[serde_json::Value],
+    provenance: &kittiwake_types::Provenance,
+    dataset: &str,
+    sql: String,
+    as_of_block: u64,
+    sealed_through: u64,
+    query_name: &str,
+    args: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<tattler::Body> {
+    Ok(tattler::Body {
+        nid: provenance.nid.clone(),
+        dataset: dataset.to_string(),
+        query: sql,
+        as_of_block,
+        sealed_through,
+        registry_hash: provenance.registry_hash.clone(),
+        result_hash: tattler::result_hash(rows)?,
+        row_count: rows.len(),
+        issued_at: chrono::Utc::now().to_rfc3339(),
+        query_name: Some(query_name.to_string()),
+        query_args: Some(receipt_args(args)),
+        merkle_root: None,
+    })
+}
+
+/// The block a receipt is pinned to, from the argument that named it.
+fn receipt_pin(args: &serde_json::Map<String, serde_json::Value>) -> Option<u64> {
+    match args.get("before_block")? {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// The arguments as the receipt records them: every value as text, sorted by key, so two identical
+/// questions serialise identically and therefore sign identically.
+fn receipt_args(
+    args: &serde_json::Map<String, serde_json::Value>,
+) -> std::collections::BTreeMap<String, String> {
+    args.iter()
+        .map(|(k, v)| {
+            let text = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            (k.clone(), text)
+        })
+        .collect()
+}
+
 /// `GET /openapi.json`: the API described on its own terms.
 ///
 /// Deliberately outside `/api/`, so it is not itself an entry in the document it serves and does
@@ -661,6 +820,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sql/catalog", get(get_sql_catalog))
         .route("/api/sql/query", post(post_sql_query))
         .route("/api/sql/named", get(get_sql_named).post(post_sql_named))
+        .route("/api/sql/receipt", post(post_sql_receipt))
         // Scuttlebutt is deliberately separate from the provenance envelope routes above: messages
         // are primary user data in Postgres, not a view of a sealed protocol nest.
         .route(
@@ -698,6 +858,7 @@ pub fn state(
     read: ReadCtx,
     edge_secret: Option<String>,
     scuttle: Option<Scuttle>,
+    receipt_key: Option<Arc<ed25519_dalek::SigningKey>>,
 ) -> AppState {
     AppState {
         chain: read.chain.clone(),
@@ -705,6 +866,7 @@ pub fn state(
         ext: kittiwake_ext::Ext::default(),
         ipfs: kittiwake_ext::Ipfs::default(),
         scuttle,
+        receipt_key,
         edge_secret: edge_secret.map(|s| Arc::from(s.as_str())),
         pool,
         limits: Arc::new(limits),
@@ -761,6 +923,129 @@ async fn get_whoami(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── SQL receipts ─────────────────────────────────────────────────────────
+
+    fn receipt_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    fn answer_rows() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({"indexer": "0xaa", "tokens": "1000000000000000000"}),
+            serde_json::json!({"indexer": "0xbb", "tokens": "2000000000000000000"}),
+        ]
+    }
+
+    fn sealed_provenance() -> kittiwake_types::Provenance {
+        kittiwake_types::Provenance {
+            as_of: Some(497_000_000),
+            sealed_through: Some(497_000_000),
+            registry_hash: Some("0xreg".into()),
+            nid: Some("protocol".into()),
+            source: None,
+            truncated: false,
+            degraded: false,
+        }
+    }
+
+    fn issued() -> tattler::Receipt {
+        let rows = answer_rows();
+        let body = receipt_body(
+            &rows,
+            &sealed_provenance(),
+            "protocol",
+            "SELECT 1".into(),
+            497_000_000,
+            497_000_000,
+            "delegations_to_indexer",
+            &serde_json::Map::from_iter([
+                ("before_block".to_string(), serde_json::json!(497_000_000)),
+                ("indexer".to_string(), serde_json::json!("0xAA")),
+            ]),
+        )
+        .unwrap();
+        tattler::issue(body, rows, &receipt_key()).unwrap()
+    }
+
+    /// The only claim that matters. A receipt this service issues has to satisfy tattler's own
+    /// verifier, because a reader checking one will use tattler and not us.
+    #[test]
+    fn a_receipt_we_issue_verifies_with_tattlers_own_verifier() {
+        assert_eq!(tattler::verify(&issued()).unwrap(), tattler::Verdict::Ok);
+    }
+
+    #[test]
+    fn a_row_edited_after_signing_is_caught() {
+        let mut receipt = issued();
+        receipt.rows[0]["tokens"] = serde_json::json!("9000000000000000000");
+        assert!(matches!(
+            tattler::verify(&receipt).unwrap(),
+            tattler::Verdict::RowsAltered { .. }
+        ));
+    }
+
+    /// The signature covers the body, so editing the question it claims to answer must not survive
+    /// either. Rows alone would still hash correctly.
+    #[test]
+    fn a_body_edited_after_signing_is_caught() {
+        let mut receipt = issued();
+        receipt.body.query = "SELECT 2".into();
+        assert_eq!(
+            tattler::verify(&receipt).unwrap(),
+            tattler::Verdict::BadSignature
+        );
+    }
+
+    /// Row order is not part of the answer, and a nest is free to return the same set either way.
+    /// A receipt that disagreed with itself over ordering would report a forgery that never was.
+    #[test]
+    fn the_same_rows_in_another_order_are_the_same_answer() {
+        let mut reversed = answer_rows();
+        reversed.reverse();
+        assert_eq!(
+            tattler::result_hash(&answer_rows()).unwrap(),
+            tattler::result_hash(&reversed).unwrap()
+        );
+    }
+
+    #[test]
+    fn the_pin_comes_from_the_argument_and_nothing_else() {
+        let pin = |v: serde_json::Value| {
+            receipt_pin(&serde_json::Map::from_iter([(
+                "before_block".to_string(),
+                v,
+            )]))
+        };
+        assert_eq!(pin(serde_json::json!(497_000_000)), Some(497_000_000));
+        assert_eq!(pin(serde_json::json!(" 497000000 ")), Some(497_000_000));
+        for refused in [
+            serde_json::json!("latest"),
+            serde_json::json!(-1),
+            serde_json::json!(4.5),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(pin(refused.clone()), None, "{refused} is not a block");
+        }
+        assert_eq!(receipt_pin(&serde_json::Map::new()), None);
+    }
+
+    /// Two identical questions have to serialise identically or they sign differently, so the
+    /// arguments are sorted and every value is text whatever it arrived as.
+    #[test]
+    fn the_recorded_arguments_are_sorted_and_textual() {
+        let args = receipt_args(&serde_json::Map::from_iter([
+            ("indexer".to_string(), serde_json::json!("0xAA")),
+            ("before_block".to_string(), serde_json::json!(497_000_000)),
+        ]));
+        assert_eq!(
+            args.into_iter().collect::<Vec<_>>(),
+            vec![
+                ("before_block".to_string(), "497000000".to_string()),
+                ("indexer".to_string(), "0xAA".to_string()),
+            ]
+        );
+    }
 
     // ── Scuttlebutt moderation ───────────────────────────────────────────────
     //

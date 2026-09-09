@@ -51,3 +51,10 @@ read_per_minute = 120
 mutation_per_minute = 30
 # Foghorn's hourly read. Its reads still go through the cache, so it adds close to zero nest load.
 exempt_ips = []
+
+# Signing key for SQL receipts, 32 bytes of hex. Leave the section out and this deployment issues
+# none, which is a posture rather than a fault: a reader can still sign an answer themselves with
+# `tattler attest-named` and their own key. Keep the key stable across restarts, or every receipt
+# already issued is signed by a public key nobody can look up any more.
+# [receipt]
+# issuer_key = "..."

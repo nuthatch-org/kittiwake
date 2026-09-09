@@ -155,6 +155,13 @@ async fn main() -> anyhow::Result<()> {
             flood: Arc::new(kittiwake_scuttle::FloodGuard::new()),
             room: kittiwake_scuttle::Room::new(),
         }),
+        cfg.receipt.as_ref().map(|r| {
+            let bytes: [u8; 32] = hex::decode(&r.issuer_key)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .expect("receipt.issuer_key was accepted by configuration");
+            Arc::new(ed25519_dalek::SigningKey::from_bytes(&bytes))
+        }),
     );
     let limits_handle = state.limits.clone();
 
