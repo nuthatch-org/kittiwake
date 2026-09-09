@@ -124,7 +124,15 @@ pub async fn rav(
     lane: Lane,
     backfill: bool,
 ) -> Result<Ingested, IngestError> {
-    let stored = state::get(pool, "rav").await?.last_block.unwrap_or(0) as i64;
+    // `last_timestamp`, falling back to the `last_block` this cursor used to be kept in. The
+    // fallback is a one-time seed, not a permanent second reading: the first run after the
+    // migration writes the new column and every run after that reads it. Without it the first run
+    // would start from zero and re-scan the whole history for no reason. #4
+    let cursor = state::get(pool, "rav").await?;
+    let stored = cursor
+        .last_timestamp
+        .or_else(|| cursor.last_block.map(i64::from))
+        .unwrap_or(0);
     let since = if backfill {
         0
     } else {
@@ -189,7 +197,7 @@ pub async fn rav(
     }
 
     if max_timestamp > stored {
-        state::set(pool, "rav", None, Some(max_timestamp as i32), None).await?;
+        state::set_timestamp(pool, "rav", max_timestamp).await?;
     } else {
         state::touch(pool, "rav").await?;
     }

@@ -32,12 +32,19 @@ pub struct State {
     pub last_epoch: Option<i32>,
     pub last_block: Option<i32>,
     pub last_id: Option<String>,
+    /// A cursor that is a **time** rather than a block, in unix seconds.
+    ///
+    /// `last_block` is `int4` and the RAV ingest was storing a unix timestamp in it, which works
+    /// until 19 January 2038 and then does something worse than stop: `max_timestamp as i32` wraps
+    /// negative in Rust, `since` clamps to zero, and every delta run silently becomes a full
+    /// backfill. A job that looks busy and re-reads everything for ever. #4
+    pub last_timestamp: Option<i64>,
 }
 
 pub async fn get(pool: &Pool, key: &str) -> Result<State, sqlx::Error> {
     let row = sqlx::query_as!(
         State,
-        "SELECT last_epoch, last_block, last_id FROM ingestion_state WHERE key = $1",
+        "SELECT last_epoch, last_block, last_id, last_timestamp FROM ingestion_state WHERE key = $1",
         self::key(key)
     )
     .fetch_optional(pool)
@@ -72,6 +79,23 @@ pub async fn set(
     Ok(())
 }
 
+/// Move a cursor that is a time rather than a block.
+///
+/// Its own column, and a `bigint`, because a timestamp in a column named `last_block` is how #4
+/// happened: nothing was wrong with the value, only with where it was kept, and nobody looks at a
+/// column whose name already explains it.
+pub async fn set_timestamp(pool: &Pool, key: &str, seconds: i64) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        "INSERT INTO ingestion_state (key, last_timestamp, updated_at) VALUES ($1, $2, NOW()) \
+         ON CONFLICT (key) DO UPDATE SET last_timestamp = EXCLUDED.last_timestamp, updated_at = NOW()",
+        self::key(key),
+        seconds
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Say "I ran and there was nothing to do", without moving any cursor.
 pub async fn touch(pool: &Pool, key: &str) -> Result<(), sqlx::Error> {
     sqlx::query!(
@@ -90,6 +114,23 @@ mod tests {
 
     /// Pinned, because the whole safety of running both systems at once rests on these keys not
     /// colliding. A change here silently re-shares the cursors.
+    /// The failure #4 describes, stated in arithmetic so nobody has to take it on trust. An `i32`
+    /// cannot hold a unix timestamp past January 2038, and Rust's `as` truncates rather than
+    /// saturating, so the cursor does not stall - it goes *backwards*, past zero, and every delta
+    /// run becomes a full backfill.
+    #[test]
+    fn a_timestamp_past_2038_does_not_fit_and_wraps_rather_than_stalling() {
+        let jan_2038: i64 = 2_147_483_648; // i32::MAX + 1, 19 January 2038
+        assert!(jan_2038 > i32::MAX as i64);
+        assert!((jan_2038 as i32) < 0, "it wraps, it does not clamp");
+        // Which is why the cursor moved to its own bigint column.
+        let s = State {
+            last_timestamp: Some(jan_2038),
+            ..Default::default()
+        };
+        assert_eq!(s.last_timestamp, Some(jan_2038));
+    }
+
     #[test]
     fn our_cursors_are_namespaced_away_from_the_platforms() {
         assert_eq!(key("epochs"), "kittiwake:epochs");
