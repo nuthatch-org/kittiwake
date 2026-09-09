@@ -1,4 +1,6 @@
 /target
 *.log
 .env
-config.toml
+# The service's own config, which carries secrets. Anchored to the root: unanchored it also
+# swallowed .cargo/config.toml, which has to be committed for CI to reach a private dependency.
+/config.toml

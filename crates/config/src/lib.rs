@@ -136,6 +136,24 @@ fn default_ipfs_url() -> String {
     "https://api.thegraph.com/ipfs".to_string()
 }
 
+/// The key that signs SQL receipts. Absent means this deployment issues none, which is a valid
+/// posture rather than a misconfiguration: a reader can still sign an answer themselves with
+/// `tattler attest-named` and their own key. #19
+#[derive(Clone, Deserialize)]
+pub struct ReceiptSettings {
+    /// A 32-byte ed25519 seed, hex. The same key across restarts, or every receipt already issued
+    /// is signed by a public key nobody can look up any more.
+    pub issuer_key: String,
+}
+
+impl std::fmt::Debug for ReceiptSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReceiptSettings")
+            .field("issuer_key", &"<redacted>")
+            .finish()
+    }
+}
+
 fn default_sql_per_min() -> u32 {
     10
 }
@@ -180,6 +198,8 @@ pub struct Config {
     #[serde(default)]
     pub studio: Option<StudioSettings>,
     pub scuttle: Option<ScuttleSettings>,
+    #[serde(default)]
+    pub receipt: Option<ReceiptSettings>,
     /// Turns the in-process scheduler on. Off by default so a second instance, or a staging box,
     /// cannot start writing to the same Postgres behind your back.
     #[serde(default)]
@@ -219,6 +239,15 @@ impl Config {
                 "nest.origin must be a URL, got {:?}",
                 self.nest.origin
             )));
+        }
+        if let Some(receipt) = &self.receipt {
+            // Checked here so a deployment that means to issue receipts finds out at boot rather
+            // than the first time somebody asks for one.
+            if hex::decode(&receipt.issuer_key).map(|b| b.len()) != Ok(32) {
+                return Err(ConfigError::Invalid(
+                    "receipt.issuer_key must be 32 bytes of hexadecimal".into(),
+                ));
+            }
         }
         if let Some(scuttle) = &self.scuttle {
             if scuttle.trip_salt.is_empty()
@@ -284,6 +313,7 @@ mod tests {
             edge_secret: None,
             studio: None,
             scuttle: None,
+            receipt: None,
             arbitrum_rpc_url: None,
             mainnet_rpc_url: None,
             bounty_board_address: None,

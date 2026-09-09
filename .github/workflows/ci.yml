@@ -20,6 +20,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # `tattler` is a private repository and a source dependency, because issuing and verifying a
+      # receipt must share one canonical encoding. #19
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.TATTLER_DEPLOY_KEY }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -40,6 +45,9 @@ jobs:
     container: rust:1-bookworm
     steps:
       - uses: actions/checkout@v4
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.TATTLER_DEPLOY_KEY }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --bin kittiwake
       - run: objdump -T target/release/kittiwake | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -3
