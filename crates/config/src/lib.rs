@@ -91,6 +91,29 @@ pub struct LimitSettings {
     pub exempt_ips: Vec<String>,
 }
 
+/// Secrets and policy for the anonymous room. It is opt-in: without this complete section the
+/// process never exposes a half-configured moderation surface.
+#[derive(Clone, Deserialize)]
+pub struct ScuttleSettings {
+    pub trip_salt: String,
+    pub ip_pepper: String,
+    pub admin_secret: String,
+    /// The existing session secret signs the `sb_admin` cookie. Keeping this identical to the
+    /// incumbent preserves a logged-in moderator across the route switch.
+    pub session_secret: String,
+}
+
+impl std::fmt::Debug for ScuttleSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScuttleSettings")
+            .field("trip_salt", &"<redacted>")
+            .field("ip_pepper", &"<redacted>")
+            .field("admin_secret", &"<redacted>")
+            .field("session_secret", &"<redacted>")
+            .finish()
+    }
+}
+
 fn default_sql_per_min() -> u32 {
     10
 }
@@ -132,6 +155,8 @@ pub struct Config {
     /// like the edge and shares one rate-limit bucket. Set it here and in the proxy that fronts
     /// this service, and nowhere else.
     pub edge_secret: Option<String>,
+    #[serde(default)]
+    pub scuttle: Option<ScuttleSettings>,
     /// Turns the in-process scheduler on. Off by default so a second instance, or a staging box,
     /// cannot start writing to the same Postgres behind your back.
     #[serde(default)]
@@ -171,6 +196,22 @@ impl Config {
                 "nest.origin must be a URL, got {:?}",
                 self.nest.origin
             )));
+        }
+        if let Some(scuttle) = &self.scuttle {
+            if scuttle.trip_salt.is_empty()
+                || scuttle.ip_pepper.is_empty()
+                || scuttle.admin_secret.is_empty()
+            {
+                return Err(ConfigError::Invalid(
+                    "scuttle.trip_salt, scuttle.ip_pepper and scuttle.admin_secret must all be set"
+                        .into(),
+                ));
+            }
+            if scuttle.session_secret.len() < 32 {
+                return Err(ConfigError::Invalid(
+                    "scuttle.session_secret must be at least 32 characters".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -218,6 +259,7 @@ mod tests {
             },
             database_url: None,
             edge_secret: None,
+            scuttle: None,
             arbitrum_rpc_url: None,
             mainnet_rpc_url: None,
             bounty_board_address: None,
