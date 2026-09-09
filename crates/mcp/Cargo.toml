@@ -1,0 +1,17 @@
+[package]
+name = "kittiwake-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kittiwake-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+kittiwake-edge = { version = "0.1.0", path = "../edge" }
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "json"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+urlencoding = "2.1.3"
