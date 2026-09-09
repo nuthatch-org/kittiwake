@@ -3221,6 +3221,7 @@ dependencies = [
  "kittiwake-rewards",
  "kittiwake-types",
  "metrics",
+ "regex",
  "serde",
  "serde_json",
  "sqlx",
