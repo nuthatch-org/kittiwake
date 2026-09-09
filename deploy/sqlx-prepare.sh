@@ -7,11 +7,11 @@
 # so a query edited without this being re-run fails the build rather than reaching production
 # unchecked - which is the whole point of #2.
 #
-# It builds a throwaway Postgres from the schema rather than pointing at the live one. Two reasons:
-# nobody should need production credentials to compile, and the schema this checks against is then
-# a thing in the repository rather than a thing on a box. The DDL still lives in
-# `nightswatchhq/lodestar` (#31), so this script reads it from a sibling checkout - which is the
-# split ownership that issue is about, made visible rather than worked around.
+# It builds a throwaway Postgres from `db/schema.sql` rather than pointing at the live one. Three
+# reasons: nobody should need production credentials to compile, the schema being checked against
+# is then a thing in this repository rather than a thing on a box, and it needs no other checkout.
+# Until #31 it read the DDL from a sibling `lodestar`, which meant the compile-time check depended
+# on somebody else's working tree being present and current.
 #
 # WHAT IS AND IS NOT CHECKED
 #
@@ -24,7 +24,6 @@
 # checking everything dishonestly.
 set -euo pipefail
 
-LODESTAR=${LODESTAR:-$(cd "$(dirname "$0")/../.." && pwd)/lodestar}
 PORT=${PORT:-55432}
 PGBIN=${PGBIN:-/opt/homebrew/opt/postgresql@15/bin}
 WORK=$(mktemp -d)
@@ -36,11 +35,8 @@ pg_ctl_stop() {
   rm -rf "$WORK"
 }
 
-[ -f "$LODESTAR/scripts/schema.sql" ] || {
-  echo "no schema at $LODESTAR/scripts/schema.sql" >&2
-  echo "clone nightswatchhq/lodestar beside this repo, or set LODESTAR=/path/to/lodestar" >&2
-  exit 1
-}
+SCHEMA="$(cd "$(dirname "$0")/.." && pwd)/db/schema.sql"
+[ -f "$SCHEMA" ] || { echo "no schema at $SCHEMA" >&2; exit 1; }
 command -v initdb >/dev/null || { echo "no postgres in $PGBIN; set PGBIN" >&2; exit 1; }
 
 initdb -D "$WORK/pg" -U postgres --auth=trust >/dev/null
@@ -56,31 +52,8 @@ done
 export PGHOST=127.0.0.1 PGPORT=$PORT PGUSER=postgres
 psql -q -c 'CREATE ROLE lodestar LOGIN' -c 'CREATE DATABASE lodestar OWNER lodestar' >/dev/null
 
-echo "applying the platform schema from $LODESTAR"
-for f in "$LODESTAR"/scripts/schema.sql "$LODESTAR"/scripts/migrate-*.sql; do
-  psql -q -d lodestar -f "$f" >/dev/null 2>&1 || {
-    echo "  failed: $(basename "$f")" >&2
-    exit 1
-  }
-done
-
-# The four tables that are ours. Kept in step with `ensure_chain_health_tables` and
-# `ensure_rolling_apy_table` in `crates/db`, which create them on the box at start-up.
-echo "applying our own tables"
-psql -q -v ON_ERROR_STOP=1 -d lodestar >/dev/null <<'SQL'
-CREATE TABLE IF NOT EXISTS indexer_rolling_apy (
-  indexer_address TEXT PRIMARY KEY,
-  rolling_apy_30d NUMERIC,
-  rolling_apy_90d NUMERIC,
-  computed_at TIMESTAMPTZ NOT NULL);
-CREATE TABLE IF NOT EXISTS live_answers (
-  key TEXT PRIMARY KEY, value JSONB NOT NULL, computed_at TIMESTAMPTZ NOT NULL);
-CREATE TABLE IF NOT EXISTS chain_head_records (
-  network TEXT PRIMARY KEY, head BIGINT NOT NULL,
-  head_first_seen_at TIMESTAMPTZ NOT NULL, last_checked_at TIMESTAMPTZ NOT NULL);
-CREATE TABLE IF NOT EXISTS indexer_chains (
-  address TEXT PRIMARY KEY, chains TEXT[] NOT NULL, captured_at TIMESTAMPTZ NOT NULL);
-SQL
+echo "applying db/schema.sql"
+psql -q -v ON_ERROR_STOP=1 -d lodestar -f "$SCHEMA" >/dev/null
 
 cd "$(dirname "$0")/.."
 command -v cargo-sqlx >/dev/null || cargo install sqlx-cli --no-default-features --features postgres,rustls
