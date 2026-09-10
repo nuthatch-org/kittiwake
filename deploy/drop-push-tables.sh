@@ -12,6 +12,17 @@
 #
 #   pg_dump "$DATABASE_URL" -t device_tokens -t push_subscriptions -t notification_log > push-backup.sql
 #   bash deploy/drop-push-tables.sh
+#
+# **Order matters, and getting it wrong stops the disputes ingest.** The binary released before
+# 2026-09-10 names `push_notified` in its `INSERT INTO disputes`. Drop the column while that binary
+# is the one running and every disputes run fails on a column that no longer exists. So:
+#
+#   1. Deploy a build that contains this script.
+#   2. Confirm `cron_runs` has a green `kittiwake:ingest-disputes` from the new binary.
+#   3. Then run this.
+#
+# The reverse order is not a rollback either: putting the column back leaves the rows it recorded
+# gone. Deploy first.
 set -euo pipefail
 
 : "${DATABASE_URL:?set DATABASE_URL to the database to change}"
