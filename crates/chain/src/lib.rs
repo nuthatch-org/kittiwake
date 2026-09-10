@@ -5,6 +5,8 @@
 //! other. So these values carry no nest provenance and are cached briefly rather than folded, and
 //! a failed read is reported rather than replaced with the last known answer.
 
+pub mod tap;
+
 use std::str::FromStr;
 use std::time::Duration;
 

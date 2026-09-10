@@ -2856,3 +2856,184 @@ pub async fn present_poi(
     crate::no_store(response.headers_mut());
     Ok(response)
 }
+
+// ── The data-service playground ──────────────────────────────────────────────
+
+/// How one provider is asked for a sample answer.
+///
+/// Server-authoritative: the caller sends a slug and nothing else. Every URL below is a constant,
+/// so no part of a request reaches a hostname, and the SSRF question does not arise.
+enum Sample {
+    /// Paid through the Lodestar gateway, which signs on our behalf; only the consumer is named.
+    JsonRpc {
+        url: &'static str,
+        consumer: &'static str,
+        body: &'static str,
+    },
+    /// Gated by a TAP receipt we sign per request with an ephemeral key.
+    RestTap {
+        url: &'static str,
+        data_service: &'static str,
+        service_provider: &'static str,
+    },
+    /// Substreams is gRPC; a shim on the provider's box runs the CLI and answers JSON.
+    Shim { url: &'static str },
+}
+
+fn sample_for(slug: &str) -> Option<Sample> {
+    Some(match slug {
+        "dispatch" => Sample::JsonRpc {
+            url: "https://rpc.cargopete.com/rpc/42161",
+            consumer: "0xB70781305939A39e74Aa918416Df1b893e1Bd904",
+            body: r#"{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}"#,
+        },
+        "camp-data-service" => Sample::RestTap {
+            url: "https://camp.89.167.109.4.sslip.io/v1/status",
+            data_service: "0x8ED612666ad1853AdB050f4c4c54082decA605b8",
+            service_provider: "0xCfBB471617Ae3F6fDa2D9F142115d59deAB50C5b",
+        },
+        "seahorn" => Sample::RestTap {
+            url: "https://seahorn.89.167.109.4.sslip.io/buys?limit=3&order=slot.desc",
+            data_service: "0xdDE3F913cb6D1332Bc018Eb63647020a87dD7B37",
+            service_provider: "0xCfBB471617Ae3F6fDa2D9F142115d59deAB50C5b",
+        },
+        "sdsce" => Sample::Shim {
+            url: "https://substreams.89.167.109.4.sslip.io/sample",
+        },
+        "mainline-firehose" => Sample::Shim {
+            url: "https://mainline.89.167.109.4.sslip.io/sample",
+        },
+        _ => return None,
+    })
+}
+
+/// The slugs this playground can answer for, for the error that says so.
+pub(crate) const SAMPLE_SLUGS: &[&str] = &[
+    "dispatch",
+    "camp-data-service",
+    "seahorn",
+    "sdsce",
+    "mainline-firehose",
+];
+
+#[derive(serde::Deserialize)]
+pub struct SampleRequest {
+    #[serde(default)]
+    pub slug: String,
+}
+
+/// `POST /api/data-services/query`: run one real sample query against a provider.
+///
+/// Server-side so the browser is spared CORS and so a receipt can be signed without a key ever
+/// reaching a client.
+pub async fn data_service_query(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<SampleRequest>,
+) -> Result<Response, ErrorResponse> {
+    let caller = client_ip(peer, &headers, st.edge_secret.as_deref());
+    st.limits.check(&st.limits.mutation, caller)?;
+
+    let Some(sample) = sample_for(&body.slug) else {
+        return Err(ApiError::BadRequest(format!(
+            "no live playground for {:?}; try one of: {}",
+            body.slug,
+            SAMPLE_SLUGS.join(", ")
+        ))
+        .into());
+    };
+
+    // Substreams goes through a shim that runs a CLI, which is slow by nature; the rest should not
+    // be given that long to fail.
+    let timeout = match sample {
+        Sample::Shim { .. } => std::time::Duration::from_secs(50),
+        _ => std::time::Duration::from_secs(15),
+    };
+    let client = reqwest::Client::new();
+    let started = std::time::Instant::now();
+
+    let (url, request) = match sample {
+        Sample::JsonRpc {
+            url,
+            consumer,
+            body,
+        } => (
+            url,
+            client
+                .post(url)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header("X-Consumer-Address", consumer)
+                .body(body),
+        ),
+        Sample::Shim { url } => (url, client.get(url)),
+        Sample::RestTap {
+            url,
+            data_service,
+            service_provider,
+        } => {
+            let receipt = sample_receipt(data_service, service_provider)
+                .map_err(|e| ApiError::Internal(format!("could not sign a receipt: {e}")))?;
+            (url, client.get(url).header("TAP-Receipt", receipt))
+        }
+    };
+
+    let outcome = request.timeout(timeout).send().await;
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let upstream = match outcome {
+        Ok(upstream) => upstream,
+        Err(e) => {
+            let mut response = axum::Json(serde_json::json!({
+                "ok": false,
+                "error": if e.is_timeout() { "request timed out".to_string() } else { e.to_string() },
+                "durationMs": duration_ms,
+            }))
+            .into_response();
+            *response.status_mut() = axum::http::StatusCode::BAD_GATEWAY;
+            crate::no_store(response.headers_mut());
+            return Ok(response);
+        }
+    };
+
+    let status = upstream.status().as_u16();
+    let ok = upstream.status().is_success();
+    let text = upstream.text().await.unwrap_or_default();
+    // A provider that answers with prose rather than JSON is still answering; the body goes back as
+    // whatever it was rather than becoming an error about parsing.
+    let result = serde_json::from_str::<serde_json::Value>(&text)
+        .unwrap_or_else(|_| serde_json::Value::String(text));
+
+    let mut response = axum::Json(serde_json::json!({
+        "ok": ok,
+        "status": status,
+        "durationMs": duration_ms,
+        "endpoint": url,
+        "result": result,
+    }))
+    .into_response();
+    crate::no_store(response.headers_mut());
+    Ok(response)
+}
+
+fn sample_receipt(data_service: &str, service_provider: &str) -> Result<String, String> {
+    let parse = |s: &str| s.parse().map_err(|_| format!("{s} is not an address"));
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos() as u64;
+    let signed = kittiwake_chain::tap::sign_receipt(
+        parse(data_service)?,
+        parse(service_provider)?,
+        now_ns,
+        rand_nonce(),
+    )?;
+    serde_json::to_string(&signed).map_err(|e| e.to_string())
+}
+
+/// A nonce that does not repeat within a run. It only has to be unique per receipt.
+fn rand_nonce() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}

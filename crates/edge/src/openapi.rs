@@ -80,6 +80,11 @@ pub const WITHHELD: &[(&str, &str)] = &[
          receipt is obtained by asking for one rather than by reading a path",
     ),
     (
+        "/api/data-services/query",
+        "runs a real sample query against a provider and is a POST; it spends a signed receipt \
+         rather than reading the protocol",
+    ),
+    (
         "/api/indexer/present-poi",
         "queues an action on an indexer's own agent and is a POST; it acts on somebody's \
          infrastructure rather than reading the protocol",
