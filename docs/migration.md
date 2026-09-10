@@ -69,9 +69,11 @@ None of the eight was in the parity harness, which is the defect the routes were
 
 Seventeen crons, of which eleven are now jobs here.
 
-**Ported and running (11).** `refresh`, `ingest-epochs`, `ingest-delegations`,
+**Ported and running (10).** `refresh`, `ingest-epochs`, `ingest-delegations`,
 `ingest-allocations`, `ingest-disputes`, `snapshot-network`, `ingest-horizon-activity`,
-`refresh-chain-health`, `ingest-rav`, `warm-ipfs`, `reconcile-bounties`.
+`refresh-chain-health`, `ingest-rav`, `warm-ipfs`.
+
+**Ported and not running (1).** `reconcile-bounties`, for the reason below.
 
 Of those, the shared-Postgres writers are behind `scheduler_enabled` and **gated by the grant as
 well as the flag** - the role has no write on the platform's ingest tables, so an accidental flip
@@ -91,8 +93,22 @@ comes to the box under a fixed GRT ceiling - and it moves with the Dock. #11
 
 `reconcile-bounties` was the other one, and was in this group only by association. It reads the
 BountyBoard contract and corrects `sync_bounties`; there is no key and nothing is spent. Ported
-2026-09-09, every ten minutes on the nine, behind `scheduler_enabled` and a `SELECT, UPDATE` grant
-on that one table. #30
+2026-09-09, on a ten-minute period at nine past, behind `scheduler_enabled` and a `SELECT, UPDATE`
+grant on that one table. #30
+
+**It is not running on the primary, and this file used to say it was.** The job needs both an
+Arbitrum RPC and `bounty_board_address`, and takes neither from a default; without them
+`crates/kittiwake-bin/src/jobs.rs` does not register it at all, which is deliberate and is better
+than logging a failure every ten minutes. `bounty_board_address` is absent from the box's
+`config.toml`, so Vercel's `/api/cron/reconcile-bounties` is the sole writer of `sync_bounties`.
+Checked on 2026-09-10: 354 rows under `reconcile-bounties` in `cron_runs`, most recent that
+afternoon, and **none at all** under `kittiwake:reconcile-bounties`. So there is no double write,
+and `CRON_EXPECTATIONS` declaring it `where: 'vercel'` is correct as things stand. #68
+
+The unhappy part is that a job which is configured off is indistinguishable from one somebody
+forgot, because nothing this service exposes lists what it scheduled. Answering "is it running
+here?" has taken three corrections and an SSH session. Until that is fixed, `cron_runs` is the
+answer: a job with no rows under `kittiwake:` is not running here, whatever this file says.
 
 ## Discontinued, so not ported at all
 
