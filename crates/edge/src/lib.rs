@@ -885,6 +885,10 @@ pub fn router(state: AppState) -> Router {
             get(handlers::subgraph_schema),
         )
         .route("/api/dips/agreements", get(handlers::dips_agreements))
+        .route(
+            "/api/subgraph-versions/{hash}",
+            get(handlers::subgraph_versions),
+        )
         // Scuttlebutt is deliberately separate from the provenance envelope routes above: messages
         // are primary user data in Postgres, not a view of a sealed protocol nest.
         .route(

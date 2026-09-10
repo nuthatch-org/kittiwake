@@ -248,6 +248,10 @@ const SUMMARIES: &[Operation] = &[
         "The Direct Indexer Payments agreement lifecycle: offered, accepted, active, collected, ended. Empty on Arbitrum One until an agreement is funded, and it says so.",
     ),
     op(
+        "/api/subgraph-versions/{hash}",
+        "Every version of the subgraph that published a deployment, with its signal and stake.",
+    ),
+    op(
         "/api/subgraph-schema/{hash}",
         "The GraphQL schema a deployment was built from, as text.",
     ),

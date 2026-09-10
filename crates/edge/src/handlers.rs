@@ -2384,3 +2384,73 @@ pub async fn dips_agreements(
     }
     Ok(envelope(read))
 }
+
+/// `GET /api/subgraph-versions/{hash}`: every version of the subgraph that published a deployment.
+///
+/// The nest half is cached; the labels are filled here from the IPFS document cache in one bulk
+/// read. The incumbent fetched each version's metadata document separately, which for a subgraph
+/// with forty versions is forty round trips to IPFS behind one request.
+pub async fn subgraph_versions(
+    State(st): State<AppState>,
+    Path(hash): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let cid = cid_v0(&hash)
+        .ok_or_else(|| ErrorResponse::from(ApiError::BadRequest("expected a CIDv0 hash".into())))?;
+    let deployment = kittiwake_read::shape::ipfs_hash_to_bytes32(cid)
+        .ok_or_else(|| ErrorResponse::from(ApiError::BadRequest("expected a CIDv0 hash".into())))?;
+
+    let read = routes::subgraph_versions(&st.read, &deployment).await?;
+    let mut value = (*read.entry.value).clone();
+    if let Some(pool) = st.pool.as_ref() {
+        label_versions(pool, &mut value).await;
+    }
+    // A new entry rather than a mutation: `read.entry` is shared, and writing labels into it would
+    // be writing into the cache from a request.
+    let read = kittiwake_read::Read {
+        entry: std::sync::Arc::new(kittiwake_cache::Entry {
+            value: std::sync::Arc::new(value),
+            provenance: read.entry.provenance.clone(),
+            fetched_at: read.entry.fetched_at,
+        }),
+        meta: read.meta,
+    };
+    Ok(envelope(read))
+}
+
+/// Replace each version's `versionMetadata` with the `label` from its IPFS document.
+///
+/// A document the cache has not seen leaves the label null rather than blocking the response on a
+/// fetch: the warm job is what fills that cache, and a version list is more useful with a missing
+/// label than it is late.
+async fn label_versions(pool: &kittiwake_db::Pool, value: &mut serde_json::Value) {
+    let Some(versions) = value.get_mut("versions").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let cids: Vec<String> = versions
+        .iter()
+        .filter_map(|v| {
+            kittiwake_read::search::metadata_cid(v.get("versionMetadata").and_then(|m| m.as_str()))
+        })
+        .collect();
+    let docs = kittiwake_ext::cached_docs(pool, &cids)
+        .await
+        .unwrap_or_default();
+
+    for version in versions.iter_mut() {
+        let label = kittiwake_read::search::metadata_cid(
+            version.get("versionMetadata").and_then(|m| m.as_str()),
+        )
+        .and_then(|cid| docs.iter().find(|d| d.cid == cid))
+        .and_then(|doc| doc.json.as_ref())
+        .and_then(|json| json.get("label"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+        if let Some(object) = version.as_object_mut() {
+            object.remove("versionMetadata");
+            object.insert("label".into(), label);
+        }
+    }
+}
