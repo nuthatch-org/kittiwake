@@ -275,6 +275,10 @@ const SUMMARIES: &[Operation] = &[
         "How allocated stake sits across quality bands. Unscored means not measured, which is most of it.",
     ),
     op(
+        "/api/operator-preflight",
+        "What would happen if an address tried to run a data service. Read-only: no wallet, no gas.",
+    ),
+    op(
         "/api/service-census",
         "Every data service's registered providers, and whether their endpoints actually answer.",
     ),

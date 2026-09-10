@@ -58,6 +58,13 @@ fn routes() -> Vec<Route> {
         both("/api/qos/capture"),
         both("/api/service-census"),
         Route {
+            path: leak(format!(
+                "/api/operator-preflight?address={A}&service=dispatch"
+            )),
+            incumbent_at: "",
+            ours_at: "",
+        },
+        Route {
             path: leak(format!("/api/manifest?hash={D}")),
             incumbent_at: "",
             ours_at: "",

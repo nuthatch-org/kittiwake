@@ -3299,3 +3299,107 @@ pub async fn service_census(
         .await?;
     Ok(envelope(read))
 }
+
+#[derive(serde::Deserialize)]
+pub struct PreflightQuery {
+    pub address: Option<String>,
+    pub service: Option<String>,
+}
+
+/// `GET /api/operator-preflight?address=0x…&service=…`: what would happen if this address tried to
+/// run this service.
+///
+/// Read-only by construction: no wallet, no signature, no gas. That is the point rather than a
+/// limitation, because it lets somebody price the job before deciding they care, for an address
+/// they have not funded or do not control.
+pub async fn operator_preflight(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<PreflightQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let address = q.address.as_deref().and_then(eth_address).ok_or_else(|| {
+        ErrorResponse::from(ApiError::BadRequest(
+            "give an address= that is a valid address".into(),
+        ))
+    })?;
+    let wanted = q.service.as_deref().unwrap_or_default();
+    let service = census::SERVICES
+        .iter()
+        .find(|s| s.id == wanted)
+        .ok_or_else(|| {
+            let names: Vec<&str> = census::SERVICES.iter().map(|s| s.id).collect();
+            ErrorResponse::from(ApiError::BadRequest(format!(
+                "unknown service; one of: {}",
+                names.join(", ")
+            )))
+        })?;
+
+    let chain = st.read.chain.as_ref().ok_or_else(|| {
+        ErrorResponse::from(ApiError::Unavailable(
+            "no Arbitrum RPC is configured, so nothing can be checked".into(),
+        ))
+    })?;
+
+    let reads = chain.preflight_reads(&address, service.address).await?;
+    let requirements = chain.provision_ranges(service.address).await.map(|r| {
+        census::interpret(
+            r.min_tokens,
+            r.max_tokens,
+            r.min_thawing,
+            r.max_thawing,
+            r.min_cut_ppm,
+            r.max_cut_ppm,
+        )
+    });
+    // Whether the registry lists this address. Read here rather than taken from the census cache,
+    // so a preflight is never answered from a picture of the registry that has since moved.
+    let registered = match chain.provider_registry(service.address).await {
+        Ok(logs) => {
+            let events: Vec<census::RegistryEvent> = logs
+                .into_iter()
+                .map(|l| census::RegistryEvent {
+                    provider: l.provider,
+                    endpoint: l.endpoint,
+                    block_number: l.block_number,
+                    log_index: l.log_index,
+                    registered: l.registered,
+                })
+                .collect();
+            census::current_providers(&events)
+                .iter()
+                .any(|p| p.address == address)
+        }
+        Err(_) => false,
+    };
+
+    let steps = kittiwake_read::preflight::preflight(&kittiwake_read::preflight::Reads {
+        grt_balance: reads.grt_balance,
+        stake: reads.stake,
+        idle_stake: reads.idle_stake,
+        provision_tokens: reads.provision_tokens,
+        provision_thawing_seconds: reads.provision_thawing_seconds,
+        registered,
+        service_implementation: kittiwake_read::preflight::implementation_from_slot(Some(
+            &reads.implementation_slot,
+        )),
+        requirements,
+    });
+
+    let mut response = axum::Json(serde_json::json!({
+        "data": {
+            "address": address,
+            "service": {
+                "id": service.id,
+                "name": service.name,
+                "address": service.address,
+            },
+            "verdict": kittiwake_read::preflight::verdict(&steps),
+            "steps": steps,
+        }
+    }))
+    .into_response();
+    crate::no_store(response.headers_mut());
+    Ok(response)
+}

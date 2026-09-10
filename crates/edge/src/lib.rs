@@ -892,6 +892,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/ens", get(handlers::ens))
         .route("/api/manifest", get(handlers::manifest))
         .route("/api/service-census", get(handlers::service_census))
+        .route("/api/operator-preflight", get(handlers::operator_preflight))
         .route("/api/qos/capture", get(handlers::qos_capture))
         .route(
             "/api/data-services/query",
