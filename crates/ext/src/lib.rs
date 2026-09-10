@@ -918,6 +918,47 @@ impl Ipfs {
         res.text().await.map_err(|e| e.to_string())
     }
 
+    /// The same `cat`, for an artefact that is not text.
+    ///
+    /// A compiled mapping module is binary and can be tens of megabytes, so this takes its own
+    /// longer timeout and refuses anything over the cap rather than holding it in memory to find
+    /// out how big it was. The client's eight seconds is right for a manifest and short for a
+    /// module on a cold gateway block.
+    pub async fn cat_bytes(&self, cid: &str, cap: usize) -> Result<Vec<u8>, String> {
+        let url = format!("{}/api/v0/cat", self.endpoint);
+        let res = self
+            .http
+            .post(&url)
+            .query(&[("arg", cid)])
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    "timed out".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+        if !res.status().is_success() {
+            return Err(format!("ipfs cat {cid}: HTTP {}", res.status().as_u16()));
+        }
+        // The declared length first, so an oversized artefact is refused before it is downloaded.
+        if let Some(len) = res.content_length()
+            && len > cap as u64
+        {
+            return Err(format!("Artifact {cid} is {len} bytes (>{cap} cap)"));
+        }
+        let bytes = res.bytes().await.map_err(|e| e.to_string())?;
+        if bytes.len() > cap {
+            return Err(format!(
+                "Artifact {cid} is {} bytes (>{cap} cap)",
+                bytes.len()
+            ));
+        }
+        Ok(bytes.to_vec())
+    }
+
     /// Put one JSON document through the IPFS API and return the CID it actually assigned.
     /// Metadata is content-addressed, so accepting an upstream response without a CID would be
     /// reporting a publication that nobody can subsequently resolve.

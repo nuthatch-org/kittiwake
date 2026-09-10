@@ -1,9 +1,9 @@
 //! The report's shape. Field names are the wire names, because the disassembly page reads them.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A host-API family graph-node exposes to mappings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum HostCategory {
     Store,
@@ -64,7 +64,7 @@ impl HostCategory {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostImport {
     pub module: String,
@@ -77,7 +77,7 @@ pub struct HostImport {
     pub is_host: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HandlerKind {
     Event,
@@ -85,7 +85,7 @@ pub enum HandlerKind {
     Block,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HandlerAnalysis {
     pub handler: String,
@@ -102,7 +102,7 @@ pub struct HandlerAnalysis {
     pub incomplete: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WasmModuleInfo {
     pub wasm_hash: String,
@@ -121,7 +121,7 @@ pub struct WasmModuleInfo {
 }
 
 /// One data-segment type string that ethabi accepted and alloy does not.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DecodeFinding {
     pub raw: String,
@@ -133,7 +133,7 @@ pub struct DecodeFinding {
     pub alloy_reason: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DecodeStatus {
     NoImport,
@@ -141,7 +141,7 @@ pub enum DecodeStatus {
     Divergent,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DecodeAudit {
     pub uses_decode: bool,
@@ -150,14 +150,14 @@ pub struct DecodeAudit {
     pub status: DecodeStatus,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Abi {
     pub name: String,
     pub hash: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataSourceReport {
     pub name: String,
@@ -176,14 +176,14 @@ pub struct DataSourceReport {
     pub decode_audit: Option<DecodeAudit>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Graft {
     pub base: String,
     pub block: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployManifestInfo {
     pub spec_version: String,
@@ -194,7 +194,7 @@ pub struct DeployManifestInfo {
     pub graft: Option<Graft>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FlagLevel {
     Info,
@@ -202,7 +202,7 @@ pub enum FlagLevel {
     Critical,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RiskFlag {
     pub level: FlagLevel,
@@ -210,7 +210,7 @@ pub struct RiskFlag {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CategoryScore {
     pub name: String,
@@ -219,7 +219,7 @@ pub struct CategoryScore {
     pub note: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Scorecard {
     pub grade: char,
@@ -230,7 +230,7 @@ pub struct Scorecard {
     pub categories: Vec<CategoryScore>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Totals {
     pub data_sources: usize,
@@ -241,7 +241,7 @@ pub struct Totals {
     pub host_categories: Vec<HostCategory>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DisassemblyReport {
     pub deployment_id: String,

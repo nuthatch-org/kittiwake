@@ -31,28 +31,29 @@ this service's router, rather than by hand. The counts below are that diff.
 
 Lodestar has **90 API route files**, twelve of which are cron endpoints rather than API surface.
 
-**Answered by this router: 73.** Their parity verdicts and timings are in [status.md](status.md),
+**Answered by this router: 75.** Their parity verdicts and timings are in [status.md](status.md),
 which the harness generates.
 
-**In Next and not here: 20.** Twelve are the crons, which are jobs in this process and are
-ledgered below. Four are deliberate: `health` judges the deployment including whether kittiwake is
-writing, so moving it here would make the thing being checked the checker; `migration` is the
-frontend describing itself; `horizon/debug` is cron-authed and wants confirming before it goes;
-`provider-liveness` goes with the Dispatch removal, nightswatchhq/lodestar#99. `disassembly/verify`
-is being deleted, nightswatchhq/lodestar#144.
+**In Next and not here: 18, and every one of them by decision.** Twelve are the crons, which are
+jobs in this process and are ledgered below. Four are deliberate: `health` judges the deployment
+including whether kittiwake is writing, so moving it here would make the thing being checked the
+checker; `migration` is the frontend describing itself; `horizon/debug` is cron-authed and wants
+confirming before it goes; `provider-liveness` goes with the Dispatch removal,
+nightswatchhq/lodestar#99. `disassembly/verify` is being deleted, nightswatchhq/lodestar#144. And
+`blog/search-index` stays, because it reads the blog posts out of the lodestar working directory at
+build time and porting it would put a repository this service does not own into its build; the
+reasoning is in [decisions.md](decisions.md).
 
-That leaves **two genuinely still to port**: `disassembly` and `disassembly/diff`, which are #18.
-`blog/search-index` was the last of #67's nineteen and stays on Next, because it reads the blog
-posts out of the lodestar working directory at build time and porting it would put a repository
-this service does not own into its build. The reasoning is in [decisions.md](decisions.md).
+**Nothing is left to port.** `disassembly` and `disassembly/diff` were the last two and answer
+here as of #18.
 
-### Ported here and reachable by nobody: 34
+### Ported here and reachable by nobody: 36
 
 The edge forwards a request only if `isMigrated` says so, and that list is `MIGRATED` in lodestar's
-`src/lib/migration.ts`. Thirty-three routes answer on this router and are not in it, and
+`src/lib/migration.ts`. Thirty-five routes answer on this router and are not in it, and
 `/api/indexer/present-poi` is in `NEVER_FORWARD` from when this service had no handler for it.
-The Dock's nine, scuttlebutt's six, the SQL upper tier's two and sixteen of the long tail are all
-written, tested and unreached; every request for them lands on Next.
+The Dock's nine, scuttlebutt's six, the SQL upper tier's two, the disassembler's two and sixteen of
+the long tail are all written, tested and unreached; every request for them lands on Next.
 
 Porting a route and flipping it are two pull requests in two repositories, and only the second one
 delivers anything. That is worth saying plainly here because the first is the enjoyable half.

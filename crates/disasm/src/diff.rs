@@ -131,13 +131,20 @@ pub struct DisassemblyDiff {
 
 const STRING_CAP: usize = 120;
 
+/// `dataSource \u{25b8} handler \u{25b8} kind`, which is stable across versions where a function
+/// index is not.
+///
+/// The incumbent's separator is a literal NUL byte, while the comment directly above it says
+/// `\u{25b8}`. A NUL in a JSON string is legal and nothing good comes of one: it survives into the
+/// wire format, into logs and into anything that round-trips through a C string. The page uses this
+/// value only as a React key, so the character the comment intended is used instead.
 fn handler_key(source: &str, handler: &HandlerAnalysis) -> String {
     let kind = match handler.kind {
         crate::types::HandlerKind::Event => "event",
         crate::types::HandlerKind::Call => "call",
         crate::types::HandlerKind::Block => "block",
     };
-    format!("{source} {} {kind}", handler.handler)
+    format!("{source} \u{25b8} {} \u{25b8} {kind}", handler.handler)
 }
 
 /// Every handler in a report by its cross-version key. A repeated key is degenerate, and the
