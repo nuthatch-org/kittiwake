@@ -57,6 +57,9 @@ fn routes() -> Vec<Route> {
         both("/api/dips/agreements"),
         both("/api/qos/capture"),
         both("/api/service-census"),
+        // The sliders are sent explicitly rather than left to default, so a change to either
+        // side's default shows up here as a value diff instead of cancelling out.
+        both("/api/delegate/recommend?returns=5&stability=5&safety=5&network=5"),
         Route {
             path: leak(format!(
                 "/api/operator-preflight?address={A}&service=dispatch"

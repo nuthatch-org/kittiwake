@@ -893,6 +893,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/manifest", get(handlers::manifest))
         .route("/api/service-census", get(handlers::service_census))
         .route("/api/operator-preflight", get(handlers::operator_preflight))
+        .route("/api/delegate/recommend", get(handlers::delegate_recommend))
         .route("/api/qos/capture", get(handlers::qos_capture))
         .route(
             "/api/data-services/query",

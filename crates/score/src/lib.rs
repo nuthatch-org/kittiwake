@@ -65,6 +65,31 @@ pub struct Breakdown {
     pub data_service_diversity: i32,
 }
 
+impl Breakdown {
+    /// A dimension by the name it is published under, or `None` for a name that is not one.
+    ///
+    /// The names are the wire names rather than the field names, because they are the keys in
+    /// `WEIGHTS`, in the JSON the dashboard renders, and in the preference map that
+    /// `/api/delegate/recommend` weights. A misspelling that returned zero rather than `None`
+    /// would drop a dimension out of the composite without changing anything visible.
+    pub fn dimension(&self, name: &str) -> Option<i32> {
+        Some(match name {
+            "reo" => self.reo,
+            "allocationEfficiency" => self.allocation_efficiency,
+            "selfStake" => self.self_stake,
+            "delegatorCut" => self.delegator_cut,
+            "overDelegation" => self.over_delegation,
+            "transparency" => self.transparency,
+            "delegatorAPY" => self.delegator_apy,
+            "queryVolume" => self.query_volume,
+            "cutStability" => self.cut_stability,
+            "dataServiceDiversity" => self.data_service_diversity,
+            "delegationTrend" => self.delegation_trend,
+            _ => return None,
+        })
+    }
+}
+
 /// The published weights. They must sum to 100; a test below enforces it, because a weight added
 /// without adjusting the others would quietly rescale every score on the site.
 pub const WEIGHTS: [(&str, i32); 11] = [
@@ -429,25 +454,9 @@ pub fn calculate(input: &Input) -> Score {
 }
 
 fn weighted(b: &Breakdown) -> i32 {
-    let by_key = |k: &str| -> i32 {
-        match k {
-            "reo" => b.reo,
-            "allocationEfficiency" => b.allocation_efficiency,
-            "selfStake" => b.self_stake,
-            "delegatorCut" => b.delegator_cut,
-            "overDelegation" => b.over_delegation,
-            "transparency" => b.transparency,
-            "delegatorAPY" => b.delegator_apy,
-            "queryVolume" => b.query_volume,
-            "cutStability" => b.cut_stability,
-            "dataServiceDiversity" => b.data_service_diversity,
-            "delegationTrend" => b.delegation_trend,
-            _ => 0,
-        }
-    };
     let sum: f64 = WEIGHTS
         .iter()
-        .map(|(k, w)| by_key(k) as f64 * (*w as f64 / 100.0))
+        .map(|(k, w)| b.dimension(k).unwrap_or(0) as f64 * (*w as f64 / 100.0))
         .sum();
     sum.round() as i32
 }
@@ -491,6 +500,31 @@ mod tests {
     fn the_weights_sum_to_one_hundred() {
         assert_eq!(WEIGHTS.iter().map(|(_, w)| w).sum::<i32>(), 100);
         assert_eq!(WEIGHTS.len(), 11);
+    }
+
+    /// Every published weight names a dimension that exists. A key that resolved to nothing would
+    /// contribute zero to every composite score, which looks exactly like a dimension nobody
+    /// scores well on.
+    #[test]
+    fn every_weight_names_a_dimension() {
+        let b = Breakdown {
+            reo: 1,
+            allocation_efficiency: 2,
+            self_stake: 3,
+            delegator_cut: 4,
+            over_delegation: 5,
+            transparency: 6,
+            delegator_apy: 7,
+            query_volume: 8,
+            cut_stability: 9,
+            delegation_trend: 10,
+            data_service_diversity: 11,
+        };
+        for (key, _) in WEIGHTS {
+            assert!(b.dimension(key).is_some(), "{key} names no dimension");
+        }
+        assert_eq!(b.dimension("selfStake"), Some(3));
+        assert_eq!(b.dimension("self_stake"), None);
     }
 
     #[test]

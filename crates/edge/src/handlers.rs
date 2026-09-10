@@ -3403,3 +3403,139 @@ pub async fn operator_preflight(
     crate::no_store(response.headers_mut());
     Ok(response)
 }
+
+/// The four sliders and how many candidates to return. Taken as strings rather than numbers so a
+/// mistyped value falls back to the default instead of failing the whole request: the incumbent
+/// runs every one of these through `Number()`, which never throws.
+#[derive(serde::Deserialize)]
+pub struct RecommendQuery {
+    pub returns: Option<String>,
+    pub stability: Option<String>,
+    pub safety: Option<String>,
+    pub network: Option<String>,
+    pub count: Option<String>,
+}
+
+/// A slider, defaulting to neutral. `Number("")` is 0 in JavaScript and `Number("x")` is NaN;
+/// both become 5 here, because a typo should not silently switch a dimension off.
+fn slider(value: Option<&String>) -> f64 {
+    value
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(5.0)
+        .clamp(0.0, 10.0)
+}
+
+/// `GET /api/delegate/recommend?returns=..&stability=..&safety=..&network=..&count=..`: which
+/// indexer to delegate to.
+///
+/// Answers in the **frontend's** field names rather than ours. `/delegate` reads `indexer.id` and
+/// `indexer.delegationCapacity.utilizationPercent` straight off this response without putting it
+/// through `enriched-normalise.ts` first, so serving our own row shape would blank the page the
+/// way the cutover did. `kittiwake_read::recommend::legacy_indexer` is a port of that normaliser
+/// and is pinned against its output by test.
+///
+/// The incumbent sends `s-maxage=60, stale-while-revalidate=300`; this sends `no-store` like every
+/// other data route here, because Vercel's CDN caches a rewritten origin by its upstream header
+/// and a five-minute-stale recommendation is not ours to give away.
+pub async fn delegate_recommend(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<RecommendQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let pool = st
+        .pool
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("no database is configured".into()))?;
+
+    // A hundred, because that is `/api/indexers-enriched`'s default page size and the incumbent
+    // ranks over exactly what that route hands it. Reading more here would recommend indexers the
+    // page it came from never showed.
+    let rows = kittiwake_db::enriched_indexers(pool, 100)
+        .await
+        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+
+    // The incumbent's own sentences, kept verbatim: they are what a delegator sees in the console
+    // when the page says it could not load a recommendation.
+    if rows.is_empty() {
+        return Ok(bare_error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Indexer data not yet available",
+        ));
+    }
+
+    let eligible: Vec<&kittiwake_db::EnrichedIndexer> = rows
+        .iter()
+        .filter(|r| kittiwake_read::recommend::eligible(r))
+        .collect();
+    if eligible.is_empty() {
+        return Ok(bare_error(
+            axum::http::StatusCode::NOT_FOUND,
+            "No eligible indexers found",
+        ));
+    }
+
+    let prefs = kittiwake_read::recommend::Prefs {
+        returns: slider(q.returns.as_ref()),
+        stability: slider(q.stability.as_ref()),
+        safety: slider(q.safety.as_ref()),
+        network: slider(q.network.as_ref()),
+    };
+    let weights = kittiwake_read::recommend::weights(&prefs);
+
+    // `None` for every row: the refresh job computes a per-dimension breakdown and the `indexers`
+    // table has nowhere to keep it, so the sliders cannot move anything yet and the ranking is the
+    // composite score. `reasons` says so rather than implying otherwise. #87
+    let mut ranked: Vec<(&kittiwake_db::EnrichedIndexer, f64)> = eligible
+        .iter()
+        .map(|r| (*r, kittiwake_read::recommend::rank_score(r, None, &weights)))
+        .collect();
+    // Stable, so indexers on the same score keep the database's order: score first, then self
+    // stake. An unstable sort would reshuffle the top of the board between two identical requests.
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+    let candidate = |(row, score): &(&kittiwake_db::EnrichedIndexer, f64)| {
+        serde_json::json!({
+            "indexer": kittiwake_read::recommend::legacy_indexer(row),
+            "score": score.round() as i64,
+            "reasons": kittiwake_read::recommend::reasons(row, None, &weights),
+        })
+    };
+
+    // `count` absent means one, and the answer is then the single recommendation rather than a
+    // list of one. The incumbent turns an unparseable count into `NaN`, which slices to an empty
+    // candidate list; a typo answering with nothing is a bug, so it reads as one here.
+    let count = q
+        .count
+        .as_deref()
+        .map(|c| {
+            c.trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .map_or(1.0, |v| v.clamp(1.0, 10.0)) as usize
+        })
+        .unwrap_or(1);
+
+    let body = if count == 1 {
+        candidate(&ranked[0])
+    } else {
+        serde_json::json!({
+            "candidates": ranked.iter().take(count).map(candidate).collect::<Vec<_>>(),
+        })
+    };
+
+    let mut resp = axum::Json(body).into_response();
+    crate::no_store(resp.headers_mut());
+    Ok(resp)
+}
+
+/// The incumbent's error body: a sentence under `error`, and nothing else. Kept rather than
+/// translated into this service's `{error, message}` because the sentence is the whole content.
+fn bare_error(status: axum::http::StatusCode, message: &str) -> Response {
+    let mut resp = (status, axum::Json(serde_json::json!({ "error": message }))).into_response();
+    crate::no_store(resp.headers_mut());
+    resp
+}

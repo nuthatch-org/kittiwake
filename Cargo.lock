@@ -3305,6 +3305,7 @@ dependencies = [
  "kittiwake-ext",
  "kittiwake-nest",
  "kittiwake-rewards",
+ "kittiwake-score",
  "kittiwake-types",
  "metrics",
  "regex",
