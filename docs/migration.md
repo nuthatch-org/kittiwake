@@ -21,7 +21,7 @@ service returns the same shape, ignoring the added `provenance` key.
 | 7 | `/api/price`, `tvl`, `reo`, `indexer-node-health` | chain and third-party reads; the SSRF guard lands here | **done** |
 | 8 | `/api/studio/*` | sessions, deploy keys, IPFS, on-chain lifecycle | to do |
 | 9 | `/api/scuttlebutt/*` | streaming and moderation | to do |
-| 10 | the long tail | some of it droppable | sixteen answer here, two were deleted, `blog/search-index` remains. #67 |
+| 10 | the long tail | some of it droppable | **settled**: sixteen answer here, two deleted, one stays on Next. #67 |
 | 11 | frontend hooks | only now do the hooks change | to do |
 
 ## The route ledger
@@ -41,8 +41,10 @@ frontend describing itself; `horizon/debug` is cron-authed and wants confirming 
 `provider-liveness` goes with the Dispatch removal, nightswatchhq/lodestar#99. `disassembly/verify`
 is being deleted, nightswatchhq/lodestar#144.
 
-That leaves **three genuinely still to port**: `disassembly` and `disassembly/diff`, which are #18,
-and `blog/search-index`, the last of #67's nineteen.
+That leaves **two genuinely still to port**: `disassembly` and `disassembly/diff`, which are #18.
+`blog/search-index` was the last of #67's nineteen and stays on Next, because it reads the blog
+posts out of the lodestar working directory at build time and porting it would put a repository
+this service does not own into its build. The reasoning is in [decisions.md](decisions.md).
 
 ### Ported here and reachable by nobody: 34
 

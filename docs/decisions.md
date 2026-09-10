@@ -8,6 +8,30 @@ Newest first.
 
 ---
 
+## 2026-09-10: `blog/search-index` stays on Next, and it is not a route this service should want
+
+The last of #67's nineteen, and the only one answered by declining it.
+
+It reads `src/content/blog/*.md` out of the lodestar working directory at build time, strips the
+markdown and returns lowercased post bodies keyed by slug. `force-static`, immutable per deploy,
+cached for a day. Nothing in it touches the protocol, Postgres, the nest or the chain.
+
+Porting it would mean one of two things. Either the blog posts are copied into this repository, so
+a writer publishing a post has to deploy a Rust service; or this service reads a checkout of a
+repository it does not own, which is a build-time dependency between two deployments dressed up as
+an API. Both are worse than the route.
+
+It belongs with `/api/migration` in the same category: the frontend describing its own content,
+which is what a frontend serves. #29 asks for lodestar to hold no API routes, and this is not one -
+it is a static asset with a build step, and the fact that Next spells that as `route.ts` is Next's
+business rather than an argument about where the data lives.
+
+So the nineteen are settled: sixteen answer here, `feed` went with the Intel Feed
+(nightswatchhq/lodestar#146, merged), `analytics/clickthrough` is being deleted for never having
+received a click (nightswatchhq/lodestar#150, open), and this one stays where it is.
+
+---
+
 ## 2026-09-09: the chain probe waits eight seconds, and the coverage difference is now moot
 
 The incumbent's `fetchIndexerDeployments` allowed three seconds; this one allows eight. That made us
