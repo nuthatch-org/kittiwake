@@ -23,6 +23,16 @@ const DEFILLAMA: &str = "https://api.llama.fi/v2/historicalChainTvl/Arbitrum";
 /// that can expire in exchange for headroom nothing needs.
 const GRAPH_SUPPORT: &str = "https://api.github.com/repos/nightswatchhq/graph-support/issues?state=all&sort=updated&direction=desc&per_page=100";
 
+/// Every comment in the repository, in one request rather than one per issue.
+///
+/// The obvious shape, walking `/issues/{n}/comments` for each issue, is thirty-four requests a run
+/// today and one more for every issue ever filed. Unauthenticated GitHub allows sixty an hour, so
+/// that design works until the archive is about sixty issues and then quietly starts failing
+/// halfway through a run. This endpoint is one request for all of them, with `issue_url` to map
+/// each back, and stays one request however large the repository gets.
+const GRAPH_SUPPORT_COMMENTS: &str =
+    "https://api.github.com/repos/nightswatchhq/graph-support/issues/comments?per_page=100";
+
 #[derive(Clone)]
 pub struct Ext {
     pub(crate) http: reqwest::Client,
@@ -30,6 +40,7 @@ pub struct Ext {
     price_url: String,
     tvl_url: String,
     graph_support_url: String,
+    graph_support_comments_url: String,
 }
 
 impl Default for Ext {
@@ -51,6 +62,7 @@ impl Ext {
             price_url: price_url.into(),
             tvl_url: tvl_url.into(),
             graph_support_url: GRAPH_SUPPORT.to_string(),
+            graph_support_comments_url: GRAPH_SUPPORT_COMMENTS.to_string(),
         }
     }
 
@@ -106,6 +118,65 @@ impl Ext {
         self
     }
 
+    /// Point the comment fetch at a stand-in. Tests only.
+    pub fn with_graph_support_comments_url(mut self, url: impl Into<String>) -> Self {
+        self.graph_support_comments_url = url.into();
+        self
+    }
+
+    /// Every comment in the repository, with the issue number each belongs to.
+    ///
+    /// An empty answer is allowed here, unlike the issue list: a repository can genuinely have
+    /// issues nobody has replied to yet, and refusing that would be inventing a fault.
+    pub async fn graph_support_thread_comments(
+        &self,
+    ) -> Result<Vec<GraphSupportComment>, ApiError> {
+        let mut collected: Vec<GraphSupportComment> = Vec::new();
+
+        for page in 1..=20u32 {
+            let batch: Vec<GhComment> = self
+                .http
+                .get(&self.graph_support_comments_url)
+                .query(&[("page", page.to_string())])
+                .send()
+                .await
+                .map_err(|e| ApiError::Unavailable(format!("graph-support comments: {e}")))?
+                .error_for_status()
+                .map_err(|e| ApiError::Unavailable(format!("graph-support comments: {e}")))?
+                .json()
+                .await
+                .map_err(|e| ApiError::Unavailable(format!("graph-support comments: {e}")))?;
+
+            let full_page = batch.len() == 100;
+            for c in batch {
+                // `issue_url` ends in the number. A comment whose parent cannot be read is dropped
+                // rather than filed under a guess.
+                let Some(number) = c
+                    .issue_url
+                    .rsplit('/')
+                    .next()
+                    .and_then(|n| n.parse::<i32>().ok())
+                else {
+                    continue;
+                };
+                collected.push(GraphSupportComment {
+                    id: c.id,
+                    issue_number: number,
+                    author: c.user.and_then(|u| u.login).unwrap_or_default(),
+                    body: c.body.unwrap_or_default(),
+                    url: c.html_url,
+                    created_at: c.created_at,
+                    updated_at: c.updated_at,
+                });
+            }
+            if !full_page {
+                break;
+            }
+        }
+
+        Ok(collected)
+    }
+
     /// Every issue in nightswatchhq/graph-support, pull requests removed.
     ///
     /// An empty answer is a failure rather than an empty archive. That repository has never had
@@ -138,6 +209,7 @@ impl Ext {
                 collected.push(GraphSupportIssue {
                     number: gh.number,
                     title: gh.title,
+                    body: gh.body.unwrap_or_default(),
                     url: gh.html_url,
                     state: if gh.state == "closed" {
                         "closed"
@@ -170,6 +242,7 @@ impl Ext {
 pub struct GraphSupportIssue {
     pub number: i32,
     pub title: String,
+    pub body: String,
     pub url: String,
     pub state: String,
     pub labels: Vec<String>,
@@ -183,6 +256,8 @@ pub struct GraphSupportIssue {
 struct GhIssue {
     number: i32,
     title: String,
+    #[serde(default)]
+    body: Option<String>,
     html_url: String,
     state: String,
     #[serde(default)]
@@ -199,6 +274,37 @@ struct GhIssue {
 #[derive(serde::Deserialize)]
 struct GhLabel {
     name: Option<String>,
+}
+
+/// One comment, reduced to what the page renders.
+#[derive(Debug, Clone)]
+pub struct GraphSupportComment {
+    pub id: i64,
+    pub issue_number: i32,
+    pub author: String,
+    pub body: String,
+    pub url: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(serde::Deserialize)]
+struct GhComment {
+    id: i64,
+    /// `.../repos/owner/repo/issues/33`, which is the only link back to the parent.
+    issue_url: String,
+    html_url: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    user: Option<GhUser>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(serde::Deserialize)]
+struct GhUser {
+    login: Option<String>,
 }
 
 #[cfg(test)]
@@ -1083,5 +1189,125 @@ mod ipfs_tests {
 
         let ext = Ext::default().with_graph_support_url(format!("{}/issues", server.uri()));
         ext.graph_support_issues().await.unwrap();
+    }
+
+    fn gh_comment(id: i64, issue: i32) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "issue_url": format!("https://api.github.com/repos/nightswatchhq/graph-support/issues/{issue}"),
+            "html_url": format!("https://github.com/nightswatchhq/graph-support/issues/{issue}#issuecomment-{id}"),
+            "body": "the gateway is routing to an indexer whose store is down",
+            "user": {"login": "cargopete"},
+            "created_at": "2026-09-02T00:00:00Z",
+            "updated_at": "2026-09-02T00:00:00Z",
+        })
+    }
+
+    #[tokio::test]
+    async fn a_comment_is_filed_under_the_issue_its_url_names() {
+        // `issue_url` is the only link back to the parent, and getting it wrong files the whole
+        // thread under the wrong issue or drops it. Neither errors.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![gh_comment(9001, 31)]))
+            .mount(&server)
+            .await;
+
+        let ext =
+            Ext::default().with_graph_support_comments_url(format!("{}/comments", server.uri()));
+        let comments = ext.graph_support_thread_comments().await.unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].issue_number, 31);
+        assert_eq!(comments[0].id, 9001);
+        assert_eq!(comments[0].author, "cargopete");
+    }
+
+    #[tokio::test]
+    async fn a_comment_whose_parent_cannot_be_read_is_dropped_not_guessed() {
+        let mut orphan = gh_comment(9002, 31);
+        orphan["issue_url"] = serde_json::json!("https://api.github.com/nonsense");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/comments"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(vec![gh_comment(9001, 31), orphan]),
+            )
+            .mount(&server)
+            .await;
+
+        let ext =
+            Ext::default().with_graph_support_comments_url(format!("{}/comments", server.uri()));
+        let comments = ext.graph_support_thread_comments().await.unwrap();
+        assert_eq!(
+            comments.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![9001]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_comments_is_a_legitimate_answer_here() {
+        // Unlike the issue list. A repository where nobody has replied yet is a real state, and
+        // refusing it would be inventing a fault.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+            .mount(&server)
+            .await;
+
+        let ext =
+            Ext::default().with_graph_support_comments_url(format!("{}/comments", server.uri()));
+        assert!(
+            ext.graph_support_thread_comments()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_comment_fetch_is_a_failure_not_a_silent_empty_thread() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/comments"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let ext =
+            Ext::default().with_graph_support_comments_url(format!("{}/comments", server.uri()));
+        assert!(ext.graph_support_thread_comments().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_issue_body_comes_across_with_the_issue() {
+        let mut issue = gh(31, "open");
+        issue["body"] = serde_json::json!("## What happened\n\nEvery allocated indexer 400s.");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/issues"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![issue]))
+            .mount(&server)
+            .await;
+
+        let ext = Ext::default().with_graph_support_url(format!("{}/issues", server.uri()));
+        let issues = ext.graph_support_issues().await.unwrap();
+        assert!(issues[0].body.contains("Every allocated indexer 400s"));
+    }
+
+    #[tokio::test]
+    async fn an_issue_filed_with_no_body_reads_as_empty_rather_than_failing() {
+        let mut issue = gh(31, "open");
+        issue["body"] = serde_json::Value::Null;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/issues"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![issue]))
+            .mount(&server)
+            .await;
+
+        let ext = Ext::default().with_graph_support_url(format!("{}/issues", server.uri()));
+        assert_eq!(ext.graph_support_issues().await.unwrap()[0].body, "");
     }
 }

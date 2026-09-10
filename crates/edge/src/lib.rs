@@ -606,6 +606,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/curators", get(handlers::curators))
         .route("/api/support", get(handlers::support))
+        .route("/api/support/{number}", get(handlers::support_issue))
         .route("/api/epochs", get(handlers::epochs))
         .route("/api/network-stats", get(handlers::network_stats))
         // Same fold, different panel: one cache entry serves both.

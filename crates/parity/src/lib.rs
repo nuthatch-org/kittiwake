@@ -297,6 +297,12 @@ pub mod coverage {
             "probes a third party's endpoint, so the answer depends on that host rather than on us",
         ),
         (
+            "/api/support/{number}",
+            Excused::Entirely,
+            "the same mirror as /api/support, one thread at a time; the dashboard has no incumbent \
+             handler for it at all",
+        ),
+        (
             "/api/support",
             Excused::Entirely,
             "has no incumbent to match: the dashboard's own handler reads GitHub live and this \

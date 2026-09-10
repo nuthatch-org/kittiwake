@@ -29,6 +29,14 @@ pub async fn graph_support(pool: &Pool, ext: &Ext) -> Result<Ingested, IngestErr
         .await
         .map_err(|e| IngestError::Refused(e.to_string()))?;
 
+    // Fetched before the transaction opens, so a slow GitHub does not hold a write lock. Two
+    // requests for the whole archive: the issues carry their own bodies, and every comment in the
+    // repository arrives in one call rather than one per issue.
+    let comments = ext
+        .graph_support_thread_comments()
+        .await
+        .map_err(|e| IngestError::Refused(e.to_string()))?;
+
     // One statement per issue rather than the UNNEST bulk insert the other jobs use. `labels` is a
     // per-row `text[]` of varying length, and Postgres array parameters must be rectangular, so
     // there is no honest way to carry thirty-three label lists through one UNNEST. At two runs a
@@ -39,16 +47,17 @@ pub async fn graph_support(pool: &Pool, ext: &Ext) -> Result<Ingested, IngestErr
     for issue in &issues {
         sqlx::query(
             "INSERT INTO graph_support_issues \
-             (number, title, url, state, labels, comments, created_at, updated_at, ingested_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW()) \
+             (number, title, body, url, state, labels, comments, created_at, updated_at, ingested_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) \
              ON CONFLICT (number) DO UPDATE SET \
-               title = EXCLUDED.title, url = EXCLUDED.url, state = EXCLUDED.state, \
-               labels = EXCLUDED.labels, comments = EXCLUDED.comments, \
+               title = EXCLUDED.title, body = EXCLUDED.body, url = EXCLUDED.url, \
+               state = EXCLUDED.state, labels = EXCLUDED.labels, comments = EXCLUDED.comments, \
                created_at = EXCLUDED.created_at, updated_at = EXCLUDED.updated_at, \
                ingested_at = NOW()",
         )
         .bind(issue.number)
         .bind(&issue.title)
+        .bind(&issue.body)
         .bind(&issue.url)
         .bind(&issue.state)
         .bind(&issue.labels)
@@ -65,10 +74,41 @@ pub async fn graph_support(pool: &Pool, ext: &Ext) -> Result<Ingested, IngestErr
         .execute(&mut *tx)
         .await?;
 
+    for c in &comments {
+        sqlx::query(
+            "INSERT INTO graph_support_comments \
+             (id, issue_number, author, body, url, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (id) DO UPDATE SET \
+               author = EXCLUDED.author, body = EXCLUDED.body, url = EXCLUDED.url, \
+               updated_at = EXCLUDED.updated_at",
+        )
+        .bind(c.id)
+        .bind(c.issue_number)
+        .bind(&c.author)
+        .bind(&c.body)
+        .bind(&c.url)
+        .bind(c.created_at)
+        .bind(c.updated_at)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // An edited-then-deleted comment must leave here too. Guarded on the fetch having returned
+    // something: an empty comment list is legitimate for a repository nobody has replied in, but
+    // deleting the whole thread store on the strength of it would not be.
+    if !comments.is_empty() {
+        let kept: Vec<i64> = comments.iter().map(|c| c.id).collect();
+        sqlx::query("DELETE FROM graph_support_comments WHERE id <> ALL($1::bigint[])")
+            .bind(&kept)
+            .execute(&mut *tx)
+            .await?;
+    }
+
     tx.commit().await?;
     state::touch(pool, "graph_support").await?;
 
     Ok(Ingested {
-        rows: issues.len() as u64,
+        rows: (issues.len() + comments.len()) as u64,
     })
 }
