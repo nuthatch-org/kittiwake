@@ -320,6 +320,11 @@ pub mod coverage {
             "POST with a body; the harness only issues GETs",
         ),
         (
+            "/api/foghorn/{*path}",
+            Excused::Entirely,
+            "a pass-through to another service; the harness would be comparing Foghorn against itself rather than this service against the incumbent",
+        ),
+        (
             "/api/sql/receipt",
             Excused::Entirely,
             "POST with a body, and it signs what it returns; the harness only issues GETs and must not mint receipts against production",

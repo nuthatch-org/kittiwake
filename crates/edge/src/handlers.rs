@@ -2612,3 +2612,113 @@ pub async fn support_templates(
     crate::no_store(resp.headers_mut());
     Ok(resp)
 }
+
+// ── Foghorn ──────────────────────────────────────────────────────────────────
+
+/// A path segment we are willing to paste into the upstream URL.
+///
+/// The segments are joined into a URL and the HTTP client normalises `..` before sending, so an
+/// encoded `%2e%2e` would walk back out of the `/v1/` prefix and reach anything else the internal
+/// service exposes. Refusing the segment is cheaper than trusting the normalisation.
+pub(crate) fn safe_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Forward Foghorn's answer, keeping its status even when the body is not JSON.
+///
+/// The parse used to sit inside the error path, so an unknown path - which Foghorn answers with a
+/// bodyless 404 - threw and was reported as the service being unreachable. An indexer chased that
+/// as an outage on our side on 2026-08-15. A 404 is an answer; only failing to reach the service
+/// is a 502.
+pub(crate) fn foghorn_answer(status: u16, body: String) -> Response {
+    let code =
+        axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+    let mut response = match serde_json::from_str::<serde_json::Value>(&body) {
+        _ if body.is_empty() => axum::Json(serde_json::json!({
+            "error": if (200..300).contains(&status) {
+                "Foghorn returned an empty response".to_string()
+            } else {
+                format!("Foghorn returned {status}")
+            }
+        }))
+        .into_response(),
+        Ok(json) => axum::Json(json).into_response(),
+        Err(_) => axum::Json(serde_json::json!({
+            "error": format!("Foghorn returned a non-JSON {status} response")
+        }))
+        .into_response(),
+    };
+    *response.status_mut() = code;
+    crate::no_store(response.headers_mut());
+    response
+}
+
+async fn foghorn_call(
+    st: &AppState,
+    path: &str,
+    query: Option<String>,
+    body: Option<String>,
+) -> Result<Response, ErrorResponse> {
+    let base = st.foghorn_api_url.as_deref().ok_or_else(|| {
+        ErrorResponse::from(ApiError::Unavailable(
+            "the Foghorn API is not configured".into(),
+        ))
+    })?;
+    let query = query.map(|q| format!("?{q}")).unwrap_or_default();
+    let target = format!("{}/v1/{path}{query}", base.trim_end_matches('/'));
+
+    let client = reqwest::Client::new();
+    let request = match &body {
+        Some(body) => client
+            .post(&target)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(body.clone()),
+        None => client.get(&target),
+    };
+    let upstream = request
+        .header(axum::http::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|_| ErrorResponse::from(ApiError::Unavailable("Foghorn is unreachable".into())))?;
+    let status = upstream.status().as_u16();
+    let text = upstream.text().await.unwrap_or_default();
+    Ok(foghorn_answer(status, text))
+}
+
+/// `GET /api/foghorn/{*path}`: the QoS pipeline, proxied.
+pub async fn foghorn_get(
+    State(st): State<AppState>,
+    Path(path): Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    if !path.split('/').all(safe_segment) {
+        return Err(ApiError::BadRequest("invalid path".into()).into());
+    }
+    foghorn_call(&st, &path, query, None).await
+}
+
+/// `POST /api/foghorn/qos/graphql`, and nothing else.
+///
+/// Deliberately narrow. GraphQL is the only POST surface Foghorn exposes, and forwarding arbitrary
+/// POSTs to an internal service is not a thing to do by accident.
+pub async fn foghorn_post(
+    State(st): State<AppState>,
+    Path(path): Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    if path != "qos/graphql" {
+        return Err(ApiError::BadRequest("not a POST endpoint".into()).into());
+    }
+    foghorn_call(&st, &path, query, Some(body)).await
+}

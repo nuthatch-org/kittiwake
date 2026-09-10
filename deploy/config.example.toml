@@ -64,3 +64,7 @@ exempt_ips = []
 # already issued is signed by a public key nobody can look up any more.
 # [receipt]
 # issuer_key = "..."
+
+# Foghorn's API, which `/api/foghorn/{*path}` proxies. Leave it out and that route answers 503
+# rather than guessing at a host. Both services sit on this box, so this is normally loopback.
+# foghorn_api_url = "http://127.0.0.1:8081"
