@@ -3104,6 +3104,7 @@ name = "kittiwake-chain"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "hex",
  "kittiwake-types",
  "metrics",
  "serde",
