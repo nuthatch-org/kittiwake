@@ -275,6 +275,10 @@ const SUMMARIES: &[Operation] = &[
         "How allocated stake sits across quality bands. Unscored means not measured, which is most of it.",
     ),
     op(
+        "/api/delegate/recommend",
+        "Which indexer to delegate to, ranked against four preference sliders, with the reasoning.",
+    ),
+    op(
         "/api/operator-preflight",
         "What would happen if an address tried to run a data service. Read-only: no wallet, no gas.",
     ),
