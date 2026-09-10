@@ -2533,6 +2533,50 @@ pub async fn ens(
     Ok(envelope_root(read))
 }
 
+#[derive(serde::Deserialize)]
+pub struct ManifestQuery {
+    pub hash: Option<String>,
+}
+
+/// `GET /api/manifest?hash=Qm…`: how hard a subgraph is to sync, and why.
+///
+/// The manifest is content-addressed, so the read goes through the document cache and the scoring
+/// is pure: two callers asking about the same deployment cost one IPFS fetch between them, ever.
+pub async fn manifest(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<ManifestQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let cid = q
+        .hash
+        .as_deref()
+        .and_then(cid_v0)
+        .ok_or_else(|| {
+            ErrorResponse::from(ApiError::BadRequest(
+                "hash must be a CIDv0 deployment id".into(),
+            ))
+        })?
+        .to_string();
+
+    let yaml = kittiwake_ext::read_through_text(pool(&st)?, &st.ipfs, &cid)
+        .await
+        .ok_or_else(|| {
+            ErrorResponse::from(ApiError::Unavailable(
+                "that manifest could not be read from IPFS".into(),
+            ))
+        })?;
+    // A hash that resolves to something else is the caller's mistake, and saying so beats scoring
+    // an arbitrary document as though it were a subgraph.
+    if !yaml.contains("dataSources") && !yaml.contains("specVersion") {
+        return Err(ApiError::BadRequest("that hash is not a subgraph manifest".into()).into());
+    }
+    let analysis = kittiwake_read::manifest::analyse(&yaml)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(axum::Json(serde_json::json!({ "data": analysis })).into_response())
+}
+
 /// `/api/support/templates`: the six issue forms, as the repository's own YAML.
 ///
 /// Served so the dashboard's compose form is generated from the templates rather than from a copy
