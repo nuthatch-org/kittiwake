@@ -37,6 +37,11 @@ pub async fn graph_support(pool: &Pool, ext: &Ext) -> Result<Ingested, IngestErr
         .await
         .map_err(|e| IngestError::Refused(e.to_string()))?;
 
+    let templates = ext
+        .graph_support_templates()
+        .await
+        .map_err(|e| IngestError::Refused(e.to_string()))?;
+
     // One statement per issue rather than the UNNEST bulk insert the other jobs use. `labels` is a
     // per-row `text[]` of varying length, and Postgres array parameters must be rectangular, so
     // there is no honest way to carry thirty-three label lists through one UNNEST. At two runs a
@@ -105,10 +110,29 @@ pub async fn graph_support(pool: &Pool, ext: &Ext) -> Result<Ingested, IngestErr
             .await?;
     }
 
+    for t in &templates {
+        sqlx::query(
+            "INSERT INTO graph_support_templates (file, yaml, fetched_at) VALUES ($1, $2, NOW()) \
+             ON CONFLICT (file) DO UPDATE SET yaml = EXCLUDED.yaml, fetched_at = NOW()",
+        )
+        .bind(&t.file)
+        .bind(&t.yaml)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // A retired template must stop being offered. `graph_support_templates` refuses an empty
+    // answer, so this cannot be handed nothing and empty the table.
+    let kept: Vec<String> = templates.iter().map(|t| t.file.clone()).collect();
+    sqlx::query("DELETE FROM graph_support_templates WHERE file <> ALL($1::text[])")
+        .bind(&kept)
+        .execute(&mut *tx)
+        .await?;
+
     tx.commit().await?;
     state::touch(pool, "graph_support").await?;
 
     Ok(Ingested {
-        rows: (issues.len() + comments.len()) as u64,
+        rows: (issues.len() + comments.len() + templates.len()) as u64,
     })
 }

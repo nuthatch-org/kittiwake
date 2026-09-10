@@ -297,6 +297,11 @@ pub mod coverage {
             "probes a third party's endpoint, so the answer depends on that host rather than on us",
         ),
         (
+            "/api/support/templates",
+            Excused::Entirely,
+            "mirrors files from a repository; the dashboard has never had a handler for it",
+        ),
+        (
             "/api/support/{number}",
             Excused::Entirely,
             "the same mirror as /api/support, one thread at a time; the dashboard has no incumbent \
