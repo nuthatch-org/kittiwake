@@ -13,6 +13,7 @@ use kittiwake_cache::CachePolicy;
 use kittiwake_nest::{Lane, NestGate, QuerySpec};
 use kittiwake_types::{ApiError, NestId, Provenance};
 
+use crate::dips_agreements as dips_agreements_mod;
 use crate::{Fetcher, Read, ReadCtx, shape, sql};
 
 /// One query inside a composed answer.
@@ -1222,6 +1223,173 @@ pub async fn deployment_status(ctx: &ReadCtx, dep: &str) -> Result<Read, ApiErro
 /// Four folds against the DIPS nest, which admits two concurrent queries. The gate is what makes
 /// that safe: the Node version fired all four at once and survived only because the client
 /// happened to stagger them, which was not a property anyone chose.
+/// `/api/subgraph-versions/[hash]`: every version of the subgraph that published this deployment.
+///
+/// Three queries and they are **dependent**, which is why this does not use [`many`]: the
+/// deployment names a subgraph, the subgraph names its versions, and only then is there a set of
+/// deployments to ask the allocations nest about. Running them concurrently would mean guessing
+/// the second query's input.
+///
+/// The version labels are not here. They live in IPFS documents, and filling them needs the
+/// Postgres document cache rather than a nest, so the caller does it in one bulk read after this
+/// answer is cached. That way one cached fold serves every request and the labels cost a single
+/// query rather than one fetch per version.
+pub fn subgraph_versions_fetcher(dep: String) -> Fetcher {
+    Arc::new(move |gate: NestGate, lane: Lane| {
+        let dep = dep.clone();
+        Box::pin(async move {
+            let ask = |gate: NestGate, nest: NestId, sql: String| async move {
+                let mut spec = QuerySpec::read(nest, sql.clone()).with_timeout(T_FOLD);
+                spec.lane = lane;
+                let key = format!(
+                    "{}:{}",
+                    nest.as_str(),
+                    blake3::hash(sql.as_bytes()).to_hex()
+                );
+                gate.query_coalesced(&key, spec)
+                    .await
+                    .map_err(ApiError::from)
+            };
+
+            let owner_sql = sql::deployment_subgraph_sql(&dep)
+                .ok_or_else(|| ApiError::BadRequest("not a valid deployment id".into()))?;
+            let owner = ask(gate.clone(), NestId::Gns, owner_sql).await?;
+            let mut provenance = owner.provenance.clone();
+
+            let subgraph_id = owner
+                .rows
+                .first()
+                .and_then(|r| r.get("subgraph_id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            // A deployment nobody has published through the GNS has no versions, which is an
+            // answer rather than an error.
+            let Some(subgraph_id) = subgraph_id else {
+                return Ok((
+                    serde_json::json!({ "subgraphId": null, "versions": [] }),
+                    provenance,
+                ));
+            };
+
+            let versions_sql = sql::subgraph_versions_sql(&subgraph_id, 100).ok_or_else(|| {
+                ApiError::Internal("the gns nest returned a subgraph id we will not query".into())
+            })?;
+            let versions = ask(gate.clone(), NestId::Gns, versions_sql).await?;
+            provenance = older_of(&provenance, &versions.provenance);
+
+            let deployments: Vec<String> = {
+                let mut seen: Vec<String> = Vec::new();
+                for row in &versions.rows {
+                    if let Some(id) = row.get("deployment_id").and_then(|v| v.as_str()) {
+                        let id = id.to_lowercase();
+                        if !seen.contains(&id) {
+                            seen.push(id);
+                        }
+                    }
+                }
+                seen
+            };
+
+            let mut stats = serde_json::Map::new();
+            if let Some(stats_sql) = sql::deployments_signal_stake_sql(&deployments) {
+                let answer = ask(gate, NestId::Alloc, stats_sql).await?;
+                provenance = older_of(&provenance, &answer.provenance);
+                for row in &answer.rows {
+                    if let Some(id) = row.get("subgraph_deployment").and_then(|v| v.as_str()) {
+                        stats.insert(id.to_string(), row.clone());
+                    }
+                }
+            }
+
+            let out: Vec<serde_json::Value> = versions
+                .rows
+                .iter()
+                .map(|row| {
+                    let id = row
+                        .get("deployment_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let stat = stats.get(&id.to_lowercase());
+                    let token = |key: &str| {
+                        stat.and_then(|s| s.get(key))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("0")
+                            .to_string()
+                    };
+                    // The `Qm…` form when it converts and the raw id otherwise, because a version
+                    // whose id will not convert is still a version.
+                    let ipfs_hash = shape::ipfs_or_id(id);
+                    serde_json::json!({
+                        "version": row.get("version_number").cloned().unwrap_or(serde_json::Value::Null),
+                        "createdAt": row.get("created_at").cloned().unwrap_or(serde_json::Value::Null),
+                        "ipfsHash": ipfs_hash,
+                        "signalledTokens": token("signalled_tokens"),
+                        "stakedTokens": token("staked_tokens"),
+                        "isCurrent": ipfs_hash == shape::ipfs_or_id(&dep),
+                        // Carried so the caller can fill `label` from the document cache; replaced
+                        // before the response is written.
+                        "versionMetadata": row.get("version_metadata").cloned().unwrap_or(serde_json::Value::Null),
+                    })
+                })
+                .collect();
+
+            Ok((
+                serde_json::json!({ "subgraphId": subgraph_id, "versions": out }),
+                provenance,
+            ))
+        })
+    })
+}
+
+pub async fn subgraph_versions(ctx: &ReadCtx, dep: &str) -> Result<Read, ApiError> {
+    ctx.cached(
+        "subgraph-versions",
+        NestId::Gns,
+        serde_json::json!({ "deployment": dep }),
+        CachePolicy::from_poll_interval(cadence::ARCHIVAL),
+        subgraph_versions_fetcher(dep.to_string()),
+    )
+    .await
+}
+
+/// `/api/dips/agreements`: the DIPS agreement lifecycle, offer through collection.
+///
+/// One `SELECT *` per stage table rather than one clever UNION. The nest's own `dips_timeline`
+/// view unions its sources and that is the right shape beside the data, but this code cannot be
+/// exercised against a populated nest, so it is written to fail loudly rather than subtly: a
+/// per-table read has no cross-branch type unification to get wrong, and a mistaken column name
+/// surfaces as an absent field rather than as a query returning plausible rubbish.
+///
+/// The parts run concurrently and each is coalesced on its own statement, so the nine cost one
+/// round of gate permits rather than nine sequential ones.
+pub async fn dips_agreements(ctx: &ReadCtx, sepolia: bool) -> Result<Read, ApiError> {
+    let nest = if sepolia {
+        NestId::DipsSepolia
+    } else {
+        NestId::Dips
+    };
+    let parts: Vec<Part> = dips_agreements_mod::STAGES
+        .iter()
+        .map(|stage| {
+            Part::rows(
+                stage.key(),
+                nest,
+                // The table name is a constant from the nest's own schema, never a caller's input.
+                format!("SELECT * FROM {} LIMIT 5000", stage.table()),
+            )
+        })
+        .collect();
+
+    ctx.cached(
+        "dips-agreements",
+        nest,
+        serde_json::json!({ "sepolia": sepolia }),
+        CachePolicy::from_poll_interval(cadence::SLOW),
+        many_folded(parts, T_FOLD, dips_agreements_mod::fold),
+    )
+    .await
+}
+
 pub async fn dips(ctx: &ReadCtx, sepolia: bool) -> Result<Read, ApiError> {
     let nest = if sepolia {
         NestId::DipsSepolia

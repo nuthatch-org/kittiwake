@@ -3173,6 +3173,7 @@ dependencies = [
  "kittiwake-nest",
  "kittiwake-obs",
  "kittiwake-read",
+ "kittiwake-rewards",
  "kittiwake-score",
  "kittiwake-scuttle",
  "kittiwake-sqlplay",
@@ -3318,6 +3319,7 @@ name = "kittiwake-rewards"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]

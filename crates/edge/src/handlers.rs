@@ -2110,3 +2110,347 @@ pub async fn scuttle_ban(
     .map_err(|e| ApiError::Unavailable(e.to_string()))?;
     Ok(axum::Json(serde_json::json!({ "ban": ban })).into_response())
 }
+
+// ── The long tail: Postgres reads ────────────────────────────────────────────
+//
+// Four routes that read tables this service already writes. They carry no provenance envelope,
+// because their source is our own Postgres rather than a sealed nest, and saying "sealed through"
+// about a row a cron wrote here would be a claim nobody can check. #67
+
+/// An Ethereum address, or nothing. Every route below is keyed by one and none of them should
+/// reach Postgres with something that is not.
+pub(crate) fn eth_address(raw: &str) -> Option<String> {
+    let lower = raw.trim().to_lowercase();
+    let hex = lower.strip_prefix("0x")?;
+    (hex.len() == 40 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then_some(lower)
+}
+
+fn bad_address() -> ErrorResponse {
+    ApiError::BadRequest("expected a 0x-prefixed 20-byte address".into()).into()
+}
+
+pub async fn indexer_disputes(
+    State(st): State<AppState>,
+    Path(address): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let address = eth_address(&address).ok_or_else(bad_address)?;
+    let disputes = kittiwake_db::indexer_disputes(pool(&st)?, &address)
+        .await
+        .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+    Ok(axum::Json(serde_json::json!({ "disputes": disputes })).into_response())
+}
+
+pub async fn parameter_history(
+    State(st): State<AppState>,
+    Path(address): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let address = eth_address(&address).ok_or_else(bad_address)?;
+    let data = kittiwake_db::parameter_history(pool(&st)?, &address)
+        .await
+        .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+    Ok(axum::Json(serde_json::json!({ "data": data })).into_response())
+}
+
+#[derive(serde::Deserialize)]
+pub struct RevenueQuery {
+    pub window: Option<u32>,
+    #[serde(rename = "byDeployment")]
+    pub by_deployment: Option<String>,
+}
+
+async fn read_revenue(
+    st: &AppState,
+    address: &str,
+    window_days: u32,
+    by_deployment: bool,
+) -> Result<kittiwake_rewards::pnl::IndexerRevenue, ErrorResponse> {
+    let days = window_days as i32;
+    let (rav, rewards) = kittiwake_db::revenue_daily(pool(st)?, address, days)
+        .await
+        .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+    let daily = kittiwake_rewards::pnl::merge_daily(&rav, &rewards);
+    let by_deployment = if by_deployment {
+        let (rav, rewards) = kittiwake_db::revenue_by_deployment(pool(st)?, address, days)
+            .await
+            .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+        Some(kittiwake_rewards::pnl::merge_by_deployment(&rav, &rewards))
+    } else {
+        None
+    };
+    Ok(kittiwake_rewards::pnl::IndexerRevenue {
+        indexer: address.to_string(),
+        window_days,
+        rav_grt: rav.iter().map(|(_, grt)| grt).sum(),
+        indexing_rewards_grt: rewards.iter().map(|(_, grt)| grt).sum(),
+        total_grt: daily.iter().map(|d| d.total_grt).sum(),
+        daily,
+        by_deployment,
+    })
+}
+
+pub async fn indexer_revenue(
+    State(st): State<AppState>,
+    Path(address): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<RevenueQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let address = eth_address(&address).ok_or_else(bad_address)?;
+    let window = kittiwake_rewards::pnl::revenue_window(q.window);
+    let data = read_revenue(
+        &st,
+        &address,
+        window,
+        q.by_deployment.as_deref() == Some("1"),
+    )
+    .await?;
+    Ok(axum::Json(serde_json::json!({ "data": data })).into_response())
+}
+
+/// The cost side is request input and is never stored.
+///
+/// There is no per-indexer configuration behind this and there deliberately is not: persisting a
+/// cost model keyed by an address nobody proved they own would be an unauthenticated write surface.
+/// An operator's figures live in their own browser until the Dock has somewhere to put them.
+pub async fn indexer_pnl(
+    State(st): State<AppState>,
+    Path(address): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(raw): Query<std::collections::BTreeMap<String, String>>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let address = eth_address(&address).ok_or_else(bad_address)?;
+    let window =
+        kittiwake_rewards::pnl::revenue_window(raw.get("window").and_then(|w| w.parse().ok()));
+    let cost = cost_model_from(&raw);
+    // The P&L view always answers in GRT; a price only adds the dollar columns.
+    let grt_price = raw
+        .get("grtPrice")
+        .and_then(|p| p.parse::<f64>().ok())
+        .filter(|p| p.is_finite() && *p >= 0.0);
+
+    let revenue = read_revenue(&st, &address, window, true).await?;
+    let pnl = kittiwake_rewards::pnl::compute_pnl(&revenue, &cost, grt_price, window);
+    let mut response = axum::Json(serde_json::json!({
+        "data": {
+            "pnl": pnl,
+            "costModel": cost,
+            "defaultChainCosts": kittiwake_rewards::pnl::default_chain_costs_map(),
+        }
+    }))
+    .into_response();
+    crate::no_store(response.headers_mut());
+    Ok(response)
+}
+
+/// `?chains=a,b&cost_a=1800&overhead=300`, as the incumbent spells it.
+fn cost_model_from(
+    raw: &std::collections::BTreeMap<String, String>,
+) -> kittiwake_rewards::pnl::CostModel {
+    let chains: Vec<String> = raw
+        .get("chains")
+        .map(|c| {
+            c.split(',')
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let overrides = raw
+        .iter()
+        .filter_map(|(key, value)| {
+            let chain = key.strip_prefix("cost_")?;
+            let price: f64 = value.parse().ok()?;
+            (price.is_finite() && price >= 0.0).then(|| (chain.to_string(), price))
+        })
+        .collect();
+    let overhead = raw
+        .get("overhead")
+        .and_then(|o| o.parse::<f64>().ok())
+        .filter(|o| o.is_finite() && *o >= 0.0);
+    kittiwake_rewards::pnl::resolve_cost_model(&chains, &overrides, overhead)
+}
+
+// ── The long tail: IPFS reads ────────────────────────────────────────────────
+
+/// A CIDv0, or nothing. Base58 is case-sensitive, so this refuses rather than normalises.
+pub(crate) fn cid_v0(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    (trimmed.len() == 46
+        && trimmed.starts_with("Qm")
+        && trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() && !matches!(b, b'0' | b'O' | b'I' | b'l')))
+    .then_some(trimmed)
+}
+
+/// The schema hash a manifest points at.
+///
+/// The manifest is YAML and the reference is `/ipfs/Qm…` under `schema:`. Parsing the whole
+/// document to reach one field would be a manifest parser, which is #67's other half and a day's
+/// work; finding the first CID before `dataSources` is what the incumbent does and is enough.
+pub(crate) fn schema_cid(manifest: &str) -> Option<&str> {
+    let head = manifest.split("dataSources").next().unwrap_or(manifest);
+    let after_schema = head.find("schema").map(|i| &head[i..]).unwrap_or(head);
+    after_schema
+        .match_indices("Qm")
+        .find_map(|(i, _)| cid_v0(after_schema.get(i..i + 46)?))
+}
+
+/// `GET /api/subgraph-schema/{hash}`: the GraphQL schema a deployment was built from.
+///
+/// Two IPFS reads, both content-addressed and therefore cached for ever rather than for a while.
+pub async fn subgraph_schema(
+    State(st): State<AppState>,
+    Path(hash): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let deployment = cid_v0(&hash)
+        .ok_or_else(|| ErrorResponse::from(ApiError::BadRequest("expected a CIDv0 hash".into())))?;
+    let pool = pool(&st)?;
+
+    let manifest = kittiwake_ext::read_through_text(pool, &st.ipfs, deployment)
+        .await
+        .ok_or_else(|| {
+            ErrorResponse::from(ApiError::Unavailable(
+                "that manifest could not be read from IPFS".into(),
+            ))
+        })?;
+    // A hash that resolves to something that is not a manifest is the caller's mistake, and saying
+    // so beats reporting that no schema was found in a document that never had one.
+    if !manifest.contains("dataSources") && !manifest.contains("specVersion") {
+        return Err(ApiError::BadRequest("that hash is not a subgraph manifest".into()).into());
+    }
+    let schema_cid = schema_cid(&manifest).ok_or(ApiError::NotFound)?;
+    let schema_text = kittiwake_ext::read_through_text(pool, &st.ipfs, schema_cid)
+        .await
+        .ok_or_else(|| {
+            ErrorResponse::from(ApiError::Unavailable(
+                "the manifest names a schema that could not be read from IPFS".into(),
+            ))
+        })?;
+
+    Ok(axum::Json(serde_json::json!({
+        "data": { "schemaText": schema_text, "schemaHash": schema_cid }
+    }))
+    .into_response())
+}
+
+#[derive(serde::Deserialize)]
+pub struct DipsAgreementsQuery {
+    pub indexer: Option<String>,
+    /// Which chain's lifecycle to read. A caller's choice here rather than an environment
+    /// variable, unlike the incumbent, because the two nests are both configured and a testnet
+    /// answer that arrives labelled as one is not a lie.
+    pub sepolia: Option<String>,
+}
+
+/// `GET /api/dips/agreements`: the DIPS agreement lifecycle.
+pub async fn dips_agreements(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<DipsAgreementsQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let indexer = match q.indexer.as_deref() {
+        Some(raw) => Some(eth_address(raw).ok_or_else(bad_address)?),
+        None => None,
+    };
+    let mut read = routes::dips_agreements(&st.read, q.sepolia.as_deref() == Some("1")).await?;
+    if let Some(indexer) = indexer {
+        // After the cache, so one fold serves every caller and a per-indexer view costs the nest
+        // nothing. A *new* entry rather than a mutation: `read.entry` is the shared cached one, and
+        // narrowing it in place would hand the next caller this indexer's filtered answer.
+        read.entry = std::sync::Arc::new(kittiwake_cache::Entry {
+            value: std::sync::Arc::new(kittiwake_read::dips_agreements::narrow(
+                &read.entry.value,
+                &indexer,
+            )),
+            provenance: read.entry.provenance.clone(),
+            fetched_at: read.entry.fetched_at,
+        });
+    }
+    Ok(envelope(read))
+}
+
+/// `GET /api/subgraph-versions/{hash}`: every version of the subgraph that published a deployment.
+///
+/// The nest half is cached; the labels are filled here from the IPFS document cache in one bulk
+/// read. The incumbent fetched each version's metadata document separately, which for a subgraph
+/// with forty versions is forty round trips to IPFS behind one request.
+pub async fn subgraph_versions(
+    State(st): State<AppState>,
+    Path(hash): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let cid = cid_v0(&hash)
+        .ok_or_else(|| ErrorResponse::from(ApiError::BadRequest("expected a CIDv0 hash".into())))?;
+    let deployment = kittiwake_read::shape::ipfs_hash_to_bytes32(cid)
+        .ok_or_else(|| ErrorResponse::from(ApiError::BadRequest("expected a CIDv0 hash".into())))?;
+
+    let read = routes::subgraph_versions(&st.read, &deployment).await?;
+    let mut value = (*read.entry.value).clone();
+    if let Some(pool) = st.pool.as_ref() {
+        label_versions(pool, &mut value).await;
+    }
+    // A new entry rather than a mutation: `read.entry` is shared, and writing labels into it would
+    // be writing into the cache from a request.
+    let read = kittiwake_read::Read {
+        entry: std::sync::Arc::new(kittiwake_cache::Entry {
+            value: std::sync::Arc::new(value),
+            provenance: read.entry.provenance.clone(),
+            fetched_at: read.entry.fetched_at,
+        }),
+        meta: read.meta,
+    };
+    Ok(envelope(read))
+}
+
+/// Replace each version's `versionMetadata` with the `label` from its IPFS document.
+///
+/// A document the cache has not seen leaves the label null rather than blocking the response on a
+/// fetch: the warm job is what fills that cache, and a version list is more useful with a missing
+/// label than it is late.
+async fn label_versions(pool: &kittiwake_db::Pool, value: &mut serde_json::Value) {
+    let Some(versions) = value.get_mut("versions").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let cids: Vec<String> = versions
+        .iter()
+        .filter_map(|v| {
+            kittiwake_read::search::metadata_cid(v.get("versionMetadata").and_then(|m| m.as_str()))
+        })
+        .collect();
+    let docs = kittiwake_ext::cached_docs(pool, &cids)
+        .await
+        .unwrap_or_default();
+
+    for version in versions.iter_mut() {
+        let label = kittiwake_read::search::metadata_cid(
+            version.get("versionMetadata").and_then(|m| m.as_str()),
+        )
+        .and_then(|cid| docs.iter().find(|d| d.cid == cid))
+        .and_then(|doc| doc.json.as_ref())
+        .and_then(|json| json.get("label"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+        if let Some(object) = version.as_object_mut() {
+            object.remove("versionMetadata");
+            object.insert("label".into(), label);
+        }
+    }
+}

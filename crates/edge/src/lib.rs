@@ -866,6 +866,29 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sql/query", post(post_sql_query))
         .route("/api/sql/named", get(get_sql_named).post(post_sql_named))
         .route("/api/sql/receipt", post(post_sql_receipt))
+        // The long tail's Postgres reads. #67
+        .route(
+            "/api/indexer-disputes/{address}",
+            get(handlers::indexer_disputes),
+        )
+        .route(
+            "/api/parameter-history/{address}",
+            get(handlers::parameter_history),
+        )
+        .route(
+            "/api/indexer/{address}/revenue",
+            get(handlers::indexer_revenue),
+        )
+        .route("/api/indexer/{address}/pnl", get(handlers::indexer_pnl))
+        .route(
+            "/api/subgraph-schema/{hash}",
+            get(handlers::subgraph_schema),
+        )
+        .route("/api/dips/agreements", get(handlers::dips_agreements))
+        .route(
+            "/api/subgraph-versions/{hash}",
+            get(handlers::subgraph_versions),
+        )
         // Scuttlebutt is deliberately separate from the provenance envelope routes above: messages
         // are primary user data in Postgres, not a view of a sealed protocol nest.
         .route(
@@ -972,6 +995,71 @@ async fn get_whoami(
 mod tests {
     use super::*;
 
+    // ── The long tail ────────────────────────────────────────────────────────
+
+    const SCHEMA_CID: &str = "QmUxJ9QYbNbDTNkQPHzq4ivqzGyMbwZBvXhrQfPTLE1Pjq";
+    const DEPLOYMENT_CID: &str = "Qmbsc6XQWbiv4DfLVfaNciScqYLyDWUYjWzrFBbzzmRsMB";
+
+    /// Base58 has no `0`, `O`, `I` or `l`, and it is case-sensitive. Normalising a near-miss into
+    /// something plausible is how a wrong document gets served confidently.
+    #[test]
+    fn only_a_real_cidv0_is_accepted() {
+        assert_eq!(
+            crate::handlers::cid_v0(DEPLOYMENT_CID),
+            Some(DEPLOYMENT_CID)
+        );
+        assert_eq!(
+            crate::handlers::cid_v0(&format!("  {DEPLOYMENT_CID}  ")),
+            Some(DEPLOYMENT_CID),
+            "surrounding space is not part of the hash"
+        );
+        for bad in [
+            "",
+            "Qm",
+            &DEPLOYMENT_CID[..45],
+            &format!("{DEPLOYMENT_CID}x"),
+            // A bytes32 deployment id is the other spelling and is not a CID.
+            "0xdb0c77a3184bf017abafb7606794d77ff53d9a59a0bc1dc23f1a762bd1e631ff",
+            // `0`, `O`, `I` and `l` are not in the alphabet, so these are 46 characters of
+            // something else.
+            "Qm0sc6XQWbiv4DfLVfaNciScqYLyDWUYjWzrFBbzzmRsMB",
+            "QmOsc6XQWbiv4DfLVfaNciScqYLyDWUYjWzrFBbzzmRsMB",
+            "QmIsc6XQWbiv4DfLVfaNciScqYLyDWUYjWzrFBbzzmRsMB",
+            "Qmlsc6XQWbiv4DfLVfaNciScqYLyDWUYjWzrFBbzzmRsMB",
+            "Qm bsc6XQWbiv4DfLVfaNciScqYLyDWUYjWzrFBbzzmRs",
+        ] {
+            assert_eq!(crate::handlers::cid_v0(bad), None, "{bad:?} is not a CIDv0");
+        }
+    }
+
+    fn manifest_with(schema: &str, source: &str) -> String {
+        format!(
+            "specVersion: 0.0.5\nschema:\n  file:\n    /: /ipfs/{schema}\ndataSources:\n  \
+             - kind: ethereum\n    mapping:\n      file:\n        /: /ipfs/{source}\n"
+        )
+    }
+
+    /// The schema reference sits above `dataSources`, and every mapping below it is also a CID.
+    /// Searching the whole document would return whichever came first in the file.
+    #[test]
+    fn the_schema_hash_is_taken_from_above_the_data_sources() {
+        let manifest = manifest_with(SCHEMA_CID, DEPLOYMENT_CID);
+        assert_eq!(crate::handlers::schema_cid(&manifest), Some(SCHEMA_CID));
+    }
+
+    #[test]
+    fn a_manifest_with_no_schema_reference_yields_nothing() {
+        assert_eq!(
+            crate::handlers::schema_cid("specVersion: 0.0.5\ndataSources: []\n"),
+            None
+        );
+        assert_eq!(crate::handlers::schema_cid(""), None);
+        // A truncated hash is not a hash, and half of one must not be returned as if it were.
+        assert_eq!(
+            crate::handlers::schema_cid("schema:\n  file:\n    /: /ipfs/Qmtooshort\n"),
+            None
+        );
+    }
     // ── SQL receipts ─────────────────────────────────────────────────────────
 
     fn receipt_key() -> ed25519_dalek::SigningKey {

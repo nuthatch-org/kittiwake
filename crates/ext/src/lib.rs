@@ -958,6 +958,31 @@ pub async fn cached_docs(
     Ok(rows)
 }
 
+/// One document, from the cache if it is there and from IPFS if it is not.
+///
+/// A CID names its own content, so a hit is correct for ever and there is no freshness question to
+/// get wrong. What needs a rule is the *miss* that failed: a gateway down for a minute must not
+/// cost a re-fetch storm, so a recorded failure is honoured for [`FAILURE_TTL`] and retried after.
+/// The warm job writes the same rows, so a document it has already pulled costs a route nothing.
+pub async fn read_through_text(pool: &sqlx::PgPool, ipfs: &Ipfs, cid: &str) -> Option<String> {
+    if let Ok(docs) = cached_docs(pool, std::slice::from_ref(&cid.to_string())).await
+        && let Some(doc) = docs.into_iter().next()
+    {
+        if doc.text.is_some() {
+            return doc.text;
+        }
+        let recent = chrono::Utc::now()
+            .signed_duration_since(doc.fetched_at)
+            .to_std()
+            .map(|age| age < FAILURE_TTL)
+            .unwrap_or(false);
+        if doc.error.is_some() && recent {
+            return None;
+        }
+    }
+    fetch_text(pool, ipfs, cid).await
+}
+
 /// Fetch one JSON document and record the outcome, returning what the cache now holds for it.
 ///
 /// A document that fetched but is not JSON is recorded as `not json` and, because that is a

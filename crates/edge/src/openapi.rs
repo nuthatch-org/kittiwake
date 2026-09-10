@@ -228,6 +228,34 @@ const SUMMARIES: &[Operation] = &[
         "The named-query tier: what may be asked, and asking it by name.",
     ),
     op(
+        "/api/indexer-disputes/{address}",
+        "Disputes and slashing raised against one indexer.",
+    ),
+    op(
+        "/api/parameter-history/{address}",
+        "When an indexer changed its cut, and what it changed from.",
+    ),
+    op(
+        "/api/indexer/{address}/revenue",
+        "Query fees and indexing rewards over a rolling window, by day and by deployment.",
+    ),
+    op(
+        "/api/indexer/{address}/pnl",
+        "That revenue netted against a modelled infrastructure cost. The cost side is an estimate the caller may override, not a measurement.",
+    ),
+    op(
+        "/api/dips/agreements",
+        "The Direct Indexer Payments agreement lifecycle: offered, accepted, active, collected, ended. Empty on Arbitrum One until an agreement is funded, and it says so.",
+    ),
+    op(
+        "/api/subgraph-versions/{hash}",
+        "Every version of the subgraph that published a deployment, with its signal and stake.",
+    ),
+    op(
+        "/api/subgraph-schema/{hash}",
+        "The GraphQL schema a deployment was built from, as text.",
+    ),
+    op(
         "/api/indexer-node-health",
         "Whether an indexer's own endpoints answer.",
     ),
