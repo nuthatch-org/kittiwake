@@ -23,7 +23,7 @@
 //! 3. the same token with one byte of its **payload** changed is rejected too - so the signature
 //!    covers the payload rather than sitting beside it.
 
-use kittiwake_dock::{Secret, SessionError, parse_session};
+use kittiwake_dock::{SESSION_TTL_SECS, Secret, SessionError, parse_session};
 
 /// Flip one hex digit at `at`, wrapping `f` to `0`. A mutation that changes exactly one byte and
 /// keeps the token the same length and shape, so what is being tested is the signature and not the
@@ -39,6 +39,102 @@ fn flip_hex_at(s: &str, at: usize) -> Option<String> {
     };
     bytes[at] = next;
     Some(bytes.into_iter().collect())
+}
+
+/// The three checks, and the verdict.
+///
+/// **Every check is judged at a clock taken from the token, not at the wall clock.** A cookie older
+/// than [`SESSION_TTL_SECS`] makes `parse_session` return `Expired` before it looks at the
+/// signature, so judging at `now` meant a stale cookie produced `FAIL … not compatible. The Dock
+/// must not be cut over.` about an implementation that agrees perfectly - and produced exactly the
+/// same output for a forged token, so the verdict carried no information at all. Whether the cookie
+/// is still live is a fact about the cookie and is reported separately; it is not a compatibility
+/// answer either way.
+fn check(secret: &Secret, token: &str, now: i64) -> (bool, Vec<String>) {
+    let mut out: Vec<String> = Vec::new();
+    let mut compatible = true;
+
+    let Some(issued_at) = issued_at_of(token) else {
+        out.push("  FAIL  the token is not `address:issued_at:signature`.".into());
+        out.push("        This is not a session cookie, or it was truncated in transit.".into());
+        return (false, out);
+    };
+    // One second after it was minted: inside the window by construction, so expiry can never
+    // stand in for the answer.
+    let at = issued_at.saturating_add(1);
+
+    // 1. It parses, and the signature is ours.
+    match parse_session(secret, token, at) {
+        Ok(address) => out.push(format!(
+            "  ok    the signature is ours, and it vouches for {address}"
+        )),
+        Err(e) => {
+            out.push(format!("  FAIL  the signature is not ours: {e}"));
+            out.push(
+                "        This is the failure #12 exists to catch. Every logged-in user".into(),
+            );
+            out.push("        would be signed out at the cutover. Do not switch.".into());
+            compatible = false;
+        }
+    }
+
+    // 2. One byte of the signature, changed.
+    let sig_at = token.rfind(':').map(|i| i + 1);
+    match sig_at.and_then(|i| flip_hex_at(token, i)) {
+        Some(forged) => match parse_session(secret, &forged, at) {
+            Err(SessionError::BadSignature) => {
+                out.push("  ok    one byte of the signature changed, and it is rejected".into())
+            }
+            other => {
+                out.push(format!(
+                    "  FAIL  a forged signature was not rejected: {other:?}"
+                ));
+                compatible = false;
+            }
+        },
+        None => {
+            out.push(
+                "  FAIL  the token has no hex signature to mutate; is it a session cookie?".into(),
+            );
+            compatible = false;
+        }
+    }
+
+    // 3. One byte of the payload, changed.
+    match flip_hex_at(token, 2) {
+        Some(tampered) if tampered != token => match parse_session(secret, &tampered, at) {
+            Err(SessionError::BadSignature) => {
+                out.push("  ok    one byte of the address changed, and it is rejected".into())
+            }
+            other => {
+                out.push(format!(
+                    "  FAIL  a tampered payload was not rejected: {other:?}"
+                ));
+                compatible = false;
+            }
+        },
+        _ => out.push("  --    the address could not be mutated in place; skipped".into()),
+    }
+
+    // Reported, never judged. A cookie captured last month answers the compatibility question just
+    // as well as one captured a minute ago.
+    let age = now.saturating_sub(issued_at);
+    if age > SESSION_TTL_SECS {
+        let days = age / 86_400;
+        out.push(format!(
+            "  --    for information: this cookie is {days} days old and has expired."
+        ));
+        out.push("        That says nothing about compatibility and is not counted below.".into());
+    }
+
+    (compatible, out)
+}
+
+/// The `issued_at` in `address:issued_at:signature`.
+fn issued_at_of(token: &str) -> Option<i64> {
+    let (payload, _) = token.rsplit_once(':')?;
+    let (_, issued) = payload.rsplit_once(':')?;
+    issued.parse().ok()
 }
 
 fn main() -> std::process::ExitCode {
@@ -63,65 +159,18 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let now = chrono_now();
-    let mut failed = false;
 
-    // 1. It parses.
-    match parse_session(&secret, &token, now) {
-        Ok(address) => println!("  ok    the token parses, and vouches for {address}"),
-        Err(SessionError::Expired) => {
-            // Worth its own line: an expired token proves the signature was accepted, which is the
-            // compatibility question, but it cannot prove the address. Capture a fresher one.
-            println!("  ??    the signature was accepted and the session has expired.");
-            println!("        That answers the compatibility question and not the address one;");
-            println!("        sign in again and re-run with a fresh cookie.");
-        }
-        Err(e) => {
-            println!("  FAIL  the token does not parse: {e}");
-            println!("        This is the failure #12 exists to catch. Every logged-in user");
-            println!("        would be signed out at the cutover. Do not switch.");
-            failed = true;
-        }
+    let (compatible, lines) = check(&secret, &token, chrono_now());
+    for line in lines {
+        println!("{line}");
     }
 
-    // 2. One byte of the signature, changed.
-    let sig_at = token.rfind(':').map(|i| i + 1);
-    match sig_at.and_then(|i| flip_hex_at(&token, i)) {
-        Some(forged) => match parse_session(&secret, &forged, now) {
-            Err(SessionError::BadSignature) => {
-                println!("  ok    one byte of the signature changed, and it is rejected")
-            }
-            other => {
-                println!("  FAIL  a forged signature was not rejected: {other:?}");
-                failed = true;
-            }
-        },
-        None => {
-            println!("  FAIL  the token has no hex signature to mutate; is it a session cookie?");
-            failed = true;
-        }
-    }
-
-    // 3. One byte of the payload, changed.
-    match flip_hex_at(&token, 2) {
-        Some(tampered) if tampered != token => match parse_session(&secret, &tampered, now) {
-            Err(SessionError::BadSignature) => {
-                println!("  ok    one byte of the address changed, and it is rejected")
-            }
-            other => {
-                println!("  FAIL  a tampered payload was not rejected: {other:?}");
-                failed = true;
-            }
-        },
-        _ => println!("  --    the address could not be mutated in place; skipped"),
-    }
-
-    if failed {
-        println!("\nnot compatible. The Dock must not be cut over.");
-        std::process::ExitCode::FAILURE
-    } else {
+    if compatible {
         println!("\ncompatible. #12 is answered for this token.");
         std::process::ExitCode::SUCCESS
+    } else {
+        println!("\nnot compatible. The Dock must not be cut over.");
+        std::process::ExitCode::FAILURE
     }
 }
 
@@ -135,8 +184,8 @@ fn chrono_now() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::flip_hex_at;
-    use kittiwake_dock::{Secret, SessionError, create_session, parse_session};
+    use super::{check, flip_hex_at};
+    use kittiwake_dock::{Secret, create_session};
 
     /// The checker checked. A mutation helper that quietly returned the original string would make
     /// every run of this binary print three `ok`s and mean nothing.
@@ -153,32 +202,91 @@ mod tests {
         );
     }
 
-    /// The three assertions the binary makes, against a token this process minted. Proves the
-    /// procedure is sound, so a real token failing means the token disagrees with us rather than
-    /// that the check is broken.
+    fn secret() -> Secret {
+        Secret::new("a-secret-long-enough-to-be-accepted-here").expect("secret")
+    }
+
+    const MINTED_AT: i64 = 1_800_000_000;
+    /// Long enough after minting that the cookie is well outside the seven-day window.
+    const MUCH_LATER: i64 = MINTED_AT + 400 * 86_400;
+
+    fn token() -> String {
+        create_session(
+            &secret(),
+            "0xAbC0000000000000000000000000000000000001",
+            MINTED_AT,
+        )
+    }
+
+    /// The regression, and the whole reason this file has tests.
+    ///
+    /// Judged at the wall clock, a cookie older than the TTL made `parse_session` answer `Expired`
+    /// before it ever looked at the signature. All three checks then failed, and the binary told
+    /// whoever ran it `not compatible. The Dock must not be cut over.` about an implementation
+    /// that agrees exactly. The test that was here set `now` to the minting time, so it exercised
+    /// a path the binary never takes.
     #[test]
-    fn the_procedure_passes_against_a_token_we_minted_ourselves() {
-        let secret = Secret::new("a-secret-long-enough-to-be-accepted-here").expect("secret");
-        let now = 1_800_000_000;
-        let token = create_session(&secret, "0xAbC0000000000000000000000000000000000001", now);
-
-        assert_eq!(
-            parse_session(&secret, &token, now).as_deref(),
-            Ok("0xabc0000000000000000000000000000000000001")
+    fn an_expired_but_genuine_cookie_is_compatible() {
+        let (compatible, lines) = check(&secret(), &token(), MUCH_LATER);
+        assert!(compatible, "{lines:#?}");
+        assert!(
+            lines.iter().any(|l| l.contains("has expired")),
+            "the age is worth saying, just not worth failing over: {lines:#?}"
         );
-
-        let sig_at = token.rfind(':').unwrap() + 1;
-        let forged = flip_hex_at(&token, sig_at).expect("a hex signature to mutate");
-        assert_eq!(
-            parse_session(&secret, &forged, now),
-            Err(SessionError::BadSignature)
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("vouches for 0xabc0000000000000000000000000000000000001")),
+            "{lines:#?}"
         );
+    }
 
-        let tampered = flip_hex_at(&token, 2).expect("a hex address to mutate");
-        assert_ne!(tampered, token);
-        assert_eq!(
-            parse_session(&secret, &tampered, now),
-            Err(SessionError::BadSignature)
+    /// The other half of it. A tool that says "not compatible" for a stale cookie *and* for a
+    /// forged one is telling you nothing either time.
+    #[test]
+    fn a_forged_signature_is_not_compatible_even_when_expired() {
+        let sig_at = token().rfind(':').unwrap() + 1;
+        let forged = flip_hex_at(&token(), sig_at).expect("a hex signature to mutate");
+        let (compatible, lines) = check(&secret(), &forged, MUCH_LATER);
+        assert!(!compatible, "{lines:#?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("the signature is not ours")),
+            "{lines:#?}"
         );
+    }
+
+    #[test]
+    fn the_wrong_secret_is_not_compatible() {
+        let other = Secret::new("a-different-secret-of-sufficient-length").expect("secret");
+        let (compatible, _) = check(&other, &token(), MUCH_LATER);
+        assert!(!compatible);
+    }
+
+    /// A fresh cookie passes and says nothing about age, so the ordinary run is three lines.
+    #[test]
+    fn a_fresh_cookie_passes_without_a_word_about_age() {
+        let (compatible, lines) = check(&secret(), &token(), MINTED_AT + 60);
+        assert!(compatible, "{lines:#?}");
+        assert!(!lines.iter().any(|l| l.contains("expired")), "{lines:#?}");
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+    }
+
+    /// Something that is not a session cookie is refused by name rather than by three confusing
+    /// failures.
+    #[test]
+    fn something_that_is_not_a_token_is_named_as_such() {
+        for bad in ["", "not-a-token", "0xabc:notanumber:deadbeef"] {
+            let (compatible, lines) = check(&secret(), bad, MUCH_LATER);
+            assert!(!compatible, "{bad:?}");
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("not `address:issued_at:signature`")
+                        || l.contains("the signature is not ours")),
+                "{bad:?}: {lines:#?}"
+            );
+        }
     }
 }
