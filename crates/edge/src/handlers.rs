@@ -1922,12 +1922,6 @@ pub async fn support_issue(
     Ok(resp)
 }
 
-/// `/api/support/templates`: the six issue forms, as the repository's own YAML.
-///
-/// Served so the dashboard's compose form is generated from the templates rather than from a copy
-/// of them. A copy is correct exactly until somebody edits a template, and nothing would say so.
-pub async fn support_templates(
-    State(st): State<AppState>,
 #[derive(serde::Deserialize)]
 pub struct ScuttleHistory {
     pub before: Option<i64>,
@@ -2162,30 +2156,6 @@ pub async fn indexer_disputes(
     headers: HeaderMap,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
-    let pool = st
-        .pool
-        .as_ref()
-        .ok_or_else(|| ApiError::Unavailable("no database is configured".into()))?;
-
-    let templates = kittiwake_db::graph_support_templates(pool)
-        .await
-        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
-
-    // Empty means the mirror has not run rather than that the repository has no templates, and a
-    // compose page rendering no options would look like a decision instead of a fault.
-    if templates.is_empty() {
-        return Err(
-            ApiError::Unavailable("the graph-support mirror has not run yet".into()).into(),
-        );
-    }
-
-    let mut resp = axum::Json(serde_json::json!({ "templates": templates })).into_response();
-    resp.headers_mut().insert(
-        axum::http::HeaderName::from_static("x-kittiwake-served-from"),
-        axum::http::HeaderValue::from_static("postgres"),
-    );
-    crate::no_store(resp.headers_mut());
-    Ok(resp)
     let address = eth_address(&address).ok_or_else(bad_address)?;
     let disputes = kittiwake_db::indexer_disputes(pool(&st)?, &address)
         .await
@@ -2561,4 +2531,40 @@ pub async fn ens(
         )
         .await?;
     Ok(envelope_root(read))
+}
+
+/// `/api/support/templates`: the six issue forms, as the repository's own YAML.
+///
+/// Served so the dashboard's compose form is generated from the templates rather than from a copy
+/// of them. A copy is correct exactly until somebody edits a template, and nothing would say so.
+pub async fn support_templates(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let pool = st
+        .pool
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("no database is configured".into()))?;
+
+    let templates = kittiwake_db::graph_support_templates(pool)
+        .await
+        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+
+    // Empty means the mirror has not run rather than that the repository has no templates, and a
+    // compose page rendering no options would look like a decision instead of a fault.
+    if templates.is_empty() {
+        return Err(
+            ApiError::Unavailable("the graph-support mirror has not run yet".into()).into(),
+        );
+    }
+
+    let mut resp = axum::Json(serde_json::json!({ "templates": templates })).into_response();
+    resp.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-kittiwake-served-from"),
+        axum::http::HeaderValue::from_static("postgres"),
+    );
+    crate::no_store(resp.headers_mut());
+    Ok(resp)
 }
