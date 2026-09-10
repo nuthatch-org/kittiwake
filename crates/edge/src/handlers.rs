@@ -2722,3 +2722,137 @@ pub async fn foghorn_post(
     }
     foghorn_call(&st, &path, query, Some(body)).await
 }
+
+// ── Presenting a proof of indexing ───────────────────────────────────────────
+
+/// An allocation id, in whatever case it was written.
+///
+/// Deliberately not normalised: the value is interpolated into a GraphQL mutation and sent to
+/// somebody's indexer agent, so it goes as the caller wrote it. What matters is that it cannot
+/// contain a quote.
+pub(crate) fn allocation_id(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    let hex = trimmed.strip_prefix("0x")?;
+    (hex.len() == 40 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then_some(trimmed)
+}
+
+/// Which credential goes to which agent.
+///
+/// **The server's token never travels to a caller-supplied URL.** The SSRF check rejects private
+/// addresses; it does not reject an attacker's perfectly public one, so falling back to our own
+/// credential for a nominated host would hand this box's management authority to whoever asked.
+/// A caller pointing at their own agent brings their own token.
+pub(crate) fn agent_token<'a>(
+    caller_url: Option<&str>,
+    caller_token: Option<&'a str>,
+    server_token: Option<&'a str>,
+) -> Option<&'a str> {
+    match caller_url {
+        Some(_) => caller_token,
+        None => caller_token.or(server_token),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct PresentPoi {
+    #[serde(default)]
+    pub deployment_id: String,
+    #[serde(default)]
+    pub allocation_id: String,
+    pub agent_url: Option<String>,
+    pub agent_token: Option<String>,
+}
+
+/// `POST /api/indexer/present-poi`: queue a `presentPOI` action on an indexer agent.
+///
+/// Both identifiers are interpolated into the mutation below, so both are validated to character
+/// sets that cannot contain a quote. Anything looser and a caller could close the string and queue
+/// actions of their own choosing on somebody's agent.
+pub async fn present_poi(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<PresentPoi>,
+) -> Result<Response, ErrorResponse> {
+    let caller = client_ip(peer, &headers, st.edge_secret.as_deref());
+    st.limits.check(&st.limits.mutation, caller)?;
+
+    let (Some(deployment), Some(allocation)) = (
+        cid_v0(&body.deployment_id),
+        allocation_id(&body.allocation_id),
+    ) else {
+        return Err(ApiError::BadRequest(
+            "deploymentId must be an IPFS CIDv0 and allocationId a 0x-prefixed 20-byte address"
+                .into(),
+        )
+        .into());
+    };
+
+    let agent = st.indexer_agent.as_ref();
+    let target = match body.agent_url.as_deref() {
+        Some(url) => {
+            kittiwake_ssrf::check_resolved(url).await.map_err(|_| {
+                ErrorResponse::from(ApiError::BadRequest(
+                    "agentUrl must be a public http or https URL".into(),
+                ))
+            })?;
+            url.to_string()
+        }
+        None => agent.map(|a| a.url.to_string()).ok_or_else(|| {
+            ErrorResponse::from(ApiError::Unavailable(
+                "no indexer agent is configured here and none was given".into(),
+            ))
+        })?,
+    };
+    let token = agent_token(
+        body.agent_url.as_deref(),
+        body.agent_token.as_deref(),
+        agent.and_then(|a| a.token.as_deref()),
+    );
+
+    let mutation = format!(
+        r#"mutation {{
+    queueActions(actions: [{{
+      type: presentPOI,
+      deploymentID: "{deployment}",
+      allocationID: "{allocation}",
+      protocolNetwork: "eip155:42161",
+      status: approved,
+      priority: 0,
+      isLegacy: false,
+      source: "lodestar-dashboard",
+      reason: "bounty claim"
+    }}]) {{ id type status failureReason }}
+  }}"#
+    );
+
+    let client = reqwest::Client::new();
+    let mut request = client
+        .post(&target)
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&serde_json::json!({ "query": mutation }));
+    if let Some(token) = token {
+        use base64::Engine;
+        request = request.header(
+            axum::http::header::AUTHORIZATION,
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(token)
+            ),
+        );
+    }
+
+    let upstream = request.send().await.map_err(|e| {
+        ErrorResponse::from(ApiError::Unavailable(format!(
+            "could not reach the indexer agent: {e}"
+        )))
+    })?;
+    let answer: serde_json::Value = upstream.json().await.map_err(|e| {
+        ErrorResponse::from(ApiError::Unavailable(format!(
+            "the indexer agent answered unreadably: {e}"
+        )))
+    })?;
+    let mut response = axum::Json(answer).into_response();
+    crate::no_store(response.headers_mut());
+    Ok(response)
+}

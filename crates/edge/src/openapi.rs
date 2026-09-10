@@ -80,6 +80,11 @@ pub const WITHHELD: &[(&str, &str)] = &[
          receipt is obtained by asking for one rather than by reading a path",
     ),
     (
+        "/api/indexer/present-poi",
+        "queues an action on an indexer's own agent and is a POST; it acts on somebody's \
+         infrastructure rather than reading the protocol",
+    ),
+    (
         "/api/foghorn/{*path}",
         "a pass-through to Foghorn's QoS API; its shape is Foghorn's rather than ours, and it is \
          documented where that service is",

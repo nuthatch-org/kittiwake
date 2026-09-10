@@ -92,6 +92,7 @@ pub struct AppState {
     pub scuttle: Option<Scuttle>,
     /// Foghorn's API base, for the QoS proxy. Absent means that route answers 503.
     pub foghorn_api_url: Option<Arc<str>>,
+    pub indexer_agent: Option<kittiwake_config::IndexerAgentSettings>,
     /// The key SQL receipts are signed with. Absent means this deployment issues none.
     pub receipt_key: Option<Arc<ed25519_dalek::SigningKey>>,
     /// The secret the edge proxy presents. Absent means no request is ever trusted to name a client
@@ -890,6 +891,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dips/agreements", get(handlers::dips_agreements))
         .route("/api/ens", get(handlers::ens))
         .route("/api/manifest", get(handlers::manifest))
+        .route("/api/indexer/present-poi", post(handlers::present_poi))
         .route(
             "/api/foghorn/{*path}",
             get(handlers::foghorn_get).post(handlers::foghorn_post),
@@ -938,6 +940,7 @@ pub fn state(
     ipfs: kittiwake_ext::Ipfs,
     scuttle: Option<Scuttle>,
     foghorn_api_url: Option<String>,
+    indexer_agent: Option<kittiwake_config::IndexerAgentSettings>,
     receipt_key: Option<Arc<ed25519_dalek::SigningKey>>,
 ) -> AppState {
     AppState {
@@ -948,6 +951,7 @@ pub fn state(
         studio,
         scuttle,
         foghorn_api_url: foghorn_api_url.map(|u| Arc::from(u.as_str())),
+        indexer_agent,
         receipt_key,
         edge_secret: edge_secret.map(|s| Arc::from(s.as_str())),
         pool,
@@ -1005,6 +1009,63 @@ async fn get_whoami(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Presenting a proof of indexing ───────────────────────────────────────
+
+    /// Both identifiers are interpolated into a GraphQL mutation sent to somebody's indexer agent.
+    /// A value that could carry a quote could close the string and queue actions of its own.
+    #[test]
+    fn nothing_that_could_close_a_graphql_string_is_an_identifier() {
+        assert!(
+            crate::handlers::allocation_id("0xB43b2CCcCEADa5292732a8c58Ae134ADEfcE09Bb").is_some()
+        );
+        assert!(
+            crate::handlers::allocation_id("0xb43b2cccceada5292732a8c58ae134adefce09bb").is_some(),
+            "either case, and neither is normalised"
+        );
+        for bad in [
+            "",
+            "0x",
+            "b43b2cccceada5292732a8c58ae134adefce09bb",
+            "0xb43b2cccceada5292732a8c58ae134adefce09b",
+            "0xb43b2cccceada5292732a8c58ae134adefce09bbb",
+            r#"0xb43b2cccceada5292732a8c58ae134adefce09bb", type: unallocate, x: ""#,
+            "0xzzzz2cccceada5292732a8c58ae134adefce09bb",
+        ] {
+            assert!(
+                crate::handlers::allocation_id(bad).is_none(),
+                "{bad:?} must not reach the mutation"
+            );
+        }
+        // The deployment side is the CIDv0 check, which refuses a quote for the same reason.
+        assert!(crate::handlers::cid_v0(r#"Qm", type: unallocate"#).is_none());
+    }
+
+    /// The one that matters most here. The SSRF check refuses private addresses; it does not refuse
+    /// an attacker's perfectly public one, so our own management credential must never follow a
+    /// caller-nominated URL.
+    #[test]
+    fn this_boxs_agent_token_never_follows_a_caller_supplied_url() {
+        let ours = Some("operator:hunter2");
+
+        // No URL given: our agent, our token.
+        assert_eq!(crate::handlers::agent_token(None, None, ours), ours);
+        // Caller nominates a host: they bring their own, or none travels at all.
+        assert_eq!(
+            crate::handlers::agent_token(Some("https://evil.example"), None, ours),
+            None,
+            "our credential must not be sent to a host the caller chose"
+        );
+        assert_eq!(
+            crate::handlers::agent_token(Some("https://mine.example"), Some("me:secret"), ours),
+            Some("me:secret")
+        );
+        // And a caller's own token still wins for our agent, as the incumbent allows.
+        assert_eq!(
+            crate::handlers::agent_token(None, Some("me:secret"), ours),
+            Some("me:secret")
+        );
+    }
 
     // ── Foghorn ──────────────────────────────────────────────────────────────
 
