@@ -1078,7 +1078,15 @@ mod schema_coverage {
         };
         while let Some(i) = rest.find("sqlx::query") {
             rest = &rest[i + "sqlx::query".len()..];
-            let window = &rest[..rest.len().min(4000)];
+            // Back the window off to a word boundary. Cutting mid-identifier invents a table: a
+            // window ending at `UPDATE scu` reports `scu` as missing from the schema, which is a
+            // failure about this function rather than about the database.
+            let cut = rest.len().min(4000);
+            let window = &rest[..cut];
+            let window = match window.rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+                Some(i) if cut == 4000 => &window[..=i],
+                _ => window,
+            };
             // The statement, reassembled from the literals in this call. Only literals that look
             // like SQL, so a doc comment sitting inside the window cannot contribute a "table".
             let mut sql = String::new();
@@ -1130,6 +1138,14 @@ mod schema_coverage {
         assert!(
             declared.len() > 15,
             "the schema did not parse: {declared:?}"
+        );
+
+        // If the extraction stops finding statements, every assertion below passes vacuously and
+        // the check quietly becomes decoration.
+        let found: usize = SOURCES.iter().map(|(_, src)| tables_in(src).len()).sum();
+        assert!(
+            found > 20,
+            "only {found} tables extracted; the scan is broken"
         );
 
         let mut missing = Vec::new();
