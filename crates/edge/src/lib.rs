@@ -885,6 +885,7 @@ pub fn router(state: AppState) -> Router {
             get(handlers::subgraph_schema),
         )
         .route("/api/dips/agreements", get(handlers::dips_agreements))
+        .route("/api/ens", get(handlers::ens))
         .route(
             "/api/subgraph-versions/{hash}",
             get(handlers::subgraph_versions),

@@ -2474,3 +2474,61 @@ async fn label_versions(pool: &kittiwake_db::Pool, value: &mut serde_json::Value
         }
     }
 }
+
+#[derive(serde::Deserialize)]
+pub struct EnsQuery {
+    pub address: Option<String>,
+}
+
+/// `GET /api/ens?address=0x…`: the address's primary ENS name, or null.
+///
+/// Cached a day per address, which is the incumbent's key and cadence: a primary name changes
+/// rarely and a mainnet round trip on every avatar render would not be worth it.
+pub async fn ens(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<EnsQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let raw = q
+        .address
+        .as_deref()
+        .ok_or_else(|| ErrorResponse::from(ApiError::BadRequest("address required".into())))?;
+    // Anything that is not an address has no name, and saying so is cheaper and truer than an
+    // error: the caller asked about something ENS has never heard of.
+    let Some(address) = eth_address(raw) else {
+        return Ok(axum::Json(serde_json::json!({ "ensName": null })).into_response());
+    };
+    let chain = st
+        .read
+        .chain
+        .as_ref()
+        .ok_or_else(|| {
+            ErrorResponse::from(ApiError::Unavailable(
+                "no mainnet RPC is configured, so ENS cannot be read".into(),
+            ))
+        })?
+        .clone();
+
+    let read = st
+        .read
+        .cached_external_keyed(
+            "ens",
+            &address,
+            std::time::Duration::from_secs(86_400),
+            kittiwake_types::ServedFrom::Chain,
+            {
+                let address = address.clone();
+                std::sync::Arc::new(move || {
+                    let chain = chain.clone();
+                    let address = address.clone();
+                    Box::pin(async move {
+                        Ok(serde_json::json!({ "ensName": chain.ens_name(&address).await? }))
+                    })
+                })
+            },
+        )
+        .await?;
+    Ok(envelope_root(read))
+}

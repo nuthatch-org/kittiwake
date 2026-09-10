@@ -8,6 +8,7 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+use alloy::ens::{EnsError, ProviderEnsExt};
 use alloy::primitives::{Address, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::sol;
@@ -128,6 +129,15 @@ const PUBLIC_MAINNET: [&str; 3] = [
     "https://eth.llamarpc.com",
     "https://cloudflare-eth.com",
 ];
+
+/// The name an address is entitled to display, or nothing.
+///
+/// A reverse record is a claim the address makes about itself; the forward record is the name
+/// owner's answer to it. Only when they agree has anybody actually granted the name, so a
+/// mismatch is `None` rather than a name we would go on to print next to somebody's stake.
+fn ens_verified(name: String, forward: Address, asked: Address) -> Option<String> {
+    (forward == asked).then_some(name)
+}
 
 impl Chain {
     /// `arbitrum_rpc` is required: every protocol contract read goes there and there is no public
@@ -255,6 +265,47 @@ impl Chain {
             "no endpoint answered for the GRT supply: {}",
             last.unwrap_or_else(|| "none configured".into())
         )))
+    }
+
+    /// The primary ENS name for an address, or `None` when it has none.
+    ///
+    /// **Reverse, then forward, and the second half is the point.** `lookup_address` reads the
+    /// `<address>.addr.reverse` record, and alloy says plainly that what comes back is neither
+    /// normalised nor forward-verified. Anyone may set a reverse record naming anything they like,
+    /// so displaying it unchecked would let one address wear another's name on a page of indexer
+    /// identities. Resolving the name back and comparing is what makes it a claim its owner made.
+    ///
+    /// A name that fails that check is `None` rather than an error: the address genuinely has no
+    /// name it is entitled to display. A lookup that *fails* is an error, and callers must never
+    /// render that as "no name" - the two are different answers and #36 is what happens when they
+    /// are conflated.
+    ///
+    /// Checked against mainnet by hand on 2026-09-10, because the tests here take no network:
+    /// `0xd8da…6045` returned `Some("vitalik.eth")` and `0x0000…dead` returned `None`.
+    pub async fn ens_name(&self, address: &str) -> Result<Option<String>, ApiError> {
+        let address = Address::from_str(address)
+            .map_err(|_| ApiError::BadRequest("not a 20-byte address".into()))?;
+        let mut last = String::from("no mainnet endpoint configured");
+        for url in &self.mainnet {
+            let Ok(parsed) = url.parse() else { continue };
+            let provider = ProviderBuilder::new().connect_http(parsed);
+            let lookup = async {
+                let name = provider.lookup_address(&address).await?;
+                let forward = provider.resolve_name(&name).await?;
+                Ok::<_, EnsError>((name, forward))
+            };
+            match tokio::time::timeout(Duration::from_secs(10), lookup).await {
+                Ok(Ok((name, forward))) => return Ok(ens_verified(name, forward, address)),
+                // No reverse record, or none that resolves: the address has no name, and that is
+                // an answer rather than a failure to reach for the next endpoint over.
+                Ok(Err(EnsError::ResolverNotFound(_) | EnsError::ReverseRegistrarNotFound)) => {
+                    return Ok(None);
+                }
+                Ok(Err(e)) => last = e.to_string(),
+                Err(_) => last = "timed out".into(),
+            }
+        }
+        Err(ApiError::Unavailable(format!("ENS lookup failed: {last}")))
     }
 
     /// Supply across both chains. Three reads; a failure in any of them makes the whole breakdown
@@ -425,6 +476,29 @@ fn now_secs() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// A reverse record is a claim; the forward record is the name owner answering it. Printing an
+    /// unverified reverse name next to somebody's stake is how one address wears another's name.
+    #[test]
+    fn a_name_that_does_not_resolve_back_is_not_a_name() {
+        let asked = Address::from_str("0xd8da6bf26964af9d7eed9e03e53415d37aa96045").unwrap();
+        let someone_else = Address::from_str("0x090f7382f9ea85c733cd501f4d87f16cb5b83ed3").unwrap();
+
+        assert_eq!(
+            super::ens_verified("vitalik.eth".into(), asked, asked),
+            Some("vitalik.eth".to_string()),
+            "the name owner agrees, so it may be displayed"
+        );
+        assert_eq!(
+            super::ens_verified("vitalik.eth".into(), someone_else, asked),
+            None,
+            "the reverse record claims a name that resolves elsewhere"
+        );
+        assert_eq!(
+            super::ens_verified("vitalik.eth".into(), Address::ZERO, asked),
+            None,
+            "and an unresolvable name is not one either"
+        );
+    }
     use super::*;
 
     /// Bridged tokens exist on both sides of the bridge; counting them twice would overstate the
