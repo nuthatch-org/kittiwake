@@ -33,6 +33,13 @@ const GRAPH_SUPPORT: &str = "https://api.github.com/repos/nightswatchhq/graph-su
 const GRAPH_SUPPORT_COMMENTS: &str =
     "https://api.github.com/repos/nightswatchhq/graph-support/issues/comments?per_page=100";
 
+/// The issue-form directory, listed rather than enumerated.
+///
+/// Naming the six files here would mean a seventh template, or a rename, silently never reaching
+/// the dashboard's compose form. Listing the directory costs one request and cannot go stale.
+const GRAPH_SUPPORT_TEMPLATES: &str =
+    "https://api.github.com/repos/nightswatchhq/graph-support/contents/.github/ISSUE_TEMPLATE";
+
 #[derive(Clone)]
 pub struct Ext {
     pub(crate) http: reqwest::Client,
@@ -41,6 +48,7 @@ pub struct Ext {
     tvl_url: String,
     graph_support_url: String,
     graph_support_comments_url: String,
+    graph_support_templates_url: String,
 }
 
 impl Default for Ext {
@@ -63,6 +71,7 @@ impl Ext {
             tvl_url: tvl_url.into(),
             graph_support_url: GRAPH_SUPPORT.to_string(),
             graph_support_comments_url: GRAPH_SUPPORT_COMMENTS.to_string(),
+            graph_support_templates_url: GRAPH_SUPPORT_TEMPLATES.to_string(),
         }
     }
 
@@ -122,6 +131,67 @@ impl Ext {
     pub fn with_graph_support_comments_url(mut self, url: impl Into<String>) -> Self {
         self.graph_support_comments_url = url.into();
         self
+    }
+
+    /// Point the template fetch at a stand-in. Tests only.
+    pub fn with_graph_support_templates_url(mut self, url: impl Into<String>) -> Self {
+        self.graph_support_templates_url = url.into();
+        self
+    }
+
+    /// The issue forms, as the YAML the repository holds.
+    ///
+    /// `config.yml` is skipped: it configures the chooser rather than describing a form, and
+    /// rendering it would produce a template nobody can file.
+    ///
+    /// A directory listing plus one request per file, so seven today. That is a lot next to the two
+    /// the rest of the mirror spends, and it is still twice a day against a sixty-an-hour
+    /// allowance. Enumerating the filenames instead would cost one request and silently miss a
+    /// seventh template for ever, which is the more expensive mistake.
+    pub async fn graph_support_templates(&self) -> Result<Vec<GraphSupportTemplate>, ApiError> {
+        let listing: Vec<GhContent> = self
+            .http
+            .get(&self.graph_support_templates_url)
+            .send()
+            .await
+            .map_err(|e| ApiError::Unavailable(format!("graph-support templates: {e}")))?
+            .error_for_status()
+            .map_err(|e| ApiError::Unavailable(format!("graph-support templates: {e}")))?
+            .json()
+            .await
+            .map_err(|e| ApiError::Unavailable(format!("graph-support templates: {e}")))?;
+
+        let mut out = Vec::new();
+        for entry in listing {
+            if entry.name == "config.yml" || !entry.name.ends_with(".yml") {
+                continue;
+            }
+            let Some(url) = entry.download_url else {
+                continue;
+            };
+            let yaml = self
+                .http
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| ApiError::Unavailable(format!("graph-support template: {e}")))?
+                .error_for_status()
+                .map_err(|e| ApiError::Unavailable(format!("graph-support template: {e}")))?
+                .text()
+                .await
+                .map_err(|e| ApiError::Unavailable(format!("graph-support template: {e}")))?;
+            out.push(GraphSupportTemplate {
+                file: entry.name,
+                yaml,
+            });
+        }
+
+        if out.is_empty() {
+            return Err(ApiError::Unavailable(
+                "graph-support has no issue templates, which it has never been true of".into(),
+            ));
+        }
+        Ok(out)
     }
 
     /// Every comment in the repository, with the issue number each belongs to.
@@ -305,6 +375,20 @@ struct GhComment {
 #[derive(serde::Deserialize)]
 struct GhUser {
     login: Option<String>,
+}
+
+/// One issue template, as bytes. Parsed by whoever renders it, not here.
+#[derive(Debug, Clone)]
+pub struct GraphSupportTemplate {
+    pub file: String,
+    pub yaml: String,
+}
+
+/// One entry from the contents API's directory listing.
+#[derive(serde::Deserialize)]
+struct GhContent {
+    name: String,
+    download_url: Option<String>,
 }
 
 #[cfg(test)]
@@ -1309,5 +1393,73 @@ mod ipfs_tests {
 
         let ext = Ext::default().with_graph_support_url(format!("{}/issues", server.uri()));
         assert_eq!(ext.graph_support_issues().await.unwrap()[0].body, "");
+    }
+
+    #[tokio::test]
+    async fn the_templates_are_listed_and_fetched_verbatim() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/templates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"name": "01-query-error.yml", "download_url": format!("{}/raw/01", server.uri())},
+                {"name": "config.yml", "download_url": format!("{}/raw/cfg", server.uri())},
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/raw/01"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("name: Query fails\nbody: []\n"),
+            )
+            .mount(&server)
+            .await;
+
+        let ext =
+            Ext::default().with_graph_support_templates_url(format!("{}/templates", server.uri()));
+        let out = ext.graph_support_templates().await.unwrap();
+
+        // config.yml configures the chooser rather than describing a form, so it is not offered.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].file, "01-query-error.yml");
+        assert!(out[0].yaml.contains("name: Query fails"));
+    }
+
+    #[tokio::test]
+    async fn a_repository_with_no_templates_is_a_failure_not_an_empty_chooser() {
+        // It has never been true of that repository, so nothing here means the request was wrong.
+        // A compose page with no options would read as a decision rather than a fault.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/templates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+            .mount(&server)
+            .await;
+
+        let ext =
+            Ext::default().with_graph_support_templates_url(format!("{}/templates", server.uri()));
+        assert!(ext.graph_support_templates().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_seventh_template_arrives_without_anyone_being_told() {
+        // The reason the directory is listed rather than the six filenames enumerated.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/templates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"name": "07-brand-new.yml", "download_url": format!("{}/raw/07", server.uri())},
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/raw/07"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("name: Brand new\n"))
+            .mount(&server)
+            .await;
+
+        let ext =
+            Ext::default().with_graph_support_templates_url(format!("{}/templates", server.uri()));
+        let out = ext.graph_support_templates().await.unwrap();
+        assert_eq!(out[0].file, "07-brand-new.yml");
     }
 }

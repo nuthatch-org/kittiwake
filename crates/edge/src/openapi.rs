@@ -131,6 +131,10 @@ const SUMMARIES: &[Operation] = &[
         "The nightswatchhq/graph-support archive, mirrored twice a day.",
     ),
     op(
+        "/api/support/templates",
+        "The graph-support issue forms, as the repository's own YAML.",
+    ),
+    op(
         "/api/support/{number}",
         "One graph-support thread: the opening post and every reply.",
     ),

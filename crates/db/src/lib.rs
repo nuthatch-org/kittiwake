@@ -1007,7 +1007,42 @@ pub async fn ensure_graph_support_table(pool: &Pool) -> Result<(), DbError> {
     )
     .execute(pool)
     .await?;
+
+    // The issue forms, so the dashboard's own compose form is generated from the repository's
+    // templates rather than from a copy of them that goes stale the first time somebody edits one.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS graph_support_templates ( \
+           file       TEXT PRIMARY KEY, \
+           yaml       TEXT NOT NULL, \
+           fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
+         )",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
+}
+
+/// Every issue template, by filename.
+pub async fn graph_support_templates(pool: &Pool) -> Result<Vec<GraphSupportTemplate>, DbError> {
+    let rows = sqlx::query_as::<_, GraphSupportTemplate>(
+        "SELECT file, yaml, fetched_at FROM graph_support_templates ORDER BY file",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// One issue template, stored as the YAML the repository holds.
+///
+/// Verbatim on purpose. GitHub's issue-form schema is GitHub's, and a mirror that parsed it would
+/// have to be taught every field type they add. This stores bytes; the dashboard interprets them.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSupportTemplate {
+    /// The filename, which is also what GitHub's `template` query parameter takes.
+    pub file: String,
+    pub yaml: String,
+    pub fetched_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// One comment on an issue.
