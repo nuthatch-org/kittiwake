@@ -38,6 +38,8 @@ fn mins(n: u64) -> Duration {
 pub fn live_jobs(store: kittiwake_cache::Store, pool: Option<Pool>, ext: Ext) -> Vec<JobDef> {
     let mut jobs = Vec::new();
     let pool_for_warm = pool.clone();
+    let pool_for_support = pool.clone();
+    let ext_for_support = ext.clone();
     {
         // Every two minutes, as the platform schedule had it. Writes into the process's own store
         // rather than Redis, because the route that reads it is in this process.
@@ -132,6 +134,36 @@ pub fn live_jobs(store: kittiwake_cache::Store, pool: Option<Pool>, ext: Ext) ->
                 }),
             )
             .staggered(mins(4)),
+        );
+    }
+
+    // The graph-support mirror. Twelve hours, because the archive is a store of write-ups rather
+    // than a feed and nothing in it moves faster than that.
+    //
+    // Lives here rather than in `ingest_jobs` for the same reason chain health does: it writes one
+    // table that is ours alone, which the platform neither reads nor writes, so running it costs
+    // nothing and turning it off gains nothing. It also touches no nest, so its offset is about
+    // tidiness rather than permits.
+    if let Some(pool) = pool_for_support {
+        let ext = ext_for_support;
+        jobs.push(
+            JobDef::every(
+                "ingest-graph-support",
+                mins(720),
+                Arc::new(move |_ctx| {
+                    let pool = pool.clone();
+                    let ext = ext.clone();
+                    Box::pin(async move {
+                        kittiwake_ingest::graph_support::graph_support(&pool, &ext)
+                            .await
+                            .map(|i| JobOutcome {
+                                rows_written: i.rows,
+                            })
+                            .map_err(|e| e.to_string())
+                    })
+                }),
+            )
+            .staggered(mins(8)),
         );
     }
 
@@ -391,6 +423,7 @@ mod tests {
             ("warm-ipfs", 10, 4),
             ("refresh-chain-health", 30, 6),
             ("reconcile-bounties", 10, 9),
+            ("ingest-graph-support", 720, 8),
         ];
         let fires = |period: u64, offset: u64| -> Vec<u64> {
             (0..60)
@@ -428,6 +461,7 @@ mod tests {
             ("warm-ipfs", mins(10), mins(4)),
             ("refresh-chain-health", mins(30), mins(6)),
             ("reconcile-bounties", mins(10), mins(9)),
+            ("ingest-graph-support", mins(720), mins(8)),
         ];
         for (i, a) in names_and_offsets.iter().enumerate() {
             for b in names_and_offsets.iter().skip(i + 1) {

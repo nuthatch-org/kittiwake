@@ -151,6 +151,10 @@ const SUMMARIES: &[Operation] = &[
         "One address's indexing rewards over time.",
     ),
     op("/api/curators", "The curator directory."),
+    op(
+        "/api/support",
+        "The nightswatchhq/graph-support archive, mirrored twice a day.",
+    ),
     op("/api/provisions", "One indexer's Horizon provisions."),
     op(
         "/api/delegation-events",
