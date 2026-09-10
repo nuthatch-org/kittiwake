@@ -1383,3 +1383,256 @@ pub async fn graph_support_ingested_at(
             .await?;
     Ok(row.map(|r| r.0))
 }
+
+// ── Saying what is wrong, without being asked twice ──────────────────────────
+
+/// The schema this binary was built against, which is the declaration `schema_gaps` checks.
+const SCHEMA_SQL: &str = include_str!("../../../db/schema.sql");
+
+/// Every `(table, column)` `db/schema.sql` declares.
+///
+/// Covers the two shapes that file uses: a column list inside `CREATE TABLE`, and a later
+/// `ALTER TABLE ... ADD COLUMN`. Table-level constraints in a `CREATE TABLE` body are not columns
+/// and are skipped by keyword; anything else on its own line is taken as a column name, which is
+/// true of this file and would be worth revisiting if it stopped being.
+fn declared_columns(sql: &str) -> Vec<(String, String)> {
+    const CONSTRAINTS: &[&str] = &[
+        "primary",
+        "unique",
+        "foreign",
+        "check",
+        "constraint",
+        "exclude",
+        "like",
+    ];
+
+    let mut out = Vec::new();
+    let mut current: Option<String> = None;
+
+    for raw in sql.lines() {
+        let line = raw.split("--").next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+
+        if let Some(rest) = lower.strip_prefix("create table if not exists ") {
+            current = rest
+                .split_whitespace()
+                .next()
+                .map(|t| t.trim_matches('(').to_string());
+            continue;
+        }
+
+        if let Some(rest) = lower.strip_prefix("alter table ") {
+            // `ALTER TABLE x ADD COLUMN IF NOT EXISTS y TYPE;` and nothing else here declares one.
+            let mut words = rest.split_whitespace();
+            let table = words.next().unwrap_or("").to_string();
+            let tail: Vec<&str> = words.collect();
+            if let Some(i) = tail.iter().position(|w| *w == "column") {
+                let after: Vec<&str> = tail[i + 1..]
+                    .iter()
+                    .copied()
+                    .skip_while(|w| matches!(*w, "if" | "not" | "exists"))
+                    .collect();
+                if let Some(col) = after.first() {
+                    out.push((table, col.trim_matches(&[',', ';'][..]).to_string()));
+                }
+            }
+            continue;
+        }
+
+        let Some(table) = current.clone() else {
+            continue;
+        };
+
+        if line.starts_with(')') {
+            current = None;
+            continue;
+        }
+
+        let Some(word) = lower.split_whitespace().next() else {
+            continue;
+        };
+        if CONSTRAINTS.contains(&word) {
+            continue;
+        }
+        out.push((table, word.trim_matches(&[',', '('][..]).to_string()));
+    }
+
+    out
+}
+
+/// A job whose recent runs have all failed.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailingJob {
+    /// The step name as `cron_runs` holds it, prefix included.
+    pub step: String,
+    /// How many consecutive failures, counting back from the most recent run.
+    pub consecutive_failures: i64,
+    /// When it last succeeded, if it ever has within the window looked at.
+    pub last_success: Option<chrono::DateTime<chrono::Utc>>,
+    /// The most recent error, which is usually the same one repeated.
+    pub last_error: Option<String>,
+}
+
+/// Jobs that have failed every run for at least `min_failures`, most broken first.
+///
+/// On 2026-09-10 five ingest jobs failed every attempt from 09:01 to 15:37 on a column the live
+/// database did not have. Every one of those failures was written to this table as it happened, and
+/// the only thing that eventually noticed was a staleness threshold six and a half hours later.
+/// The rows were always here; nothing read them.
+///
+/// Consecutive rather than a rate, because a rate hides the difference between a job that fails one
+/// run in three and a job that has not worked since breakfast. Skipped runs are not failures and
+/// are excluded: an overlapping run says the previous one is slow, not broken.
+pub async fn failing_jobs(pool: &Pool, min_failures: i64) -> Result<Vec<FailingJob>, DbError> {
+    // The window bounds the scan; a job silent for longer than this is a staleness question rather
+    // than a failure question, and the ingestion ages already answer that one.
+    let rows = sqlx::query_as::<_, (String, i64, Option<chrono::DateTime<chrono::Utc>>, Option<String>)>(
+        "WITH recent AS ( \
+           SELECT step, started_at, success, error_message, \
+                  ROW_NUMBER() OVER (PARTITION BY step ORDER BY started_at DESC) AS n \
+             FROM cron_runs \
+            WHERE started_at > NOW() - INTERVAL '24 hours' \
+              AND error_message IS DISTINCT FROM 'previous run still in flight' \
+         ), \
+         since_success AS ( \
+           SELECT step, MIN(n) AS first_ok FROM recent WHERE success GROUP BY step \
+         ) \
+         SELECT r.step, \
+                COALESCE(s.first_ok - 1, MAX(r.n)) AS consecutive_failures, \
+                (SELECT MAX(started_at) FROM recent x WHERE x.step = r.step AND x.success) AS last_success, \
+                (SELECT error_message FROM recent y WHERE y.step = r.step AND y.n = 1) AS last_error \
+           FROM recent r LEFT JOIN since_success s ON s.step = r.step \
+          GROUP BY r.step, s.first_ok \
+         HAVING COALESCE(s.first_ok - 1, MAX(r.n)) >= $1 \
+          ORDER BY consecutive_failures DESC",
+    )
+    .bind(min_failures)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(step, consecutive_failures, last_success, last_error)| FailingJob {
+                step,
+                consecutive_failures,
+                last_success,
+                last_error,
+            },
+        )
+        .collect())
+}
+
+/// A table or column `db/schema.sql` declares and the live database does not have.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemaGap {
+    pub table: String,
+    /// `None` when the whole table is missing.
+    pub column: Option<String>,
+}
+
+/// What `db/schema.sql` declares that this database does not have.
+///
+/// The static `schema_coverage` test already checks that every table the code names appears in that
+/// file. This is the other half, and it is the half that failed: the file said `ingestion_state` had
+/// a `last_timestamp` column, the code read it, and the database it was pointed at did not have it.
+/// Two of the three agreeing is not a confirmation.
+///
+/// Checked rather than applied. Applying would need DDL rights this service does not have and
+/// should not want, and a binary that quietly reshapes a database it merely reads from is a worse
+/// idea than one that refuses to pretend.
+pub async fn schema_gaps(pool: &Pool) -> Result<Vec<SchemaGap>, DbError> {
+    let live = sqlx::query_as::<_, (String, String)>(
+        "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'public'",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let have: std::collections::HashSet<(String, String)> = live.into_iter().collect();
+    let tables: std::collections::HashSet<String> = have.iter().map(|(t, _)| t.clone()).collect();
+
+    Ok(declared_columns(SCHEMA_SQL)
+        .into_iter()
+        .filter_map(|(table, column)| {
+            if !tables.contains(&table) {
+                Some(SchemaGap {
+                    table,
+                    column: None,
+                })
+            } else if !have.contains(&(table.clone(), column.clone())) {
+                Some(SchemaGap {
+                    table,
+                    column: Some(column),
+                })
+            } else {
+                None
+            }
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect())
+}
+
+#[cfg(test)]
+mod schema_declaration {
+    //! What `db/schema.sql` says it declares, checked against the file itself.
+    //!
+    //! `schema_gaps` compares this against a live database and cannot be unit tested without one.
+    //! What can be tested is the half that reads the file, and the case worth pinning is the one
+    //! that broke: `ingestion_state.last_timestamp` is declared by an `ALTER TABLE ... ADD COLUMN`
+    //! rather than in the `CREATE TABLE` body, which is exactly the shape a naive parser misses.
+
+    use super::{SCHEMA_SQL, declared_columns};
+
+    #[test]
+    fn reads_columns_from_a_create_table_body() {
+        let declared = declared_columns(SCHEMA_SQL);
+        assert!(declared.contains(&("cron_runs".into(), "step".into())));
+        assert!(declared.contains(&("cron_runs".into(), "success".into())));
+        assert!(declared.contains(&("cron_runs".into(), "error_message".into())));
+    }
+
+    #[test]
+    fn reads_a_column_added_by_a_later_alter() {
+        let declared = declared_columns(SCHEMA_SQL);
+        assert!(
+            declared.contains(&("ingestion_state".into(), "last_timestamp".into())),
+            "the column five ingest jobs died on for six and a half hours",
+        );
+    }
+
+    #[test]
+    fn does_not_mistake_a_table_constraint_for_a_column() {
+        let declared = declared_columns(
+            "CREATE TABLE IF NOT EXISTS t (\n  a TEXT,\n  PRIMARY KEY (a),\n  UNIQUE (a)\n);\n",
+        );
+        assert_eq!(declared, vec![("t".to_string(), "a".to_string())]);
+    }
+
+    #[test]
+    fn stops_at_the_end_of_a_table() {
+        // A statement after the closing paren must not be read as another column.
+        let declared = declared_columns(
+            "CREATE TABLE IF NOT EXISTS t (\n  a TEXT\n);\nCREATE INDEX IF NOT EXISTS i ON t (a);\n",
+        );
+        assert_eq!(declared, vec![("t".to_string(), "a".to_string())]);
+    }
+
+    #[test]
+    fn finds_every_table_the_file_creates() {
+        let declared = declared_columns(SCHEMA_SQL);
+        let tables: std::collections::BTreeSet<&str> =
+            declared.iter().map(|(t, _)| t.as_str()).collect();
+        let created = SCHEMA_SQL.matches("CREATE TABLE IF NOT EXISTS ").count();
+        assert_eq!(
+            tables.len(),
+            created,
+            "every created table should contribute at least one column: {tables:?}",
+        );
+    }
+}
