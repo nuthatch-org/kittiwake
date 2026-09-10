@@ -1,4 +1,6 @@
 /target
 *.log
 .env
-config.toml
+# The service's own config, which carries secrets. Anchored to the root: unanchored, this pattern
+# also swallows any nested config.toml, including a .cargo/ one somebody adds later.
+/config.toml

@@ -315,6 +315,11 @@ pub mod coverage {
             "POST with a body; the harness only issues GETs",
         ),
         (
+            "/api/sql/receipt",
+            Excused::Entirely,
+            "POST with a body, and it signs what it returns; the harness only issues GETs and must not mint receipts against production",
+        ),
+        (
             "/api/scuttlebutt/messages",
             Excused::Entirely,
             "anonymous user content that changes between two calls by design; the incumbent room and this one are different rooms, so a shape diff would compare two unrelated sets of messages",
