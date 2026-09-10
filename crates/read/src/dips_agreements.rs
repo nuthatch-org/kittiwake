@@ -236,6 +236,14 @@ pub struct Agreement {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Summary {
+    /// Whether this service could ask the nest at all.
+    ///
+    /// Always true here: reaching this code means the read succeeded, and a nest that cannot be
+    /// asked is an error rather than a summary. It is on the wire because `DipsAgreements.tsx`
+    /// and `DipsStatus.tsx` both open with `if (!d?.available) return null`, so a response
+    /// without it renders as an empty panel with no error anywhere - the shape of the fault that
+    /// put eight routes into production answering 200 on 7 September.
+    pub available: bool,
     pub agreements: Vec<Agreement>,
     pub events: Vec<Event>,
     pub counts: serde_json::Map<String, Value>,
@@ -387,6 +395,7 @@ pub fn build(rows: &BTreeMap<Stage, Vec<Value>>) -> Summary {
     agreements.sort_by(|x, y| y.last_seen.total_cmp(&x.last_seen));
 
     Summary {
+        available: true,
         counts: counts_of(&agreements),
         total_collected_grt: agreements.iter().map(|a| a.collected_grt).sum(),
         empty: events.is_empty(),
@@ -406,6 +415,7 @@ pub fn for_indexer(summary: &Summary, indexer: &str) -> Summary {
         .collect();
     let ids: std::collections::BTreeSet<&str> = agreements.iter().map(|a| a.id.as_str()).collect();
     Summary {
+        available: true,
         counts: counts_of(&agreements),
         total_collected_grt: agreements.iter().map(|a| a.collected_grt).sum(),
         // An indexer with no agreements is empty for that indexer, whatever the room holds.
