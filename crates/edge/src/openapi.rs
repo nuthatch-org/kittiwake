@@ -271,6 +271,10 @@ const SUMMARIES: &[Operation] = &[
         "Every version of the subgraph that published a deployment, with its signal and stake.",
     ),
     op(
+        "/api/qos/capture",
+        "How allocated stake sits across quality bands. Unscored means not measured, which is most of it.",
+    ),
+    op(
         "/api/manifest",
         "How hard a subgraph is to sync, scored out of a hundred with the reasoning attached.",
     ),

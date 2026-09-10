@@ -3037,3 +3037,114 @@ fn rand_nonce() -> u64 {
         .build_hasher()
         .finish()
 }
+
+// ── Quality capture ──────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct FoghornIndexer {
+    indexer_address: String,
+    #[serde(default)]
+    composite: Option<f64>,
+    #[serde(default)]
+    rated: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct FoghornIndexers {
+    #[serde(default)]
+    indexers: Vec<FoghornIndexer>,
+}
+
+/// `GET /api/qos/capture`: how allocated stake sits across quality bands.
+///
+/// The unscored band is large and that is the honest state of our coverage: the Lodestar Oracle
+/// grades only what it has probed, so most allocated GRT lands in "not measured" rather than being
+/// filled in from somebody else's telemetry.
+pub async fn qos_capture(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let pool = pool(&st)?.clone();
+    let base = st
+        .foghorn_api_url
+        .as_deref()
+        .ok_or_else(|| {
+            ErrorResponse::from(ApiError::Unavailable(
+                "the Foghorn API is not configured, so nothing can be scored".into(),
+            ))
+        })?
+        .trim_end_matches('/')
+        .to_string();
+
+    let read = st
+        .read
+        .cached_external(
+            "qos-capture",
+            std::time::Duration::from_secs(900),
+            kittiwake_types::ServedFrom::Postgres,
+            std::sync::Arc::new(move || {
+                let pool = pool.clone();
+                let base = base.clone();
+                Box::pin(async move {
+                    let scores = reqwest::Client::new()
+                        .get(format!("{base}/v1/indexers?limit=500"))
+                        .header(axum::http::header::ACCEPT, "application/json")
+                        .timeout(std::time::Duration::from_secs(15))
+                        .send()
+                        .await
+                        .map_err(|e| ApiError::Unavailable(format!("Foghorn: {e}")))?;
+                    if !scores.status().is_success() {
+                        return Err(ApiError::Unavailable(format!(
+                            "Foghorn returned {}",
+                            scores.status()
+                        )));
+                    }
+                    let scores: FoghornIndexers = scores
+                        .json()
+                        .await
+                        .map_err(|e| ApiError::Unavailable(format!("Foghorn: {e}")))?;
+                    let allocations = kittiwake_db::allocating_indexers(&pool)
+                        .await
+                        .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+
+                    // Only a *rated* indexer carries a score. An unrated one is not a zero, it is
+                    // one we have not measured, and collapsing those is the exact failure this
+                    // whole view exists to complain about.
+                    let scored: std::collections::BTreeMap<String, Option<f64>> = scores
+                        .indexers
+                        .into_iter()
+                        .map(|i| {
+                            (
+                                i.indexer_address.to_lowercase(),
+                                i.rated.then_some(i.composite).flatten(),
+                            )
+                        })
+                        .collect();
+
+                    let rows: Vec<kittiwake_read::concentration::Allocation> = allocations
+                        .iter()
+                        .map(|(address, grt)| kittiwake_read::concentration::Allocation {
+                            allocated_grt: *grt,
+                            q_score: scored.get(&address.to_lowercase()).copied().flatten(),
+                        })
+                        .collect();
+                    let measured = rows.iter().filter(|r| r.q_score.is_some()).count();
+
+                    Ok(serde_json::json!({
+                        "concentration": kittiwake_read::concentration::compute(&rows, 6),
+                        "coverage": {
+                            "allocated_indexers": rows.len(),
+                            "measured_indexers": measured,
+                            "note": "Scored by the Lodestar Oracle, which grades only what it has \
+                                     probed. Unscored means not measured, never measured and found \
+                                     wanting.",
+                        }
+                    }))
+                })
+            }),
+        )
+        .await?;
+    Ok(envelope(read))
+}

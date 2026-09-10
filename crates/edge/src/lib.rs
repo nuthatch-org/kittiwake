@@ -891,6 +891,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dips/agreements", get(handlers::dips_agreements))
         .route("/api/ens", get(handlers::ens))
         .route("/api/manifest", get(handlers::manifest))
+        .route("/api/qos/capture", get(handlers::qos_capture))
         .route(
             "/api/data-services/query",
             post(handlers::data_service_query),
