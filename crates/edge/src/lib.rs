@@ -866,6 +866,20 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sql/query", post(post_sql_query))
         .route("/api/sql/named", get(get_sql_named).post(post_sql_named))
         .route("/api/sql/receipt", post(post_sql_receipt))
+        // The long tail's Postgres reads. #67
+        .route(
+            "/api/indexer-disputes/{address}",
+            get(handlers::indexer_disputes),
+        )
+        .route(
+            "/api/parameter-history/{address}",
+            get(handlers::parameter_history),
+        )
+        .route(
+            "/api/indexer/{address}/revenue",
+            get(handlers::indexer_revenue),
+        )
+        .route("/api/indexer/{address}/pnl", get(handlers::indexer_pnl))
         // Scuttlebutt is deliberately separate from the provenance envelope routes above: messages
         // are primary user data in Postgres, not a view of a sealed protocol nest.
         .route(
