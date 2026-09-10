@@ -143,11 +143,23 @@ pub fn is_deployment_id(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// A GNS subgraph id: the same 32-byte hex shape as a deployment id, and checked the same way.
-/// Separate from [`is_deployment_id`] because they identify different things and a future change
-/// to one should not silently move the other.
+/// A GNS subgraph id, which is a `uint256` and reaches us as **decimal**, not as hex.
+///
+/// This used to defer to [`is_deployment_id`], on the stated belief that the two identifiers share
+/// a shape. They do not: the gns nest answers `deployment_subgraphs` with a seventy-seven digit
+/// decimal, so every id the nest returned failed the check and `/api/subgraph-versions` answered
+/// `500 the gns nest returned a subgraph id we will not query` for every deployment that has ever
+/// been published. Live until the route was probed against a real deployment.
+///
+/// Decimal digits, no sign, no leading zero, and no wider than a `uint256`.
 pub fn is_subgraph_id(s: &str) -> bool {
-    is_deployment_id(s)
+    const UINT256_MAX: &str =
+        "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+    !s.is_empty()
+        && s.len() <= UINT256_MAX.len()
+        && s.bytes().all(|b| b.is_ascii_digit())
+        && (s == "0" || !s.starts_with('0'))
+        && (s.len() < UINT256_MAX.len() || s <= UINT256_MAX)
 }
 
 /// The all-zero POI, which means "closed without a proof" and is never a real one.
@@ -897,7 +909,9 @@ mod tests {
 
     #[test]
     fn a_version_limit_outside_its_range_is_refused() {
-        let id = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        // Decimal, because a GNS subgraph id is a `uint256` and not a hash. This test used a hex
+        // one, which is the belief that made the route answer 500 in production.
+        let id = "89208477503844421768723574082634065786850291557104984756921772861043965025630";
         assert!(subgraph_versions_sql(id, 100).is_some());
         assert!(subgraph_versions_sql(id, 0).is_none());
         assert!(subgraph_versions_sql(id, -1).is_none());
@@ -1017,5 +1031,59 @@ mod tests {
     #[test]
     fn our_own_indexer_stays_out_of_the_public_directory() {
         assert!(indexers_sql(10, 0, "stakedTokens", true).contains(INDEXERS_EXCLUDED));
+    }
+}
+
+#[cfg(test)]
+mod subgraph_id_tests {
+    use super::*;
+
+    /// The seventy-seven digit decimal the gns nest actually returned for the deployment that
+    /// exposed this, taken from the incumbent's own answer for the same request.
+    const REAL: &str =
+        "89208477503844421768723574082634065786850291557104984756921772861043965025630";
+
+    #[test]
+    fn a_gns_subgraph_id_is_a_decimal_uint256() {
+        assert!(is_subgraph_id(REAL));
+        assert!(is_subgraph_id("0"));
+        assert!(is_subgraph_id("1"));
+        assert!(subgraph_versions_sql(REAL, 100).is_some());
+    }
+
+    /// The regression. A deployment id is hex and is not one of these, and treating it as one is
+    /// what made the route answer 500 for every published subgraph.
+    #[test]
+    fn a_deployment_id_is_not_a_subgraph_id() {
+        let deployment = "0x".to_string() + &"ab".repeat(32);
+        assert!(is_deployment_id(&deployment));
+        assert!(!is_subgraph_id(&deployment));
+    }
+
+    /// The id is interpolated into the statement, so the check is the guard.
+    #[test]
+    fn nothing_that_is_not_a_number_gets_through() {
+        for bad in [
+            "",
+            "12'; DROP TABLE subgraph_versions --",
+            "-1",
+            "1.5",
+            "0123",
+            " 12",
+            "12 ",
+            "1e30",
+            // One digit wider than a uint256, and the same width but larger.
+            "1157920892373161954235709850086879078532699846656405640394575840079131296399350",
+            "115792089237316195423570985008687907853269984665640564039457584007913129639936",
+        ] {
+            assert!(!is_subgraph_id(bad), "{bad:?} should not be a subgraph id");
+            assert!(subgraph_versions_sql(bad, 100).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_ceiling_itself_is_allowed() {
+        let max = "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+        assert!(is_subgraph_id(max));
     }
 }

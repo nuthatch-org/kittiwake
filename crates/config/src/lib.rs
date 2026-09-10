@@ -364,3 +364,32 @@ mod tests {
         assert!(printed.contains("<redacted>"));
     }
 }
+
+#[cfg(test)]
+mod deploy_safety {
+    /// A config that predates every optional section still parses.
+    ///
+    /// The box's `/etc/kittiwake/config.toml` is written once and never overwritten, so a section
+    /// added here that is not genuinely optional stops the service starting on the next deploy,
+    /// after the binary has already been swapped.
+    #[test]
+    fn a_config_without_any_of_the_newer_sections_parses() {
+        let minimal = r#"
+bind = "127.0.0.1:8080"
+scheduler_enabled = true
+warmer_enabled = true
+
+[nest]
+origin = "https://nest.example"
+username = "u"
+password = "p"
+"#;
+        let dir = std::env::temp_dir().join(format!("kittiwake-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, minimal).unwrap();
+        let parsed = super::Config::load(path.to_str().unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(parsed.is_ok(), "{:?}", parsed.err());
+    }
+}

@@ -2318,12 +2318,46 @@ pub(crate) fn cid_v0(raw: &str) -> Option<&str> {
 /// The manifest is YAML and the reference is `/ipfs/Qm…` under `schema:`. Parsing the whole
 /// document to reach one field would be a manifest parser, which is #67's other half and a day's
 /// work; finding the first CID before `dataSources` is what the incumbent does and is enough.
+/// The CID of the GraphQL schema a manifest names.
+///
+/// Anchored on the `schema:` key wherever in the document it sits. Looking only at the text before
+/// `dataSources` is the incumbent's *fallback* rather than its rule, and porting the fallback alone
+/// answered 404 for every manifest with its keys in alphabetical order - which is what `graph
+/// build` emits, so `dataSources` comes first and `schema:` sits a hundred lines below it. That was
+/// live on `/api/subgraph-schema` until the route was probed against a real deployment.
 pub(crate) fn schema_cid(manifest: &str) -> Option<&str> {
+    let first_cid = |text: &str| -> Option<usize> {
+        text.match_indices("Qm")
+            .find(|(i, _)| text.get(*i..*i + 46).and_then(cid_v0).is_some())
+            .map(|(i, _)| i)
+    };
+
+    // The key on a line of its own, which is what a real manifest has. Anchored, so the word
+    // appearing inside an entity name or a file path earlier in the document cannot claim the
+    // search: the incumbent's regex takes the first "schema" anywhere and would find the wrong
+    // CID for a subgraph with a `schemaVersion` field above its schema.
+    let anchored = manifest
+        .match_indices("schema:")
+        .find(|(i, _)| {
+            manifest[..*i]
+                .chars()
+                .rev()
+                .take_while(|c| *c != '\n')
+                .all(char::is_whitespace)
+        })
+        .map(|(i, _)| i);
+
+    for from in [anchored, manifest.find("schema")].into_iter().flatten() {
+        let text = &manifest[from..];
+        if let Some(i) = first_cid(text) {
+            return cid_v0(&text[i..i + 46]);
+        }
+    }
+
+    // Nothing named `schema` at all: the head of the document, where a hand-written manifest tends
+    // to put it.
     let head = manifest.split("dataSources").next().unwrap_or(manifest);
-    let after_schema = head.find("schema").map(|i| &head[i..]).unwrap_or(head);
-    after_schema
-        .match_indices("Qm")
-        .find_map(|(i, _)| cid_v0(after_schema.get(i..i + 46)?))
+    first_cid(head).and_then(|i| cid_v0(&head[i..i + 46]))
 }
 
 /// `GET /api/subgraph-schema/{hash}`: the GraphQL schema a deployment was built from.
@@ -3626,4 +3660,49 @@ fn deployment_cid(raw: Option<&str>) -> Result<String, ErrorResponse> {
     raw.and_then(cid_v0).map(str::to_string).ok_or_else(|| {
         ApiError::BadRequest("Invalid deployment ID. Expected a CIDv0 hash (Qm…)".into()).into()
     })
+}
+
+#[cfg(test)]
+mod schema_cid_tests {
+    use super::schema_cid;
+
+    const SCHEMA: &str = "QmcGeTxBaueyQtNuV2p9DGjsnu9wNDQqMgTR2XyT3Fiz6U";
+    const ABI: &str = "QmPfKNZPkVATzL3EHypkcsyKhehR4jkiYEVqSzh2hxWYj1";
+
+    /// The shape `graph build` emits: keys in alphabetical order, so `dataSources` comes first and
+    /// carries CIDs of its own, and `schema:` sits below it. Reading only the text above
+    /// `dataSources` finds nothing here and the route answered 404 for the whole of mainnet.
+    #[test]
+    fn the_schema_is_found_below_the_data_sources() {
+        let manifest = format!(
+            "dataSources:\n  - kind: ethereum/contract\n    mapping:\n      abis:\n        - file:\n            /: /ipfs/{ABI}\n          name: ERC20\nschema:\n  file:\n    /: /ipfs/{SCHEMA}\nspecVersion: 0.0.4\n"
+        );
+        assert_eq!(schema_cid(&manifest), Some(SCHEMA));
+    }
+
+    /// The hand-written order, which is the one the port did handle.
+    #[test]
+    fn the_schema_is_found_above_the_data_sources() {
+        let manifest = format!(
+            "specVersion: 0.0.5\nschema:\n  file: /ipfs/{SCHEMA}\ndataSources:\n  - mapping:\n      abis:\n        - file: /ipfs/{ABI}\n"
+        );
+        assert_eq!(schema_cid(&manifest), Some(SCHEMA));
+    }
+
+    /// The key on its own line wins over the word appearing earlier. The incumbent's regex takes
+    /// the first `schema` anywhere and would answer with the ABI's CID here.
+    #[test]
+    fn a_key_named_after_the_word_does_not_claim_the_search() {
+        let manifest = format!(
+            "schemaVersion: 3\ndataSources:\n  - mapping:\n      abis:\n        - file: /ipfs/{ABI}\nschema:\n  file: /ipfs/{SCHEMA}\n"
+        );
+        assert_eq!(schema_cid(&manifest), Some(SCHEMA));
+    }
+
+    #[test]
+    fn a_manifest_with_no_schema_names_none() {
+        let manifest =
+            format!("specVersion: 0.0.5\ndataSources:\n  - mapping:\n      file: /ipfs/{ABI}\n");
+        assert_eq!(schema_cid(&manifest), None);
+    }
 }
