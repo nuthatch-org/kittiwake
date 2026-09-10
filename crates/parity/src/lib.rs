@@ -237,6 +237,11 @@ pub mod coverage {
     /// Every entry here is a thing somebody chose. Empty would be better; a long list is a smell.
     pub const UNCHECKED: &[(&str, Excused, &str)] = &[
         (
+            "/api/analytics/clickthrough",
+            Excused::Entirely,
+            "a write. Comparing it against the incumbent would mean inserting a row into the shared analytics table on every parity run, and its answer is a fixed {ok:true} that says nothing about what was stored",
+        ),
+        (
             "/api/studio/auth",
             Excused::Entirely,
             "session cookies and wallet signatures make the frozen public incumbent unsuitable as a fixture; covered by Dock compatibility tests",

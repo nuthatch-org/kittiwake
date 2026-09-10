@@ -1578,6 +1578,57 @@ pub async fn schema_gaps(pool: &Pool) -> Result<Vec<SchemaGap>, DbError> {
         .collect())
 }
 
+/// One trade click or protocol visit, as `/api/analytics/clickthrough` receives it.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Clickthrough {
+    pub event_type: String,
+    pub token_address: Option<String>,
+    pub token_symbol: Option<String>,
+    pub protocol_slug: Option<String>,
+    pub venue: String,
+    pub pool_address: Option<String>,
+    pub chain: Option<String>,
+    pub destination_url: Option<String>,
+    pub wallet: Option<String>,
+    pub session_id: String,
+}
+
+/// The two the table's own CHECK constraint allows. Rejected here so a bad payload is a 400 rather
+/// than a constraint violation reported as a 500.
+pub const CLICKTHROUGH_EVENT_TYPES: &[&str] = &["trade_click", "protocol_visit"];
+
+/// Append one clickthrough.
+///
+/// `wallet` is stored only when it looks like an address, and `session_id` is truncated, both as
+/// the incumbent did: this is a public unauthenticated write, and the only thing standing between
+/// it and arbitrary strings in a shared table is what this function refuses.
+pub async fn record_clickthrough(pool: &Pool, e: &Clickthrough) -> Result<(), DbError> {
+    let wallet = e.wallet.as_deref().filter(|w| {
+        w.len() == 42 && w.starts_with("0x") && w[2..].chars().all(|c| c.is_ascii_hexdigit())
+    });
+
+    sqlx::query(
+        "INSERT INTO clickthrough_events ( \
+           event_type, token_address, token_symbol, protocol_slug, \
+           venue, pool_address, chain, destination_url, wallet, session_id \
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(&e.event_type)
+    .bind(&e.token_address)
+    .bind(&e.token_symbol)
+    .bind(&e.protocol_slug)
+    .bind(&e.venue)
+    .bind(&e.pool_address)
+    .bind(e.chain.as_deref().unwrap_or("mainnet"))
+    .bind(&e.destination_url)
+    .bind(wallet.map(|w| w.to_ascii_lowercase()))
+    .bind(e.session_id.chars().take(64).collect::<String>())
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod schema_declaration {
     //! What `db/schema.sql` says it declares, checked against the file itself.

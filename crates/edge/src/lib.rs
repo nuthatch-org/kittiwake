@@ -882,6 +882,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/horizon/activity", get(handlers::horizon_activity))
         .route("/api/subgraph-search", get(handlers::subgraph_search))
         .route("/api/subgraph-names", post(handlers::subgraph_names))
+        .route(
+            "/api/analytics/clickthrough",
+            post(handlers::analytics_clickthrough),
+        )
         .route("/api/chain-lag", get(handlers::chain_lag))
         .route("/api/dropped-chains", get(handlers::dropped_chains))
         .route("/api/reo", get(handlers::reo))

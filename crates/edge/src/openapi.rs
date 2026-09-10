@@ -125,6 +125,10 @@ struct Operation {
 /// left out - it will fail the test below until somebody writes its line.
 const SUMMARIES: &[Operation] = &[
     op(
+        "/api/analytics/clickthrough",
+        "Record one trade click or protocol visit from the dashboard.",
+    ),
+    op(
         "/api/network-stats",
         "Protocol-wide totals: stake, delegation, signal, allocation, supply and the current epoch.",
     ),
