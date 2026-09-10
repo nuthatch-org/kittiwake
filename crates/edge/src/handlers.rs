@@ -2279,3 +2279,70 @@ fn cost_model_from(
         .filter(|o| o.is_finite() && *o >= 0.0);
     kittiwake_rewards::pnl::resolve_cost_model(&chains, &overrides, overhead)
 }
+
+// ── The long tail: IPFS reads ────────────────────────────────────────────────
+
+/// A CIDv0, or nothing. Base58 is case-sensitive, so this refuses rather than normalises.
+pub(crate) fn cid_v0(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    (trimmed.len() == 46
+        && trimmed.starts_with("Qm")
+        && trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() && !matches!(b, b'0' | b'O' | b'I' | b'l')))
+    .then_some(trimmed)
+}
+
+/// The schema hash a manifest points at.
+///
+/// The manifest is YAML and the reference is `/ipfs/Qm…` under `schema:`. Parsing the whole
+/// document to reach one field would be a manifest parser, which is #67's other half and a day's
+/// work; finding the first CID before `dataSources` is what the incumbent does and is enough.
+pub(crate) fn schema_cid(manifest: &str) -> Option<&str> {
+    let head = manifest.split("dataSources").next().unwrap_or(manifest);
+    let after_schema = head.find("schema").map(|i| &head[i..]).unwrap_or(head);
+    after_schema
+        .match_indices("Qm")
+        .find_map(|(i, _)| cid_v0(after_schema.get(i..i + 46)?))
+}
+
+/// `GET /api/subgraph-schema/{hash}`: the GraphQL schema a deployment was built from.
+///
+/// Two IPFS reads, both content-addressed and therefore cached for ever rather than for a while.
+pub async fn subgraph_schema(
+    State(st): State<AppState>,
+    Path(hash): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let deployment = cid_v0(&hash)
+        .ok_or_else(|| ErrorResponse::from(ApiError::BadRequest("expected a CIDv0 hash".into())))?;
+    let pool = pool(&st)?;
+
+    let manifest = kittiwake_ext::read_through_text(pool, &st.ipfs, deployment)
+        .await
+        .ok_or_else(|| {
+            ErrorResponse::from(ApiError::Unavailable(
+                "that manifest could not be read from IPFS".into(),
+            ))
+        })?;
+    // A hash that resolves to something that is not a manifest is the caller's mistake, and saying
+    // so beats reporting that no schema was found in a document that never had one.
+    if !manifest.contains("dataSources") && !manifest.contains("specVersion") {
+        return Err(ApiError::BadRequest("that hash is not a subgraph manifest".into()).into());
+    }
+    let schema_cid = schema_cid(&manifest).ok_or(ApiError::NotFound)?;
+    let schema_text = kittiwake_ext::read_through_text(pool, &st.ipfs, schema_cid)
+        .await
+        .ok_or_else(|| {
+            ErrorResponse::from(ApiError::Unavailable(
+                "the manifest names a schema that could not be read from IPFS".into(),
+            ))
+        })?;
+
+    Ok(axum::Json(serde_json::json!({
+        "data": { "schemaText": schema_text, "schemaHash": schema_cid }
+    }))
+    .into_response())
+}

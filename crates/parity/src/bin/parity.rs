@@ -54,6 +54,11 @@ fn routes() -> Vec<Route> {
             ours_at: "/data",
         },
         both("/api/curators?first=10"),
+        Route {
+            path: leak(format!("/api/subgraph-schema/{D}")),
+            incumbent_at: "",
+            ours_at: "",
+        },
         // The long tail's Postgres reads. Both sides read the same tables, so these compare on
         // values as well as shape. #67
         Route {

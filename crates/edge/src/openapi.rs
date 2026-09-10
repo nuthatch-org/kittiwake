@@ -244,6 +244,10 @@ const SUMMARIES: &[Operation] = &[
         "That revenue netted against a modelled infrastructure cost. The cost side is an estimate the caller may override, not a measurement.",
     ),
     op(
+        "/api/subgraph-schema/{hash}",
+        "The GraphQL schema a deployment was built from, as text.",
+    ),
+    op(
         "/api/indexer-node-health",
         "Whether an indexer's own endpoints answer.",
     ),
