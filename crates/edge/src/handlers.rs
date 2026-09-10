@@ -22,7 +22,15 @@ fn dock(st: &AppState) -> Result<&crate::Studio, ErrorResponse> {
         .ok_or_else(|| ApiError::Unavailable("the Dock is not configured".into()).into())
 }
 
-fn session(st: &AppState, headers: &HeaderMap) -> Result<String, ErrorResponse> {
+/// The address a request's session vouches for, taking only what it decides on.
+///
+/// Split out from [`session`] so the refusals are testable without an `AppState`: the Dock's whole
+/// authorisation is this cookie, and every owner-scoped route is exactly as strong as it is.
+pub(crate) fn session_address(
+    secret: &kittiwake_dock::Secret,
+    headers: &HeaderMap,
+    now: i64,
+) -> Option<String> {
     let token = headers
         .get(header::COOKIE)
         .and_then(|h| h.to_str().ok())
@@ -30,10 +38,12 @@ fn session(st: &AppState, headers: &HeaderMap) -> Result<String, ErrorResponse> 
             all.split(';')
                 .map(str::trim)
                 .find_map(|part| part.strip_prefix("studio_session="))
-        })
-        .ok_or(ApiError::Unauthorized)?;
-    kittiwake_dock::parse_session(&dock(st)?.secret, token, now())
-        .map_err(|_| ApiError::Unauthorized.into())
+        })?;
+    kittiwake_dock::parse_session(secret, token, now).ok()
+}
+
+fn session(st: &AppState, headers: &HeaderMap) -> Result<String, ErrorResponse> {
+    session_address(&dock(st)?.secret, headers, now()).ok_or_else(|| ApiError::Unauthorized.into())
 }
 
 fn scuttle(st: &AppState) -> Result<&crate::Scuttle, ErrorResponse> {
@@ -1024,7 +1034,17 @@ pub async fn studio_subgraph_delete(
     Ok(axum::Json(serde_json::json!({"ok":true})).into_response())
 }
 
-fn valid_slug(s: &str) -> bool {
+/// A bounty amount: positive, and a number that exists.
+///
+/// The finite check is the point. `"inf"` and `"1e400"` both parse to `f64::INFINITY`, which is
+/// greater than zero, and the column is text - so the value reaches Postgres intact and the board
+/// query orders by `amount_grt::numeric`, where Postgres 16 accepts Infinity quite happily. One
+/// signed-in caller could pin a bounty to the top of the public board for ever.
+pub(crate) fn positive_amount(s: &str) -> bool {
+    s.parse::<f64>().is_ok_and(|n| n.is_finite() && n > 0.0)
+}
+
+pub(crate) fn valid_slug(s: &str) -> bool {
     let mut p = s.split('/');
     let ok = |x: &str| {
         !x.is_empty()
@@ -1231,7 +1251,7 @@ pub async fn studio_bounties_post(
     let amount = body
         .get("amount_grt")
         .and_then(|v| v.as_str())
-        .filter(|s| s.parse::<f64>().is_ok_and(|n| n > 0.0))
+        .filter(|s| positive_amount(s))
         .ok_or_else(|| ApiError::BadRequest("amount_grt must be a positive number".into()))?;
     let subgraph_id = match body.get("slug").and_then(|v| v.as_str()) {
         Some(s) => kittiwake_db::studio_subgraph_by_slug(pool(&st)?, s)

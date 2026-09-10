@@ -1276,6 +1276,53 @@ mod tests {
         }
     }
 
+    // ── The Dock ─────────────────────────────────────────────────────────────
+    //
+    // The nine Studio routes landed in #64 without coverage for the three things standing between
+    // them and a bad request: the slug format, the bounty amount, and the session cookie.
+
+    const DOCK_NOW: i64 = 1_760_000_000;
+
+    fn dock_secret() -> kittiwake_dock::Secret {
+        kittiwake_dock::Secret::new("a-studio-session-secret-of-adequate-length").unwrap()
+    }
+
+    fn dock_cookie(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(value).unwrap(),
+        );
+        h
+    }
+
+    /// A slug is the address the frontend routes on, so anything that is not exactly `org/name` in
+    /// lowercase is refused rather than normalised into something plausible.
+    #[test]
+    fn a_slug_is_two_lowercase_parts_and_nothing_else() {
+        for good in ["acme/uniswap-v3", "a/b", "org-1/name-2", "0x/9"] {
+            assert!(crate::handlers::valid_slug(good), "{good} is a valid slug");
+        }
+        for bad in [
+            "",
+            "acme",
+            "acme/",
+            "/uniswap",
+            "Acme/uniswap",
+            "acme/Uniswap",
+            "acme/uni swap",
+            "acme/uni_swap",
+            "acme/a/b",
+            "../etc/passwd",
+            "acme/uniswap!",
+        ] {
+            assert!(
+                !crate::handlers::valid_slug(bad),
+                "{bad:?} is not a valid slug"
+            );
+        }
+    }
+
     /// A session that has run out is refused rather than renewed by being presented.
     #[test]
     fn a_session_older_than_its_lifetime_is_refused() {
@@ -1305,6 +1352,72 @@ mod tests {
             Some("wanted")
         );
         assert_eq!(crate::handlers::scuttle_cookie(&h, "absent"), None);
+    }
+
+    /// The regression this test exists for. `amount_grt` is text in the table and the public board
+    /// orders by `amount_grt::numeric`; Postgres 16 parses Infinity, so `"inf"` from one signed-in
+    /// caller would sit at the top of everyone's board permanently.
+    #[test]
+    fn an_infinite_bounty_is_not_a_positive_number() {
+        for refused in ["inf", "-inf", "infinity", "Infinity", "1e400", "NaN", "nan"] {
+            assert!(
+                !crate::handlers::positive_amount(refused),
+                "{refused:?} must not be accepted as an amount"
+            );
+        }
+        for accepted in ["1", "0.5", "1000000", "1e6"] {
+            assert!(
+                crate::handlers::positive_amount(accepted),
+                "{accepted:?} is a real amount"
+            );
+        }
+        // And the boundary, which was already right and stays that way.
+        for refused in ["0", "-1", "", "one", "1 GRT"] {
+            assert!(!crate::handlers::positive_amount(refused), "{refused:?}");
+        }
+    }
+
+    /// The session cookie is the whole of the Dock's authorisation, so every owner-scoped route is
+    /// exactly as strong as this is.
+    #[test]
+    fn a_studio_session_names_an_address_or_nobody() {
+        let token = kittiwake_dock::create_session(&dock_secret(), "0xAbCd", DOCK_NOW);
+        let other = kittiwake_dock::Secret::new("a-different-secret-of-adequate-length!!").unwrap();
+        let named = |h: &HeaderMap| crate::handlers::session_address(&dock_secret(), h, DOCK_NOW);
+
+        // Lowercased, because that is what every owner column stores.
+        assert_eq!(
+            named(&dock_cookie(&format!("studio_session={token}"))).as_deref(),
+            Some("0xabcd")
+        );
+        // And found among its neighbours, which is the normal case in a browser.
+        assert_eq!(
+            named(&dock_cookie(&format!(
+                "theme=dark; studio_session={token}; x=1"
+            )))
+            .as_deref(),
+            Some("0xabcd")
+        );
+
+        assert_eq!(named(&HeaderMap::new()), None);
+        assert_eq!(named(&dock_cookie("studio_session=")), None);
+        assert_eq!(
+            named(&dock_cookie(&format!(
+                "studio_session={}",
+                kittiwake_dock::create_session(&other, "0xAbCd", DOCK_NOW)
+            ))),
+            None,
+            "a token signed with another secret is not a session"
+        );
+        assert_eq!(
+            crate::handlers::session_address(
+                &dock_secret(),
+                &dock_cookie(&format!("studio_session={token}")),
+                DOCK_NOW + kittiwake_dock::SESSION_TTL_SECS + 1
+            ),
+            None,
+            "an expired session stays expired"
+        );
     }
 
     fn hdr(k: &str, v: &str) -> HeaderMap {
