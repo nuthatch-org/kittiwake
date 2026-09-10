@@ -3148,3 +3148,154 @@ pub async fn qos_capture(
         .await?;
     Ok(envelope(read))
 }
+
+// ── The service census ───────────────────────────────────────────────────────
+
+use kittiwake_read::census;
+
+/// Call one provider's advertised endpoint and read the answer.
+///
+/// **The endpoint is a string somebody put on chain**, so it goes through the SSRF guard before it
+/// goes anywhere near a socket. The incumbent fetched it unchecked, which made a public route into
+/// an SSRF with a status code and a latency for an oracle; see nightswatchhq/lodestar#149.
+async fn probe_provider(provider: &census::Provider, kind: census::Probe) -> census::ProviderProbe {
+    let mut out = census::ProviderProbe {
+        address: provider.address.clone(),
+        endpoint: provider.endpoint.clone(),
+        verdict: census::Verdict::NoEndpoint,
+        http_status: None,
+        latency_ms: None,
+    };
+    if provider.endpoint.is_empty() {
+        return out;
+    }
+    if kittiwake_ssrf::check_resolved(&provider.endpoint)
+        .await
+        .is_err()
+    {
+        out.verdict = census::Verdict::Refused;
+        return out;
+    }
+
+    let started = std::time::Instant::now();
+    let answer = reqwest::Client::new()
+        .get(&provider.endpoint)
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await;
+    out.latency_ms = Some(started.elapsed().as_millis() as u64);
+    match answer {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            out.http_status = Some(status);
+            out.verdict = census::verdict_of(status, kind);
+        }
+        Err(e) if e.is_timeout() => {
+            out.verdict = census::Verdict::Timeout;
+            out.http_status = None;
+        }
+        Err(_) => {
+            out.verdict = census::Verdict::Unreachable;
+            out.http_status = None;
+        }
+    }
+    out
+}
+
+/// `GET /api/service-census`: registry versus reality across every data service.
+///
+/// One service failing does not fail the census. A census returning nothing because one RPC call
+/// timed out tells a reader less than one saying which service it could not read.
+pub async fn service_census(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let chain = st.read.chain.clone().ok_or_else(|| {
+        ErrorResponse::from(ApiError::Unavailable(
+            "no Arbitrum RPC is configured, so no registry can be read".into(),
+        ))
+    })?;
+
+    let read = st
+        .read
+        .cached_external(
+            "service-census",
+            std::time::Duration::from_secs(300),
+            kittiwake_types::ServedFrom::Chain,
+            std::sync::Arc::new(move || {
+                let chain = chain.clone();
+                Box::pin(async move {
+                    let mut services = Vec::new();
+                    for service in census::SERVICES {
+                        services.push(match chain.provider_registry(service.address).await {
+                            Ok(logs) => {
+                                let events: Vec<census::RegistryEvent> = logs
+                                    .into_iter()
+                                    .map(|l| census::RegistryEvent {
+                                        provider: l.provider,
+                                        endpoint: l.endpoint,
+                                        block_number: l.block_number,
+                                        log_index: l.log_index,
+                                        registered: l.registered,
+                                    })
+                                    .collect();
+                                let mut probes = Vec::new();
+                                for provider in census::current_providers(&events) {
+                                    probes.push(probe_provider(&provider, service.probe).await);
+                                }
+                                let requirements =
+                                    chain.provision_ranges(service.address).await.map(|r| {
+                                        census::interpret(
+                                            r.min_tokens,
+                                            r.max_tokens,
+                                            r.min_thawing,
+                                            r.max_thawing,
+                                            r.min_cut_ppm,
+                                            r.max_cut_ppm,
+                                        )
+                                    });
+                                census::summarise(service, probes, requirements)
+                            }
+                            // Named rather than reported as zero providers, so nobody reads "we
+                            // could not look" as "there is nobody there".
+                            Err(e) => census::ServiceCensus {
+                                id: service.id,
+                                name: service.name,
+                                address: service.address,
+                                registered: 0,
+                                serving: 0,
+                                lying: 0,
+                                providers: Vec::new(),
+                                requirements: None,
+                                error: Some(e.to_string()),
+                            },
+                        });
+                    }
+
+                    let benchmark =
+                        chain
+                            .provision_ranges(census::SUBGRAPH_SERVICE)
+                            .await
+                            .map(|r| {
+                                census::interpret(
+                                    r.min_tokens,
+                                    r.max_tokens,
+                                    r.min_thawing,
+                                    r.max_thawing,
+                                    r.min_cut_ppm,
+                                    r.max_cut_ppm,
+                                )
+                            });
+                    Ok(serde_json::json!({
+                        "headline": census::headline(&services),
+                        "benchmark": benchmark,
+                        "services": services,
+                    }))
+                })
+            }),
+        )
+        .await?;
+    Ok(envelope(read))
+}

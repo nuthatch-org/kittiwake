@@ -275,6 +275,10 @@ const SUMMARIES: &[Operation] = &[
         "How allocated stake sits across quality bands. Unscored means not measured, which is most of it.",
     ),
     op(
+        "/api/service-census",
+        "Every data service's registered providers, and whether their endpoints actually answer.",
+    ),
+    op(
         "/api/manifest",
         "How hard a subgraph is to sync, scored out of a hundred with the reasoning attached.",
     ),
