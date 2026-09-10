@@ -28,7 +28,7 @@ kittiwake-types = { version = "0.1.0", path = "../types" }
 # share one canonical encoding: two implementations are two sets of decisions about key ordering
 # and number formatting, and the day they disagree a verifier reports a forgery that never
 # happened. The incumbent compiles this same crate to wasm to avoid exactly that. #19
-tattler = { git = "ssh://git@github.com/nightswatchhq/tattler.git", rev = "0d94f0bdea9d7d854c69d78f0b4f13d72184e091", default-features = false }
+tattler = { git = "https://github.com/nightswatchhq/tattler.git", rev = "0d94f0bdea9d7d854c69d78f0b4f13d72184e091", default-features = false }
 anyhow = "1.0.104"
 ed25519-dalek = "2.2.0"
 hex = "0.4.3"

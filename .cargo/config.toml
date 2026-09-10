@@ -1,5 +1,0 @@
-# `tattler` is a private repository, and libgit2 cannot use the ssh-agent identity that reaches it.
-# Shelling out to git works for a developer with the checkout and for CI with a deploy key, and it
-# is the same mechanism in both places. #19
-[net]
-git-fetch-with-cli = true
