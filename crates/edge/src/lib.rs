@@ -90,6 +90,8 @@ pub struct AppState {
     /// Present only when the Dock has its independently managed session secret.
     pub studio: Option<Studio>,
     pub scuttle: Option<Scuttle>,
+    /// Foghorn's API base, for the QoS proxy. Absent means that route answers 503.
+    pub foghorn_api_url: Option<Arc<str>>,
     /// The key SQL receipts are signed with. Absent means this deployment issues none.
     pub receipt_key: Option<Arc<ed25519_dalek::SigningKey>>,
     /// The secret the edge proxy presents. Absent means no request is ever trusted to name a client
@@ -889,6 +891,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/ens", get(handlers::ens))
         .route("/api/manifest", get(handlers::manifest))
         .route(
+            "/api/foghorn/{*path}",
+            get(handlers::foghorn_get).post(handlers::foghorn_post),
+        )
+        .route(
             "/api/subgraph-versions/{hash}",
             get(handlers::subgraph_versions),
         )
@@ -931,6 +937,7 @@ pub fn state(
     studio: Option<Studio>,
     ipfs: kittiwake_ext::Ipfs,
     scuttle: Option<Scuttle>,
+    foghorn_api_url: Option<String>,
     receipt_key: Option<Arc<ed25519_dalek::SigningKey>>,
 ) -> AppState {
     AppState {
@@ -940,6 +947,7 @@ pub fn state(
         ipfs,
         studio,
         scuttle,
+        foghorn_api_url: foghorn_api_url.map(|u| Arc::from(u.as_str())),
         receipt_key,
         edge_secret: edge_secret.map(|s| Arc::from(s.as_str())),
         pool,
@@ -997,6 +1005,49 @@ async fn get_whoami(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Foghorn ──────────────────────────────────────────────────────────────
+
+    /// The segments are pasted into an upstream URL and the client normalises `..` before sending,
+    /// so a traversal has to be refused here rather than relied on to fail there.
+    #[test]
+    fn a_path_that_could_walk_out_of_the_prefix_is_refused() {
+        for good in ["qos", "status", "buckets", "0x1234", "a.b_c-d", "v1.2"] {
+            assert!(
+                crate::handlers::safe_segment(good),
+                "{good} is a fine segment"
+            );
+        }
+        for bad in [
+            "", ".", "..", "%2e%2e", "a/b", "a b", "a?b", "a#b", "a:b", "..%2f", "a\\b",
+        ] {
+            assert!(
+                !crate::handlers::safe_segment(bad),
+                "{bad:?} must not reach the upstream URL"
+            );
+        }
+    }
+
+    /// A 404 from Foghorn is Foghorn answering. Reporting it as unreachable sent an indexer
+    /// chasing an outage on our side on 2026-08-15, which is why the status is kept.
+    #[test]
+    fn foghorns_own_status_survives_whatever_its_body_is() {
+        let cases = [
+            (200u16, r#"{"ok":true}"#, 200u16),
+            (404, "", 404),
+            (404, "not found", 404),
+            (500, r#"{"error":"boom"}"#, 500),
+            (200, "", 200),
+        ];
+        for (status, body, expected) in cases {
+            let response = crate::handlers::foghorn_answer(status, body.to_string());
+            assert_eq!(
+                response.status().as_u16(),
+                expected,
+                "status {status} with body {body:?}"
+            );
+        }
+    }
 
     // ── The long tail ────────────────────────────────────────────────────────
 

@@ -198,6 +198,9 @@ pub struct Config {
     #[serde(default)]
     pub studio: Option<StudioSettings>,
     pub scuttle: Option<ScuttleSettings>,
+    /// Foghorn's API, which `/api/foghorn/{*path}` proxies. Absent means that route answers 503
+    /// rather than guessing at a host.
+    pub foghorn_api_url: Option<String>,
     #[serde(default)]
     pub receipt: Option<ReceiptSettings>,
     /// Turns the in-process scheduler on. Off by default so a second instance, or a staging box,
@@ -313,6 +316,7 @@ mod tests {
             edge_secret: None,
             studio: None,
             scuttle: None,
+            foghorn_api_url: None,
             receipt: None,
             arbitrum_rpc_url: None,
             mainnet_rpc_url: None,

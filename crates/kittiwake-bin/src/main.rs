@@ -175,6 +175,7 @@ async fn main() -> anyhow::Result<()> {
             flood: Arc::new(kittiwake_scuttle::FloodGuard::new()),
             room: kittiwake_scuttle::Room::new(),
         }),
+        cfg.foghorn_api_url.clone(),
         cfg.receipt.as_ref().map(|r| {
             let bytes: [u8; 32] = hex::decode(&r.issuer_key)
                 .ok()

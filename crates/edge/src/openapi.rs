@@ -80,6 +80,11 @@ pub const WITHHELD: &[(&str, &str)] = &[
          receipt is obtained by asking for one rather than by reading a path",
     ),
     (
+        "/api/foghorn/{*path}",
+        "a pass-through to Foghorn's QoS API; its shape is Foghorn's rather than ours, and it is \
+         documented where that service is",
+    ),
+    (
         "/api/scuttlebutt/admin/login",
         "validates a moderation credential; it is not a public data operation",
     ),
