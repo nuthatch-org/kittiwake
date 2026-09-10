@@ -297,6 +297,13 @@ pub mod coverage {
             "probes a third party's endpoint, so the answer depends on that host rather than on us",
         ),
         (
+            "/api/support",
+            Excused::Entirely,
+            "has no incumbent to match: the dashboard's own handler reads GitHub live and this \
+             reads a mirror written twice a day, so the two disagree by design and the harness \
+             would be comparing freshness rather than correctness",
+        ),
+        (
             "/api/subgraph-names",
             Excused::Entirely,
             "POST with a body; the harness only issues GETs",

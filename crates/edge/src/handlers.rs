@@ -1747,3 +1747,54 @@ async fn kept(st: &AppState, key: &str) -> Option<(serde_json::Value, kittiwake_
         },
     ))
 }
+
+/// `/api/support`: the graph-support archive, as the twice-daily mirror last left it.
+///
+/// The dashboard used to call GitHub for this from its own serverless function, which put a
+/// credential in the frontend's environment and a rate limit in the page load. The mirror removes
+/// both: the repository is public, two requests a day sit well inside what GitHub allows
+/// unauthenticated, and the page reads a table.
+///
+/// An empty table is a failure rather than an empty archive. That repository has never had zero
+/// issues, so nothing here means the job has not run yet or has never succeeded, and answering
+/// `{"issues": []}` would render as "no issues" on a page whose whole purpose is that the answers
+/// exist and are findable.
+pub async fn support(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let pool = st
+        .pool
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("no database is configured".into()))?;
+
+    let issues = kittiwake_db::graph_support_issues(pool)
+        .await
+        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+
+    if issues.is_empty() {
+        return Err(
+            ApiError::Unavailable("the graph-support mirror has not run yet".into()).into(),
+        );
+    }
+
+    // The freshness of the rows, not of this request. Read from the table so it describes the
+    // data being served rather than a cursor that may have moved while the write failed.
+    let fetched_at = kittiwake_db::graph_support_ingested_at(pool)
+        .await
+        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+
+    let mut resp = axum::Json(serde_json::json!({
+        "issues": issues,
+        "fetchedAt": fetched_at,
+    }))
+    .into_response();
+    resp.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-kittiwake-served-from"),
+        axum::http::HeaderValue::from_static("postgres"),
+    );
+    crate::no_store(resp.headers_mut());
+    Ok(resp)
+}
