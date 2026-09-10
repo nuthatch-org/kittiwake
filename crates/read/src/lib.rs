@@ -5,6 +5,7 @@
 //! are properties of *reading a nest*, not of any particular panel, and the previous service put
 //! them at each call site where they drifted.
 
+pub mod concentration;
 pub mod dips_agreements;
 pub mod indexing_status;
 pub mod manifest;

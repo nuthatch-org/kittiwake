@@ -772,6 +772,18 @@ pub async fn update_bounty_status(
 }
 
 // ---------------------------------------------------------------------------------------------
+/// Every indexer holding an allocation, and how much.
+///
+/// The quality score does not come from here: it is Foghorn's, and joining them is the caller's
+/// job precisely so an indexer missing from Foghorn stays missing rather than becoming a zero.
+pub async fn allocating_indexers(pool: &Pool) -> Result<Vec<(String, f64)>, DbError> {
+    Ok(sqlx::query_as(
+        "SELECT address, allocated_grt::float8 FROM indexers WHERE allocated_grt > 0",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
 // ---------------------------------------------------------------------------------------------
 // The long tail: disputes, the parameter trail, and indexer revenue
 // ---------------------------------------------------------------------------------------------
