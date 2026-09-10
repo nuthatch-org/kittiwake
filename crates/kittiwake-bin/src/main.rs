@@ -199,6 +199,9 @@ async fn main() -> anyhow::Result<()> {
             kittiwake_db::ensure_rolling_apy_table(p)
                 .await
                 .context("creating the rolling-APY table")?;
+            kittiwake_db::ensure_graph_support_table(p)
+                .await
+                .context("creating the graph-support mirror table")?;
         }
         jobs.extend(jobs::live_jobs(
             store.clone(),

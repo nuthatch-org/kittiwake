@@ -12,6 +12,7 @@ use kittiwake_nest::{Lane, NestGate, QuerySpec, SqlAnswer};
 use kittiwake_types::NestId;
 
 pub mod bounties;
+pub mod graph_support;
 pub mod live;
 pub mod liveness;
 pub mod rav;
