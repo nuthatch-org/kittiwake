@@ -1,0 +1,20 @@
+[package]
+name = "kittiwake-disasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# graph-node <= 0.41 parsed `ethereum.decode` type strings with ethabi.
+ethabi = { version = "18.0.0", default-features = false, features = ["std", "serde"] }
+# graph-node >= 0.42 parses them with alloy. The two disagreeing is the whole audit.
+alloy-dyn-abi = "1.7.2"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serde_yaml_ng = "0.10.0"
+wasmparser = "0.258.0"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["full"] }
+wat = "1.258.0"

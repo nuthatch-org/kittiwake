@@ -8,6 +8,39 @@ Newest first.
 
 ---
 
+## 2026-09-10: the disassembler needs a parser, not a sandbox
+
+#18 asks for the wasm disassembler to move onto wasmtime with fuel and epoch limits, so a submitted
+module that loops for ever is stopped by the runtime rather than by a timeout wrapped round it.
+
+Nothing in the two surviving routes executes anything. `src/lib/disassembly/index.ts` says so in its
+own header, `types.ts` repeats it, and the whole directory contains exactly one file that shells
+out or instantiates: `build-sandbox.ts`, which belongs to `verify` and goes in
+nightswatchhq/lodestar#144. Fuel bounds instructions executed; the count here is nought.
+
+So this is `wasmparser`, and the improvement is a different one. The incumbent decodes the sections
+by hand, six hundred lines of LEB128 reader and an opcode table, and bails at the first instruction
+it does not model. That is why its reports carry a caveat saying SIMD and atomics make reachability
+partial. `wasmparser` knows the instruction set, so the caveat goes and `incomplete` comes to mean
+what it says: a body that could not be read at all. A transparency tool that no longer has to
+admit it looked away is worth more than a sandbox around code nobody runs.
+
+Two smaller consequences, recorded so they are not read as omissions.
+
+**The decode audit stops being able to fail.** The incumbent classifies `ethereum.decode` type
+strings by compiling the real ethabi and alloy parsers to WebAssembly and loading the artefact from
+Node, and degrades to `unavailable` when that load fails. Here they are ordinary dependencies.
+There is no artefact, no loader and no unavailable state, so the field and the caveat that reported
+it are both gone. The vectors from `crates/decode-classify` are ported as they stand and pass
+against alloy 1.7.2, which the incumbent pinned at 0.8.
+
+**`sourceHint` is not ported.** It exists to pre-fill the repository URL in the "Verify against
+source" box, and #144 deletes that box along with the route behind it. Porting a field whose only
+reader is being removed in the same week would be carrying a decision across a migration rather
+than making one.
+
+---
+
 ## 2026-09-10: `blog/search-index` stays on Next, and it is not a route this service should want
 
 The last of #67's nineteen, and the only one answered by declining it.
