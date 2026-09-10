@@ -699,13 +699,68 @@ async fn get_openapi() -> Response {
 
 /// Liveness: is this process answering. Deliberately says nothing about the nests, because a
 /// process that is up and a service that is correct are different questions.
+/// Whether this service is well, and if not, which part of it is not.
+///
+/// It used to answer `ok: true` unconditionally, which meant that on 2026-09-10 the only thing
+/// able to notice five ingest jobs failing every run for six and a half hours was a staleness
+/// threshold on the other side of the internet. A process that cannot report its own faults leaves
+/// that job to whoever happens to read a graph.
+///
+/// Two faults it can now name. A schema gap is knowable at boot and in milliseconds: the binary
+/// declares the columns it needs and the database either has them or does not. A job failing every
+/// run is knowable from `cron_runs`, which has recorded every one of them all along.
+///
+/// `ok` is false when either is present, so anything already watching this endpoint inherits both
+/// without being told about them.
 async fn get_health(State(st): State<AppState>) -> Response {
-    axum::Json(serde_json::json!({
-        "ok": true,
-        "uptime_seconds": st.started.elapsed().as_secs(),
-        "cached_entries": st.read.store.entry_count(),
-    }))
-    .into_response()
+    let mut body = serde_json::Map::new();
+    body.insert("uptime_seconds".into(), st.started.elapsed().as_secs().into());
+    body.insert(
+        "cached_entries".into(),
+        st.read.store.entry_count().into(),
+    );
+
+    let mut ok = true;
+
+    match st.pool.as_ref() {
+        None => {
+            // Read-only against the nests, with no Postgres configured. Neither check applies, and
+            // saying so is better than reporting a clean bill nothing looked for.
+            body.insert("database".into(), serde_json::json!("not configured"));
+        }
+        Some(pool) => {
+            match kittiwake_db::schema_gaps(pool).await {
+                Ok(gaps) => {
+                    if !gaps.is_empty() {
+                        ok = false;
+                    }
+                    body.insert("schema_gaps".into(), serde_json::json!(gaps));
+                }
+                Err(e) => {
+                    ok = false;
+                    body.insert("schema_gaps".into(), serde_json::json!({ "error": e.to_string() }));
+                }
+            }
+
+            // Three in a row rather than one: every job here is retried on a schedule, and a single
+            // failure against a nest that blinked is not news.
+            match kittiwake_db::failing_jobs(pool, 3).await {
+                Ok(jobs) => {
+                    if !jobs.is_empty() {
+                        ok = false;
+                    }
+                    body.insert("failing_jobs".into(), serde_json::json!(jobs));
+                }
+                Err(e) => {
+                    ok = false;
+                    body.insert("failing_jobs".into(), serde_json::json!({ "error": e.to_string() }));
+                }
+            }
+        }
+    }
+
+    body.insert("ok".into(), ok.into());
+    axum::Json(serde_json::Value::Object(body)).into_response()
 }
 
 /// Readiness: what every nest says about itself. The archive is reported without judgement,

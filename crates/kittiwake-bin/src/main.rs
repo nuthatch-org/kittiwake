@@ -88,6 +88,39 @@ async fn main() -> anyhow::Result<()> {
                 max_connections = cfg.database_max_connections,
                 "postgres ready"
             );
+
+            // Said once, loudly, at the moment a deploy is being watched. On 2026-09-10 a binary
+            // needing `ingestion_state.last_timestamp` ran for six and a half hours against a
+            // database without it, and the only symptom was five ingest jobs quietly failing every
+            // run. This is knowable here, in one query, before any of them fire.
+            //
+            // It does not refuse to start. The read API serves the dashboard from the nests and is
+            // unaffected by a gap in a table only the ingest side writes, and taking the whole
+            // service down for that would turn a partial outage into a total one.
+            match kittiwake_db::schema_gaps(&pool).await {
+                Ok(gaps) if !gaps.is_empty() => {
+                    for gap in &gaps {
+                        match &gap.column {
+                            Some(column) => tracing::error!(
+                                table = %gap.table,
+                                column = %column,
+                                "the database is missing a column this build declares"
+                            ),
+                            None => tracing::error!(
+                                table = %gap.table,
+                                "the database is missing a table this build declares"
+                            ),
+                        }
+                    }
+                    tracing::error!(
+                        count = gaps.len(),
+                        "schema gaps: jobs touching these will fail every run. /health reports them"
+                    );
+                }
+                Ok(_) => tracing::info!("schema matches this build"),
+                Err(e) => tracing::warn!(error = %e, "the schema could not be checked"),
+            }
+
             Some(pool)
         }
         None => {
