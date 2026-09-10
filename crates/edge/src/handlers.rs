@@ -3662,6 +3662,39 @@ fn deployment_cid(raw: Option<&str>) -> Result<String, ErrorResponse> {
     })
 }
 
+/// `POST /api/analytics/clickthrough` — one trade click or protocol visit.
+///
+/// Unauthenticated and fire-and-forget: the caller ignores the answer, and a reader must never see
+/// anything because a click could not be counted. What that buys is a public write into a shared
+/// table, so the validation here is the whole of the door: the event type is checked against the
+/// two the column's CHECK allows, `venue` and `session_id` are required, and the wallet is stored
+/// only when it is shaped like an address.
+pub async fn analytics_clickthrough(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<kittiwake_db::Clickthrough>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let pool = st
+        .pool
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("no database is configured".into()))?;
+
+    if !kittiwake_db::CLICKTHROUGH_EVENT_TYPES.contains(&body.event_type.as_str())
+        || body.venue.is_empty()
+        || body.session_id.is_empty()
+    {
+        return Err(ApiError::BadRequest("invalid payload".into()).into());
+    }
+
+    kittiwake_db::record_clickthrough(pool, &body)
+        .await
+        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+
+    Ok(axum::Json(serde_json::json!({ "ok": true })).into_response())
+}
+
 #[cfg(test)]
 mod schema_cid_tests {
     use super::schema_cid;
@@ -3705,37 +3738,4 @@ mod schema_cid_tests {
             format!("specVersion: 0.0.5\ndataSources:\n  - mapping:\n      file: /ipfs/{ABI}\n");
         assert_eq!(schema_cid(&manifest), None);
     }
-}
-
-/// `POST /api/analytics/clickthrough` — one trade click or protocol visit.
-///
-/// Unauthenticated and fire-and-forget: the caller ignores the answer, and a reader must never see
-/// anything because a click could not be counted. What that buys is a public write into a shared
-/// table, so the validation here is the whole of the door: the event type is checked against the
-/// two the column's CHECK allows, `venue` and `session_id` are required, and the wallet is stored
-/// only when it is shaped like an address.
-pub async fn analytics_clickthrough(
-    State(st): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    axum::Json(body): axum::Json<kittiwake_db::Clickthrough>,
-) -> Result<Response, ErrorResponse> {
-    budget!(st, peer, headers);
-    let pool = st
-        .pool
-        .as_ref()
-        .ok_or_else(|| ApiError::Unavailable("no database is configured".into()))?;
-
-    if !kittiwake_db::CLICKTHROUGH_EVENT_TYPES.contains(&body.event_type.as_str())
-        || body.venue.is_empty()
-        || body.session_id.is_empty()
-    {
-        return Err(ApiError::BadRequest("invalid payload".into()).into());
-    }
-
-    kittiwake_db::record_clickthrough(pool, &body)
-        .await
-        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
-
-    Ok(axum::Json(serde_json::json!({ "ok": true })).into_response())
 }
