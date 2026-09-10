@@ -771,6 +771,106 @@ pub async fn update_bounty_status(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------------------------
+// Scuttlebutt
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct ScuttleMessage {
+    pub id: i64,
+    pub room: String,
+    pub name: Option<String>,
+    pub tripcode: Option<String>,
+    pub body: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub async fn scuttle_history(
+    pool: &Pool,
+    before: Option<i64>,
+    limit: i64,
+) -> Result<Vec<ScuttleMessage>, DbError> {
+    let rows = if let Some(before) = before {
+        sqlx::query_as("SELECT id, room, name, tripcode, body, created_at FROM scuttlebutt_messages WHERE room = 'main' AND deleted = false AND id < $1 ORDER BY id DESC LIMIT $2")
+            .bind(before).bind(limit).fetch_all(pool).await?
+    } else {
+        sqlx::query_as("SELECT id, room, name, tripcode, body, created_at FROM scuttlebutt_messages WHERE room = 'main' AND deleted = false ORDER BY id DESC LIMIT $1")
+            .bind(limit).fetch_all(pool).await?
+    };
+    Ok(rows)
+}
+
+pub async fn scuttle_post(
+    pool: &Pool,
+    name: Option<&str>,
+    tripcode: Option<&str>,
+    body: &str,
+    ip_hash: &str,
+) -> Result<ScuttleMessage, DbError> {
+    Ok(sqlx::query_as("INSERT INTO scuttlebutt_messages (room, name, tripcode, body, ip_hash) VALUES ('main', $1, $2, $3, $4) RETURNING id, room, name, tripcode, body, created_at")
+        .bind(name).bind(tripcode).bind(body).bind(ip_hash).fetch_one(pool).await?)
+}
+
+pub async fn scuttle_is_banned(
+    pool: &Pool,
+    ip_hash: &str,
+    tripcode: Option<&str>,
+) -> Result<bool, DbError> {
+    let found: Option<(i64,)> = sqlx::query_as("SELECT id FROM scuttlebutt_bans WHERE (expires_at IS NULL OR expires_at > NOW()) AND (ip_hash = $1 OR tripcode = $2) LIMIT 1")
+        .bind(ip_hash).bind(tripcode).fetch_optional(pool).await?;
+    Ok(found.is_some())
+}
+
+pub async fn scuttle_delete(pool: &Pool, id: i64, reason: Option<&str>) -> Result<bool, DbError> {
+    let done = sqlx::query(
+        "UPDATE scuttlebutt_messages SET deleted = true, deleted_at = NOW(), delete_reason = $2 \
+         WHERE id = $1 AND deleted = false",
+    )
+    .bind(id)
+    .bind(reason)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() == 1)
+}
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct ScuttleBan {
+    pub id: i64,
+    pub ip_hash: Option<String>,
+    pub tripcode: Option<String>,
+    pub reason: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+pub async fn scuttle_bans(pool: &Pool) -> Result<Vec<ScuttleBan>, DbError> {
+    Ok(sqlx::query_as(
+        "SELECT id, ip_hash, tripcode, reason, created_at, expires_at FROM scuttlebutt_bans \
+         ORDER BY id DESC",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn scuttle_ban(
+    pool: &Pool,
+    ip_hash: Option<&str>,
+    tripcode: Option<&str>,
+    reason: Option<&str>,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<ScuttleBan, DbError> {
+    Ok(sqlx::query_as(
+        "INSERT INTO scuttlebutt_bans (ip_hash, tripcode, reason, expires_at) VALUES ($1, $2, $3, $4) \
+         RETURNING id, ip_hash, tripcode, reason, created_at, expires_at",
+    )
+    .bind(ip_hash)
+    .bind(tripcode)
+    .bind(reason)
+    .bind(expires_at)
+    .fetch_one(pool)
+    .await?)
+}
+
 #[cfg(test)]
 mod schema_coverage {
     //! Every Postgres table this service names must exist in `db/schema.sql`.

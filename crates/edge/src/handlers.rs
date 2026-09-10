@@ -9,7 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{ConnectInfo, OriginalUri, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::sse::Event as SseEvent;
+use axum::response::{IntoResponse, Response, Sse};
 use kittiwake_read::routes;
 use kittiwake_types::ApiError;
 
@@ -35,6 +36,12 @@ fn session(st: &AppState, headers: &HeaderMap) -> Result<String, ErrorResponse> 
         .map_err(|_| ApiError::Unauthorized.into())
 }
 
+fn scuttle(st: &AppState) -> Result<&crate::Scuttle, ErrorResponse> {
+    st.scuttle
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("Scuttlebutt is not configured".into()).into())
+}
+
 fn pool(st: &AppState) -> Result<&kittiwake_db::Pool, ErrorResponse> {
     st.pool
         .as_ref()
@@ -43,6 +50,54 @@ fn pool(st: &AppState) -> Result<&kittiwake_db::Pool, ErrorResponse> {
 
 fn db_err(e: kittiwake_db::DbError) -> ErrorResponse {
     ApiError::Unavailable(format!("database: {e}")).into()
+}
+
+fn scuttle_message(row: kittiwake_db::ScuttleMessage) -> kittiwake_scuttle::Message {
+    kittiwake_scuttle::Message {
+        id: row.id,
+        room: row.room,
+        name: row.name,
+        tripcode: row.tripcode,
+        body: row.body,
+        created_at: row.created_at.to_rfc3339(),
+    }
+}
+
+/// Extract a named cookie without accepting an almost-match. Cookie attributes are not sent back
+/// by a browser, but treating an arbitrary `sb_adminish=` value as one would still be a rather
+/// needless way to make authentication exciting.
+pub(crate) fn scuttle_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())?
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(key, value)| (key == name).then_some(value))
+}
+
+/// The moderator check, taking only what it decides on. Keeping `AppState` out of it is what makes
+/// the refusals testable, and a moderation surface exercised only in production is not exercised.
+pub(crate) fn scuttle_admin_ok(
+    secret: &kittiwake_dock::Secret,
+    headers: &HeaderMap,
+    mutation: bool,
+    now: i64,
+) -> bool {
+    let signed_in = scuttle_cookie(headers, "sb_admin")
+        .and_then(|token| kittiwake_dock::parse_session(secret, token, now).ok())
+        .as_deref()
+        == Some("admin");
+    // A cookie travels on every same-site request, so a mutation additionally wants something only
+    // a script of ours sends. A browser will not attach this header cross-origin without CORS.
+    signed_in && (!mutation || headers.get("x-sb-admin").and_then(|v| v.to_str().ok()) == Some("1"))
+}
+
+fn scuttle_admin(st: &AppState, headers: &HeaderMap, mutation: bool) -> Result<(), ErrorResponse> {
+    let room = scuttle(st)?;
+    if scuttle_admin_ok(&room.admin_session_secret, headers, mutation, now()) {
+        return Ok(());
+    }
+    Err(ApiError::BadRequest("invalid Scuttlebutt administrator session".into()).into())
 }
 
 /// Seconds since the epoch, for the "since" windows.
@@ -1845,4 +1900,213 @@ pub async fn support_issue(
     );
     crate::no_store(resp.headers_mut());
     Ok(resp)
+}
+
+#[derive(serde::Deserialize)]
+pub struct ScuttleHistory {
+    pub before: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+/// The durable room history, newest first. The stream only tells a subscriber what happened after
+/// it joined; history is what lets it recover from a reconnect or a reported broadcast gap.
+pub async fn scuttle_messages(
+    State(st): State<AppState>,
+    Query(q): Query<ScuttleHistory>,
+) -> Result<Response, ErrorResponse> {
+    scuttle(&st)?;
+    let rows =
+        kittiwake_db::scuttle_history(pool(&st)?, q.before, q.limit.unwrap_or(50).clamp(1, 100))
+            .await
+            .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+    let mut response = axum::Json(serde_json::json!({ "messages": rows })).into_response();
+    crate::no_store(response.headers_mut());
+    Ok(response)
+}
+
+#[derive(serde::Deserialize)]
+pub struct ScuttlePost {
+    pub name: Option<String>,
+    pub body: String,
+}
+
+/// Store first, then fan out. Sending first makes a transient database failure visible in the
+/// stream but absent from a reconnecting reader's history, which is precisely the sort of little
+/// contradiction a chat room never forgets.
+pub async fn scuttle_post(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<ScuttlePost>,
+) -> Result<Response, ErrorResponse> {
+    let room = scuttle(&st)?;
+    let caller = client_ip(peer, &headers, st.edge_secret.as_deref());
+    st.limits.check(&st.limits.mutation, caller)?;
+    let ip_hash = kittiwake_scuttle::hash_ip(&room.ip_pepper, &caller.to_string());
+    if room.flood.check(&ip_hash).reason().is_some() {
+        return Err(ApiError::RateLimited { retry_after: 2 }.into());
+    }
+    let identity = kittiwake_scuttle::parse_name(&room.salt, body.name.as_deref());
+    let cleaned = kittiwake_scuttle::clean(&body.body, &[])
+        .ok_or_else(|| ApiError::BadRequest("message is empty".into()))?;
+    if cleaned.chars().count() > kittiwake_scuttle::MAX_BODY {
+        return Err(ApiError::BadRequest(format!(
+            "message is longer than {} characters",
+            kittiwake_scuttle::MAX_BODY
+        ))
+        .into());
+    }
+    if kittiwake_db::scuttle_is_banned(pool(&st)?, &ip_hash, identity.tripcode.as_deref())
+        .await
+        .map_err(|e| ApiError::Unavailable(e.to_string()))?
+    {
+        return Err(ApiError::BadRequest("you are banned from this room".into()).into());
+    }
+    let saved = kittiwake_db::scuttle_post(
+        pool(&st)?,
+        identity.name.as_deref(),
+        identity.tripcode.as_deref(),
+        &cleaned,
+        &ip_hash,
+    )
+    .await
+    .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+    let message = scuttle_message(saved);
+    room.room.publish(kittiwake_scuttle::Event::Message {
+        message: Box::new(message.clone()),
+    });
+    let mut response = axum::Json(serde_json::json!({ "message": message })).into_response();
+    crate::no_store(response.headers_mut());
+    Ok(response)
+}
+
+/// The live half of the room. A lagged subscriber receives an explicit `gap` event and can refill
+/// from `GET messages`; silently disconnecting it is a lie by omission.
+pub async fn scuttle_stream(State(st): State<AppState>) -> Result<Response, ErrorResponse> {
+    let subscriber = scuttle(&st)?.room.subscribe();
+    let stream = futures::stream::unfold(subscriber, |mut subscriber| async move {
+        let event = subscriber.next().await?;
+        let name = match event {
+            kittiwake_scuttle::Event::Message { .. } => "message",
+            kittiwake_scuttle::Event::Delete { .. } => "delete",
+            kittiwake_scuttle::Event::Gap { .. } => "gap",
+        };
+        let data = serde_json::to_string(&event).expect("Scuttlebutt events serialize");
+        Some((
+            Ok::<_, std::convert::Infallible>(SseEvent::default().event(name).data(data)),
+            subscriber,
+        ))
+    });
+    let mut response = Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response();
+    crate::no_store(response.headers_mut());
+    Ok(response)
+}
+
+#[derive(serde::Deserialize)]
+pub struct ScuttleDelete {
+    pub reason: Option<String>,
+}
+
+pub async fn scuttle_delete(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<ScuttleDelete>,
+) -> Result<Response, ErrorResponse> {
+    scuttle_admin(&st, &headers, true)?;
+    if !kittiwake_db::scuttle_delete(pool(&st)?, id, body.reason.as_deref())
+        .await
+        .map_err(|e| ApiError::Unavailable(e.to_string()))?
+    {
+        return Err(ApiError::NotFound.into());
+    }
+    scuttle(&st)?
+        .room
+        .publish(kittiwake_scuttle::Event::Delete { id });
+    Ok(axum::Json(serde_json::json!({ "deleted": id })).into_response())
+}
+
+pub async fn scuttle_admin_messages(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ScuttleHistory>,
+) -> Result<Response, ErrorResponse> {
+    scuttle_admin(&st, &headers, false)?;
+    scuttle_messages(State(st), Query(q)).await
+}
+
+#[derive(serde::Deserialize)]
+pub struct ScuttleLogin {
+    pub password: String,
+}
+
+/// Log in by minting the same stateless HMAC cookie as the incumbent. This is deliberately not a
+/// second auth format: its payload is `admin:<issued-at>` and its signature uses SESSION_SECRET,
+/// so a moderator's session survives moving the route.
+pub async fn scuttle_admin_login(
+    State(st): State<AppState>,
+    axum::Json(body): axum::Json<ScuttleLogin>,
+) -> Result<Response, ErrorResponse> {
+    let room = scuttle(&st)?;
+    let equal: bool =
+        subtle::ConstantTimeEq::ct_eq(body.password.as_bytes(), room.admin_secret.as_bytes())
+            .into();
+    if body.password.len() != room.admin_secret.len() || !equal {
+        return Err(
+            ApiError::BadRequest("invalid Scuttlebutt administrator password".into()).into(),
+        );
+    }
+    let token = kittiwake_dock::create_session(&room.admin_session_secret, "admin", now());
+    let mut response = axum::Json(serde_json::json!({ "admin": true })).into_response();
+    let cookie = format!(
+        "sb_admin={token}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict",
+        kittiwake_dock::SESSION_TTL_SECS
+    );
+    response.headers_mut().insert(
+        axum::http::header::SET_COOKIE,
+        axum::http::HeaderValue::from_str(&cookie).expect("session cookie is a valid header"),
+    );
+    Ok(response)
+}
+
+pub async fn scuttle_bans(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    scuttle_admin(&st, &headers, false)?;
+    let bans = kittiwake_db::scuttle_bans(pool(&st)?)
+        .await
+        .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+    Ok(axum::Json(serde_json::json!({ "bans": bans })).into_response())
+}
+
+#[derive(serde::Deserialize)]
+pub struct ScuttleBanRequest {
+    pub ip_hash: Option<String>,
+    pub tripcode: Option<String>,
+    pub reason: Option<String>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+pub async fn scuttle_ban(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<ScuttleBanRequest>,
+) -> Result<Response, ErrorResponse> {
+    scuttle_admin(&st, &headers, true)?;
+    if body.ip_hash.is_none() && body.tripcode.is_none() {
+        return Err(ApiError::BadRequest("a ban needs an IP hash or tripcode".into()).into());
+    }
+    let ban = kittiwake_db::scuttle_ban(
+        pool(&st)?,
+        body.ip_hash.as_deref(),
+        body.tripcode.as_deref(),
+        body.reason.as_deref(),
+        body.expires_at,
+    )
+    .await
+    .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+    Ok(axum::Json(serde_json::json!({ "ban": ban })).into_response())
 }
