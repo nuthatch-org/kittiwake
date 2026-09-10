@@ -244,6 +244,10 @@ const SUMMARIES: &[Operation] = &[
         "That revenue netted against a modelled infrastructure cost. The cost side is an estimate the caller may override, not a measurement.",
     ),
     op(
+        "/api/dips/agreements",
+        "The Direct Indexer Payments agreement lifecycle: offered, accepted, active, collected, ended. Empty on Arbitrum One until an agreement is funded, and it says so.",
+    ),
+    op(
         "/api/subgraph-schema/{hash}",
         "The GraphQL schema a deployment was built from, as text.",
     ),

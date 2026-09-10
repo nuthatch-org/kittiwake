@@ -13,6 +13,7 @@ use kittiwake_cache::CachePolicy;
 use kittiwake_nest::{Lane, NestGate, QuerySpec};
 use kittiwake_types::{ApiError, NestId, Provenance};
 
+use crate::dips_agreements as dips_agreements_mod;
 use crate::{Fetcher, Read, ReadCtx, shape, sql};
 
 /// One query inside a composed answer.
@@ -1222,6 +1223,44 @@ pub async fn deployment_status(ctx: &ReadCtx, dep: &str) -> Result<Read, ApiErro
 /// Four folds against the DIPS nest, which admits two concurrent queries. The gate is what makes
 /// that safe: the Node version fired all four at once and survived only because the client
 /// happened to stagger them, which was not a property anyone chose.
+/// `/api/dips/agreements`: the DIPS agreement lifecycle, offer through collection.
+///
+/// One `SELECT *` per stage table rather than one clever UNION. The nest's own `dips_timeline`
+/// view unions its sources and that is the right shape beside the data, but this code cannot be
+/// exercised against a populated nest, so it is written to fail loudly rather than subtly: a
+/// per-table read has no cross-branch type unification to get wrong, and a mistaken column name
+/// surfaces as an absent field rather than as a query returning plausible rubbish.
+///
+/// The parts run concurrently and each is coalesced on its own statement, so the nine cost one
+/// round of gate permits rather than nine sequential ones.
+pub async fn dips_agreements(ctx: &ReadCtx, sepolia: bool) -> Result<Read, ApiError> {
+    let nest = if sepolia {
+        NestId::DipsSepolia
+    } else {
+        NestId::Dips
+    };
+    let parts: Vec<Part> = dips_agreements_mod::STAGES
+        .iter()
+        .map(|stage| {
+            Part::rows(
+                stage.key(),
+                nest,
+                // The table name is a constant from the nest's own schema, never a caller's input.
+                format!("SELECT * FROM {} LIMIT 5000", stage.table()),
+            )
+        })
+        .collect();
+
+    ctx.cached(
+        "dips-agreements",
+        nest,
+        serde_json::json!({ "sepolia": sepolia }),
+        CachePolicy::from_poll_interval(cadence::SLOW),
+        many_folded(parts, T_FOLD, dips_agreements_mod::fold),
+    )
+    .await
+}
+
 pub async fn dips(ctx: &ReadCtx, sepolia: bool) -> Result<Read, ApiError> {
     let nest = if sepolia {
         NestId::DipsSepolia

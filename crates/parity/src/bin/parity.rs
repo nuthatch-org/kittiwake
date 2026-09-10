@@ -54,6 +54,7 @@ fn routes() -> Vec<Route> {
             ours_at: "/data",
         },
         both("/api/curators?first=10"),
+        both("/api/dips/agreements"),
         Route {
             path: leak(format!("/api/subgraph-schema/{D}")),
             incumbent_at: "",

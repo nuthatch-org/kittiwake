@@ -2346,3 +2346,41 @@ pub async fn subgraph_schema(
     }))
     .into_response())
 }
+
+#[derive(serde::Deserialize)]
+pub struct DipsAgreementsQuery {
+    pub indexer: Option<String>,
+    /// Which chain's lifecycle to read. A caller's choice here rather than an environment
+    /// variable, unlike the incumbent, because the two nests are both configured and a testnet
+    /// answer that arrives labelled as one is not a lie.
+    pub sepolia: Option<String>,
+}
+
+/// `GET /api/dips/agreements`: the DIPS agreement lifecycle.
+pub async fn dips_agreements(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<DipsAgreementsQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let indexer = match q.indexer.as_deref() {
+        Some(raw) => Some(eth_address(raw).ok_or_else(bad_address)?),
+        None => None,
+    };
+    let mut read = routes::dips_agreements(&st.read, q.sepolia.as_deref() == Some("1")).await?;
+    if let Some(indexer) = indexer {
+        // After the cache, so one fold serves every caller and a per-indexer view costs the nest
+        // nothing. A *new* entry rather than a mutation: `read.entry` is the shared cached one, and
+        // narrowing it in place would hand the next caller this indexer's filtered answer.
+        read.entry = std::sync::Arc::new(kittiwake_cache::Entry {
+            value: std::sync::Arc::new(kittiwake_read::dips_agreements::narrow(
+                &read.entry.value,
+                &indexer,
+            )),
+            provenance: read.entry.provenance.clone(),
+            fetched_at: read.entry.fetched_at,
+        });
+    }
+    Ok(envelope(read))
+}
