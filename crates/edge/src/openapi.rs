@@ -252,6 +252,10 @@ const SUMMARIES: &[Operation] = &[
         "Every version of the subgraph that published a deployment, with its signal and stake.",
     ),
     op(
+        "/api/ens",
+        "The primary ENS name for an address, forward-verified, or null where it has none.",
+    ),
+    op(
         "/api/subgraph-schema/{hash}",
         "The GraphQL schema a deployment was built from, as text.",
     ),
