@@ -215,12 +215,10 @@ CREATE TABLE IF NOT EXISTS disputes (
   tokens_slashed_grt  NUMERIC,
   tokens_burned_grt   NUMERIC,
   created_at          TIMESTAMPTZ,
-  closed_at           TIMESTAMPTZ,
-  push_notified       BOOLEAN NOT NULL DEFAULT FALSE
+  closed_at           TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_disputes_indexer ON disputes (indexer_address);
-CREATE INDEX IF NOT EXISTS idx_disputes_unnotified ON disputes (created_at) WHERE NOT push_notified;
 
 CREATE TABLE IF NOT EXISTS parameter_changes (
   id               SERIAL PRIMARY KEY,
@@ -229,7 +227,6 @@ CREATE TABLE IF NOT EXISTS parameter_changes (
   old_value        NUMERIC,
   new_value        NUMERIC,
   epoch            INTEGER,
-  push_notified    BOOLEAN NOT NULL DEFAULT FALSE,
   created_at       TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -316,39 +313,6 @@ CREATE TABLE IF NOT EXISTS roadmap_community_updates (
 
 CREATE INDEX IF NOT EXISTS idx_roadmap_updates_item_id ON roadmap_community_updates (item_id, created_at DESC);
 
--- ── Push notifications ────────────────────────────────────────────────────────
-
-CREATE TABLE IF NOT EXISTS push_subscriptions (
-  address       TEXT PRIMARY KEY,
-  subscribed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  is_active     BOOLEAN NOT NULL DEFAULT TRUE
-);
-
-CREATE TABLE IF NOT EXISTS notification_log (
-  id               SERIAL PRIMARY KEY,
-  event_type       TEXT NOT NULL,
-  indexer_address  TEXT NOT NULL,
-  recipient_count  INTEGER NOT NULL DEFAULT 0,
-  notified_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  details          JSONB
-);
-
-CREATE INDEX IF NOT EXISTS idx_notification_log_notified_at ON notification_log (notified_at DESC);
-
--- Native push device tokens (iOS APNs; room for fcm later). One row per device,
--- bound to the wallet address that opted in (proved by an EIP-191 signature over
--- the push-subscribe message). Many devices may map to one address.
-CREATE TABLE IF NOT EXISTS device_tokens (
-  token        TEXT PRIMARY KEY,
-  address      TEXT NOT NULL,
-  platform     TEXT NOT NULL DEFAULT 'ios',
-  is_active    BOOLEAN NOT NULL DEFAULT TRUE,
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_device_tokens_address ON device_tokens (address) WHERE is_active;
-
 -- ── Operations ────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS cron_runs (
@@ -397,9 +361,6 @@ ALTER TABLE network_snapshots OWNER TO lodestar;
 ALTER TABLE indexer_scores OWNER TO lodestar;
 ALTER TABLE community_votes OWNER TO lodestar;
 ALTER TABLE roadmap_community_updates OWNER TO lodestar;
-ALTER TABLE push_subscriptions OWNER TO lodestar;
-ALTER TABLE notification_log OWNER TO lodestar;
-ALTER TABLE device_tokens OWNER TO lodestar;
 ALTER TABLE cron_runs OWNER TO lodestar;
 ALTER TABLE servability_rounds OWNER TO lodestar;
 

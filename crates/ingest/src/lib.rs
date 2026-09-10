@@ -426,10 +426,10 @@ pub async fn disputes(pool: &Pool, gate: &NestGate, lane: Lane) -> Result<Ingest
     // the money to buy a compile-time check. #2.
     sqlx::query(
         "INSERT INTO disputes (id, dispute_type, indexer_address, fisherman, allocation_id, deployment_id, \
-         status, tokens_slashed_grt, tokens_burned_grt, created_at, closed_at, push_notified) \
+         status, tokens_slashed_grt, tokens_burned_grt, created_at, closed_at) \
          SELECT id, kind, indexer, NULLIF(fisherman, ''), NULLIF(alloc, ''), NULLIF(deployment, ''), \
          status, 0, 0, to_timestamp(created), \
-         CASE WHEN closed = 0 THEN NULL ELSE to_timestamp(closed) END, FALSE \
+         CASE WHEN closed = 0 THEN NULL ELSE to_timestamp(closed) END \
          FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], \
          $8::bigint[], $9::bigint[]) \
          AS t(id, kind, indexer, fisherman, alloc, deployment, status, created, closed) \
