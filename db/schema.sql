@@ -346,6 +346,36 @@ CREATE INDEX IF NOT EXISTS idx_servability_rounds_hash_probed
 
 -- Ownership. The application connects as `lodestar`; a migration run as the superuser creates
 -- tables owned by `postgres`, and every statement from the app then fails with 42501 - silently, in
+
+-- Trade clicks and protocol visits from the dashboard, written by /api/analytics/clickthrough.
+--
+-- The declaration moved here from lodestar's `scripts/migrate-clickthroughs.sql` when the route
+-- did (#31 put the schema in the repository that writes it). The conversion columns are filled by
+-- nothing at present: they were for a cron that checked whether a wallet that clicked through
+-- actually swapped, and that cron does not exist. They are kept because the rows do.
+CREATE TABLE IF NOT EXISTS clickthrough_events (
+  id             BIGSERIAL PRIMARY KEY,
+  event_type     TEXT NOT NULL CHECK (event_type IN ('trade_click', 'protocol_visit')),
+  token_address  TEXT,
+  token_symbol   TEXT,
+  protocol_slug  TEXT,
+  venue          TEXT NOT NULL,
+  pool_address   TEXT,
+  chain          TEXT NOT NULL DEFAULT 'mainnet',
+  destination_url TEXT,
+  wallet         TEXT,
+  session_id     TEXT NOT NULL,
+  clicked_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  converted      BOOLEAN,
+  converted_at   TIMESTAMPTZ,
+  converted_tx   TEXT,
+  converted_usd  NUMERIC(20, 4)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ct_wallet  ON clickthrough_events (wallet) WHERE wallet IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_ct_pending ON clickthrough_events (clicked_at) WHERE converted IS NULL AND wallet IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_ct_venue   ON clickthrough_events (venue);
+
 -- the case of a fire-and-forget writer (#113). Idempotent, and a no-op when already correct.
 ALTER TABLE ingestion_state OWNER TO lodestar;
 ALTER TABLE epochs OWNER TO lodestar;
