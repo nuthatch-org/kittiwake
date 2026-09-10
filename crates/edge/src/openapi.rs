@@ -252,6 +252,10 @@ const SUMMARIES: &[Operation] = &[
         "Every version of the subgraph that published a deployment, with its signal and stake.",
     ),
     op(
+        "/api/manifest",
+        "How hard a subgraph is to sync, scored out of a hundred with the reasoning attached.",
+    ),
+    op(
         "/api/ens",
         "The primary ENS name for an address, forward-verified, or null where it has none.",
     ),

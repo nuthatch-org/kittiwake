@@ -7,6 +7,7 @@
 
 pub mod dips_agreements;
 pub mod indexing_status;
+pub mod manifest;
 pub mod sql;
 
 use std::sync::Arc;
