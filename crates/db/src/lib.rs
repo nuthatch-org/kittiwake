@@ -939,6 +939,8 @@ mod schema_coverage {
 pub struct GraphSupportIssue {
     pub number: i32,
     pub title: String,
+    /// The opening post, as Markdown. Empty for an issue filed with no body at all.
+    pub body: String,
     pub url: String,
     pub state: String,
     pub labels: Vec<String>,
@@ -973,7 +975,52 @@ pub async fn ensure_graph_support_table(pool: &Pool) -> Result<(), DbError> {
     )
     .execute(pool)
     .await?;
+
+    // Added after the table shipped, so it arrives as an alter rather than in the CREATE above.
+    // A default of empty string rather than null: an issue filed with no body is a real thing and
+    // reads as empty, where null would invite a downstream `unwrap` on the difference.
+    sqlx::query(
+        "ALTER TABLE graph_support_issues ADD COLUMN IF NOT EXISTS body TEXT NOT NULL DEFAULT ''",
+    )
+    .execute(pool)
+    .await?;
+
+    // The thread under each issue. The write-ups this archive exists for are frequently in the
+    // comments rather than the opening post: the reporter describes a symptom and the mechanism
+    // gets worked out below it.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS graph_support_comments ( \
+           id           BIGINT PRIMARY KEY, \
+           issue_number INTEGER NOT NULL, \
+           author       TEXT NOT NULL, \
+           body         TEXT NOT NULL, \
+           url          TEXT NOT NULL, \
+           created_at   TIMESTAMPTZ NOT NULL, \
+           updated_at   TIMESTAMPTZ NOT NULL \
+         )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_graph_support_comments_issue \
+         ON graph_support_comments(issue_number, created_at)",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
+}
+
+/// One comment on an issue.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSupportComment {
+    pub id: i64,
+    pub issue_number: i32,
+    pub author: String,
+    pub body: String,
+    pub url: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// The whole archive, newest activity first.
@@ -981,10 +1028,43 @@ pub async fn ensure_graph_support_table(pool: &Pool) -> Result<(), DbError> {
 /// Unpaginated on purpose. It is thirty-three rows and grows by a handful a month; a limit here
 /// would be a truncation the page could not tell from the archive being that size.
 pub async fn graph_support_issues(pool: &Pool) -> Result<Vec<GraphSupportIssue>, DbError> {
+    // `body` is deliberately not selected here and comes back empty. The index renders titles and
+    // labels; carrying thirty-three bodies of seven to ten thousand characters each would be most
+    // of a megabyte on a page that shows none of it.
     let rows = sqlx::query_as::<_, GraphSupportIssue>(
-        "SELECT number, title, url, state, labels, comments, created_at, updated_at \
+        "SELECT number, title, '' AS body, url, state, labels, comments, created_at, updated_at \
          FROM graph_support_issues ORDER BY updated_at DESC",
     )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// One issue with its body, for the page dedicated to it.
+pub async fn graph_support_issue(
+    pool: &Pool,
+    number: i32,
+) -> Result<Option<GraphSupportIssue>, DbError> {
+    let row = sqlx::query_as::<_, GraphSupportIssue>(
+        "SELECT number, title, body, url, state, labels, comments, created_at, updated_at \
+         FROM graph_support_issues WHERE number = $1",
+    )
+    .bind(number)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// The thread under one issue, oldest first, which is the order it was worked out in.
+pub async fn graph_support_thread(
+    pool: &Pool,
+    number: i32,
+) -> Result<Vec<GraphSupportComment>, DbError> {
+    let rows = sqlx::query_as::<_, GraphSupportComment>(
+        "SELECT id, issue_number, author, body, url, created_at, updated_at \
+         FROM graph_support_comments WHERE issue_number = $1 ORDER BY created_at",
+    )
+    .bind(number)
     .fetch_all(pool)
     .await?;
     Ok(rows)

@@ -1798,3 +1798,51 @@ pub async fn support(
     crate::no_store(resp.headers_mut());
     Ok(resp)
 }
+
+/// `/api/support/{number}`: one thread, with its opening post and every reply.
+///
+/// The archive's whole value is in the write-ups, and those are frequently in the comments rather
+/// than the opening post: somebody reports a symptom and the mechanism gets worked out underneath
+/// it. A page that showed only titles and labels would be an index to a thing it never rendered.
+///
+/// A number this mirror has never seen answers 404 rather than an empty thread. The distinction
+/// matters: an issue that exists with nothing said on it, and an issue that does not exist here,
+/// are different answers and should not look the same.
+pub async fn support_issue(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(number): Path<i32>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let pool = st
+        .pool
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("no database is configured".into()))?;
+
+    let issue = kittiwake_db::graph_support_issue(pool, number)
+        .await
+        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?
+        .ok_or(ApiError::NotFound)?;
+
+    let comments = kittiwake_db::graph_support_thread(pool, number)
+        .await
+        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+
+    let fetched_at = kittiwake_db::graph_support_ingested_at(pool)
+        .await
+        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+
+    let mut resp = axum::Json(serde_json::json!({
+        "issue": issue,
+        "comments": comments,
+        "fetchedAt": fetched_at,
+    }))
+    .into_response();
+    resp.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-kittiwake-served-from"),
+        axum::http::HeaderValue::from_static("postgres"),
+    );
+    crate::no_store(resp.headers_mut());
+    Ok(resp)
+}

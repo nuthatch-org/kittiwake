@@ -130,6 +130,10 @@ const SUMMARIES: &[Operation] = &[
         "/api/support",
         "The nightswatchhq/graph-support archive, mirrored twice a day.",
     ),
+    op(
+        "/api/support/{number}",
+        "One graph-support thread: the opening post and every reply.",
+    ),
     op("/api/provisions", "One indexer's Horizon provisions."),
     op(
         "/api/delegation-events",
