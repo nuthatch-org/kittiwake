@@ -39,6 +39,19 @@ source" box, and #144 deletes that box along with the route behind it. Porting a
 reader is being removed in the same week would be carrying a decision across a migration rather
 than making one.
 
+**The diff's handler keys are joined with a triangle rather than a NUL byte.** `handlerKey` in
+`diff.ts` reads `` `${dsName}\0${h.handler}\0${h.kind}` ``, and the comment directly above it says
+the key is `dataSource ▸ handler ▸ kind`. The NUL reaches the wire: every key in a live
+`/api/disassembly/diff` response carries two of them. It is legal JSON and nothing good comes of
+it, the page uses the value only as a React key, and the character the comment intended is used
+here instead. Found by diffing this port against production, which is the reason for doing that
+rather than reading the source and believing it.
+
+Verified against production on three deployments, twelve data sources and seventy-five handlers
+between them: the manifest, every handler's reachable host surface, the recovered strings, the
+decode audit, the scorecard and the caveats are identical, and so is the diff apart from that
+separator.
+
 ---
 
 ## 2026-09-10: `blog/search-index` stays on Next, and it is not a route this service should want

@@ -3539,3 +3539,91 @@ fn bare_error(status: axum::http::StatusCode, message: &str) -> Response {
     crate::no_store(resp.headers_mut());
     resp
 }
+
+#[derive(serde::Deserialize)]
+pub struct DisassemblyQuery {
+    pub id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct DisassemblyDiffQuery {
+    pub a: Option<String>,
+    pub b: Option<String>,
+}
+
+/// `GET /api/disassembly?id=Qm…`: what a deployed mapping can actually do.
+///
+/// The manifest and every module it names are fetched from IPFS and decoded; nothing is executed,
+/// which is what makes the answer a pure function of a content-addressed id and what lets it be
+/// kept for ever rather than for seven days. `kittiwake_read::disassembly::ANALYSIS_VERSION` is
+/// what expires it, and only when the analysis itself changes.
+pub async fn disassembly(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<DisassemblyQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let id = deployment_cid(q.id.as_deref())?;
+
+    let report = kittiwake_read::disassembly::report(st.pool.as_ref(), &st.ipfs, &id).await?;
+    let signal = kittiwake_read::disassembly::signal(&st.read.gate, &id).await;
+
+    let mut resp = axum::Json(serde_json::json!({
+        "data": kittiwake_read::disassembly::with_signal(&report, signal.as_ref()),
+    }))
+    .into_response();
+    crate::no_store(resp.headers_mut());
+    Ok(resp)
+}
+
+/// `GET /api/disassembly/diff?a=Qm…&b=Qm…`: what changed between two versions.
+///
+/// Both reports go through the same cache as the single-deployment route, so comparing two
+/// deployments a reader has already looked at costs nothing beyond the diff itself.
+pub async fn disassembly_diff(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<DisassemblyDiffQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let a = deployment_cid(q.a.as_deref())?;
+    let b = deployment_cid(q.b.as_deref())?;
+    if a == b {
+        return Err(ApiError::BadRequest(
+            "Both deployment IDs are identical, so there is nothing to compare".into(),
+        )
+        .into());
+    }
+
+    let (base, target) = tokio::try_join!(
+        kittiwake_read::disassembly::report(st.pool.as_ref(), &st.ipfs, &a),
+        kittiwake_read::disassembly::report(st.pool.as_ref(), &st.ipfs, &b),
+    )?;
+    let (base_signal, target_signal) = tokio::join!(
+        kittiwake_read::disassembly::signal(&st.read.gate, &a),
+        kittiwake_read::disassembly::signal(&st.read.gate, &b),
+    );
+
+    let mut resp = axum::Json(serde_json::json!({
+        "data": {
+            "diff": kittiwake_disasm::diff::diff(&base, &target),
+            "base": kittiwake_read::disassembly::with_signal(&base, base_signal.as_ref()),
+            "target": kittiwake_read::disassembly::with_signal(&target, target_signal.as_ref()),
+        }
+    }))
+    .into_response();
+    crate::no_store(resp.headers_mut());
+    Ok(resp)
+}
+
+/// A deployment CID, or a refusal naming the shape. Requesting the gateway with anything else asks
+/// it to resolve a hash that cannot exist and turns the caller's typo into a timeout.
+///
+/// The CID form, not the hex `deployment_id` above returns: IPFS is what this route talks to.
+fn deployment_cid(raw: Option<&str>) -> Result<String, ErrorResponse> {
+    raw.and_then(cid_v0).map(str::to_string).ok_or_else(|| {
+        ApiError::BadRequest("Invalid deployment ID. Expected a CIDv0 hash (Qm…)".into()).into()
+    })
+}

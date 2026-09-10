@@ -370,6 +370,22 @@ pub mod coverage {
             "the same history behind the moderator session; the harness holds no moderator credential and would only ever record the refusal",
         ),
         (
+            "/api/disassembly",
+            Excused::Entirely,
+            "both sides analyse the same immutable bytes, and three differences are deliberate: \
+             the incumbent's hand-rolled decoder marks a module using SIMD or atomics partial and \
+             wasmparser does not, its decode audit carries an `unavailable` flag for a classifier \
+             that here is a linked dependency, and `sourceHint` is not ported because \
+             nightswatchhq/lodestar#144 deletes its only reader. A fourth is in the diff: its \
+             handler keys are joined with a literal NUL byte where its own comment says a \
+             triangle. See docs/decisions.md",
+        ),
+        (
+            "/api/disassembly/diff",
+            Excused::Entirely,
+            "a diff of two reports, so it inherits every difference above twice over",
+        ),
+        (
             "/api/indexers-enriched",
             Excused::ValuesOnly,
             "reads rows the platform's own crons write, so both sides read the same table and \

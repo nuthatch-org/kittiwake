@@ -279,6 +279,14 @@ const SUMMARIES: &[Operation] = &[
         "Which indexer to delegate to, ranked against four preference sliders, with the reasoning.",
     ),
     op(
+        "/api/disassembly",
+        "What a deployed subgraph's mappings can actually do, read off the WebAssembly.",
+    ),
+    op(
+        "/api/disassembly/diff",
+        "What changed between two deployments: handlers, host surface, risk flags and strings.",
+    ),
+    op(
         "/api/operator-preflight",
         "What would happen if an address tried to run a data service. Read-only: no wallet, no gas.",
     ),
