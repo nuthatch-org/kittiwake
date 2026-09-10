@@ -166,6 +166,22 @@ async fn main() -> anyhow::Result<()> {
         cfg.edge_secret.clone(),
         studio,
         ipfs,
+        cfg.scuttle.as_ref().map(|s| kittiwake_edge::Scuttle {
+            salt: kittiwake_scuttle::Salt::new(s.trip_salt.clone()),
+            ip_pepper: Arc::from(s.ip_pepper.as_str()),
+            admin_secret: Arc::from(s.admin_secret.as_str()),
+            admin_session_secret: kittiwake_dock::Secret::new(&s.session_secret)
+                .expect("Scuttlebutt session_secret was accepted by configuration"),
+            flood: Arc::new(kittiwake_scuttle::FloodGuard::new()),
+            room: kittiwake_scuttle::Room::new(),
+        }),
+        cfg.receipt.as_ref().map(|r| {
+            let bytes: [u8; 32] = hex::decode(&r.issuer_key)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .expect("receipt.issuer_key was accepted by configuration");
+            Arc::new(ed25519_dalek::SigningKey::from_bytes(&bytes))
+        }),
     );
     let limits_handle = state.limits.clone();
 

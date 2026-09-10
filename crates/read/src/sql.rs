@@ -143,6 +143,13 @@ pub fn is_deployment_id(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// A GNS subgraph id: the same 32-byte hex shape as a deployment id, and checked the same way.
+/// Separate from [`is_deployment_id`] because they identify different things and a future change
+/// to one should not silently move the other.
+pub fn is_subgraph_id(s: &str) -> bool {
+    is_deployment_id(s)
+}
+
 /// The all-zero POI, which means "closed without a proof" and is never a real one.
 pub const ZERO_POI: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -735,6 +742,44 @@ pub fn deployment_subgraph_sql(dep: &str) -> Option<String> {
     ))
 }
 
+/// A subgraph's versions, newest first.
+///
+/// The id comes from `deployment_subgraph_sql` rather than from a caller, and is checked anyway:
+/// a builder that trusts its input because of where it was called from stops being true the first
+/// time somebody calls it from somewhere else.
+pub fn subgraph_versions_sql(subgraph_id: &str, limit: i64) -> Option<String> {
+    if !is_subgraph_id(subgraph_id) || !(1..=1000).contains(&limit) {
+        return None;
+    }
+    Some(format!(
+        "SELECT deployment_id, version_metadata, version_number, created_at \
+         FROM subgraph_versions WHERE subgraph_id = '{subgraph_id}' \
+         ORDER BY version_number DESC LIMIT {limit}"
+    ))
+}
+
+/// Signal and active stake for a set of deployments, in one pass.
+///
+/// `MAX(signalled_tokens)` and a filtered `SUM` of allocations, matching the shape the single
+/// deployment view uses, so a version row and a deployment page cannot disagree about the same
+/// deployment.
+pub fn deployments_signal_stake_sql(ids: &[String]) -> Option<String> {
+    if ids.is_empty() || ids.len() > 200 || !ids.iter().all(|i| is_deployment_id(i)) {
+        return None;
+    }
+    let list = ids
+        .iter()
+        .map(|i| format!("'{i}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "SELECT LOWER(subgraph_deployment) AS subgraph_deployment, \
+         CAST(MAX(signalled_tokens) AS VARCHAR) AS signalled_tokens, \
+         CAST(COALESCE(SUM(allocated_tokens) FILTER (WHERE status = 'Active'), 0) AS VARCHAR) AS staked_tokens \
+         FROM lodestar_allocations WHERE LOWER(subgraph_deployment) IN ({list}) GROUP BY 1"
+    ))
+}
+
 pub const SUBGRAPH_METADATA_SQL: &str = "SELECT subgraph_metadata FROM subgraph_current WHERE NOT deprecated AND subgraph_metadata IS NOT NULL";
 
 // ---------------------------------------------------------------------------------------------
@@ -807,6 +852,56 @@ mod tests {
         assert!(deployment_serving_indexers_sql(bad, 10).is_none());
         assert!(indexer_url_sql(bad).is_none());
         assert!(deployment_subgraph_sql(bad).is_none());
+        assert!(subgraph_versions_sql(bad, 100).is_none());
+        assert!(deployments_signal_stake_sql(&[bad.to_string()]).is_none());
+    }
+
+    /// The version list and the deployment page must agree about the same deployment, so both read
+    /// signal and stake the same way rather than two ways that happen to match today.
+    #[test]
+    fn versions_and_the_deployment_view_measure_stake_alike() {
+        let dep = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let many = deployments_signal_stake_sql(&[dep.to_string()]).unwrap();
+        let one = deployment_sql(dep).unwrap();
+        for fragment in [
+            "MAX(signalled_tokens)",
+            "FILTER (WHERE status = 'Active')",
+            "lodestar_allocations",
+        ] {
+            assert!(
+                many.contains(fragment),
+                "the set query is missing {fragment}"
+            );
+            assert!(
+                one.contains(fragment),
+                "the single query is missing {fragment}"
+            );
+        }
+    }
+
+    /// One statement for the whole set, not one per deployment: a subgraph with forty versions
+    /// would otherwise be forty round trips to the nest behind one request.
+    #[test]
+    fn a_versions_signal_lookup_is_one_statement_for_the_set() {
+        let ids: Vec<String> = (0..3)
+            .map(|n| format!("0x{}{}", "0".repeat(63), n))
+            .collect();
+        let sql = deployments_signal_stake_sql(&ids).unwrap();
+        assert_eq!(sql.matches("SELECT").count(), 1);
+        for id in &ids {
+            assert!(sql.contains(id), "{id} is not in the statement");
+        }
+        // And a set nobody asked about is no statement rather than one matching everything.
+        assert!(deployments_signal_stake_sql(&[]).is_none());
+    }
+
+    #[test]
+    fn a_version_limit_outside_its_range_is_refused() {
+        let id = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        assert!(subgraph_versions_sql(id, 100).is_some());
+        assert!(subgraph_versions_sql(id, 0).is_none());
+        assert!(subgraph_versions_sql(id, -1).is_none());
+        assert!(subgraph_versions_sql(id, 1001).is_none());
     }
 
     #[test]

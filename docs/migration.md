@@ -86,8 +86,14 @@ on that one table. #30
 
 **Push notifications** (`/api/push/*`, APNs, Push Protocol) and **Lodie** (`/api/lodie/*`, the
 Ollama-backed assistant) were discontinued on 2026-09-06. Neither is in this service and neither
-should be added. Their tables can stay in Postgres until someone decides to drop them; nothing here
-reads or writes them.
+should be added.
+
+The routes and the interfaces that offered them went in `nightswatchhq/lodestar`#136 on 2026-09-09.
+The tables went on 2026-09-10: `device_tokens`, `push_subscriptions` and `notification_log`, and
+the `push_notified` columns on `disputes` and `parameter_changes`. Lodie had none. This file used to
+say they could stay "until someone decides to drop them", which is how a decision becomes sediment.
+`deploy/drop-push-tables.sh` is the one-way script that does it, and it is the only statement in
+this repository that is not safe to re-run.
 
 ## Two that should be rewritten rather than ported
 

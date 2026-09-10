@@ -74,6 +74,27 @@ pub const WITHHELD: &[(&str, &str)] = &[
         "/api/studio/subgraphs/{id}",
         "mutates one signed-in Studio user's subgraph",
     ),
+    (
+        "/api/sql/receipt",
+        "issues a signed receipt and is a POST; this document describes GET operations, and a \
+         receipt is obtained by asking for one rather than by reading a path",
+    ),
+    (
+        "/api/scuttlebutt/admin/login",
+        "validates a moderation credential; it is not a public data operation",
+    ),
+    (
+        "/api/scuttlebutt/admin/messages",
+        "the moderation view of room history, protected by the administrator credential",
+    ),
+    (
+        "/api/scuttlebutt/bans",
+        "reads and writes moderation bans, protected by the administrator credential",
+    ),
+    (
+        "/api/scuttlebutt/messages/{id}",
+        "deletes a message and is protected by the administrator credential",
+    ),
 ];
 
 /// One published operation.
@@ -211,8 +232,48 @@ const SUMMARIES: &[Operation] = &[
         "The named-query tier: what may be asked, and asking it by name.",
     ),
     op(
+        "/api/indexer-disputes/{address}",
+        "Disputes and slashing raised against one indexer.",
+    ),
+    op(
+        "/api/parameter-history/{address}",
+        "When an indexer changed its cut, and what it changed from.",
+    ),
+    op(
+        "/api/indexer/{address}/revenue",
+        "Query fees and indexing rewards over a rolling window, by day and by deployment.",
+    ),
+    op(
+        "/api/indexer/{address}/pnl",
+        "That revenue netted against a modelled infrastructure cost. The cost side is an estimate the caller may override, not a measurement.",
+    ),
+    op(
+        "/api/dips/agreements",
+        "The Direct Indexer Payments agreement lifecycle: offered, accepted, active, collected, ended. Empty on Arbitrum One until an agreement is funded, and it says so.",
+    ),
+    op(
+        "/api/subgraph-versions/{hash}",
+        "Every version of the subgraph that published a deployment, with its signal and stake.",
+    ),
+    op(
+        "/api/ens",
+        "The primary ENS name for an address, forward-verified, or null where it has none.",
+    ),
+    op(
+        "/api/subgraph-schema/{hash}",
+        "The GraphQL schema a deployment was built from, as text.",
+    ),
+    op(
         "/api/indexer-node-health",
         "Whether an indexer's own endpoints answer.",
+    ),
+    op(
+        "/api/scuttlebutt/messages",
+        "The anonymous room's durable message history, newest first.",
+    ),
+    op(
+        "/api/scuttlebutt/stream",
+        "The anonymous room's live Server-Sent Event stream. A gap event means refetch history.",
     ),
 ];
 

@@ -771,6 +771,237 @@ pub async fn update_bounty_status(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------
+// The long tail: disputes, the parameter trail, and indexer revenue
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct IndexerDispute {
+    pub id: String,
+    pub dispute_type: Option<String>,
+    pub fisherman: Option<String>,
+    pub allocation_id: Option<String>,
+    pub deployment_id: Option<String>,
+    pub status: Option<String>,
+    /// Held as text for the same reason every other amount is: these are `numeric` in the table and
+    /// an `f64` would round the ones somebody is trying to tell apart.
+    pub tokens_slashed_grt: Option<String>,
+    pub tokens_burned_grt: Option<String>,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub closed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+pub async fn indexer_disputes(pool: &Pool, address: &str) -> Result<Vec<IndexerDispute>, DbError> {
+    Ok(sqlx::query_as(
+        "SELECT id, dispute_type, fisherman, allocation_id, deployment_id, status, \
+         tokens_slashed_grt::text, tokens_burned_grt::text, created_at, closed_at \
+         FROM disputes WHERE indexer_address = $1 \
+         ORDER BY created_at DESC NULLS LAST LIMIT 100",
+    )
+    .bind(address.to_lowercase())
+    .fetch_all(pool)
+    .await?)
+}
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct ParameterChange {
+    pub param_name: String,
+    pub old_value: Option<f64>,
+    pub new_value: f64,
+    pub epoch: Option<i32>,
+    pub detected_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The parameter trail, deduplicated.
+///
+/// `DISTINCT ON` over the change itself rather than over the row: the refresh job records what it
+/// observed each pass, so one cut change seen across forty passes is forty rows and one event.
+pub async fn parameter_history(
+    pool: &Pool,
+    address: &str,
+) -> Result<Vec<ParameterChange>, DbError> {
+    Ok(sqlx::query_as(
+        "SELECT param_name, old_value::float8, new_value::float8, epoch, detected_at FROM ( \
+           SELECT DISTINCT ON (param_name, old_value, new_value, epoch) \
+             param_name, old_value, new_value, epoch, created_at AS detected_at \
+           FROM parameter_changes \
+           WHERE indexer_address = $1 AND old_value IS DISTINCT FROM new_value \
+           ORDER BY param_name, old_value, new_value, epoch, created_at DESC \
+         ) deduped ORDER BY detected_at DESC LIMIT 100",
+    )
+    .bind(address.to_lowercase())
+    .fetch_all(pool)
+    .await?)
+}
+
+/// One day's total, as the revenue fold wants it.
+///
+/// Cast to `float8` in the statement rather than carried as text, and this is the one place that is
+/// right: the column is GRT rather than wei, the figure is charted rather than compared, and the
+/// incumbent's shape is a JSON number. A string here would be a parity break.
+pub async fn revenue_daily(
+    pool: &Pool,
+    address: &str,
+    window_days: i32,
+) -> Result<(Vec<(String, f64)>, Vec<(String, f64)>), DbError> {
+    let address = address.to_lowercase();
+    let rav: Vec<(String, f64)> = sqlx::query_as(
+        "SELECT to_char(date_trunc('day', collected_at), 'YYYY-MM-DD'), \
+         COALESCE(sum(tokens_grt), 0)::float8 \
+         FROM rav_redemptions \
+         WHERE indexer_address = $1 AND collected_at >= now() - ($2::int * INTERVAL '1 day') \
+         GROUP BY 1 ORDER BY 1",
+    )
+    .bind(&address)
+    .bind(window_days)
+    .fetch_all(pool)
+    .await?;
+    let rewards: Vec<(String, f64)> = sqlx::query_as(
+        "SELECT to_char(date_trunc('day', closed_at), 'YYYY-MM-DD'), \
+         COALESCE(sum(indexing_rewards_grt), 0)::float8 \
+         FROM allocations \
+         WHERE indexer_address = $1 AND closed_at IS NOT NULL \
+         AND closed_at >= now() - ($2::int * INTERVAL '1 day') \
+         GROUP BY 1 ORDER BY 1",
+    )
+    .bind(&address)
+    .bind(window_days)
+    .fetch_all(pool)
+    .await?;
+    Ok((rav, rewards))
+}
+
+pub async fn revenue_by_deployment(
+    pool: &Pool,
+    address: &str,
+    window_days: i32,
+) -> Result<(Vec<(Option<String>, f64)>, Vec<(Option<String>, f64)>), DbError> {
+    let address = address.to_lowercase();
+    let rav: Vec<(Option<String>, f64)> = sqlx::query_as(
+        "SELECT deployment_id, COALESCE(sum(tokens_grt), 0)::float8 \
+         FROM rav_redemptions \
+         WHERE indexer_address = $1 AND collected_at >= now() - ($2::int * INTERVAL '1 day') \
+         GROUP BY deployment_id",
+    )
+    .bind(&address)
+    .bind(window_days)
+    .fetch_all(pool)
+    .await?;
+    let rewards: Vec<(Option<String>, f64)> = sqlx::query_as(
+        "SELECT deployment_id, COALESCE(sum(indexing_rewards_grt), 0)::float8 \
+         FROM allocations \
+         WHERE indexer_address = $1 AND closed_at IS NOT NULL \
+         AND closed_at >= now() - ($2::int * INTERVAL '1 day') \
+         GROUP BY deployment_id",
+    )
+    .bind(&address)
+    .bind(window_days)
+    .fetch_all(pool)
+    .await?;
+    Ok((rav, rewards))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scuttlebutt
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct ScuttleMessage {
+    pub id: i64,
+    pub room: String,
+    pub name: Option<String>,
+    pub tripcode: Option<String>,
+    pub body: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub async fn scuttle_history(
+    pool: &Pool,
+    before: Option<i64>,
+    limit: i64,
+) -> Result<Vec<ScuttleMessage>, DbError> {
+    let rows = if let Some(before) = before {
+        sqlx::query_as("SELECT id, room, name, tripcode, body, created_at FROM scuttlebutt_messages WHERE room = 'main' AND deleted = false AND id < $1 ORDER BY id DESC LIMIT $2")
+            .bind(before).bind(limit).fetch_all(pool).await?
+    } else {
+        sqlx::query_as("SELECT id, room, name, tripcode, body, created_at FROM scuttlebutt_messages WHERE room = 'main' AND deleted = false ORDER BY id DESC LIMIT $1")
+            .bind(limit).fetch_all(pool).await?
+    };
+    Ok(rows)
+}
+
+pub async fn scuttle_post(
+    pool: &Pool,
+    name: Option<&str>,
+    tripcode: Option<&str>,
+    body: &str,
+    ip_hash: &str,
+) -> Result<ScuttleMessage, DbError> {
+    Ok(sqlx::query_as("INSERT INTO scuttlebutt_messages (room, name, tripcode, body, ip_hash) VALUES ('main', $1, $2, $3, $4) RETURNING id, room, name, tripcode, body, created_at")
+        .bind(name).bind(tripcode).bind(body).bind(ip_hash).fetch_one(pool).await?)
+}
+
+pub async fn scuttle_is_banned(
+    pool: &Pool,
+    ip_hash: &str,
+    tripcode: Option<&str>,
+) -> Result<bool, DbError> {
+    let found: Option<(i64,)> = sqlx::query_as("SELECT id FROM scuttlebutt_bans WHERE (expires_at IS NULL OR expires_at > NOW()) AND (ip_hash = $1 OR tripcode = $2) LIMIT 1")
+        .bind(ip_hash).bind(tripcode).fetch_optional(pool).await?;
+    Ok(found.is_some())
+}
+
+pub async fn scuttle_delete(pool: &Pool, id: i64, reason: Option<&str>) -> Result<bool, DbError> {
+    let done = sqlx::query(
+        "UPDATE scuttlebutt_messages SET deleted = true, deleted_at = NOW(), delete_reason = $2 \
+         WHERE id = $1 AND deleted = false",
+    )
+    .bind(id)
+    .bind(reason)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() == 1)
+}
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct ScuttleBan {
+    pub id: i64,
+    pub ip_hash: Option<String>,
+    pub tripcode: Option<String>,
+    pub reason: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+pub async fn scuttle_bans(pool: &Pool) -> Result<Vec<ScuttleBan>, DbError> {
+    Ok(sqlx::query_as(
+        "SELECT id, ip_hash, tripcode, reason, created_at, expires_at FROM scuttlebutt_bans \
+         ORDER BY id DESC",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn scuttle_ban(
+    pool: &Pool,
+    ip_hash: Option<&str>,
+    tripcode: Option<&str>,
+    reason: Option<&str>,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<ScuttleBan, DbError> {
+    Ok(sqlx::query_as(
+        "INSERT INTO scuttlebutt_bans (ip_hash, tripcode, reason, expires_at) VALUES ($1, $2, $3, $4) \
+         RETURNING id, ip_hash, tripcode, reason, created_at, expires_at",
+    )
+    .bind(ip_hash)
+    .bind(tripcode)
+    .bind(reason)
+    .bind(expires_at)
+    .fetch_one(pool)
+    .await?)
+}
+
 #[cfg(test)]
 mod schema_coverage {
     //! Every Postgres table this service names must exist in `db/schema.sql`.
@@ -847,7 +1078,15 @@ mod schema_coverage {
         };
         while let Some(i) = rest.find("sqlx::query") {
             rest = &rest[i + "sqlx::query".len()..];
-            let window = &rest[..rest.len().min(4000)];
+            // Back the window off to a word boundary. Cutting mid-identifier invents a table: a
+            // window ending at `UPDATE scu` reports `scu` as missing from the schema, which is a
+            // failure about this function rather than about the database.
+            let cut = rest.len().min(4000);
+            let window = &rest[..cut];
+            let window = match window.rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+                Some(i) if cut == 4000 => &window[..=i],
+                _ => window,
+            };
             // The statement, reassembled from the literals in this call. Only literals that look
             // like SQL, so a doc comment sitting inside the window cannot contribute a "table".
             let mut sql = String::new();
@@ -869,6 +1108,11 @@ mod schema_coverage {
                 .map(|w| w.to_lowercase())
                 .collect();
             for (n, w) in words.iter().enumerate() {
+                // `a IS DISTINCT FROM b` is an operator, not a table reference, and the `b` is a
+                // column. Reading it as a table reported `new_value` as missing from the schema.
+                if n > 0 && words[n - 1] == "distinct" {
+                    continue;
+                }
                 if matches!(w.as_str(), "from" | "into" | "update" | "join")
                     && let Some(next) = words.get(n + 1)
                     && !NOT_A_TABLE.contains(&next.as_str())
@@ -894,6 +1138,14 @@ mod schema_coverage {
         assert!(
             declared.len() > 15,
             "the schema did not parse: {declared:?}"
+        );
+
+        // If the extraction stops finding statements, every assertion below passes vacuously and
+        // the check quietly becomes decoration.
+        let found: usize = SOURCES.iter().map(|(_, src)| tables_in(src).len()).sum();
+        assert!(
+            found > 20,
+            "only {found} tables extracted; the scan is broken"
         );
 
         let mut missing = Vec::new();

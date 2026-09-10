@@ -89,6 +89,9 @@ pub struct AppState {
     pub ipfs: kittiwake_ext::Ipfs,
     /// Present only when the Dock has its independently managed session secret.
     pub studio: Option<Studio>,
+    pub scuttle: Option<Scuttle>,
+    /// The key SQL receipts are signed with. Absent means this deployment issues none.
+    pub receipt_key: Option<Arc<ed25519_dalek::SigningKey>>,
     /// The secret the edge proxy presents. Absent means no request is ever trusted to name a client
     /// other than the one that connected - safe, and wrong once traffic arrives through Vercel.
     pub edge_secret: Option<Arc<str>>,
@@ -106,6 +109,16 @@ pub struct AppState {
 pub struct Studio {
     pub secret: kittiwake_dock::Secret,
     pub bounty_board_address: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct Scuttle {
+    pub salt: kittiwake_scuttle::Salt,
+    pub ip_pepper: Arc<str>,
+    pub admin_secret: Arc<str>,
+    pub admin_session_secret: kittiwake_dock::Secret,
+    pub flood: Arc<kittiwake_scuttle::FloodGuard>,
+    pub room: kittiwake_scuttle::Room,
 }
 
 /// The client's address.
@@ -509,6 +522,163 @@ async fn post_sql_named(
     Ok(resp)
 }
 
+/// `POST /api/sql/receipt`: a declared query, answered and signed.
+///
+/// Named queries only. A receipt over arbitrary SQL attests to an answer nobody can agree the
+/// question for; a declared one pinned to a block means the same thing to both parties next year,
+/// which is the reason the named tier exists. #19
+async fn post_sql_receipt(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<NamedCall>,
+) -> Result<Response, ErrorResponse> {
+    st.limits.check(
+        &st.limits.sql,
+        client_ip(peer, &headers, st.edge_secret.as_deref()),
+    )?;
+
+    let Some(key) = st.receipt_key.clone() else {
+        return Err(ApiError::Unavailable(
+            "this deployment does not issue receipts; sign the answer yourself with `tattler \
+             attest-named` and your own key"
+                .into(),
+        )
+        .into());
+    };
+
+    let Some(query) = kittiwake_sqlplay::named::find_named_query(&body.name) else {
+        let allowed: Vec<&str> = kittiwake_sqlplay::named::NAMED_QUERIES
+            .iter()
+            .map(|q| q.name)
+            .collect();
+        return Err(ApiError::BadRequest(format!(
+            "receipts are issued for declared queries only; allowed: {}",
+            allowed.join(", ")
+        ))
+        .into());
+    };
+
+    let sql = kittiwake_sqlplay::named::render(query, &body.args)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let dataset = kittiwake_sqlplay::find_dataset(query.dataset).ok_or_else(|| {
+        tracing::error!(
+            query = query.name,
+            dataset = query.dataset,
+            "named query targets an unknown dataset"
+        );
+        ApiError::Internal("this query is misconfigured".into())
+    })?;
+
+    // The block the answer is pinned to has to come from the caller's own argument. Reading it off
+    // the nest's tip instead would pin the receipt to whatever the tip happened to be, which is the
+    // one thing a replaying verifier cannot reproduce.
+    let as_of_block = receipt_pin(&body.args).ok_or_else(|| {
+        ApiError::BadRequest(
+            "this query has no `before_block` argument to pin the answer to".into(),
+        )
+    })?;
+
+    let spec = kittiwake_nest::QuerySpec::read(dataset.nest, sql.clone())
+        .with_timeout(Duration::from_secs(6));
+    let answer = st.read.gate.query(&spec).await.map_err(ApiError::from)?;
+
+    // A truncated or degraded answer is not the answer. Signing one puts our name on a partial
+    // result presented as complete, which is the single thing a receipt must never do.
+    if answer.provenance.truncated || answer.provenance.degraded {
+        return Err(ApiError::BadRequest(
+            "the answer was truncated or served from a degraded set of tables, so it will not be \
+             signed; narrow the query"
+                .into(),
+        )
+        .into());
+    }
+    let Some(sealed_through) = answer.provenance.sealed_through.filter(|s| *s >= 0) else {
+        return Err(ApiError::Unavailable(
+            "the nest reported no sealed_through, so reproducibility cannot be established".into(),
+        )
+        .into());
+    };
+
+    let rows = answer.rows.clone();
+    let receipt_body = receipt_body(
+        &rows,
+        &answer.provenance,
+        dataset.id,
+        sql,
+        as_of_block,
+        sealed_through as u64,
+        query.name,
+        &body.args,
+    )
+    .map_err(|e| ApiError::Internal(e.to_string()))?;
+    // `issue` refuses rather than signs when the body and the rows disagree, or when the answer
+    // leaned on unsealed tip data. Either is our fault and neither is the caller's.
+    let receipt =
+        tattler::issue(receipt_body, rows, &key).map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let mut resp = axum::Json(receipt).into_response();
+    no_store(resp.headers_mut());
+    Ok(resp)
+}
+
+/// The receipt body, assembled from one answer.
+///
+/// Separated from the handler so a test can build the same body and hand it to tattler's own
+/// verifier. A receipt this service issues that tattler will not verify is worse than no receipt,
+/// and nothing about the handler's shape would reveal it.
+#[allow(clippy::too_many_arguments)]
+fn receipt_body(
+    rows: &[serde_json::Value],
+    provenance: &kittiwake_types::Provenance,
+    dataset: &str,
+    sql: String,
+    as_of_block: u64,
+    sealed_through: u64,
+    query_name: &str,
+    args: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<tattler::Body> {
+    Ok(tattler::Body {
+        nid: provenance.nid.clone(),
+        dataset: dataset.to_string(),
+        query: sql,
+        as_of_block,
+        sealed_through,
+        registry_hash: provenance.registry_hash.clone(),
+        result_hash: tattler::result_hash(rows)?,
+        row_count: rows.len(),
+        issued_at: chrono::Utc::now().to_rfc3339(),
+        query_name: Some(query_name.to_string()),
+        query_args: Some(receipt_args(args)),
+        merkle_root: None,
+    })
+}
+
+/// The block a receipt is pinned to, from the argument that named it.
+fn receipt_pin(args: &serde_json::Map<String, serde_json::Value>) -> Option<u64> {
+    match args.get("before_block")? {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// The arguments as the receipt records them: every value as text, sorted by key, so two identical
+/// questions serialise identically and therefore sign identically.
+fn receipt_args(
+    args: &serde_json::Map<String, serde_json::Value>,
+) -> std::collections::BTreeMap<String, String> {
+    args.iter()
+        .map(|(k, v)| {
+            let text = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            (k.clone(), text)
+        })
+        .collect()
+}
+
 /// `GET /openapi.json`: the API described on its own terms.
 ///
 /// Deliberately outside `/api/`, so it is not itself an entry in the document it serves and does
@@ -696,6 +866,54 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sql/catalog", get(get_sql_catalog))
         .route("/api/sql/query", post(post_sql_query))
         .route("/api/sql/named", get(get_sql_named).post(post_sql_named))
+        .route("/api/sql/receipt", post(post_sql_receipt))
+        // The long tail's Postgres reads. #67
+        .route(
+            "/api/indexer-disputes/{address}",
+            get(handlers::indexer_disputes),
+        )
+        .route(
+            "/api/parameter-history/{address}",
+            get(handlers::parameter_history),
+        )
+        .route(
+            "/api/indexer/{address}/revenue",
+            get(handlers::indexer_revenue),
+        )
+        .route("/api/indexer/{address}/pnl", get(handlers::indexer_pnl))
+        .route(
+            "/api/subgraph-schema/{hash}",
+            get(handlers::subgraph_schema),
+        )
+        .route("/api/dips/agreements", get(handlers::dips_agreements))
+        .route("/api/ens", get(handlers::ens))
+        .route(
+            "/api/subgraph-versions/{hash}",
+            get(handlers::subgraph_versions),
+        )
+        // Scuttlebutt is deliberately separate from the provenance envelope routes above: messages
+        // are primary user data in Postgres, not a view of a sealed protocol nest.
+        .route(
+            "/api/scuttlebutt/messages",
+            get(handlers::scuttle_messages).post(handlers::scuttle_post),
+        )
+        .route(
+            "/api/scuttlebutt/messages/{id}",
+            axum::routing::delete(handlers::scuttle_delete),
+        )
+        .route("/api/scuttlebutt/stream", get(handlers::scuttle_stream))
+        .route(
+            "/api/scuttlebutt/bans",
+            get(handlers::scuttle_bans).post(handlers::scuttle_ban),
+        )
+        .route(
+            "/api/scuttlebutt/admin/messages",
+            get(handlers::scuttle_admin_messages),
+        )
+        .route(
+            "/api/scuttlebutt/admin/login",
+            post(handlers::scuttle_admin_login),
+        )
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(tower_http::catch_panic::CatchPanicLayer::new())
         .with_state(state)
@@ -711,6 +929,8 @@ pub fn state(
     edge_secret: Option<String>,
     studio: Option<Studio>,
     ipfs: kittiwake_ext::Ipfs,
+    scuttle: Option<Scuttle>,
+    receipt_key: Option<Arc<ed25519_dalek::SigningKey>>,
 ) -> AppState {
     AppState {
         chain: read.chain.clone(),
@@ -718,6 +938,8 @@ pub fn state(
         ext: kittiwake_ext::Ext::default(),
         ipfs,
         studio,
+        scuttle,
+        receipt_key,
         edge_secret: edge_secret.map(|s| Arc::from(s.as_str())),
         pool,
         limits: Arc::new(limits),
@@ -774,6 +996,431 @@ async fn get_whoami(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── The long tail ────────────────────────────────────────────────────────
+
+    const SCHEMA_CID: &str = "QmUxJ9QYbNbDTNkQPHzq4ivqzGyMbwZBvXhrQfPTLE1Pjq";
+    const DEPLOYMENT_CID: &str = "Qmbsc6XQWbiv4DfLVfaNciScqYLyDWUYjWzrFBbzzmRsMB";
+
+    /// Base58 has no `0`, `O`, `I` or `l`, and it is case-sensitive. Normalising a near-miss into
+    /// something plausible is how a wrong document gets served confidently.
+    #[test]
+    fn only_a_real_cidv0_is_accepted() {
+        assert_eq!(
+            crate::handlers::cid_v0(DEPLOYMENT_CID),
+            Some(DEPLOYMENT_CID)
+        );
+        assert_eq!(
+            crate::handlers::cid_v0(&format!("  {DEPLOYMENT_CID}  ")),
+            Some(DEPLOYMENT_CID),
+            "surrounding space is not part of the hash"
+        );
+        for bad in [
+            "",
+            "Qm",
+            &DEPLOYMENT_CID[..45],
+            &format!("{DEPLOYMENT_CID}x"),
+            // A bytes32 deployment id is the other spelling and is not a CID.
+            "0xdb0c77a3184bf017abafb7606794d77ff53d9a59a0bc1dc23f1a762bd1e631ff",
+            // `0`, `O`, `I` and `l` are not in the alphabet, so these are 46 characters of
+            // something else.
+            "Qm0sc6XQWbiv4DfLVfaNciScqYLyDWUYjWzrFBbzzmRsMB",
+            "QmOsc6XQWbiv4DfLVfaNciScqYLyDWUYjWzrFBbzzmRsMB",
+            "QmIsc6XQWbiv4DfLVfaNciScqYLyDWUYjWzrFBbzzmRsMB",
+            "Qmlsc6XQWbiv4DfLVfaNciScqYLyDWUYjWzrFBbzzmRsMB",
+            "Qm bsc6XQWbiv4DfLVfaNciScqYLyDWUYjWzrFBbzzmRs",
+        ] {
+            assert_eq!(crate::handlers::cid_v0(bad), None, "{bad:?} is not a CIDv0");
+        }
+    }
+
+    fn manifest_with(schema: &str, source: &str) -> String {
+        format!(
+            "specVersion: 0.0.5\nschema:\n  file:\n    /: /ipfs/{schema}\ndataSources:\n  \
+             - kind: ethereum\n    mapping:\n      file:\n        /: /ipfs/{source}\n"
+        )
+    }
+
+    /// The schema reference sits above `dataSources`, and every mapping below it is also a CID.
+    /// Searching the whole document would return whichever came first in the file.
+    #[test]
+    fn the_schema_hash_is_taken_from_above_the_data_sources() {
+        let manifest = manifest_with(SCHEMA_CID, DEPLOYMENT_CID);
+        assert_eq!(crate::handlers::schema_cid(&manifest), Some(SCHEMA_CID));
+    }
+
+    #[test]
+    fn a_manifest_with_no_schema_reference_yields_nothing() {
+        assert_eq!(
+            crate::handlers::schema_cid("specVersion: 0.0.5\ndataSources: []\n"),
+            None
+        );
+        assert_eq!(crate::handlers::schema_cid(""), None);
+        // A truncated hash is not a hash, and half of one must not be returned as if it were.
+        assert_eq!(
+            crate::handlers::schema_cid("schema:\n  file:\n    /: /ipfs/Qmtooshort\n"),
+            None
+        );
+    }
+    // ── SQL receipts ─────────────────────────────────────────────────────────
+
+    fn receipt_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    fn answer_rows() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({"indexer": "0xaa", "tokens": "1000000000000000000"}),
+            serde_json::json!({"indexer": "0xbb", "tokens": "2000000000000000000"}),
+        ]
+    }
+
+    fn sealed_provenance() -> kittiwake_types::Provenance {
+        kittiwake_types::Provenance {
+            as_of: Some(497_000_000),
+            sealed_through: Some(497_000_000),
+            registry_hash: Some("0xreg".into()),
+            nid: Some("protocol".into()),
+            source: None,
+            truncated: false,
+            degraded: false,
+        }
+    }
+
+    fn issued() -> tattler::Receipt {
+        let rows = answer_rows();
+        let body = receipt_body(
+            &rows,
+            &sealed_provenance(),
+            "protocol",
+            "SELECT 1".into(),
+            497_000_000,
+            497_000_000,
+            "delegations_to_indexer",
+            &serde_json::Map::from_iter([
+                ("before_block".to_string(), serde_json::json!(497_000_000)),
+                ("indexer".to_string(), serde_json::json!("0xAA")),
+            ]),
+        )
+        .unwrap();
+        tattler::issue(body, rows, &receipt_key()).unwrap()
+    }
+
+    /// The only claim that matters. A receipt this service issues has to satisfy tattler's own
+    /// verifier, because a reader checking one will use tattler and not us.
+    #[test]
+    fn a_receipt_we_issue_verifies_with_tattlers_own_verifier() {
+        assert_eq!(tattler::verify(&issued()).unwrap(), tattler::Verdict::Ok);
+    }
+
+    #[test]
+    fn a_row_edited_after_signing_is_caught() {
+        let mut receipt = issued();
+        receipt.rows[0]["tokens"] = serde_json::json!("9000000000000000000");
+        assert!(matches!(
+            tattler::verify(&receipt).unwrap(),
+            tattler::Verdict::RowsAltered { .. }
+        ));
+    }
+
+    /// The signature covers the body, so editing the question it claims to answer must not survive
+    /// either. Rows alone would still hash correctly.
+    #[test]
+    fn a_body_edited_after_signing_is_caught() {
+        let mut receipt = issued();
+        receipt.body.query = "SELECT 2".into();
+        assert_eq!(
+            tattler::verify(&receipt).unwrap(),
+            tattler::Verdict::BadSignature
+        );
+    }
+
+    /// Row order is not part of the answer, and a nest is free to return the same set either way.
+    /// A receipt that disagreed with itself over ordering would report a forgery that never was.
+    #[test]
+    fn the_same_rows_in_another_order_are_the_same_answer() {
+        let mut reversed = answer_rows();
+        reversed.reverse();
+        assert_eq!(
+            tattler::result_hash(&answer_rows()).unwrap(),
+            tattler::result_hash(&reversed).unwrap()
+        );
+    }
+
+    #[test]
+    fn the_pin_comes_from_the_argument_and_nothing_else() {
+        let pin = |v: serde_json::Value| {
+            receipt_pin(&serde_json::Map::from_iter([(
+                "before_block".to_string(),
+                v,
+            )]))
+        };
+        assert_eq!(pin(serde_json::json!(497_000_000)), Some(497_000_000));
+        assert_eq!(pin(serde_json::json!(" 497000000 ")), Some(497_000_000));
+        for refused in [
+            serde_json::json!("latest"),
+            serde_json::json!(-1),
+            serde_json::json!(4.5),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(pin(refused.clone()), None, "{refused} is not a block");
+        }
+        assert_eq!(receipt_pin(&serde_json::Map::new()), None);
+    }
+
+    /// Two identical questions have to serialise identically or they sign differently, so the
+    /// arguments are sorted and every value is text whatever it arrived as.
+    #[test]
+    fn the_recorded_arguments_are_sorted_and_textual() {
+        let args = receipt_args(&serde_json::Map::from_iter([
+            ("indexer".to_string(), serde_json::json!("0xAA")),
+            ("before_block".to_string(), serde_json::json!(497_000_000)),
+        ]));
+        assert_eq!(
+            args.into_iter().collect::<Vec<_>>(),
+            vec![
+                ("before_block".to_string(), "497000000".to_string()),
+                ("indexer".to_string(), "0xAA".to_string()),
+            ]
+        );
+    }
+
+    // ── Scuttlebutt moderation ───────────────────────────────────────────────
+    //
+    // The parity harness excuses every administrator route, so these are the only thing standing
+    // between the moderation surface and nobody having checked it.
+
+    fn admin_secret() -> kittiwake_dock::Secret {
+        kittiwake_dock::Secret::new("a-scuttlebutt-session-secret-of-adequate-length").unwrap()
+    }
+
+    fn cookie(value: &str) -> HeaderMap {
+        headers(&[("cookie", value)])
+    }
+
+    const NOW: i64 = 1_760_000_000;
+
+    #[test]
+    fn a_moderator_with_a_valid_cookie_may_read() {
+        let token = kittiwake_dock::create_session(&admin_secret(), "admin", NOW);
+        let h = cookie(&format!("sb_admin={token}"));
+        assert!(crate::handlers::scuttle_admin_ok(
+            &admin_secret(),
+            &h,
+            false,
+            NOW
+        ));
+    }
+
+    /// A cookie rides along on any same-site request, so reading is not enough to authorise a
+    /// deletion. Without the header the same valid session must buy nothing.
+    #[test]
+    fn a_mutation_needs_the_header_as_well_as_the_cookie() {
+        let token = kittiwake_dock::create_session(&admin_secret(), "admin", NOW);
+        let signed_in = cookie(&format!("sb_admin={token}"));
+        assert!(!crate::handlers::scuttle_admin_ok(
+            &admin_secret(),
+            &signed_in,
+            true,
+            NOW
+        ));
+
+        let mut with_header = signed_in.clone();
+        with_header.insert("x-sb-admin", HeaderValue::from_static("1"));
+        assert!(crate::handlers::scuttle_admin_ok(
+            &admin_secret(),
+            &with_header,
+            true,
+            NOW
+        ));
+    }
+
+    #[test]
+    fn nothing_short_of_a_valid_session_gets_in() {
+        let token = kittiwake_dock::create_session(&admin_secret(), "admin", NOW);
+        let other = kittiwake_dock::Secret::new("a-different-secret-of-adequate-length!!").unwrap();
+        let cases: Vec<(&str, HeaderMap)> = vec![
+            ("no cookie at all", HeaderMap::new()),
+            (
+                "a cookie for some other name",
+                cookie(&format!("sb_session={token}")),
+            ),
+            // `sb_adminish` starts with `sb_admin`, and a prefix match would accept it.
+            (
+                "a cookie whose name merely starts the same",
+                cookie(&format!("sb_adminish={token}")),
+            ),
+            (
+                "a truncated token",
+                cookie(&format!("sb_admin={}", &token[..token.len() - 1])),
+            ),
+            (
+                "a token signed for somebody else",
+                cookie(&format!(
+                    "sb_admin={}",
+                    kittiwake_dock::create_session(&admin_secret(), "not-admin", NOW)
+                )),
+            ),
+            (
+                "a token signed with another secret",
+                cookie(&format!(
+                    "sb_admin={}",
+                    kittiwake_dock::create_session(&other, "admin", NOW)
+                )),
+            ),
+            ("no token, just the name", cookie("sb_admin=")),
+        ];
+        for (what, h) in cases {
+            assert!(
+                !crate::handlers::scuttle_admin_ok(&admin_secret(), &h, false, NOW),
+                "{what} must not authorise a moderator"
+            );
+        }
+    }
+
+    // ── The Dock ─────────────────────────────────────────────────────────────
+    //
+    // The nine Studio routes landed in #64 without coverage for the three things standing between
+    // them and a bad request: the slug format, the bounty amount, and the session cookie.
+
+    const DOCK_NOW: i64 = 1_760_000_000;
+
+    fn dock_secret() -> kittiwake_dock::Secret {
+        kittiwake_dock::Secret::new("a-studio-session-secret-of-adequate-length").unwrap()
+    }
+
+    fn dock_cookie(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_str(value).unwrap(),
+        );
+        h
+    }
+
+    /// A slug is the address the frontend routes on, so anything that is not exactly `org/name` in
+    /// lowercase is refused rather than normalised into something plausible.
+    #[test]
+    fn a_slug_is_two_lowercase_parts_and_nothing_else() {
+        for good in ["acme/uniswap-v3", "a/b", "org-1/name-2", "0x/9"] {
+            assert!(crate::handlers::valid_slug(good), "{good} is a valid slug");
+        }
+        for bad in [
+            "",
+            "acme",
+            "acme/",
+            "/uniswap",
+            "Acme/uniswap",
+            "acme/Uniswap",
+            "acme/uni swap",
+            "acme/uni_swap",
+            "acme/a/b",
+            "../etc/passwd",
+            "acme/uniswap!",
+        ] {
+            assert!(
+                !crate::handlers::valid_slug(bad),
+                "{bad:?} is not a valid slug"
+            );
+        }
+    }
+
+    /// A session that has run out is refused rather than renewed by being presented.
+    #[test]
+    fn a_session_older_than_its_lifetime_is_refused() {
+        let token = kittiwake_dock::create_session(&admin_secret(), "admin", NOW);
+        let h = cookie(&format!("sb_admin={token}"));
+        let expired = NOW + kittiwake_dock::SESSION_TTL_SECS + 1;
+        assert!(crate::handlers::scuttle_admin_ok(
+            &admin_secret(),
+            &h,
+            false,
+            expired - 2
+        ));
+        assert!(!crate::handlers::scuttle_admin_ok(
+            &admin_secret(),
+            &h,
+            false,
+            expired
+        ));
+    }
+
+    /// Cookies arrive as one header, and the moderation cookie is rarely the only one in it.
+    #[test]
+    fn the_cookie_is_found_among_its_neighbours() {
+        let h = cookie("theme=dark; sb_admin=wanted; other=x");
+        assert_eq!(
+            crate::handlers::scuttle_cookie(&h, "sb_admin"),
+            Some("wanted")
+        );
+        assert_eq!(crate::handlers::scuttle_cookie(&h, "absent"), None);
+    }
+
+    /// The regression this test exists for. `amount_grt` is text in the table and the public board
+    /// orders by `amount_grt::numeric`; Postgres 16 parses Infinity, so `"inf"` from one signed-in
+    /// caller would sit at the top of everyone's board permanently.
+    #[test]
+    fn an_infinite_bounty_is_not_a_positive_number() {
+        for refused in ["inf", "-inf", "infinity", "Infinity", "1e400", "NaN", "nan"] {
+            assert!(
+                !crate::handlers::positive_amount(refused),
+                "{refused:?} must not be accepted as an amount"
+            );
+        }
+        for accepted in ["1", "0.5", "1000000", "1e6"] {
+            assert!(
+                crate::handlers::positive_amount(accepted),
+                "{accepted:?} is a real amount"
+            );
+        }
+        // And the boundary, which was already right and stays that way.
+        for refused in ["0", "-1", "", "one", "1 GRT"] {
+            assert!(!crate::handlers::positive_amount(refused), "{refused:?}");
+        }
+    }
+
+    /// The session cookie is the whole of the Dock's authorisation, so every owner-scoped route is
+    /// exactly as strong as this is.
+    #[test]
+    fn a_studio_session_names_an_address_or_nobody() {
+        let token = kittiwake_dock::create_session(&dock_secret(), "0xAbCd", DOCK_NOW);
+        let other = kittiwake_dock::Secret::new("a-different-secret-of-adequate-length!!").unwrap();
+        let named = |h: &HeaderMap| crate::handlers::session_address(&dock_secret(), h, DOCK_NOW);
+
+        // Lowercased, because that is what every owner column stores.
+        assert_eq!(
+            named(&dock_cookie(&format!("studio_session={token}"))).as_deref(),
+            Some("0xabcd")
+        );
+        // And found among its neighbours, which is the normal case in a browser.
+        assert_eq!(
+            named(&dock_cookie(&format!(
+                "theme=dark; studio_session={token}; x=1"
+            )))
+            .as_deref(),
+            Some("0xabcd")
+        );
+
+        assert_eq!(named(&HeaderMap::new()), None);
+        assert_eq!(named(&dock_cookie("studio_session=")), None);
+        assert_eq!(
+            named(&dock_cookie(&format!(
+                "studio_session={}",
+                kittiwake_dock::create_session(&other, "0xAbCd", DOCK_NOW)
+            ))),
+            None,
+            "a token signed with another secret is not a session"
+        );
+        assert_eq!(
+            crate::handlers::session_address(
+                &dock_secret(),
+                &dock_cookie(&format!("studio_session={token}")),
+                DOCK_NOW + kittiwake_dock::SESSION_TTL_SECS + 1
+            ),
+            None,
+            "an expired session stays expired"
+        );
+    }
 
     fn hdr(k: &str, v: &str) -> HeaderMap {
         let mut h = HeaderMap::new();

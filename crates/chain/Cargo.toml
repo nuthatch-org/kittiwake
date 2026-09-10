@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-alloy = { version = "2.4.1", features = ["provider-http", "sol-types", "contract", "rpc-types", "signers"] }
+alloy = { version = "2.4.1", features = ["provider-http", "sol-types", "contract", "rpc-types", "signers", "ens"] }
 kittiwake-types = { version = "0.1.0", path = "../types" }
 metrics = "0.24.6"
 serde = { version = "1.0.229", features = ["derive"] }

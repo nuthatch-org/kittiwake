@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 figment = { version = "0.10.19", features = ["toml", "env"] }
+hex = "0.4.3"
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.20"

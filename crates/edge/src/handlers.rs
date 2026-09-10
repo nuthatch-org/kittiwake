@@ -9,7 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{ConnectInfo, OriginalUri, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, Method, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::sse::Event as SseEvent;
+use axum::response::{IntoResponse, Response, Sse};
 use kittiwake_read::routes;
 use kittiwake_types::ApiError;
 
@@ -21,7 +22,15 @@ fn dock(st: &AppState) -> Result<&crate::Studio, ErrorResponse> {
         .ok_or_else(|| ApiError::Unavailable("the Dock is not configured".into()).into())
 }
 
-fn session(st: &AppState, headers: &HeaderMap) -> Result<String, ErrorResponse> {
+/// The address a request's session vouches for, taking only what it decides on.
+///
+/// Split out from [`session`] so the refusals are testable without an `AppState`: the Dock's whole
+/// authorisation is this cookie, and every owner-scoped route is exactly as strong as it is.
+pub(crate) fn session_address(
+    secret: &kittiwake_dock::Secret,
+    headers: &HeaderMap,
+    now: i64,
+) -> Option<String> {
     let token = headers
         .get(header::COOKIE)
         .and_then(|h| h.to_str().ok())
@@ -29,10 +38,18 @@ fn session(st: &AppState, headers: &HeaderMap) -> Result<String, ErrorResponse> 
             all.split(';')
                 .map(str::trim)
                 .find_map(|part| part.strip_prefix("studio_session="))
-        })
-        .ok_or(ApiError::Unauthorized)?;
-    kittiwake_dock::parse_session(&dock(st)?.secret, token, now())
-        .map_err(|_| ApiError::Unauthorized.into())
+        })?;
+    kittiwake_dock::parse_session(secret, token, now).ok()
+}
+
+fn session(st: &AppState, headers: &HeaderMap) -> Result<String, ErrorResponse> {
+    session_address(&dock(st)?.secret, headers, now()).ok_or_else(|| ApiError::Unauthorized.into())
+}
+
+fn scuttle(st: &AppState) -> Result<&crate::Scuttle, ErrorResponse> {
+    st.scuttle
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("Scuttlebutt is not configured".into()).into())
 }
 
 fn pool(st: &AppState) -> Result<&kittiwake_db::Pool, ErrorResponse> {
@@ -43,6 +60,54 @@ fn pool(st: &AppState) -> Result<&kittiwake_db::Pool, ErrorResponse> {
 
 fn db_err(e: kittiwake_db::DbError) -> ErrorResponse {
     ApiError::Unavailable(format!("database: {e}")).into()
+}
+
+fn scuttle_message(row: kittiwake_db::ScuttleMessage) -> kittiwake_scuttle::Message {
+    kittiwake_scuttle::Message {
+        id: row.id,
+        room: row.room,
+        name: row.name,
+        tripcode: row.tripcode,
+        body: row.body,
+        created_at: row.created_at.to_rfc3339(),
+    }
+}
+
+/// Extract a named cookie without accepting an almost-match. Cookie attributes are not sent back
+/// by a browser, but treating an arbitrary `sb_adminish=` value as one would still be a rather
+/// needless way to make authentication exciting.
+pub(crate) fn scuttle_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())?
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(key, value)| (key == name).then_some(value))
+}
+
+/// The moderator check, taking only what it decides on. Keeping `AppState` out of it is what makes
+/// the refusals testable, and a moderation surface exercised only in production is not exercised.
+pub(crate) fn scuttle_admin_ok(
+    secret: &kittiwake_dock::Secret,
+    headers: &HeaderMap,
+    mutation: bool,
+    now: i64,
+) -> bool {
+    let signed_in = scuttle_cookie(headers, "sb_admin")
+        .and_then(|token| kittiwake_dock::parse_session(secret, token, now).ok())
+        .as_deref()
+        == Some("admin");
+    // A cookie travels on every same-site request, so a mutation additionally wants something only
+    // a script of ours sends. A browser will not attach this header cross-origin without CORS.
+    signed_in && (!mutation || headers.get("x-sb-admin").and_then(|v| v.to_str().ok()) == Some("1"))
+}
+
+fn scuttle_admin(st: &AppState, headers: &HeaderMap, mutation: bool) -> Result<(), ErrorResponse> {
+    let room = scuttle(st)?;
+    if scuttle_admin_ok(&room.admin_session_secret, headers, mutation, now()) {
+        return Ok(());
+    }
+    Err(ApiError::BadRequest("invalid Scuttlebutt administrator session".into()).into())
 }
 
 /// Seconds since the epoch, for the "since" windows.
@@ -969,7 +1034,17 @@ pub async fn studio_subgraph_delete(
     Ok(axum::Json(serde_json::json!({"ok":true})).into_response())
 }
 
-fn valid_slug(s: &str) -> bool {
+/// A bounty amount: positive, and a number that exists.
+///
+/// The finite check is the point. `"inf"` and `"1e400"` both parse to `f64::INFINITY`, which is
+/// greater than zero, and the column is text - so the value reaches Postgres intact and the board
+/// query orders by `amount_grt::numeric`, where Postgres 16 accepts Infinity quite happily. One
+/// signed-in caller could pin a bounty to the top of the public board for ever.
+pub(crate) fn positive_amount(s: &str) -> bool {
+    s.parse::<f64>().is_ok_and(|n| n.is_finite() && n > 0.0)
+}
+
+pub(crate) fn valid_slug(s: &str) -> bool {
     let mut p = s.split('/');
     let ok = |x: &str| {
         !x.is_empty()
@@ -1176,7 +1251,7 @@ pub async fn studio_bounties_post(
     let amount = body
         .get("amount_grt")
         .and_then(|v| v.as_str())
-        .filter(|s| s.parse::<f64>().is_ok_and(|n| n > 0.0))
+        .filter(|s| positive_amount(s))
         .ok_or_else(|| ApiError::BadRequest("amount_grt must be a positive number".into()))?;
     let subgraph_id = match body.get("slug").and_then(|v| v.as_str()) {
         Some(s) => kittiwake_db::studio_subgraph_by_slug(pool(&st)?, s)
@@ -1853,6 +1928,236 @@ pub async fn support_issue(
 /// of them. A copy is correct exactly until somebody edits a template, and nothing would say so.
 pub async fn support_templates(
     State(st): State<AppState>,
+#[derive(serde::Deserialize)]
+pub struct ScuttleHistory {
+    pub before: Option<i64>,
+    pub limit: Option<i64>,
+}
+
+/// The durable room history, newest first. The stream only tells a subscriber what happened after
+/// it joined; history is what lets it recover from a reconnect or a reported broadcast gap.
+pub async fn scuttle_messages(
+    State(st): State<AppState>,
+    Query(q): Query<ScuttleHistory>,
+) -> Result<Response, ErrorResponse> {
+    scuttle(&st)?;
+    let rows =
+        kittiwake_db::scuttle_history(pool(&st)?, q.before, q.limit.unwrap_or(50).clamp(1, 100))
+            .await
+            .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+    let mut response = axum::Json(serde_json::json!({ "messages": rows })).into_response();
+    crate::no_store(response.headers_mut());
+    Ok(response)
+}
+
+#[derive(serde::Deserialize)]
+pub struct ScuttlePost {
+    pub name: Option<String>,
+    pub body: String,
+}
+
+/// Store first, then fan out. Sending first makes a transient database failure visible in the
+/// stream but absent from a reconnecting reader's history, which is precisely the sort of little
+/// contradiction a chat room never forgets.
+pub async fn scuttle_post(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<ScuttlePost>,
+) -> Result<Response, ErrorResponse> {
+    let room = scuttle(&st)?;
+    let caller = client_ip(peer, &headers, st.edge_secret.as_deref());
+    st.limits.check(&st.limits.mutation, caller)?;
+    let ip_hash = kittiwake_scuttle::hash_ip(&room.ip_pepper, &caller.to_string());
+    if room.flood.check(&ip_hash).reason().is_some() {
+        return Err(ApiError::RateLimited { retry_after: 2 }.into());
+    }
+    let identity = kittiwake_scuttle::parse_name(&room.salt, body.name.as_deref());
+    let cleaned = kittiwake_scuttle::clean(&body.body, &[])
+        .ok_or_else(|| ApiError::BadRequest("message is empty".into()))?;
+    if cleaned.chars().count() > kittiwake_scuttle::MAX_BODY {
+        return Err(ApiError::BadRequest(format!(
+            "message is longer than {} characters",
+            kittiwake_scuttle::MAX_BODY
+        ))
+        .into());
+    }
+    if kittiwake_db::scuttle_is_banned(pool(&st)?, &ip_hash, identity.tripcode.as_deref())
+        .await
+        .map_err(|e| ApiError::Unavailable(e.to_string()))?
+    {
+        return Err(ApiError::BadRequest("you are banned from this room".into()).into());
+    }
+    let saved = kittiwake_db::scuttle_post(
+        pool(&st)?,
+        identity.name.as_deref(),
+        identity.tripcode.as_deref(),
+        &cleaned,
+        &ip_hash,
+    )
+    .await
+    .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+    let message = scuttle_message(saved);
+    room.room.publish(kittiwake_scuttle::Event::Message {
+        message: Box::new(message.clone()),
+    });
+    let mut response = axum::Json(serde_json::json!({ "message": message })).into_response();
+    crate::no_store(response.headers_mut());
+    Ok(response)
+}
+
+/// The live half of the room. A lagged subscriber receives an explicit `gap` event and can refill
+/// from `GET messages`; silently disconnecting it is a lie by omission.
+pub async fn scuttle_stream(State(st): State<AppState>) -> Result<Response, ErrorResponse> {
+    let subscriber = scuttle(&st)?.room.subscribe();
+    let stream = futures::stream::unfold(subscriber, |mut subscriber| async move {
+        let event = subscriber.next().await?;
+        let name = match event {
+            kittiwake_scuttle::Event::Message { .. } => "message",
+            kittiwake_scuttle::Event::Delete { .. } => "delete",
+            kittiwake_scuttle::Event::Gap { .. } => "gap",
+        };
+        let data = serde_json::to_string(&event).expect("Scuttlebutt events serialize");
+        Some((
+            Ok::<_, std::convert::Infallible>(SseEvent::default().event(name).data(data)),
+            subscriber,
+        ))
+    });
+    let mut response = Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response();
+    crate::no_store(response.headers_mut());
+    Ok(response)
+}
+
+#[derive(serde::Deserialize)]
+pub struct ScuttleDelete {
+    pub reason: Option<String>,
+}
+
+pub async fn scuttle_delete(
+    State(st): State<AppState>,
+    Path(id): Path<i64>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<ScuttleDelete>,
+) -> Result<Response, ErrorResponse> {
+    scuttle_admin(&st, &headers, true)?;
+    if !kittiwake_db::scuttle_delete(pool(&st)?, id, body.reason.as_deref())
+        .await
+        .map_err(|e| ApiError::Unavailable(e.to_string()))?
+    {
+        return Err(ApiError::NotFound.into());
+    }
+    scuttle(&st)?
+        .room
+        .publish(kittiwake_scuttle::Event::Delete { id });
+    Ok(axum::Json(serde_json::json!({ "deleted": id })).into_response())
+}
+
+pub async fn scuttle_admin_messages(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ScuttleHistory>,
+) -> Result<Response, ErrorResponse> {
+    scuttle_admin(&st, &headers, false)?;
+    scuttle_messages(State(st), Query(q)).await
+}
+
+#[derive(serde::Deserialize)]
+pub struct ScuttleLogin {
+    pub password: String,
+}
+
+/// Log in by minting the same stateless HMAC cookie as the incumbent. This is deliberately not a
+/// second auth format: its payload is `admin:<issued-at>` and its signature uses SESSION_SECRET,
+/// so a moderator's session survives moving the route.
+pub async fn scuttle_admin_login(
+    State(st): State<AppState>,
+    axum::Json(body): axum::Json<ScuttleLogin>,
+) -> Result<Response, ErrorResponse> {
+    let room = scuttle(&st)?;
+    let equal: bool =
+        subtle::ConstantTimeEq::ct_eq(body.password.as_bytes(), room.admin_secret.as_bytes())
+            .into();
+    if body.password.len() != room.admin_secret.len() || !equal {
+        return Err(
+            ApiError::BadRequest("invalid Scuttlebutt administrator password".into()).into(),
+        );
+    }
+    let token = kittiwake_dock::create_session(&room.admin_session_secret, "admin", now());
+    let mut response = axum::Json(serde_json::json!({ "admin": true })).into_response();
+    let cookie = format!(
+        "sb_admin={token}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict",
+        kittiwake_dock::SESSION_TTL_SECS
+    );
+    response.headers_mut().insert(
+        axum::http::header::SET_COOKIE,
+        axum::http::HeaderValue::from_str(&cookie).expect("session cookie is a valid header"),
+    );
+    Ok(response)
+}
+
+pub async fn scuttle_bans(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    scuttle_admin(&st, &headers, false)?;
+    let bans = kittiwake_db::scuttle_bans(pool(&st)?)
+        .await
+        .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+    Ok(axum::Json(serde_json::json!({ "bans": bans })).into_response())
+}
+
+#[derive(serde::Deserialize)]
+pub struct ScuttleBanRequest {
+    pub ip_hash: Option<String>,
+    pub tripcode: Option<String>,
+    pub reason: Option<String>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+pub async fn scuttle_ban(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<ScuttleBanRequest>,
+) -> Result<Response, ErrorResponse> {
+    scuttle_admin(&st, &headers, true)?;
+    if body.ip_hash.is_none() && body.tripcode.is_none() {
+        return Err(ApiError::BadRequest("a ban needs an IP hash or tripcode".into()).into());
+    }
+    let ban = kittiwake_db::scuttle_ban(
+        pool(&st)?,
+        body.ip_hash.as_deref(),
+        body.tripcode.as_deref(),
+        body.reason.as_deref(),
+        body.expires_at,
+    )
+    .await
+    .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+    Ok(axum::Json(serde_json::json!({ "ban": ban })).into_response())
+}
+
+// ── The long tail: Postgres reads ────────────────────────────────────────────
+//
+// Four routes that read tables this service already writes. They carry no provenance envelope,
+// because their source is our own Postgres rather than a sealed nest, and saying "sealed through"
+// about a row a cron wrote here would be a claim nobody can check. #67
+
+/// An Ethereum address, or nothing. Every route below is keyed by one and none of them should
+/// reach Postgres with something that is not.
+pub(crate) fn eth_address(raw: &str) -> Option<String> {
+    let lower = raw.trim().to_lowercase();
+    let hex = lower.strip_prefix("0x")?;
+    (hex.len() == 40 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then_some(lower)
+}
+
+fn bad_address() -> ErrorResponse {
+    ApiError::BadRequest("expected a 0x-prefixed 20-byte address".into()).into()
+}
+
+pub async fn indexer_disputes(
+    State(st): State<AppState>,
+    Path(address): Path<String>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Response, ErrorResponse> {
@@ -1881,4 +2186,379 @@ pub async fn support_templates(
     );
     crate::no_store(resp.headers_mut());
     Ok(resp)
+    let address = eth_address(&address).ok_or_else(bad_address)?;
+    let disputes = kittiwake_db::indexer_disputes(pool(&st)?, &address)
+        .await
+        .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+    Ok(axum::Json(serde_json::json!({ "disputes": disputes })).into_response())
+}
+
+pub async fn parameter_history(
+    State(st): State<AppState>,
+    Path(address): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let address = eth_address(&address).ok_or_else(bad_address)?;
+    let data = kittiwake_db::parameter_history(pool(&st)?, &address)
+        .await
+        .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+    Ok(axum::Json(serde_json::json!({ "data": data })).into_response())
+}
+
+#[derive(serde::Deserialize)]
+pub struct RevenueQuery {
+    pub window: Option<u32>,
+    #[serde(rename = "byDeployment")]
+    pub by_deployment: Option<String>,
+}
+
+async fn read_revenue(
+    st: &AppState,
+    address: &str,
+    window_days: u32,
+    by_deployment: bool,
+) -> Result<kittiwake_rewards::pnl::IndexerRevenue, ErrorResponse> {
+    let days = window_days as i32;
+    let (rav, rewards) = kittiwake_db::revenue_daily(pool(st)?, address, days)
+        .await
+        .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+    let daily = kittiwake_rewards::pnl::merge_daily(&rav, &rewards);
+    let by_deployment = if by_deployment {
+        let (rav, rewards) = kittiwake_db::revenue_by_deployment(pool(st)?, address, days)
+            .await
+            .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+        Some(kittiwake_rewards::pnl::merge_by_deployment(&rav, &rewards))
+    } else {
+        None
+    };
+    Ok(kittiwake_rewards::pnl::IndexerRevenue {
+        indexer: address.to_string(),
+        window_days,
+        rav_grt: rav.iter().map(|(_, grt)| grt).sum(),
+        indexing_rewards_grt: rewards.iter().map(|(_, grt)| grt).sum(),
+        total_grt: daily.iter().map(|d| d.total_grt).sum(),
+        daily,
+        by_deployment,
+    })
+}
+
+pub async fn indexer_revenue(
+    State(st): State<AppState>,
+    Path(address): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<RevenueQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let address = eth_address(&address).ok_or_else(bad_address)?;
+    let window = kittiwake_rewards::pnl::revenue_window(q.window);
+    let data = read_revenue(
+        &st,
+        &address,
+        window,
+        q.by_deployment.as_deref() == Some("1"),
+    )
+    .await?;
+    Ok(axum::Json(serde_json::json!({ "data": data })).into_response())
+}
+
+/// The cost side is request input and is never stored.
+///
+/// There is no per-indexer configuration behind this and there deliberately is not: persisting a
+/// cost model keyed by an address nobody proved they own would be an unauthenticated write surface.
+/// An operator's figures live in their own browser until the Dock has somewhere to put them.
+pub async fn indexer_pnl(
+    State(st): State<AppState>,
+    Path(address): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(raw): Query<std::collections::BTreeMap<String, String>>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let address = eth_address(&address).ok_or_else(bad_address)?;
+    let window =
+        kittiwake_rewards::pnl::revenue_window(raw.get("window").and_then(|w| w.parse().ok()));
+    let cost = cost_model_from(&raw);
+    // The P&L view always answers in GRT; a price only adds the dollar columns.
+    let grt_price = raw
+        .get("grtPrice")
+        .and_then(|p| p.parse::<f64>().ok())
+        .filter(|p| p.is_finite() && *p >= 0.0);
+
+    let revenue = read_revenue(&st, &address, window, true).await?;
+    let pnl = kittiwake_rewards::pnl::compute_pnl(&revenue, &cost, grt_price, window);
+    let mut response = axum::Json(serde_json::json!({
+        "data": {
+            "pnl": pnl,
+            "costModel": cost,
+            "defaultChainCosts": kittiwake_rewards::pnl::default_chain_costs_map(),
+        }
+    }))
+    .into_response();
+    crate::no_store(response.headers_mut());
+    Ok(response)
+}
+
+/// `?chains=a,b&cost_a=1800&overhead=300`, as the incumbent spells it.
+fn cost_model_from(
+    raw: &std::collections::BTreeMap<String, String>,
+) -> kittiwake_rewards::pnl::CostModel {
+    let chains: Vec<String> = raw
+        .get("chains")
+        .map(|c| {
+            c.split(',')
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let overrides = raw
+        .iter()
+        .filter_map(|(key, value)| {
+            let chain = key.strip_prefix("cost_")?;
+            let price: f64 = value.parse().ok()?;
+            (price.is_finite() && price >= 0.0).then(|| (chain.to_string(), price))
+        })
+        .collect();
+    let overhead = raw
+        .get("overhead")
+        .and_then(|o| o.parse::<f64>().ok())
+        .filter(|o| o.is_finite() && *o >= 0.0);
+    kittiwake_rewards::pnl::resolve_cost_model(&chains, &overrides, overhead)
+}
+
+// ── The long tail: IPFS reads ────────────────────────────────────────────────
+
+/// A CIDv0, or nothing. Base58 is case-sensitive, so this refuses rather than normalises.
+pub(crate) fn cid_v0(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    (trimmed.len() == 46
+        && trimmed.starts_with("Qm")
+        && trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() && !matches!(b, b'0' | b'O' | b'I' | b'l')))
+    .then_some(trimmed)
+}
+
+/// The schema hash a manifest points at.
+///
+/// The manifest is YAML and the reference is `/ipfs/Qm…` under `schema:`. Parsing the whole
+/// document to reach one field would be a manifest parser, which is #67's other half and a day's
+/// work; finding the first CID before `dataSources` is what the incumbent does and is enough.
+pub(crate) fn schema_cid(manifest: &str) -> Option<&str> {
+    let head = manifest.split("dataSources").next().unwrap_or(manifest);
+    let after_schema = head.find("schema").map(|i| &head[i..]).unwrap_or(head);
+    after_schema
+        .match_indices("Qm")
+        .find_map(|(i, _)| cid_v0(after_schema.get(i..i + 46)?))
+}
+
+/// `GET /api/subgraph-schema/{hash}`: the GraphQL schema a deployment was built from.
+///
+/// Two IPFS reads, both content-addressed and therefore cached for ever rather than for a while.
+pub async fn subgraph_schema(
+    State(st): State<AppState>,
+    Path(hash): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let deployment = cid_v0(&hash)
+        .ok_or_else(|| ErrorResponse::from(ApiError::BadRequest("expected a CIDv0 hash".into())))?;
+    let pool = pool(&st)?;
+
+    let manifest = kittiwake_ext::read_through_text(pool, &st.ipfs, deployment)
+        .await
+        .ok_or_else(|| {
+            ErrorResponse::from(ApiError::Unavailable(
+                "that manifest could not be read from IPFS".into(),
+            ))
+        })?;
+    // A hash that resolves to something that is not a manifest is the caller's mistake, and saying
+    // so beats reporting that no schema was found in a document that never had one.
+    if !manifest.contains("dataSources") && !manifest.contains("specVersion") {
+        return Err(ApiError::BadRequest("that hash is not a subgraph manifest".into()).into());
+    }
+    let schema_cid = schema_cid(&manifest).ok_or(ApiError::NotFound)?;
+    let schema_text = kittiwake_ext::read_through_text(pool, &st.ipfs, schema_cid)
+        .await
+        .ok_or_else(|| {
+            ErrorResponse::from(ApiError::Unavailable(
+                "the manifest names a schema that could not be read from IPFS".into(),
+            ))
+        })?;
+
+    Ok(axum::Json(serde_json::json!({
+        "data": { "schemaText": schema_text, "schemaHash": schema_cid }
+    }))
+    .into_response())
+}
+
+#[derive(serde::Deserialize)]
+pub struct DipsAgreementsQuery {
+    pub indexer: Option<String>,
+    /// Which chain's lifecycle to read. A caller's choice here rather than an environment
+    /// variable, unlike the incumbent, because the two nests are both configured and a testnet
+    /// answer that arrives labelled as one is not a lie.
+    pub sepolia: Option<String>,
+}
+
+/// `GET /api/dips/agreements`: the DIPS agreement lifecycle.
+pub async fn dips_agreements(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<DipsAgreementsQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let indexer = match q.indexer.as_deref() {
+        Some(raw) => Some(eth_address(raw).ok_or_else(bad_address)?),
+        None => None,
+    };
+    let mut read = routes::dips_agreements(&st.read, q.sepolia.as_deref() == Some("1")).await?;
+    if let Some(indexer) = indexer {
+        // After the cache, so one fold serves every caller and a per-indexer view costs the nest
+        // nothing. A *new* entry rather than a mutation: `read.entry` is the shared cached one, and
+        // narrowing it in place would hand the next caller this indexer's filtered answer.
+        read.entry = std::sync::Arc::new(kittiwake_cache::Entry {
+            value: std::sync::Arc::new(kittiwake_read::dips_agreements::narrow(
+                &read.entry.value,
+                &indexer,
+            )),
+            provenance: read.entry.provenance.clone(),
+            fetched_at: read.entry.fetched_at,
+        });
+    }
+    Ok(envelope(read))
+}
+
+/// `GET /api/subgraph-versions/{hash}`: every version of the subgraph that published a deployment.
+///
+/// The nest half is cached; the labels are filled here from the IPFS document cache in one bulk
+/// read. The incumbent fetched each version's metadata document separately, which for a subgraph
+/// with forty versions is forty round trips to IPFS behind one request.
+pub async fn subgraph_versions(
+    State(st): State<AppState>,
+    Path(hash): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let cid = cid_v0(&hash)
+        .ok_or_else(|| ErrorResponse::from(ApiError::BadRequest("expected a CIDv0 hash".into())))?;
+    let deployment = kittiwake_read::shape::ipfs_hash_to_bytes32(cid)
+        .ok_or_else(|| ErrorResponse::from(ApiError::BadRequest("expected a CIDv0 hash".into())))?;
+
+    let read = routes::subgraph_versions(&st.read, &deployment).await?;
+    let mut value = (*read.entry.value).clone();
+    if let Some(pool) = st.pool.as_ref() {
+        label_versions(pool, &mut value).await;
+    }
+    // A new entry rather than a mutation: `read.entry` is shared, and writing labels into it would
+    // be writing into the cache from a request.
+    let read = kittiwake_read::Read {
+        entry: std::sync::Arc::new(kittiwake_cache::Entry {
+            value: std::sync::Arc::new(value),
+            provenance: read.entry.provenance.clone(),
+            fetched_at: read.entry.fetched_at,
+        }),
+        meta: read.meta,
+    };
+    Ok(envelope(read))
+}
+
+/// Replace each version's `versionMetadata` with the `label` from its IPFS document.
+///
+/// A document the cache has not seen leaves the label null rather than blocking the response on a
+/// fetch: the warm job is what fills that cache, and a version list is more useful with a missing
+/// label than it is late.
+async fn label_versions(pool: &kittiwake_db::Pool, value: &mut serde_json::Value) {
+    let Some(versions) = value.get_mut("versions").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let cids: Vec<String> = versions
+        .iter()
+        .filter_map(|v| {
+            kittiwake_read::search::metadata_cid(v.get("versionMetadata").and_then(|m| m.as_str()))
+        })
+        .collect();
+    let docs = kittiwake_ext::cached_docs(pool, &cids)
+        .await
+        .unwrap_or_default();
+
+    for version in versions.iter_mut() {
+        let label = kittiwake_read::search::metadata_cid(
+            version.get("versionMetadata").and_then(|m| m.as_str()),
+        )
+        .and_then(|cid| docs.iter().find(|d| d.cid == cid))
+        .and_then(|doc| doc.json.as_ref())
+        .and_then(|json| json.get("label"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+        if let Some(object) = version.as_object_mut() {
+            object.remove("versionMetadata");
+            object.insert("label".into(), label);
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct EnsQuery {
+    pub address: Option<String>,
+}
+
+/// `GET /api/ens?address=0x…`: the address's primary ENS name, or null.
+///
+/// Cached a day per address, which is the incumbent's key and cadence: a primary name changes
+/// rarely and a mainnet round trip on every avatar render would not be worth it.
+pub async fn ens(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<EnsQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let raw = q
+        .address
+        .as_deref()
+        .ok_or_else(|| ErrorResponse::from(ApiError::BadRequest("address required".into())))?;
+    // Anything that is not an address has no name, and saying so is cheaper and truer than an
+    // error: the caller asked about something ENS has never heard of.
+    let Some(address) = eth_address(raw) else {
+        return Ok(axum::Json(serde_json::json!({ "ensName": null })).into_response());
+    };
+    let chain = st
+        .read
+        .chain
+        .as_ref()
+        .ok_or_else(|| {
+            ErrorResponse::from(ApiError::Unavailable(
+                "no mainnet RPC is configured, so ENS cannot be read".into(),
+            ))
+        })?
+        .clone();
+
+    let read = st
+        .read
+        .cached_external_keyed(
+            "ens",
+            &address,
+            std::time::Duration::from_secs(86_400),
+            kittiwake_types::ServedFrom::Chain,
+            {
+                let address = address.clone();
+                std::sync::Arc::new(move || {
+                    let chain = chain.clone();
+                    let address = address.clone();
+                    Box::pin(async move {
+                        Ok(serde_json::json!({ "ensName": chain.ens_name(&address).await? }))
+                    })
+                })
+            },
+        )
+        .await?;
+    Ok(envelope_root(read))
 }
