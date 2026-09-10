@@ -320,6 +320,11 @@ pub mod coverage {
             "POST with a body; the harness only issues GETs",
         ),
         (
+            "/api/data-services/query",
+            Excused::Entirely,
+            "POST that signs a receipt and calls a live provider; the harness must not spend receipts against production",
+        ),
+        (
             "/api/indexer/present-poi",
             Excused::Entirely,
             "POST that queues an action on a live indexer agent; the harness must not present proofs against production",
