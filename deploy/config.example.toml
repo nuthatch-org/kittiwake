@@ -68,3 +68,11 @@ exempt_ips = []
 # Foghorn's API, which `/api/foghorn/{*path}` proxies. Leave it out and that route answers 503
 # rather than guessing at a host. Both services sit on this box, so this is normally loopback.
 # foghorn_api_url = "http://127.0.0.1:8081"
+
+# The indexer-agent management API that `/api/indexer/present-poi` queues actions against. The
+# token belongs to this URL and travels only here: a caller who nominates their own agent brings
+# their own credential, because the SSRF check refuses private addresses and not attacker-owned
+# public ones.
+# [indexer_agent]
+# url = "http://127.0.0.1:18000"
+# token = "user:password"

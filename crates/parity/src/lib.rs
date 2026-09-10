@@ -320,6 +320,11 @@ pub mod coverage {
             "POST with a body; the harness only issues GETs",
         ),
         (
+            "/api/indexer/present-poi",
+            Excused::Entirely,
+            "POST that queues an action on a live indexer agent; the harness must not present proofs against production",
+        ),
+        (
             "/api/foghorn/{*path}",
             Excused::Entirely,
             "a pass-through to another service; the harness would be comparing Foghorn against itself rather than this service against the incumbent",

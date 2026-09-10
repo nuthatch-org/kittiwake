@@ -136,6 +136,26 @@ fn default_ipfs_url() -> String {
     "https://api.thegraph.com/ipfs".to_string()
 }
 
+/// The indexer-agent management API `/api/indexer/present-poi` queues actions against.
+///
+/// The token belongs to this URL and travels only here. A caller may nominate their own agent, and
+/// when they do they bring their own credential: see the handler for why.
+#[derive(Clone, Deserialize)]
+pub struct IndexerAgentSettings {
+    pub url: String,
+    /// `user:password` for Basic auth, if the endpoint wants it.
+    pub token: Option<String>,
+}
+
+impl std::fmt::Debug for IndexerAgentSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexerAgentSettings")
+            .field("url", &self.url)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 /// The key that signs SQL receipts. Absent means this deployment issues none, which is a valid
 /// posture rather than a misconfiguration: a reader can still sign an answer themselves with
 /// `tattler attest-named` and their own key. #19
@@ -201,6 +221,8 @@ pub struct Config {
     /// Foghorn's API, which `/api/foghorn/{*path}` proxies. Absent means that route answers 503
     /// rather than guessing at a host.
     pub foghorn_api_url: Option<String>,
+    #[serde(default)]
+    pub indexer_agent: Option<IndexerAgentSettings>,
     #[serde(default)]
     pub receipt: Option<ReceiptSettings>,
     /// Turns the in-process scheduler on. Off by default so a second instance, or a staging box,
@@ -317,6 +339,7 @@ mod tests {
             studio: None,
             scuttle: None,
             foghorn_api_url: None,
+            indexer_agent: None,
             receipt: None,
             arbitrum_rpc_url: None,
             mainnet_rpc_url: None,
