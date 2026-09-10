@@ -276,17 +276,35 @@ pub fn compute_pnl(
         margin_pct,
         // Dividing by a zero total would be an infinity presented as a price.
         breakeven_grt_price: (revenue_grt > 0.0).then(|| infra_cost_usd / revenue_grt),
-        per_deployment: revenue
-            .by_deployment
-            .iter()
-            .flatten()
-            .map(|d| DeploymentPnl {
-                deployment_id: d.deployment_id.clone(),
-                revenue_grt: d.total_grt,
-                revenue_usd: grt_price.map(|p| d.total_grt * p),
-            })
-            .collect(),
+        per_deployment: per_deployment(revenue, grt_price),
     }
+}
+
+/// Deployments by what they earned, most first.
+///
+/// The order is the answer here: the panel renders the head of this list as "where the revenue came
+/// from", and the source collection is keyed by deployment id, so leaving it alone puts whichever
+/// deployment sorts first alphabetically at the top of a table about money. The same ninety-two
+/// deployments with the same figures in a different order is still the wrong page.
+fn per_deployment(revenue: &IndexerRevenue, grt_price: Option<f64>) -> Vec<DeploymentPnl> {
+    let mut out: Vec<DeploymentPnl> = revenue
+        .by_deployment
+        .iter()
+        .flatten()
+        .map(|d| DeploymentPnl {
+            deployment_id: d.deployment_id.clone(),
+            revenue_grt: d.total_grt,
+            revenue_usd: grt_price.map(|p| d.total_grt * p),
+        })
+        .collect();
+    // The id breaks a tie, so two deployments that earned the same amount keep a stable order
+    // between one request and the next.
+    out.sort_by(|a, b| {
+        b.revenue_grt
+            .total_cmp(&a.revenue_grt)
+            .then_with(|| a.deployment_id.cmp(&b.deployment_id))
+    });
+    out
 }
 
 #[cfg(test)]
@@ -475,5 +493,58 @@ mod tests {
         assert_eq!(revenue_window(Some(31)), 30);
         assert_eq!(revenue_window(Some(0)), 30);
         assert_eq!(revenue_window(None), 30);
+    }
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    use super::*;
+
+    fn revenue(pairs: &[(&str, f64)]) -> IndexerRevenue {
+        IndexerRevenue {
+            indexer: "0xabc".into(),
+            window_days: 30,
+            rav_grt: 0.0,
+            indexing_rewards_grt: 0.0,
+            total_grt: pairs.iter().map(|(_, grt)| grt).sum(),
+            daily: Vec::new(),
+            by_deployment: Some(
+                pairs
+                    .iter()
+                    .map(|(id, grt)| DeploymentRevenue {
+                        deployment_id: Some((*id).to_string()),
+                        rav_grt: 0.0,
+                        indexing_rewards_grt: *grt,
+                        total_grt: *grt,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    fn ids(out: &[DeploymentPnl]) -> Vec<&str> {
+        out.iter()
+            .map(|d| d.deployment_id.as_deref().unwrap_or(""))
+            .collect()
+    }
+
+    /// The panel shows the head of this list as where the revenue came from. The source is keyed
+    /// by deployment id, so without this the top of a table about money is whichever id sorts
+    /// first, and every figure on the page is right while the page is wrong.
+    #[test]
+    fn deployments_are_ordered_by_what_they_earned() {
+        let out = per_deployment(
+            &revenue(&[("0xaa", 5.0), ("0xbb", 500.0), ("0xcc", 50.0)]),
+            None,
+        );
+        assert_eq!(ids(&out), ["0xbb", "0xcc", "0xaa"]);
+    }
+
+    /// Two deployments on the same figure keep a stable order between requests, so a reader
+    /// refreshing the page does not watch them swap.
+    #[test]
+    fn a_tie_is_broken_by_the_deployment_id() {
+        let out = per_deployment(&revenue(&[("0xbb", 10.0), ("0xaa", 10.0)]), None);
+        assert_eq!(ids(&out), ["0xaa", "0xbb"]);
     }
 }
