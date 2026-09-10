@@ -714,11 +714,11 @@ async fn get_openapi() -> Response {
 /// without being told about them.
 async fn get_health(State(st): State<AppState>) -> Response {
     let mut body = serde_json::Map::new();
-    body.insert("uptime_seconds".into(), st.started.elapsed().as_secs().into());
     body.insert(
-        "cached_entries".into(),
-        st.read.store.entry_count().into(),
+        "uptime_seconds".into(),
+        st.started.elapsed().as_secs().into(),
     );
+    body.insert("cached_entries".into(), st.read.store.entry_count().into());
 
     let mut ok = true;
 
@@ -738,7 +738,10 @@ async fn get_health(State(st): State<AppState>) -> Response {
                 }
                 Err(e) => {
                     ok = false;
-                    body.insert("schema_gaps".into(), serde_json::json!({ "error": e.to_string() }));
+                    body.insert(
+                        "schema_gaps".into(),
+                        serde_json::json!({ "error": e.to_string() }),
+                    );
                 }
             }
 
@@ -753,7 +756,10 @@ async fn get_health(State(st): State<AppState>) -> Response {
                 }
                 Err(e) => {
                     ok = false;
-                    body.insert("failing_jobs".into(), serde_json::json!({ "error": e.to_string() }));
+                    body.insert(
+                        "failing_jobs".into(),
+                        serde_json::json!({ "error": e.to_string() }),
+                    );
                 }
             }
         }

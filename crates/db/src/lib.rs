@@ -1397,7 +1397,13 @@ const SCHEMA_SQL: &str = include_str!("../../../db/schema.sql");
 /// true of this file and would be worth revisiting if it stopped being.
 fn declared_columns(sql: &str) -> Vec<(String, String)> {
     const CONSTRAINTS: &[&str] = &[
-        "primary", "unique", "foreign", "check", "constraint", "exclude", "like",
+        "primary",
+        "unique",
+        "foreign",
+        "check",
+        "constraint",
+        "exclude",
+        "like",
     ];
 
     let mut out = Vec::new();
@@ -1411,7 +1417,10 @@ fn declared_columns(sql: &str) -> Vec<(String, String)> {
         let lower = line.to_ascii_lowercase();
 
         if let Some(rest) = lower.strip_prefix("create table if not exists ") {
-            current = rest.split_whitespace().next().map(|t| t.trim_matches('(').to_string());
+            current = rest
+                .split_whitespace()
+                .next()
+                .map(|t| t.trim_matches('(').to_string());
             continue;
         }
 
@@ -1433,18 +1442,22 @@ fn declared_columns(sql: &str) -> Vec<(String, String)> {
             continue;
         }
 
-        let Some(table) = current.clone() else { continue };
+        let Some(table) = current.clone() else {
+            continue;
+        };
 
         if line.starts_with(')') {
             current = None;
             continue;
         }
 
-        let Some(word) = lower.split_whitespace().next() else { continue };
+        let Some(word) = lower.split_whitespace().next() else {
+            continue;
+        };
         if CONSTRAINTS.contains(&word) {
             continue;
         }
-        out.push((table, word.trim_matches(&[',', '(' ][..]).to_string()));
+        out.push((table, word.trim_matches(&[',', '('][..]).to_string()));
     }
 
     out
@@ -1503,12 +1516,14 @@ pub async fn failing_jobs(pool: &Pool, min_failures: i64) -> Result<Vec<FailingJ
 
     Ok(rows
         .into_iter()
-        .map(|(step, consecutive_failures, last_success, last_error)| FailingJob {
-            step,
-            consecutive_failures,
-            last_success,
-            last_error,
-        })
+        .map(
+            |(step, consecutive_failures, last_success, last_error)| FailingJob {
+                step,
+                consecutive_failures,
+                last_success,
+                last_error,
+            },
+        )
         .collect())
 }
 
@@ -1545,9 +1560,15 @@ pub async fn schema_gaps(pool: &Pool) -> Result<Vec<SchemaGap>, DbError> {
         .into_iter()
         .filter_map(|(table, column)| {
             if !tables.contains(&table) {
-                Some(SchemaGap { table, column: None })
+                Some(SchemaGap {
+                    table,
+                    column: None,
+                })
             } else if !have.contains(&(table.clone(), column.clone())) {
-                Some(SchemaGap { table, column: Some(column) })
+                Some(SchemaGap {
+                    table,
+                    column: Some(column),
+                })
             } else {
                 None
             }
@@ -1566,7 +1587,7 @@ mod schema_declaration {
     //! that broke: `ingestion_state.last_timestamp` is declared by an `ALTER TABLE ... ADD COLUMN`
     //! rather than in the `CREATE TABLE` body, which is exactly the shape a naive parser misses.
 
-    use super::{declared_columns, SCHEMA_SQL};
+    use super::{SCHEMA_SQL, declared_columns};
 
     #[test]
     fn reads_columns_from_a_create_table_body() {
