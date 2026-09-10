@@ -12,12 +12,24 @@ use kittiwake_types::ApiError;
 const COINGECKO: &str = "https://api.coingecko.com/api/v3/simple/price?ids=the-graph&vs_currencies=usd&include_24hr_change=true";
 const DEFILLAMA: &str = "https://api.llama.fi/v2/historicalChainTvl/Arbitrum";
 
+/// The whole graph-support archive in one request.
+///
+/// `state=all` because the archive is mostly closed threads: the write-ups are the product, and a
+/// page of open issues would be the least useful two thirds of it. `per_page=100` fits the
+/// repository several times over, and the caller pages anyway rather than trusting that.
+///
+/// No credential. The repository is public and the job that calls this runs twice a day, which is
+/// two of the sixty requests an hour GitHub allows unauthenticated. A token here would be a thing
+/// that can expire in exchange for headroom nothing needs.
+const GRAPH_SUPPORT: &str = "https://api.github.com/repos/nightswatchhq/graph-support/issues?state=all&sort=updated&direction=desc&per_page=100";
+
 #[derive(Clone)]
 pub struct Ext {
     pub(crate) http: reqwest::Client,
     /// Overridable so the tests can point at a stand-in rather than the live API.
     price_url: String,
     tvl_url: String,
+    graph_support_url: String,
 }
 
 impl Default for Ext {
@@ -38,6 +50,7 @@ impl Ext {
                 .unwrap_or_default(),
             price_url: price_url.into(),
             tvl_url: tvl_url.into(),
+            graph_support_url: GRAPH_SUPPORT.to_string(),
         }
     }
 
@@ -86,6 +99,106 @@ impl Ext {
             .and_then(|v| v.as_f64())
             .ok_or_else(|| ApiError::Unavailable("tvl source answered with an empty series".into()))
     }
+
+    /// Point the archive fetch at a stand-in. Tests only; the default is the live repository.
+    pub fn with_graph_support_url(mut self, url: impl Into<String>) -> Self {
+        self.graph_support_url = url.into();
+        self
+    }
+
+    /// Every issue in nightswatchhq/graph-support, pull requests removed.
+    ///
+    /// An empty answer is a failure rather than an empty archive. That repository has never had
+    /// zero issues, so a 200 with nothing in it means the request was wrong, not the repository -
+    /// and writing it would replace a mirror of thirty-three worked answers with a mirror of none.
+    pub async fn graph_support_issues(&self) -> Result<Vec<GraphSupportIssue>, ApiError> {
+        let mut collected: Vec<GraphSupportIssue> = Vec::new();
+
+        // Enough for the repository to grow thirty-fold before the cap is what truncates it.
+        for page in 1..=10u32 {
+            let batch: Vec<GhIssue> = self
+                .http
+                .get(&self.graph_support_url)
+                .query(&[("page", page.to_string())])
+                .send()
+                .await
+                .map_err(|e| ApiError::Unavailable(format!("graph-support: {e}")))?
+                .error_for_status()
+                .map_err(|e| ApiError::Unavailable(format!("graph-support: {e}")))?
+                .json()
+                .await
+                .map_err(|e| ApiError::Unavailable(format!("graph-support: {e}")))?;
+
+            let full_page = batch.len() == 100;
+            for gh in batch {
+                // The issues endpoint returns pull requests too, and they are not support threads.
+                if gh.pull_request.is_some() {
+                    continue;
+                }
+                collected.push(GraphSupportIssue {
+                    number: gh.number,
+                    title: gh.title,
+                    url: gh.html_url,
+                    state: if gh.state == "closed" {
+                        "closed"
+                    } else {
+                        "open"
+                    }
+                    .to_string(),
+                    labels: gh.labels.into_iter().filter_map(|l| l.name).collect(),
+                    comments: gh.comments,
+                    created_at: gh.created_at,
+                    updated_at: gh.updated_at,
+                });
+            }
+            if !full_page {
+                break;
+            }
+        }
+
+        if collected.is_empty() {
+            return Err(ApiError::Unavailable(
+                "graph-support answered with no issues at all".into(),
+            ));
+        }
+        Ok(collected)
+    }
+}
+
+/// One issue, reduced to what the dashboard renders.
+#[derive(Debug, Clone)]
+pub struct GraphSupportIssue {
+    pub number: i32,
+    pub title: String,
+    pub url: String,
+    pub state: String,
+    pub labels: Vec<String>,
+    pub comments: i32,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Only the fields read above.
+#[derive(serde::Deserialize)]
+struct GhIssue {
+    number: i32,
+    title: String,
+    html_url: String,
+    state: String,
+    #[serde(default)]
+    labels: Vec<GhLabel>,
+    #[serde(default)]
+    comments: i32,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+    /// Present on pull requests, which is how they are told apart from issues.
+    #[serde(default)]
+    pull_request: Option<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct GhLabel {
+    name: Option<String>,
 }
 
 #[cfg(test)]
@@ -813,5 +926,101 @@ mod ipfs_tests {
         assert!(!doc(Some("timed out"), 7200).failed_recently(now));
         // A success is never "failed recently", however old it is.
         assert!(!doc(None, 60).failed_recently(now));
+    }
+
+    fn gh(number: i32, state: &str) -> serde_json::Value {
+        serde_json::json!({
+            "number": number,
+            "title": format!("bad indexers: BadResponse(400) #{number}"),
+            "html_url": format!("https://github.com/nightswatchhq/graph-support/issues/{number}"),
+            "state": state,
+            "labels": [{"name": "area/gateway"}, {"name": "owner/edge-and-node"}],
+            "comments": 4,
+            "created_at": "2026-09-01T00:00:00Z",
+            "updated_at": "2026-09-08T00:00:00Z",
+        })
+    }
+
+    #[tokio::test]
+    async fn the_archive_is_read_with_its_labels_flattened() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/issues"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![gh(31, "open")]))
+            .mount(&server)
+            .await;
+
+        let ext = Ext::default().with_graph_support_url(format!("{}/issues", server.uri()));
+        let issues = ext.graph_support_issues().await.unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].number, 31);
+        assert_eq!(issues[0].state, "open");
+        assert_eq!(
+            issues[0].labels,
+            vec!["area/gateway", "owner/edge-and-node"]
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_requests_are_not_support_threads() {
+        // The issues endpoint returns both, told apart only by a `pull_request` key.
+        let mut pr = gh(32, "open");
+        pr["pull_request"] = serde_json::json!({"url": "https://example.invalid"});
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/issues"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![gh(31, "open"), pr]))
+            .mount(&server)
+            .await;
+
+        let ext = Ext::default().with_graph_support_url(format!("{}/issues", server.uri()));
+        let issues = ext.graph_support_issues().await.unwrap();
+        assert_eq!(
+            issues.iter().map(|i| i.number).collect::<Vec<_>>(),
+            vec![31]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_archive_is_a_failure_not_an_empty_archive() {
+        // That repository has never had zero issues. Writing this to the mirror would replace
+        // thirty-three worked answers with none, and the page would render it as "no issues".
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/issues"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<serde_json::Value>::new()))
+            .mount(&server)
+            .await;
+
+        let ext = Ext::default().with_graph_support_url(format!("{}/issues", server.uri()));
+        assert!(ext.graph_support_issues().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_rejection_is_a_failure_rather_than_a_short_archive() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/issues"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let ext = Ext::default().with_graph_support_url(format!("{}/issues", server.uri()));
+        assert!(ext.graph_support_issues().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_short_page_ends_the_walk() {
+        // One request, not ten: the stop condition is a page that did not come back full.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/issues"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![gh(31, "closed")]))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let ext = Ext::default().with_graph_support_url(format!("{}/issues", server.uri()));
+        ext.graph_support_issues().await.unwrap();
     }
 }

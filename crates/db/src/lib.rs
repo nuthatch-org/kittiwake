@@ -738,3 +738,82 @@ mod schema_coverage {
         }
     }
 }
+// ---------------------------------------------------------------------------------------------
+// graph-support: the community triage archive
+
+/// One issue from nightswatchhq/graph-support, as the mirror job last saw it.
+///
+/// `labels` is the flat list of names rather than anything parsed. The taxonomy in that repo's
+/// `TRIAGE.md` is not exhaustive - `area/governance` and `kind/question` are both in use and in
+/// neither published list - so a mirror that understood the labels would drop the ones it had not
+/// been told about. The dashboard groups them; this stores them.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSupportIssue {
+    pub number: i32,
+    pub title: String,
+    pub url: String,
+    pub state: String,
+    pub labels: Vec<String>,
+    pub comments: i32,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Create the mirror table.
+///
+/// Additive and ours alone: nothing the platform runs reads or writes it, which is what lets it
+/// live here rather than in the schema the migration must be able to roll back to.
+pub async fn ensure_graph_support_table(pool: &Pool) -> Result<(), DbError> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS graph_support_issues ( \
+           number      INTEGER PRIMARY KEY, \
+           title       TEXT NOT NULL, \
+           url         TEXT NOT NULL, \
+           state       TEXT NOT NULL, \
+           labels      TEXT[] NOT NULL DEFAULT '{}', \
+           comments    INTEGER NOT NULL DEFAULT 0, \
+           created_at  TIMESTAMPTZ NOT NULL, \
+           updated_at  TIMESTAMPTZ NOT NULL, \
+           ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
+         )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_graph_support_updated \
+         ON graph_support_issues(updated_at DESC)",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The whole archive, newest activity first.
+///
+/// Unpaginated on purpose. It is thirty-three rows and grows by a handful a month; a limit here
+/// would be a truncation the page could not tell from the archive being that size.
+pub async fn graph_support_issues(pool: &Pool) -> Result<Vec<GraphSupportIssue>, DbError> {
+    let rows = sqlx::query_as::<_, GraphSupportIssue>(
+        "SELECT number, title, url, state, labels, comments, created_at, updated_at \
+         FROM graph_support_issues ORDER BY updated_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// When the mirror last ran, whether or not it wrote anything.
+///
+/// Read from the rows rather than from `ingestion_state` so the answer describes the data being
+/// served. A cursor that moved while the write failed would report freshness the table does not
+/// have.
+pub async fn graph_support_ingested_at(
+    pool: &Pool,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, DbError> {
+    let row: Option<(chrono::DateTime<chrono::Utc>,)> =
+        sqlx::query_as("SELECT MAX(ingested_at) FROM graph_support_issues")
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|r| r.0))
+}

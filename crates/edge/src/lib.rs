@@ -597,6 +597,7 @@ pub fn router(state: AppState) -> Router {
             get(handlers::indexer_stake_history),
         )
         .route("/api/curators", get(handlers::curators))
+        .route("/api/support", get(handlers::support))
         .route("/api/epochs", get(handlers::epochs))
         .route("/api/network-stats", get(handlers::network_stats))
         // Same fold, different panel: one cache entry serves both.

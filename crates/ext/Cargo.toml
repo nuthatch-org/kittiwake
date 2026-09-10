@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-chrono = "0.4.45"
+chrono = { version = "0.4.45", features = ["serde"] }
 kittiwake-cache = { version = "0.1.0", path = "../cache" }
 kittiwake-ssrf = { version = "0.1.0", path = "../ssrf" }
 kittiwake-types = { version = "0.1.0", path = "../types" }
