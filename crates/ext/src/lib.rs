@@ -18,6 +18,7 @@ pub struct Ext {
     /// Overridable so the tests can point at a stand-in rather than the live API.
     price_url: String,
     tvl_url: String,
+    graph_support_url: String,
 }
 
 impl Default for Ext {
@@ -38,6 +39,7 @@ impl Ext {
                 .unwrap_or_default(),
             price_url: price_url.into(),
             tvl_url: tvl_url.into(),
+            graph_support_url: GRAPH_SUPPORT.to_string(),
         }
     }
 

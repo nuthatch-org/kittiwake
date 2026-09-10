@@ -614,6 +614,136 @@ pub async fn upsert_deploy_key(pool: &Pool, owner: &str, key_hash: &str) -> Resu
 }
 
 // ---------------------------------------------------------------------------------------------
+// The long tail: disputes, the parameter trail, and indexer revenue
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct IndexerDispute {
+    pub id: String,
+    pub dispute_type: Option<String>,
+    pub fisherman: Option<String>,
+    pub allocation_id: Option<String>,
+    pub deployment_id: Option<String>,
+    pub status: Option<String>,
+    /// Held as text for the same reason every other amount is: these are `numeric` in the table and
+    /// an `f64` would round the ones somebody is trying to tell apart.
+    pub tokens_slashed_grt: Option<String>,
+    pub tokens_burned_grt: Option<String>,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub closed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+pub async fn indexer_disputes(pool: &Pool, address: &str) -> Result<Vec<IndexerDispute>, DbError> {
+    Ok(sqlx::query_as(
+        "SELECT id, dispute_type, fisherman, allocation_id, deployment_id, status, \
+         tokens_slashed_grt::text, tokens_burned_grt::text, created_at, closed_at \
+         FROM disputes WHERE indexer_address = $1 \
+         ORDER BY created_at DESC NULLS LAST LIMIT 100",
+    )
+    .bind(address.to_lowercase())
+    .fetch_all(pool)
+    .await?)
+}
+
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct ParameterChange {
+    pub param_name: String,
+    pub old_value: Option<f64>,
+    pub new_value: f64,
+    pub epoch: Option<i32>,
+    pub detected_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The parameter trail, deduplicated.
+///
+/// `DISTINCT ON` over the change itself rather than over the row: the refresh job records what it
+/// observed each pass, so one cut change seen across forty passes is forty rows and one event.
+pub async fn parameter_history(
+    pool: &Pool,
+    address: &str,
+) -> Result<Vec<ParameterChange>, DbError> {
+    Ok(sqlx::query_as(
+        "SELECT param_name, old_value::float8, new_value::float8, epoch, detected_at FROM ( \
+           SELECT DISTINCT ON (param_name, old_value, new_value, epoch) \
+             param_name, old_value, new_value, epoch, created_at AS detected_at \
+           FROM parameter_changes \
+           WHERE indexer_address = $1 AND old_value IS DISTINCT FROM new_value \
+           ORDER BY param_name, old_value, new_value, epoch, created_at DESC \
+         ) deduped ORDER BY detected_at DESC LIMIT 100",
+    )
+    .bind(address.to_lowercase())
+    .fetch_all(pool)
+    .await?)
+}
+
+/// One day's total, as the revenue fold wants it.
+///
+/// Cast to `float8` in the statement rather than carried as text, and this is the one place that is
+/// right: the column is GRT rather than wei, the figure is charted rather than compared, and the
+/// incumbent's shape is a JSON number. A string here would be a parity break.
+pub async fn revenue_daily(
+    pool: &Pool,
+    address: &str,
+    window_days: i32,
+) -> Result<(Vec<(String, f64)>, Vec<(String, f64)>), DbError> {
+    let address = address.to_lowercase();
+    let rav: Vec<(String, f64)> = sqlx::query_as(
+        "SELECT to_char(date_trunc('day', collected_at), 'YYYY-MM-DD'), \
+         COALESCE(sum(tokens_grt), 0)::float8 \
+         FROM rav_redemptions \
+         WHERE indexer_address = $1 AND collected_at >= now() - ($2::int * INTERVAL '1 day') \
+         GROUP BY 1 ORDER BY 1",
+    )
+    .bind(&address)
+    .bind(window_days)
+    .fetch_all(pool)
+    .await?;
+    let rewards: Vec<(String, f64)> = sqlx::query_as(
+        "SELECT to_char(date_trunc('day', closed_at), 'YYYY-MM-DD'), \
+         COALESCE(sum(indexing_rewards_grt), 0)::float8 \
+         FROM allocations \
+         WHERE indexer_address = $1 AND closed_at IS NOT NULL \
+         AND closed_at >= now() - ($2::int * INTERVAL '1 day') \
+         GROUP BY 1 ORDER BY 1",
+    )
+    .bind(&address)
+    .bind(window_days)
+    .fetch_all(pool)
+    .await?;
+    Ok((rav, rewards))
+}
+
+pub async fn revenue_by_deployment(
+    pool: &Pool,
+    address: &str,
+    window_days: i32,
+) -> Result<(Vec<(Option<String>, f64)>, Vec<(Option<String>, f64)>), DbError> {
+    let address = address.to_lowercase();
+    let rav: Vec<(Option<String>, f64)> = sqlx::query_as(
+        "SELECT deployment_id, COALESCE(sum(tokens_grt), 0)::float8 \
+         FROM rav_redemptions \
+         WHERE indexer_address = $1 AND collected_at >= now() - ($2::int * INTERVAL '1 day') \
+         GROUP BY deployment_id",
+    )
+    .bind(&address)
+    .bind(window_days)
+    .fetch_all(pool)
+    .await?;
+    let rewards: Vec<(Option<String>, f64)> = sqlx::query_as(
+        "SELECT deployment_id, COALESCE(sum(indexing_rewards_grt), 0)::float8 \
+         FROM allocations \
+         WHERE indexer_address = $1 AND closed_at IS NOT NULL \
+         AND closed_at >= now() - ($2::int * INTERVAL '1 day') \
+         GROUP BY deployment_id",
+    )
+    .bind(&address)
+    .bind(window_days)
+    .fetch_all(pool)
+    .await?;
+    Ok((rav, rewards))
+}
+
+// ---------------------------------------------------------------------------------------------
 // Dock subgraphs and bounties
 // ---------------------------------------------------------------------------------------------
 
@@ -1113,6 +1243,11 @@ mod schema_coverage {
                 .map(|w| w.to_lowercase())
                 .collect();
             for (n, w) in words.iter().enumerate() {
+                // `a IS DISTINCT FROM b` is an operator, not a table reference, and the `b` is a
+                // column. Reading it as a table reported `new_value` as missing from the schema.
+                if n > 0 && words[n - 1] == "distinct" {
+                    continue;
+                }
                 if matches!(w.as_str(), "from" | "into" | "update" | "join")
                     && let Some(next) = words.get(n + 1)
                     && !NOT_A_TABLE.contains(&next.as_str())
@@ -1176,4 +1311,85 @@ mod schema_coverage {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// graph-support: the community triage archive
+// ---------------------------------------------------------------------------------------------
+
+/// One issue from nightswatchhq/graph-support, as the mirror job last saw it.
+///
+/// `labels` is the flat list of names rather than anything parsed. The taxonomy in that repo's
+/// `TRIAGE.md` is not exhaustive - `area/governance` and `kind/question` are both in use and in
+/// neither published list - so a mirror that understood the labels would drop the ones it had not
+/// been told about. The dashboard groups them; this stores them.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphSupportIssue {
+    pub number: i32,
+    pub title: String,
+    pub url: String,
+    pub state: String,
+    pub labels: Vec<String>,
+    pub comments: i32,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Create the mirror table.
+///
+/// Additive and ours alone: nothing the platform runs reads or writes it, which is what lets it
+/// live here rather than in the schema the migration must be able to roll back to.
+pub async fn ensure_graph_support_table(pool: &Pool) -> Result<(), DbError> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS graph_support_issues ( \
+           number      INTEGER PRIMARY KEY, \
+           title       TEXT NOT NULL, \
+           url         TEXT NOT NULL, \
+           state       TEXT NOT NULL, \
+           labels      TEXT[] NOT NULL DEFAULT '{}', \
+           comments    INTEGER NOT NULL DEFAULT 0, \
+           created_at  TIMESTAMPTZ NOT NULL, \
+           updated_at  TIMESTAMPTZ NOT NULL, \
+           ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW() \
+         )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_graph_support_updated \
+         ON graph_support_issues(updated_at DESC)",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The whole archive, newest activity first.
+///
+/// Unpaginated on purpose. It is thirty-three rows and grows by a handful a month; a limit here
+/// would be a truncation the page could not tell from the archive being that size.
+pub async fn graph_support_issues(pool: &Pool) -> Result<Vec<GraphSupportIssue>, DbError> {
+    let rows = sqlx::query_as::<_, GraphSupportIssue>(
+        "SELECT number, title, url, state, labels, comments, created_at, updated_at \
+         FROM graph_support_issues ORDER BY updated_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// When the mirror last ran, whether or not it wrote anything.
+///
+/// Read from the rows rather than from `ingestion_state` so the answer describes the data being
+/// served. A cursor that moved while the write failed would report freshness the table does not
+/// have.
+pub async fn graph_support_ingested_at(
+    pool: &Pool,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, DbError> {
+    let row: Option<(chrono::DateTime<chrono::Utc>,)> =
+        sqlx::query_as("SELECT MAX(ingested_at) FROM graph_support_issues")
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|r| r.0))
 }

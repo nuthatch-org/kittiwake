@@ -2152,3 +2152,172 @@ pub async fn studio_ipfs(
     crate::no_store(response.headers_mut());
     Ok(response)
 }
+
+// ── The long tail: Postgres reads ────────────────────────────────────────────
+//
+// Four routes that read tables this service already writes. They carry no provenance envelope,
+// because their source is our own Postgres rather than a sealed nest, and saying "sealed through"
+// about a row a cron wrote here would be a claim nobody can check. #67
+
+/// An Ethereum address, or nothing. Every route below is keyed by one and none of them should
+/// reach Postgres with something that is not.
+pub(crate) fn eth_address(raw: &str) -> Option<String> {
+    let lower = raw.trim().to_lowercase();
+    let hex = lower.strip_prefix("0x")?;
+    (hex.len() == 40 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then_some(lower)
+}
+
+fn bad_address() -> ErrorResponse {
+    ApiError::BadRequest("expected a 0x-prefixed 20-byte address".into()).into()
+}
+
+pub async fn indexer_disputes(
+    State(st): State<AppState>,
+    Path(address): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let address = eth_address(&address).ok_or_else(bad_address)?;
+    let disputes = kittiwake_db::indexer_disputes(pool(&st)?, &address)
+        .await
+        .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+    Ok(axum::Json(serde_json::json!({ "disputes": disputes })).into_response())
+}
+
+pub async fn parameter_history(
+    State(st): State<AppState>,
+    Path(address): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let address = eth_address(&address).ok_or_else(bad_address)?;
+    let data = kittiwake_db::parameter_history(pool(&st)?, &address)
+        .await
+        .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+    Ok(axum::Json(serde_json::json!({ "data": data })).into_response())
+}
+
+#[derive(serde::Deserialize)]
+pub struct RevenueQuery {
+    pub window: Option<u32>,
+    #[serde(rename = "byDeployment")]
+    pub by_deployment: Option<String>,
+}
+
+async fn read_revenue(
+    st: &AppState,
+    address: &str,
+    window_days: u32,
+    by_deployment: bool,
+) -> Result<kittiwake_rewards::pnl::IndexerRevenue, ErrorResponse> {
+    let days = window_days as i32;
+    let (rav, rewards) = kittiwake_db::revenue_daily(pool(st)?, address, days)
+        .await
+        .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+    let daily = kittiwake_rewards::pnl::merge_daily(&rav, &rewards);
+    let by_deployment = if by_deployment {
+        let (rav, rewards) = kittiwake_db::revenue_by_deployment(pool(st)?, address, days)
+            .await
+            .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+        Some(kittiwake_rewards::pnl::merge_by_deployment(&rav, &rewards))
+    } else {
+        None
+    };
+    Ok(kittiwake_rewards::pnl::IndexerRevenue {
+        indexer: address.to_string(),
+        window_days,
+        rav_grt: rav.iter().map(|(_, grt)| grt).sum(),
+        indexing_rewards_grt: rewards.iter().map(|(_, grt)| grt).sum(),
+        total_grt: daily.iter().map(|d| d.total_grt).sum(),
+        daily,
+        by_deployment,
+    })
+}
+
+pub async fn indexer_revenue(
+    State(st): State<AppState>,
+    Path(address): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<RevenueQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let address = eth_address(&address).ok_or_else(bad_address)?;
+    let window = kittiwake_rewards::pnl::revenue_window(q.window);
+    let data = read_revenue(
+        &st,
+        &address,
+        window,
+        q.by_deployment.as_deref() == Some("1"),
+    )
+    .await?;
+    Ok(axum::Json(serde_json::json!({ "data": data })).into_response())
+}
+
+/// The cost side is request input and is never stored.
+///
+/// There is no per-indexer configuration behind this and there deliberately is not: persisting a
+/// cost model keyed by an address nobody proved they own would be an unauthenticated write surface.
+/// An operator's figures live in their own browser until the Dock has somewhere to put them.
+pub async fn indexer_pnl(
+    State(st): State<AppState>,
+    Path(address): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(raw): Query<std::collections::BTreeMap<String, String>>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let address = eth_address(&address).ok_or_else(bad_address)?;
+    let window =
+        kittiwake_rewards::pnl::revenue_window(raw.get("window").and_then(|w| w.parse().ok()));
+    let cost = cost_model_from(&raw);
+    // The P&L view always answers in GRT; a price only adds the dollar columns.
+    let grt_price = raw
+        .get("grtPrice")
+        .and_then(|p| p.parse::<f64>().ok())
+        .filter(|p| p.is_finite() && *p >= 0.0);
+
+    let revenue = read_revenue(&st, &address, window, true).await?;
+    let pnl = kittiwake_rewards::pnl::compute_pnl(&revenue, &cost, grt_price, window);
+    let mut response = axum::Json(serde_json::json!({
+        "data": {
+            "pnl": pnl,
+            "costModel": cost,
+            "defaultChainCosts": kittiwake_rewards::pnl::default_chain_costs_map(),
+        }
+    }))
+    .into_response();
+    crate::no_store(response.headers_mut());
+    Ok(response)
+}
+
+/// `?chains=a,b&cost_a=1800&overhead=300`, as the incumbent spells it.
+fn cost_model_from(
+    raw: &std::collections::BTreeMap<String, String>,
+) -> kittiwake_rewards::pnl::CostModel {
+    let chains: Vec<String> = raw
+        .get("chains")
+        .map(|c| {
+            c.split(',')
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let overrides = raw
+        .iter()
+        .filter_map(|(key, value)| {
+            let chain = key.strip_prefix("cost_")?;
+            let price: f64 = value.parse().ok()?;
+            (price.is_finite() && price >= 0.0).then(|| (chain.to_string(), price))
+        })
+        .collect();
+    let overhead = raw
+        .get("overhead")
+        .and_then(|o| o.parse::<f64>().ok())
+        .filter(|o| o.is_finite() && *o >= 0.0);
+    kittiwake_rewards::pnl::resolve_cost_model(&chains, &overrides, overhead)
+}

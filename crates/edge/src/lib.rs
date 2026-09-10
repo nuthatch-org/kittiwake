@@ -831,6 +831,20 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sql/query", post(post_sql_query))
         .route("/api/sql/named", get(get_sql_named).post(post_sql_named))
         .route("/api/sql/receipt", post(post_sql_receipt))
+        // The long tail's Postgres reads. #67
+        .route(
+            "/api/indexer-disputes/{address}",
+            get(handlers::indexer_disputes),
+        )
+        .route(
+            "/api/parameter-history/{address}",
+            get(handlers::parameter_history),
+        )
+        .route(
+            "/api/indexer/{address}/revenue",
+            get(handlers::indexer_revenue),
+        )
+        .route("/api/indexer/{address}/pnl", get(handlers::indexer_pnl))
         // The Dock. Session-scoped and owner-scoped rather than public reads, which is why none of
         // it appears in the published document. #16
         .route(

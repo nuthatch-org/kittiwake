@@ -4,6 +4,8 @@
 //! delegator-facing dimensions are built from, and they are the ones most easily got subtly wrong,
 //! so each carries the reasoning rather than only the arithmetic.
 
+pub mod pnl;
+
 use serde::Serialize;
 
 /// One allocation, as far as the reward calculation cares.

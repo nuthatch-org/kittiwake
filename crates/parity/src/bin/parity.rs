@@ -54,6 +54,28 @@ fn routes() -> Vec<Route> {
             ours_at: "/data",
         },
         both("/api/curators?first=10"),
+        // The long tail's Postgres reads. Both sides read the same tables, so these compare on
+        // values as well as shape. #67
+        Route {
+            path: leak(format!("/api/indexer-disputes/{A}")),
+            incumbent_at: "",
+            ours_at: "",
+        },
+        Route {
+            path: leak(format!("/api/parameter-history/{A}")),
+            incumbent_at: "",
+            ours_at: "",
+        },
+        Route {
+            path: leak(format!("/api/indexer/{A}/revenue?window=30")),
+            incumbent_at: "",
+            ours_at: "",
+        },
+        Route {
+            path: leak(format!("/api/indexer/{A}/pnl?window=30&chains=arbitrum")),
+            incumbent_at: "",
+            ours_at: "",
+        },
         both("/api/token-metrics?count=5"),
         Route {
             path: leak(format!("/api/provisions?indexer={A}")),
