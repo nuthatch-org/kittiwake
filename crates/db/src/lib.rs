@@ -1013,8 +1013,6 @@ pub async fn scuttle_ban(
     .fetch_one(pool)
     .await?)
 }
-
-const SCHEMA: &str = include_str!("../../../db/schema.sql");
 /// Every table this service's own statements name, worked out once.
 ///
 /// `schema_gaps` checks against this rather than against everything `db/schema.sql` declares. That
@@ -1149,7 +1147,7 @@ mod schema_coverage {
     //! So this reads the source, pulls the table names out of every `sqlx::query` literal, and
     //! checks each against the schema. It covers exactly the statements the macro cannot.
 
-    use super::{NOT_A_TABLE, SCHEMA, SOURCES, is_nest_table, tables_in};
+    use super::{SCHEMA_SQL as SCHEMA, SOURCES, tables_in};
 
     #[test]
     fn every_table_a_statement_names_is_in_the_schema() {
