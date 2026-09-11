@@ -66,17 +66,29 @@ ask_for() {
   printf '%s' "$v"
 }
 
-declare -A SECRET
-for k in SESSION_SECRET SCUTTLEBUTT_TRIP_SALT SCUTTLEBUTT_IP_PEPPER SCUTTLEBUTT_ADMIN_SECRET; do
-  v="$(val "$k")"
-  if [ -z "$v" ] || ! refuse_placeholder "$k" "$v" 2>/dev/null; then
-    echo "$k could not be read from Vercel." >&2
-    v="$(ask_for "$k")"
+# Four plain variables rather than an associative array. macOS ships bash 3.2, where `declare -A`
+# is a syntax error, and this is a script whose whole job is to be run from a laptop.
+SECRET_SESSION=""
+SECRET_TRIP=""
+SECRET_PEPPER=""
+SECRET_ADMIN=""
+
+collect() {
+  local name="$1" v
+  v="$(val "$name")"
+  if [ -z "$v" ] || ! refuse_placeholder "$name" "$v" 2>/dev/null; then
+    echo "$name could not be read from Vercel." >&2
+    v="$(ask_for "$name")"
   fi
-  [ -n "$v" ] || { echo "$k is empty; nothing was changed" >&2; exit 1; }
-  refuse_placeholder "$k" "$v" || exit 1
-  SECRET[$k]="$v"
-done
+  [ -n "$v" ] || { echo "$name is empty; nothing was changed" >&2; return 1; }
+  refuse_placeholder "$name" "$v" || return 1
+  printf '%s' "$v"
+}
+
+SECRET_SESSION="$(collect SESSION_SECRET)" || exit 1
+SECRET_TRIP="$(collect SCUTTLEBUTT_TRIP_SALT)" || exit 1
+SECRET_PEPPER="$(collect SCUTTLEBUTT_IP_PEPPER)" || exit 1
+SECRET_ADMIN="$(collect SCUTTLEBUTT_ADMIN_SECRET)" || exit 1
 
 # The service's own rules, mirrored exactly, so a value it will refuse is a sentence from here
 # rather than a process that will not start after the config has been replaced.
@@ -90,7 +102,7 @@ done
 # to production - because `vercel env pull` had returned `[SENSITIVE]` rather than the secret. The
 # value was not short, it was absent. `refuse_placeholder` checks for that by name; length is not
 # the thing that can catch it.
-SS="${SECRET[SESSION_SECRET]}"
+SS="$SECRET_SESSION"
 [ "${#SS}" -ge 32 ] || {
   echo "SESSION_SECRET is shorter than 32 characters; kittiwake will refuse it" >&2; exit 1; }
 unset SS
@@ -102,10 +114,10 @@ echo "writing [studio] and [scuttle] to $HOST"
 # the command runs; and not through `SendEnv`, which needs a matching `AcceptEnv` in the server's
 # sshd config and silently sends nothing when there isn't one.
 {
-  printf '%s\n' "${SECRET[SESSION_SECRET]}"
-  printf '%s\n' "${SECRET[SCUTTLEBUTT_TRIP_SALT]}"
-  printf '%s\n' "${SECRET[SCUTTLEBUTT_IP_PEPPER]}"
-  printf '%s\n' "${SECRET[SCUTTLEBUTT_ADMIN_SECRET]}"
+  printf '%s\n' "$SECRET_SESSION"
+  printf '%s\n' "$SECRET_TRIP"
+  printf '%s\n' "$SECRET_PEPPER"
+  printf '%s\n' "$SECRET_ADMIN"
   cat <<'BOX'
 set -euo pipefail
 export LC_ALL=C
