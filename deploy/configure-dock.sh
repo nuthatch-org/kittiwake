@@ -53,12 +53,18 @@ for k in SESSION_SECRET SCUTTLEBUTT_TRIP_SALT SCUTTLEBUTT_IP_PEPPER SCUTTLEBUTT_
   [ -n "$(val "$k")" ] || { echo "$k is not set in the production environment" >&2; exit 1; }
 done
 
-# Checked here as well as in the service, so a short secret is a message from this script rather
-# than a process that refuses to start after the config has already been replaced.
-for k in SESSION_SECRET SCUTTLEBUTT_TRIP_SALT SCUTTLEBUTT_IP_PEPPER SCUTTLEBUTT_ADMIN_SECRET; do
-  v=$(val "$k")
-  [ "${#v}" -ge 32 ] || { echo "$k is shorter than 32 characters; kittiwake will refuse it" >&2; exit 1; }
-done
+# The service's own rules, mirrored exactly, so a value it will refuse is a sentence from here
+# rather than a process that will not start after the config has been replaced.
+#
+# Only the session secret has a length floor. The salt, the pepper and the admin secret need only
+# be non-empty, and inventing a minimum for them would be worse than useless: whatever length the
+# incumbent's trip salt happens to be is the length that derives every tripcode in the room, and a
+# check that refused to copy it would guarantee the outcome it was meant to prevent. This script
+# refused a perfectly good salt on exactly that mistake, 2026-09-11.
+SS=$(val SESSION_SECRET)
+[ "${#SS}" -ge 32 ] || {
+  echo "SESSION_SECRET is shorter than 32 characters; kittiwake will refuse it" >&2; exit 1; }
+unset SS
 
 echo "writing [studio] and [scuttle] to $HOST"
 
