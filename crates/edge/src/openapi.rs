@@ -34,6 +34,12 @@ pub const WITHHELD: &[(&str, &str)] = &[
          a way to ask anything at all",
     ),
     (
+        "/api/file-issue",
+        "opens an issue in a public repository on a reporter's behalf, authored by one credential. \
+         Documenting it as an anonymous endpoint would be an invitation to write into somebody \
+         else's issue tracker through us",
+    ),
+    (
         "/api/health",
         "reports on this deployment rather than on the protocol. It exists under /api because that \
          is the URL the platform's health endpoint had and monitors already point at it",
@@ -182,6 +188,10 @@ const SUMMARIES: &[Operation] = &[
     op(
         "/api/support/{number}",
         "One graph-support thread: the opening post and every reply.",
+    ),
+    op(
+        "/api/issue-forms",
+        "The graph-support issue forms, parsed into fields, and whether this deployment can file.",
     ),
     op("/api/provisions", "One indexer's Horizon provisions."),
     op(

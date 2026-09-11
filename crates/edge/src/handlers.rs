@@ -3844,3 +3844,287 @@ mod schema_cid_tests {
         assert_eq!(schema_cid(&manifest), None);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Filing an issue in nightswatchhq/graph-support
+// ---------------------------------------------------------------------------------------------
+
+/// Long enough for a stack trace and a query, short enough that nobody pastes a database in.
+const MAX_FIELD_CHARS: usize = 20_000;
+const MAX_TITLE_CHARS: usize = 256;
+const MIN_TITLE_CHARS: usize = 8;
+
+/// The forms, parsed, for the compose page to render.
+///
+/// On its own path rather than sharing one with `file_issue`, because the rate limiter buckets by
+/// path and not by method: three writes a minute is right for opening issues in a public repository
+/// and would lock a reader out of the form on their third page load.
+pub async fn issue_forms(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let pool = st
+        .pool
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("no database is configured".into()))?;
+
+    let rows = kittiwake_db::graph_support_templates(pool)
+        .await
+        .map_err(|e| ApiError::Unavailable(e.to_string()))?;
+
+    // A template the mirror holds but this cannot parse is skipped rather than fatal: five usable
+    // forms beat a page that will not load because a sixth grew a field type we do not know.
+    let templates: Vec<kittiwake_support::IssueForm> = rows
+        .iter()
+        .filter_map(
+            |r| match kittiwake_support::parse_issue_form(&r.file, &r.yaml) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    tracing::warn!(file = %r.file, error = %e, "a graph-support template did not parse");
+                    None
+                }
+            },
+        )
+        .collect();
+
+    if templates.is_empty() {
+        return Err(ApiError::Unavailable("The issue forms could not be read.".into()).into());
+    }
+
+    let mut response = axum::Json(serde_json::json!({
+        "templates": templates,
+        "canFile": st.support_token.is_some(),
+        "chooserUrl": kittiwake_support::chooser_url(),
+    }))
+    .into_response();
+    crate::no_store(response.headers_mut());
+    Ok(response)
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+pub struct FileIssueBody {
+    template: String,
+    title: String,
+    values: serde_json::Value,
+    handle: Option<String>,
+    /// Honeypot. A real form leaves it empty because it is never shown.
+    website: Option<String>,
+}
+
+/// Coerce the posted answers into the shape the renderer takes, dropping anything else.
+fn read_values(raw: &serde_json::Value) -> kittiwake_support::Values {
+    let mut out = std::collections::HashMap::new();
+    let Some(obj) = raw.as_object() else {
+        return kittiwake_support::Values(out);
+    };
+    for (key, value) in obj {
+        let answer = match value {
+            serde_json::Value::String(s) => Some(kittiwake_support::Answer::One(clamp(s))),
+            serde_json::Value::Array(items) => Some(kittiwake_support::Answer::Many(
+                items.iter().filter_map(|v| v.as_str()).map(clamp).collect(),
+            )),
+            _ => None,
+        };
+        if let Some(a) = answer {
+            out.insert(key.clone(), a);
+        }
+    }
+    kittiwake_support::Values(out)
+}
+
+/// Truncated on a character boundary. Slicing bytes would panic mid-codepoint on the first report
+/// that pastes twenty thousand characters of anything but ASCII.
+fn clamp(s: &str) -> String {
+    s.chars().take(MAX_FIELD_CHARS).collect()
+}
+
+fn filing_error(message: &str, status: axum::http::StatusCode) -> Response {
+    let mut r = (
+        status,
+        axum::Json(serde_json::json!({
+            "error": message,
+            "chooserUrl": kittiwake_support::chooser_url(),
+        })),
+    )
+        .into_response();
+    crate::no_store(r.headers_mut());
+    r
+}
+
+/// Open an issue on a reporter's behalf.
+///
+/// The credential is one account, so every thread filed here is authored by it.
+/// `provenance_footer` says so in the body rather than letting the archive imply the maintainer
+/// reported it themselves.
+pub async fn file_issue(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Option<axum::Json<FileIssueBody>>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+
+    // `Option<Json<..>>` rather than `Json<..>`: a mandatory body makes axum answer 400 before the
+    // handler runs, so a client that sends none gets a bare rejection with no explanation. That
+    // shipped once already on the Scuttlebutt delete (kittiwake#109).
+    let Some(axum::Json(payload)) = body else {
+        return Ok(filing_error(
+            "The request body was not JSON.",
+            axum::http::StatusCode::BAD_REQUEST,
+        ));
+    };
+
+    if !payload
+        .website
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        return Ok(filing_error(
+            "Rejected.",
+            axum::http::StatusCode::BAD_REQUEST,
+        ));
+    }
+
+    let Some(token) = st.support_token.as_deref() else {
+        // Not a failure the reporter caused, and their typing is still in the form, so the answer
+        // says where else to put it rather than pretending the send worked.
+        return Ok(filing_error(
+            "Filing from Lodestar is not configured. The issue can still be opened on GitHub.",
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        ));
+    };
+
+    let pool = st
+        .pool
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("no database is configured".into()))?;
+    let rows = match kittiwake_db::graph_support_templates(pool).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "the issue forms could not be read");
+            return Ok(filing_error(
+                "The issue forms could not be read, so nothing was filed.",
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            ));
+        }
+    };
+
+    let Some(form) = rows
+        .iter()
+        .find(|r| r.file == payload.template)
+        .and_then(|r| kittiwake_support::parse_issue_form(&r.file, &r.yaml).ok())
+    else {
+        return Ok(filing_error(
+            "That is not one of the issue forms.",
+            axum::http::StatusCode::BAD_REQUEST,
+        ));
+    };
+
+    let title = payload.title.trim();
+    if title.chars().count() < MIN_TITLE_CHARS {
+        return Ok(filing_error(
+            "The title needs to say what broke, in at least a few words.",
+            axum::http::StatusCode::BAD_REQUEST,
+        ));
+    }
+    if title.chars().count() > MAX_TITLE_CHARS {
+        return Ok(filing_error(
+            "The title is too long.",
+            axum::http::StatusCode::BAD_REQUEST,
+        ));
+    }
+
+    let values = read_values(&payload.values);
+    let errors = kittiwake_support::validate(&form, &values);
+    if let Some(first) = errors.first() {
+        let mut r = (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": first,
+                "errors": errors,
+                "chooserUrl": kittiwake_support::chooser_url(),
+            })),
+        )
+            .into_response();
+        crate::no_store(r.headers_mut());
+        return Ok(r);
+    }
+
+    let handle = payload
+        .handle
+        .as_deref()
+        .map(|h| h.chars().take(120).collect::<String>());
+    let body_md = format!(
+        "{}\n\n{}",
+        kittiwake_support::render_issue_body(&form, &values),
+        kittiwake_support::provenance_footer(handle.as_deref())
+    );
+
+    let client = reqwest::Client::new();
+    let res = match client
+        .post(format!(
+            "https://api.github.com/repos/{}/issues",
+            kittiwake_support::REPO
+        ))
+        .header(axum::http::header::ACCEPT, "application/vnd.github.v3+json")
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+        // GitHub refuses a request with no user agent, and a named one is what appears in their
+        // rate-limit accounting rather than an anonymous bucket shared with everything else.
+        .header(axum::http::header::USER_AGENT, "kittiwake")
+        .json(&serde_json::json!({
+            "title": title,
+            "body": body_md,
+            "labels": form.labels,
+        }))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, file = %form.file, "GitHub could not be reached to open an issue");
+            return Ok(filing_error(
+                "GitHub could not be reached, so nothing was filed.",
+                axum::http::StatusCode::BAD_GATEWAY,
+            ));
+        }
+    };
+
+    if !res.status().is_success() {
+        tracing::warn!(
+            status = res.status().as_u16(),
+            file = %form.file,
+            rate_limit_remaining = ?res.headers().get("x-ratelimit-remaining"),
+            "GitHub refused to open a graph-support issue"
+        );
+        return Ok(filing_error(
+            "GitHub refused the issue, so nothing was filed.",
+            axum::http::StatusCode::BAD_GATEWAY,
+        ));
+    }
+
+    let created: serde_json::Value = res.json().await.unwrap_or(serde_json::Value::Null);
+    let Some(number) = created.get("number").and_then(|n| n.as_u64()) else {
+        // The issue may well exist; what is missing is the number to send anyone to.
+        return Ok(filing_error(
+            "The issue was accepted but GitHub did not say which number it got.",
+            axum::http::StatusCode::BAD_GATEWAY,
+        ));
+    };
+
+    let mut response = axum::Json(serde_json::json!({
+        "number": number,
+        "url": created
+            .get("html_url")
+            .and_then(|u| u.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("https://github.com/{}/issues/{number}", kittiwake_support::REPO)),
+    }))
+    .into_response();
+    crate::no_store(response.headers_mut());
+    Ok(response)
+}

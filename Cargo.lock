@@ -3254,6 +3254,7 @@ dependencies = [
  "kittiwake-scuttle",
  "kittiwake-sqlplay",
  "kittiwake-ssrf",
+ "kittiwake-support",
  "kittiwake-types",
  "metrics",
  "reqwest",
@@ -3460,6 +3461,15 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "kittiwake-support"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
 ]
 
 [[package]]

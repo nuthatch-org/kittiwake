@@ -242,6 +242,11 @@ pub mod coverage {
             "a write. Comparing it against the incumbent would mean inserting a row into the shared analytics table on every parity run, and its answer is a fixed {ok:true} that says nothing about what was stored",
         ),
         (
+            "/api/file-issue",
+            Excused::Entirely,
+            "opens a real issue in a public repository. A parity run would file one on each side, every run, in somebody else's tracker, and there is no way to un-file it",
+        ),
+        (
             "/api/health",
             Excused::Entirely,
             "reports on the deployment answering it, so the two can only ever disagree: the incumbent describes a Vercel function and its Redis, this describes a box and its scheduler. The parity run itself would be comparing two different machines' weather",
