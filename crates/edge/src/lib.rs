@@ -1106,7 +1106,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/scuttlebutt/admin/login",
-            post(handlers::scuttle_admin_login),
+            // Three methods on one path, as the incumbent had it: the board asks GET on load,
+            // POST signs in, DELETE signs out. Binding only POST made the other two 405.
+            get(handlers::scuttle_admin_session)
+                .post(handlers::scuttle_admin_login)
+                .delete(handlers::scuttle_admin_logout),
         )
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(tower_http::catch_panic::CatchPanicLayer::new())

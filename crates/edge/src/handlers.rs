@@ -662,7 +662,9 @@ pub async fn poi(
     Query(q): Query<PoiQuery>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
-    let dep = q.deployment.map(|d| addr(&d));
+    // `deployment_id`, not `addr`: the latter lowercases, base58 is case-sensitive, and this is
+    // the fourth route to make that mistake. Every POI deployment page 400'd on it.
+    let dep = q.deployment.map(|d| deployment_id(&d));
     Ok(envelope(
         routes::poi(&st.read, dep.as_deref(), q.first).await?,
     ))
@@ -2156,6 +2158,44 @@ pub async fn scuttle_admin_messages(
 #[derive(serde::Deserialize)]
 pub struct ScuttleLogin {
     pub password: String,
+}
+
+/// Whether this caller is signed in as a moderator.
+///
+/// The board asks on load, so the controls are there after a reload rather than only in the tab
+/// that logged in. Only POST was bound when the route moved, so this answered 405 and the caller's
+/// `.catch(() => {})` turned that into `admin: false` - a moderator silently demoted by a refresh,
+/// with nothing in the UI to say why. Found by a browser sweep on 2026-09-12, not by a test.
+///
+/// Not gated: answering "no" to an anonymous reader is the honest answer, not a refusal.
+pub async fn scuttle_admin_session(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    let room = scuttle(&st)?;
+    let admin = scuttle_admin_ok(&room.admin_session_secret, &headers, false, now());
+    let mut response = axum::Json(serde_json::json!({ "admin": admin })).into_response();
+    crate::no_store(response.headers_mut());
+    Ok(response)
+}
+
+/// Sign out, by expiring the cookie the login minted.
+///
+/// Unconditional on purpose. Someone without a session asking to have no session has got what they
+/// asked for, and refusing would mean a stale or malformed cookie could never be cleared.
+pub async fn scuttle_admin_logout(State(st): State<AppState>) -> Result<Response, ErrorResponse> {
+    scuttle(&st)?;
+    let mut response = axum::Json(serde_json::json!({ "admin": false })).into_response();
+    // Same attributes as the cookie it clears: a browser matches on them, and one that differs
+    // leaves the original in place while this reports success.
+    response.headers_mut().insert(
+        axum::http::header::SET_COOKIE,
+        axum::http::HeaderValue::from_static(
+            "sb_admin=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict",
+        ),
+    );
+    crate::no_store(response.headers_mut());
+    Ok(response)
 }
 
 /// Log in by minting the same stateless HMAC cookie as the incumbent. This is deliberately not a
@@ -4139,4 +4179,44 @@ pub async fn file_issue(
     .into_response();
     crate::no_store(response.headers_mut());
     Ok(response)
+}
+
+#[cfg(test)]
+mod deployment_id_tests {
+    use super::*;
+
+    /// **base58 is case-sensitive and `addr` lowercases.**
+    ///
+    /// This shipped once and 400'd `/api/indexing-status`, `/api/subgraph-curation` and
+    /// `/api/subgraph-history`. `deployment_id` was written to fix it, and on 2026-09-12 a browser
+    /// sweep found `/api/poi?deployment=` still using `addr`, so every POI deployment page had been
+    /// failing. Four routes, one mistake, and the comment warning about it was directly above.
+    ///
+    /// So the property is pinned rather than the callers audited again: a CID must survive, and the
+    /// naive normaliser must be visibly unable to carry one.
+    #[test]
+    fn a_cid_survives_deployment_id_and_does_not_survive_addr() {
+        let cid = "QmStfa6zwPUzKHyGrgdNMh8rgbc91sgvmskidBSujG92FR";
+
+        let id = deployment_id(cid);
+        assert_eq!(id.len(), 66, "a CID must convert to a bytes32 hex id: {id}");
+        assert!(id.starts_with("0x"), "{id}");
+        assert_eq!(id, id.to_lowercase(), "the hex form is lowercase");
+
+        // The failure mode, stated so the test explains itself: `addr` mangles the CID, and the
+        // mangled value cannot be converted at all.
+        assert_ne!(addr(cid), cid, "addr lowercases, which is the bug");
+        assert!(
+            kittiwake_read::shape::ipfs_hash_to_bytes32(&addr(cid)).is_none(),
+            "a lowercased CID must be unconvertible, or this test proves nothing"
+        );
+    }
+
+    /// A hex id handed in directly still works, because links carry CIDs and callers carry both.
+    #[test]
+    fn a_bytes32_id_passes_through_unchanged() {
+        let hex = "0x43a24eec54b93a1f0e5f1c6a4b9a0a6d1e2f3c4b5a69788796a5b4c3d2e1f009";
+        assert_eq!(deployment_id(hex), hex);
+        assert_eq!(deployment_id(&hex.to_uppercase()), hex);
+    }
 }
