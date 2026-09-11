@@ -1532,8 +1532,20 @@ pub async fn failing_jobs(pool: &Pool, min_failures: i64) -> Result<Vec<FailingJ
 #[serde(rename_all = "camelCase")]
 pub struct SchemaGap {
     pub table: String,
-    /// `None` when the whole table is missing.
+    /// `None` when the whole table is the problem.
     pub column: Option<String>,
+    /// What is actually wrong, which is not always what it looks like.
+    pub kind: GapKind,
+}
+
+/// Why a declared table or column is not usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GapKind {
+    /// The database does not have it. A migration is owed.
+    Missing,
+    /// It exists and this role cannot see it. A GRANT is owed, and no schema change is.
+    NoPrivilege,
 }
 
 /// What `db/schema.sql` declares that this database does not have.
@@ -1547,27 +1559,51 @@ pub struct SchemaGap {
 /// should not want, and a binary that quietly reshapes a database it merely reads from is a worse
 /// idea than one that refuses to pretend.
 pub async fn schema_gaps(pool: &Pool) -> Result<Vec<SchemaGap>, DbError> {
-    let live = sqlx::query_as::<_, (String, String)>(
+    // `information_schema` shows only what the calling role has a privilege on, so a table this
+    // role cannot touch is indistinguishable there from one that does not exist. The first
+    // deployment of this check reported eleven tables as missing that were all present and all
+    // ungranted: an operator's problem announced as a migration's. `pg_class` does not filter, so
+    // asking both tells them apart.
+    let visible = sqlx::query_as::<_, (String, String)>(
         "SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'public'",
     )
     .fetch_all(pool)
     .await?;
 
-    let have: std::collections::HashSet<(String, String)> = live.into_iter().collect();
-    let tables: std::collections::HashSet<String> = have.iter().map(|(t, _)| t.clone()).collect();
+    let existing = sqlx::query_as::<_, (String,)>(
+        "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm')",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let have: std::collections::HashSet<(String, String)> = visible.into_iter().collect();
+    let visible_tables: std::collections::HashSet<String> =
+        have.iter().map(|(t, _)| t.clone()).collect();
+    let existing_tables: std::collections::HashSet<String> =
+        existing.into_iter().map(|(t,)| t).collect();
 
     Ok(declared_columns(SCHEMA_SQL)
         .into_iter()
         .filter_map(|(table, column)| {
-            if !tables.contains(&table) {
+            if !visible_tables.contains(&table) {
+                let kind = if existing_tables.contains(&table) {
+                    GapKind::NoPrivilege
+                } else {
+                    GapKind::Missing
+                };
                 Some(SchemaGap {
                     table,
                     column: None,
+                    kind,
                 })
             } else if !have.contains(&(table.clone(), column.clone())) {
+                // A column invisible on a visible table would be a column-level grant, which
+                // nothing here uses, so an absence at this point really is one.
                 Some(SchemaGap {
                     table,
                     column: Some(column),
+                    kind: GapKind::Missing,
                 })
             } else {
                 None
