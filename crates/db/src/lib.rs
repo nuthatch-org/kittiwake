@@ -1017,7 +1017,7 @@ pub async fn scuttle_ban(
 ///
 /// `schema_gaps` checks against this rather than against everything `db/schema.sql` declares. That
 /// file describes the whole database, including tables only the platform touches - `community_votes`
-/// from a feature that has been deleted, `servability_rounds`, `indexer_scores` - and reporting
+/// from a feature that has been deleted, `indexer_scores` - and reporting
 /// those as gaps asks an operator to grant privileges nothing here will ever use. A check that
 /// lists things nobody intends to fix teaches people to skip reading it.
 fn tables_we_use() -> &'static std::collections::HashSet<String> {
@@ -1532,6 +1532,92 @@ pub async fn failing_jobs(pool: &Pool, min_failures: i64) -> Result<Vec<FailingJ
                 consecutive_failures,
                 last_success,
                 last_error,
+            },
+        )
+        .collect())
+}
+
+/// One probe round of `/api/indexing-status/{hash}`, as it goes into the store.
+#[derive(Debug, Clone)]
+pub struct ServabilityRound<'a> {
+    pub deployment_hash: &'a str,
+    pub probed_at: chrono::DateTime<chrono::Utc>,
+    pub serving_operators: i32,
+    pub serving_indexers: i32,
+    pub gateway_verdict: Option<&'a str>,
+    /// The verdict with `probes` inside it, which is what tells an edge block from a timeout after
+    /// the fact. Passed as a value, never as a pre-serialised string: a string handed to a `jsonb`
+    /// parameter lands as a JSON *string* inside the column and `verdict_json->'probes'` reads
+    /// null on every row. lodestar#61 shipped exactly that.
+    pub verdict_json: serde_json::Value,
+}
+
+/// The short history a round summary is read back as.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoundSummary {
+    pub probed_at: chrono::DateTime<chrono::Utc>,
+    pub serving_operators: i64,
+    pub serving_indexers: i64,
+    pub gateway_verdict: Option<String>,
+}
+
+/// Append one round.
+///
+/// "Effectively dead" is derived from the last K rounds and never from one, so this table is what
+/// makes that verdict possible at all. Without it the persistence rule sees a single round and
+/// renders `rechecking` for ever, which is safe and useless.
+pub async fn record_servability_round(
+    pool: &Pool,
+    round: ServabilityRound<'_>,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "INSERT INTO servability_rounds \
+           (deployment_hash, probed_at, serving_operator_count, serving_indexer_count, \
+            gateway_verdict, verdict_json) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(round.deployment_hash)
+    .bind(round.probed_at)
+    .bind(round.serving_operators)
+    .bind(round.serving_indexers)
+    .bind(round.gateway_verdict)
+    .bind(round.verdict_json)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The newest `limit` rounds for a deployment, **oldest first**.
+///
+/// The query takes them newest-first because that is what the index is for; the reversal is here
+/// rather than left to the caller, because `apply_persistence` reads a history in time order and
+/// handing it a reversed one silently inverts "recovering" and "going dead".
+pub async fn recent_servability_rounds(
+    pool: &Pool,
+    deployment_hash: &str,
+    limit: i64,
+) -> Result<Vec<RoundSummary>, DbError> {
+    let rows = sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, i32, i32, Option<String>)>(
+        "SELECT probed_at, serving_operator_count, serving_indexer_count, gateway_verdict \
+           FROM servability_rounds \
+          WHERE deployment_hash = $1 \
+          ORDER BY probed_at DESC \
+          LIMIT $2",
+    )
+    .bind(deployment_hash)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .rev()
+        .map(
+            |(probed_at, operators, indexers, gateway_verdict)| RoundSummary {
+                probed_at,
+                serving_operators: operators as i64,
+                serving_indexers: indexers as i64,
+                gateway_verdict,
             },
         )
         .collect())

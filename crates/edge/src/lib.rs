@@ -95,6 +95,9 @@ pub struct AppState {
     pub indexer_agent: Option<kittiwake_config::IndexerAgentSettings>,
     /// The key SQL receipts are signed with. Absent means this deployment issues none.
     pub receipt_key: Option<Arc<ed25519_dalek::SigningKey>>,
+    /// The escrow-funded payer a serving probe signs with. Absent means probes go out unpaid and
+    /// an indexer that wants a receipt is reported as unverified rather than as broken.
+    pub tap_payer: Option<Arc<kittiwake_chain::tap::Payer>>,
     /// The secret the edge proxy presents. Absent means no request is ever trusted to name a client
     /// other than the one that connected - safe, and wrong once traffic arrives through Vercel.
     pub edge_secret: Option<Arc<str>>,
@@ -1109,6 +1112,7 @@ pub fn state(
     foghorn_api_url: Option<String>,
     indexer_agent: Option<kittiwake_config::IndexerAgentSettings>,
     receipt_key: Option<Arc<ed25519_dalek::SigningKey>>,
+    tap_payer: Option<Arc<kittiwake_chain::tap::Payer>>,
 ) -> AppState {
     AppState {
         chain: read.chain.clone(),
@@ -1120,6 +1124,7 @@ pub fn state(
         foghorn_api_url: foghorn_api_url.map(|u| Arc::from(u.as_str())),
         indexer_agent,
         receipt_key,
+        tap_payer,
         edge_secret: edge_secret.map(|s| Arc::from(s.as_str())),
         pool,
         limits: Arc::new(limits),

@@ -120,6 +120,11 @@ GRANT SELECT ON ingestion_state, epochs, delegation_events, disputes, network_sn
 
 GRANT INSERT, UPDATE ON ipfs_metadata TO $ROLE;
 GRANT INSERT ON cron_runs TO $ROLE;
+-- The probe-round store behind "effectively dead". Not gated on GRANT_WRITER: this is written by
+-- a read route on every request rather than by the scheduler, and without INSERT here the history
+-- never accumulates, so the verdict is stuck on `rechecking` for ever. It fails as a logged warning
+-- rather than an error, which is the quiet way for a check to stop being able to reach a verdict.
+GRANT SELECT, INSERT ON servability_rounds TO $ROLE;
 -- INSERT on a table with a serial primary key is not enough on its own: the default draws from the
 -- sequence, and the sequence is a separate object with its own permissions. Every job run failed to
 -- record itself until this was added, and it failed as a warning rather than an error, which is the

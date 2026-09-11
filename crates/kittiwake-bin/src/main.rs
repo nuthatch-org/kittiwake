@@ -224,6 +224,12 @@ async fn main() -> anyhow::Result<()> {
                 .expect("receipt.issuer_key was accepted by configuration");
             Arc::new(ed25519_dalek::SigningKey::from_bytes(&bytes))
         }),
+        cfg.tap.as_ref().map(|t| {
+            Arc::new(
+                kittiwake_chain::tap::Payer::from_hex(&t.signer_private_key)
+                    .expect("tap.signer_private_key was accepted by configuration"),
+            )
+        }),
     );
     let limits_handle = state.limits.clone();
 
