@@ -745,6 +745,29 @@ async fn get_health(State(st): State<AppState>) -> Response {
                 }
             }
 
+            // A scheduled job that has stopped firing writes nothing, so `failing_jobs` cannot see
+            // it. The periods come from the scheduler that is running in this process rather than
+            // from a list kept beside it.
+            let scheduled: Vec<(String, i64)> = kittiwake_sched::scheduled_jobs()
+                .into_iter()
+                .map(|j| (j.name.to_string(), j.period.as_secs() as i64))
+                .collect();
+            match kittiwake_db::silent_jobs(pool, &scheduled, st.started.elapsed()).await {
+                Ok(jobs) => {
+                    if !jobs.is_empty() {
+                        ok = false;
+                    }
+                    body.insert("silent_jobs".into(), serde_json::json!(jobs));
+                }
+                Err(e) => {
+                    ok = false;
+                    body.insert(
+                        "silent_jobs".into(),
+                        serde_json::json!({ "error": e.to_string() }),
+                    );
+                }
+            }
+
             // Three in a row rather than one: every job here is retried on a schedule, and a single
             // failure against a nest that blinked is not news.
             match kittiwake_db::failing_jobs(pool, 3).await {

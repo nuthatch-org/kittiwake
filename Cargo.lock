@@ -3249,6 +3249,7 @@ dependencies = [
  "kittiwake-obs",
  "kittiwake-read",
  "kittiwake-rewards",
+ "kittiwake-sched",
  "kittiwake-score",
  "kittiwake-scuttle",
  "kittiwake-sqlplay",

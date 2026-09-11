@@ -1537,6 +1537,196 @@ pub async fn failing_jobs(pool: &Pool, min_failures: i64) -> Result<Vec<FailingJ
         .collect())
 }
 
+/// A job that is scheduled and has stopped firing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SilentJob {
+    pub step: String,
+    /// How often it is supposed to fire.
+    pub period_minutes: i64,
+    /// Since its last run, or since this process started when it has never run at all.
+    pub silent_for_minutes: i64,
+    /// The window it overran.
+    pub allowed_minutes: i64,
+    /// True when `cron_runs` has no row for it under any process.
+    pub never_ran: bool,
+}
+
+/// Three missed ticks, and never less than this.
+///
+/// A one-minute warmer that has not run for three minutes is not news; it is a tick landing late
+/// under load, and a check that fires on those is one people learn to scroll past. Twenty minutes
+/// is short enough to catch a stopped job within a working morning and long enough that nothing
+/// healthy trips it.
+const SILENCE_FLOOR_MINUTES: i64 = 20;
+
+fn silence_window_minutes(period_minutes: i64) -> i64 {
+    (period_minutes * 3).max(SILENCE_FLOOR_MINUTES)
+}
+
+/// The whole judgement, with the database left out of it so it can be tested.
+///
+/// `quiet_minutes` is `None` when `cron_runs` has no row for the step under any process, and the
+/// silence is then measured from start-up: after a restart, or against a fresh database, every job
+/// has legitimately never run and judging it on that would report the entire schedule as stopped
+/// the moment the service came up.
+fn judge_silence(
+    name: &str,
+    period_secs: i64,
+    quiet_minutes: Option<i64>,
+    uptime_minutes: i64,
+) -> Option<SilentJob> {
+    // A sub-minute period would floor to zero and make every window the floor anyway; one minute
+    // is the finest cadence anything here runs at.
+    let period_minutes = (period_secs / 60).max(1);
+    let allowed = silence_window_minutes(period_minutes);
+    let (silent_for, never_ran) = match quiet_minutes {
+        Some(q) => (q, false),
+        None => (uptime_minutes, true),
+    };
+    (silent_for > allowed).then(|| SilentJob {
+        step: format!("{CRON_RUN_PREFIX}{name}"),
+        period_minutes,
+        silent_for_minutes: silent_for,
+        allowed_minutes: allowed,
+        never_ran,
+    })
+}
+
+/// Scheduled jobs that have not run for far longer than their own period.
+///
+/// `failing_jobs` sees a job that runs and errors. It cannot see one that has stopped running,
+/// because a job that fires no longer writes no rows to argue with, and the two failures need
+/// looking for in opposite directions. Until now the second was caught in the other repository, by
+/// a hand-written table of thresholds describing this scheduler from a distance. The period comes
+/// from the running scheduler instead, so there is nothing left to keep in step.
+///
+/// `uptime` covers the start-up case honestly: after a restart, or against a fresh database, every
+/// job has legitimately never run, and a job is only judged once this process has been up long
+/// enough for it to have fired.
+pub async fn silent_jobs(
+    pool: &Pool,
+    jobs: &[(String, i64)],
+    uptime: Duration,
+) -> Result<Vec<SilentJob>, DbError> {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let steps: Vec<String> = jobs
+        .iter()
+        .map(|(name, _)| format!("{CRON_RUN_PREFIX}{name}"))
+        .collect();
+
+    // Every run ever, not a recent window: a job silent for a week has nothing inside one.
+    let rows = sqlx::query_as::<_, (String, Option<i64>)>(
+        "SELECT step,                 (EXTRACT(EPOCH FROM (NOW() - MAX(started_at))) / 60)::bigint AS quiet_minutes            FROM cron_runs           WHERE step = ANY($1)           GROUP BY step",
+    )
+    .bind(&steps)
+    .fetch_all(pool)
+    .await?;
+
+    let last_run: std::collections::HashMap<String, i64> = rows
+        .into_iter()
+        .filter_map(|(step, quiet)| quiet.map(|q| (step, q)))
+        .collect();
+
+    let uptime_minutes = (uptime.as_secs() / 60) as i64;
+    let mut out = Vec::new();
+
+    for ((name, period_secs), step) in jobs.iter().zip(steps.iter()) {
+        if let Some(j) = judge_silence(
+            name,
+            *period_secs,
+            last_run.get(step).copied(),
+            uptime_minutes,
+        ) {
+            out.push(j);
+        }
+    }
+
+    out.sort_by_key(|j| std::cmp::Reverse(j.silent_for_minutes));
+    Ok(out)
+}
+
+#[cfg(test)]
+mod silence_tests {
+    use super::*;
+
+    /// The case this exists for: a job whose last run is far older than its own cadence.
+    ///
+    /// On 2026-09-10 five ingest jobs stopped producing anything for six and a half hours and the
+    /// only thing that eventually noticed was a threshold living in another repository. That
+    /// repository is now frontend-only, so the judgement has to be here or nowhere.
+    #[test]
+    fn a_job_that_stopped_firing_is_reported() {
+        let j = judge_silence("ingest-epochs", 10 * 60, Some(390), 1000)
+            .expect("390 minutes of silence from a ten-minute job is a stopped job");
+        assert_eq!(j.step, "kittiwake:ingest-epochs");
+        assert_eq!(j.allowed_minutes, 30);
+        assert_eq!(j.silent_for_minutes, 390);
+        assert!(!j.never_ran);
+    }
+
+    /// A late tick is not a stopped job, and a check that cannot tell them apart gets ignored.
+    #[test]
+    fn a_single_late_tick_is_not_reported() {
+        assert!(judge_silence("ingest-epochs", 10 * 60, Some(11), 1000).is_none());
+        assert!(judge_silence("ingest-epochs", 10 * 60, Some(29), 1000).is_none());
+    }
+
+    /// The floor. Three minutes of quiet from a one-minute warmer is load, not a fault.
+    #[test]
+    fn a_fast_job_gets_the_floor_rather_than_three_of_its_own_ticks() {
+        assert_eq!(silence_window_minutes(1), SILENCE_FLOOR_MINUTES);
+        assert_eq!(silence_window_minutes(2), SILENCE_FLOOR_MINUTES);
+        assert!(judge_silence("warm", 60, Some(5), 1000).is_none());
+        assert!(judge_silence("warm", 60, Some(45), 1000).is_some());
+    }
+
+    /// Start-up. Every job has legitimately never run, and reporting the whole schedule as stopped
+    /// thirty seconds after a deploy is how a health endpoint gets muted.
+    #[test]
+    fn a_job_that_has_never_run_is_judged_on_uptime_not_on_absence() {
+        assert!(judge_silence("ingest-disputes", 360 * 60, None, 2).is_none());
+        let j = judge_silence("ingest-epochs", 10 * 60, None, 400)
+            .expect("up for six hours and never once fired is a stopped job");
+        assert!(j.never_ran);
+        assert_eq!(j.silent_for_minutes, 400);
+    }
+
+    /// The recorded step carries the prefix; the scheduler's own name does not. Comparing the two
+    /// directly would silently match nothing and report every job as never having run.
+    #[test]
+    fn the_step_name_is_the_recorded_one() {
+        let j = judge_silence("refresh", 5 * 60, Some(999), 1000).unwrap();
+        assert_eq!(j.step, format!("{CRON_RUN_PREFIX}refresh"));
+    }
+
+    /// Every cadence the scheduler actually runs, against the windows the other repository used
+    /// before this took the judgement over. Pinned so a period change has to be looked at.
+    #[test]
+    fn the_live_cadences_all_get_a_sane_window() {
+        for (period_minutes, want) in [
+            (1, 20),     // warm
+            (2, 20),     // ingest-horizon-activity
+            (5, 20),     // refresh, snapshot-network
+            (10, 30),    // ingest-epochs, warm-ipfs
+            (15, 45),    // ingest-delegations
+            (30, 90),    // refresh-chain-health
+            (60, 180),   // ingest-allocations, ingest-rav
+            (360, 1080), // ingest-disputes
+            (720, 2160), // ingest-graph-support
+        ] {
+            assert_eq!(
+                silence_window_minutes(period_minutes),
+                want,
+                "window for a {period_minutes}-minute job"
+            );
+        }
+    }
+}
+
 /// A table or column `db/schema.sql` declares and the live database does not have.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
