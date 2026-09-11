@@ -1159,11 +1159,17 @@ fn fold_one(
 /// An allocation with no registered URL is `unreachable` without a request being made. That is not
 /// the same as a failure and is counted separately, because an indexer that never published an
 /// endpoint has not been asked anything.
+/// Probe every allocated indexer, paying if this deployment has a payer.
+///
+/// `payer` rather than a receipt: a TAP receipt names one service provider, so a round that probes
+/// six indexers signs six. Handing this one receipt would address it to whichever indexer it named
+/// and the other five would reject it, which the classifier reads as "asked to be paid" - a
+/// deployment that serves perfectly well, reported as unverified, because of how we asked.
 pub async fn probe_all(
     ext: &kittiwake_ext::Ext,
     allocations: &[Allocated],
     ipfs_hash: &str,
-    receipt: Option<&str>,
+    payer: Option<&kittiwake_chain::tap::Payer>,
 ) -> Vec<IndexerStatus> {
     use futures::StreamExt;
 
@@ -1179,11 +1185,19 @@ pub async fn probe_all(
     let probed: Vec<IndexerStatus> =
         futures::stream::iter(with_url.into_iter().map(|a| async move {
             let url = a.url.clone().unwrap_or_default();
+            // Signing failure falls back to an unpaid probe rather than dropping the indexer: a
+            // weaker question still beats reporting nothing about a deployment that may be fine.
+            let receipt = payer.and_then(|p| {
+                a.indexer_id
+                    .parse()
+                    .ok()
+                    .and_then(|addr| p.receipt_for(addr).ok())
+            });
             // Together rather than one after the other: they ask different questions of the same host
             // and the slow one should not be waited for twice.
             let (status, serve) = tokio::join!(
                 ext.deployment_status(&url, ipfs_hash),
-                ext.probe_serving(&url, ipfs_hash, receipt, PROBE_TIMEOUT),
+                ext.probe_serving(&url, ipfs_hash, receipt.as_deref(), PROBE_TIMEOUT),
             );
             fold_one(&a, status, Some(&serve), receipt.is_some())
         }))

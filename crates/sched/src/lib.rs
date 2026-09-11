@@ -6,8 +6,8 @@
 //! collision structurally impossible rather than merely unlikely.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -100,6 +100,33 @@ impl RunRecorder for NoopRecorder {
     }
 }
 
+/// A job this process actually started, and how often it fires.
+///
+/// Read by `/health`, which judges a job against its own cadence rather than against a table of
+/// thresholds. That table existed, in the other repository, describing this schedule from a
+/// distance and kept in step by hand; it had already drifted. Anything derived from here cannot,
+/// because this is written by the act of spawning rather than beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledJob {
+    /// The bare job name. `cron_runs` records it prefixed - see `kittiwake_db::CRON_RUN_PREFIX`.
+    pub name: &'static str,
+    pub period: Duration,
+    /// Paid once at start-up, so the first run of a job is this much later than the rest.
+    pub stagger: Duration,
+}
+
+static SCHEDULED: OnceLock<RwLock<Vec<ScheduledJob>>> = OnceLock::new();
+
+fn registry() -> &'static RwLock<Vec<ScheduledJob>> {
+    SCHEDULED.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// What is running, in spawn order. Empty in a process with no scheduler, which is a true answer:
+/// a read-only replica schedules nothing and has nothing to go quiet.
+pub fn scheduled_jobs() -> Vec<ScheduledJob> {
+    registry().read().map(|g| g.clone()).unwrap_or_default()
+}
+
 pub struct Scheduler {
     gate: NestGate,
     recorder: Arc<dyn RunRecorder>,
@@ -123,6 +150,18 @@ impl Scheduler {
     fn spawn(&mut self, job: JobDef) -> tokio::task::JoinHandle<()> {
         let flag = Arc::new(AtomicBool::new(false));
         self.running.insert(job.name, flag.clone());
+        {
+            let Schedule::Every(period) = &job.schedule;
+            let period = *period;
+            if let Ok(mut reg) = registry().write() {
+                reg.retain(|j| j.name != job.name);
+                reg.push(ScheduledJob {
+                    name: job.name,
+                    period,
+                    stagger: job.stagger,
+                });
+            }
+        }
         let gate = self.gate.clone();
         let recorder = self.recorder.clone();
 
@@ -231,6 +270,34 @@ mod tests {
 
     fn gate() -> NestGate {
         NestGate::new(kittiwake_nest::NestConfig::new("http://127.0.0.1:1")).unwrap()
+    }
+
+    /// `/health` judges a job by the period recorded here, so a job that is running and not
+    /// registered is a job nothing can tell has stopped. Asserting on this one job rather than on
+    /// the whole list, because the registry is process-wide and the other tests spawn into it too.
+    #[tokio::test]
+    async fn spawning_a_job_records_its_cadence() {
+        let recorder: Arc<dyn RunRecorder> = Arc::new(Collect::default());
+        let mut sched = Scheduler::new(gate(), recorder);
+        let handles = sched.spawn_all(vec![
+            JobDef::every(
+                "a-test-job-with-a-name-nothing-else-uses",
+                Duration::from_secs(900),
+                Arc::new(|_| Box::pin(async { Ok(JobOutcome { rows_written: 0 }) })),
+            )
+            .staggered(Duration::from_secs(60)),
+        ]);
+
+        let found = scheduled_jobs()
+            .into_iter()
+            .find(|j| j.name == "a-test-job-with-a-name-nothing-else-uses")
+            .expect("a spawned job must appear in the registry");
+        assert_eq!(found.period, Duration::from_secs(900));
+        assert_eq!(found.stagger, Duration::from_secs(60));
+
+        for h in handles {
+            h.abort();
+        }
     }
 
     /// A slow job must not have a second copy piled on top of it.

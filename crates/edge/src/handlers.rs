@@ -847,23 +847,99 @@ pub async fn indexing_status(
         .collect();
 
     let ipfs_hash = kittiwake_read::shape::ipfs_or_id(&dep);
-    // No receipt: the TAP key is not on this box yet, so the probe is receipt-less and reads
-    // "the gate is up" rather than "the thing behind it works". That is the weaker of the two
-    // readings and the Next handler falls back to exactly the same one when no signer is
-    // configured, so this is the current behaviour rather than a regression. #11.
-    let indexers = is::probe_all(&st.ext, &allocations, &ipfs_hash, None).await;
+    // Paid when this deployment has a payer, and receipt-less when it does not. Unpaid reads
+    // "the gate is up" rather than "the thing behind it works", which is the weaker of the two
+    // readings and the one the Next handler also falls back to with no signer configured. #11.
+    let indexers = is::probe_all(&st.ext, &allocations, &ipfs_hash, st.tap_payer.as_deref()).await;
 
     let servability = is::assess_servability(&indexers, None);
-    // One round, because the round store is not here yet. `apply_persistence` renders a lone dead
-    // round as `rechecking`, which is the safe direction and what the handler being replaced does
-    // whenever its own store is unavailable. It can never render `dead` from one round.
-    let round = is::Round {
-        probed_at: chrono::Utc::now().to_rfc3339(),
+    let probed_at = chrono::Utc::now();
+    let this_round = is::Round {
+        probed_at: probed_at.to_rfc3339(),
         serving_operators: servability.effective_serving_operators,
         serving_indexers: servability.serving_indexer_count,
         gateway_verdict: None,
     };
-    let rendered = is::apply_persistence(&[round], is::DEFAULT_DEAD_ROUNDS);
+
+    // Best-effort throughout: "effectively dead" is derived from the last K rounds, and a store
+    // that is down must not take the status page with it. With no history `apply_persistence`
+    // renders a dead round as `rechecking`, which is the safe direction - it can never say `dead`
+    // on one round - so a failure here costs certainty rather than correctness.
+    let history = match st.pool.as_ref() {
+        None => vec![this_round.clone()],
+        Some(pool) => {
+            let verdict_json = serde_json::to_value(&servability)
+                .ok()
+                .map(|mut v| {
+                    if let Some(obj) = v.as_object_mut() {
+                        // The per-indexer evidence, which is what tells an edge block from a
+                        // timeout once the round is history. The probe and who it was of, not the
+                        // whole status row: the sync figures are already the answer this round
+                        // returned, and the question a stored round has to settle later is what
+                        // each probe actually saw. lodestar#62.
+                        let probes: Vec<serde_json::Value> = indexers
+                            .iter()
+                            .filter_map(|i| {
+                                let d = i.serve_probe_detail.as_ref()?;
+                                let mut v = serde_json::to_value(d).ok()?;
+                                let o = v.as_object_mut()?;
+                                o.insert("indexerId".into(), i.indexer_id.clone().into());
+                                o.insert("url".into(), i.url.clone().into());
+                                Some(v)
+                            })
+                            .collect();
+                        obj.insert("probes".into(), probes.into());
+                    }
+                    v
+                })
+                .unwrap_or(serde_json::Value::Null);
+
+            if let Err(e) = kittiwake_db::record_servability_round(
+                pool,
+                kittiwake_db::ServabilityRound {
+                    deployment_hash: &dep,
+                    probed_at,
+                    serving_operators: servability.effective_serving_operators as i32,
+                    serving_indexers: servability.serving_indexer_count as i32,
+                    gateway_verdict: None,
+                    verdict_json,
+                },
+            )
+            .await
+            {
+                tracing::warn!(error = %e, deployment = %dep, "could not record the probe round");
+            }
+
+            // Read back rather than appending in memory, so the history is the stored one: if the
+            // write above failed, this round is legitimately absent and the verdict should be the
+            // less certain one rather than one built on a row that does not exist.
+            match kittiwake_db::recent_servability_rounds(
+                pool,
+                &dep,
+                is::DEFAULT_DEAD_ROUNDS as i64,
+            )
+            .await
+            {
+                Ok(rows) if !rows.is_empty() => rows
+                    .into_iter()
+                    .map(|r| is::Round {
+                        probed_at: r.probed_at.to_rfc3339(),
+                        serving_operators: r.serving_operators.max(0) as usize,
+                        serving_indexers: r.serving_indexers.max(0) as usize,
+                        gateway_verdict: r.gateway_verdict.and_then(|v| {
+                            serde_json::from_value(serde_json::Value::String(v)).ok()
+                        }),
+                    })
+                    .collect(),
+                Ok(_) => vec![this_round.clone()],
+                Err(e) => {
+                    tracing::warn!(error = %e, deployment = %dep, "could not read the round history");
+                    vec![this_round.clone()]
+                }
+            }
+        }
+    };
+    let rendered = is::apply_persistence(&history, is::DEFAULT_DEAD_ROUNDS);
 
     let body = is::shape(
         &is::Deployment {

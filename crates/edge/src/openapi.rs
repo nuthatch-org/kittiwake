@@ -34,6 +34,11 @@ pub const WITHHELD: &[(&str, &str)] = &[
          a way to ask anything at all",
     ),
     (
+        "/api/health",
+        "reports on this deployment rather than on the protocol. It exists under /api because that \
+         is the URL the platform's health endpoint had and monitors already point at it",
+    ),
+    (
         "/api/whoami",
         "a diagnostic that reports the caller's own address back to them; it describes the request \
          rather than the protocol",

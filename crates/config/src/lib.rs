@@ -174,6 +174,25 @@ impl std::fmt::Debug for ReceiptSettings {
     }
 }
 
+/// The key that pays for a serving probe. Absent means probes go out unpaid, which is a weaker
+/// question rather than a broken one: an indexer that wants a receipt answers "pay me", and the
+/// probe reports that it could not tell whether the deployment serves.
+#[derive(Clone, Deserialize)]
+pub struct TapSettings {
+    /// A 32-byte secp256k1 private key, hex, with or without `0x`. It must be the address that
+    /// holds the escrow balance: an indexer that verifies looks the payer up, and a key it has
+    /// never seen has no balance no matter how well formed the receipt is.
+    pub signer_private_key: String,
+}
+
+impl std::fmt::Debug for TapSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TapSettings")
+            .field("signer_private_key", &"<redacted>")
+            .finish()
+    }
+}
+
 fn default_sql_per_min() -> u32 {
     10
 }
@@ -225,6 +244,7 @@ pub struct Config {
     pub indexer_agent: Option<IndexerAgentSettings>,
     #[serde(default)]
     pub receipt: Option<ReceiptSettings>,
+    pub tap: Option<TapSettings>,
     /// Turns the in-process scheduler on. Off by default so a second instance, or a staging box,
     /// cannot start writing to the same Postgres behind your back.
     #[serde(default)]
@@ -271,6 +291,17 @@ impl Config {
             if hex::decode(&receipt.issuer_key).map(|b| b.len()) != Ok(32) {
                 return Err(ConfigError::Invalid(
                     "receipt.issuer_key must be 32 bytes of hexadecimal".into(),
+                ));
+            }
+        }
+        if let Some(tap) = &self.tap {
+            // Checked at boot rather than at the first probe. A malformed key would otherwise
+            // surface as every indexer in a round reporting that it wants to be paid, which reads
+            // as a network-wide fault rather than as our own configuration.
+            let key = tap.signer_private_key.trim_start_matches("0x");
+            if hex::decode(key).map(|b| b.len()) != Ok(32) {
+                return Err(ConfigError::Invalid(
+                    "tap.signer_private_key must be 32 bytes of hexadecimal".into(),
                 ));
             }
         }
@@ -341,6 +372,7 @@ mod tests {
             foghorn_api_url: None,
             indexer_agent: None,
             receipt: None,
+            tap: None,
             arbitrum_rpc_url: None,
             mainnet_rpc_url: None,
             bounty_board_address: None,
