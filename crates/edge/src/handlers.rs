@@ -3603,8 +3603,29 @@ pub async fn disassembly(
     let report = kittiwake_read::disassembly::report(st.pool.as_ref(), &st.ipfs, &id).await?;
     let signal = kittiwake_read::disassembly::signal(&st.read.gate, &id).await;
 
+    // Best-effort, and deliberately not joined into the `?` above: a metadata lookup that fails
+    // must not take the whole disassembly report with it. The incumbent swallows the same failure
+    // to `null`, and the report is the thing the page is for.
+    let source_hint = match st.pool.as_ref() {
+        Some(pool) => {
+            kittiwake_read::disassembly::source_hint(
+                pool,
+                &st.ipfs,
+                &st.read.gate,
+                kittiwake_nest::Lane::Read,
+                &id,
+            )
+            .await
+        }
+        None => None,
+    };
+
     let mut resp = axum::Json(serde_json::json!({
-        "data": kittiwake_read::disassembly::with_signal(&report, signal.as_ref()),
+        "data": kittiwake_read::disassembly::with_signal_and_source(
+            &report,
+            signal.as_ref(),
+            source_hint.as_ref(),
+        ),
     }))
     .into_response();
     crate::no_store(resp.headers_mut());

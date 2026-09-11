@@ -4,10 +4,11 @@
 //! The analysis itself is `kittiwake_disasm` and is pure. This is the part that talks to IPFS and
 //! to the nest.
 
+use kittiwake_db::Pool;
 use kittiwake_disasm::report::{self as build, Fetched};
 use kittiwake_disasm::types::DisassemblyReport;
 use kittiwake_ext::Ipfs;
-use kittiwake_nest::{NestGate, QuerySpec};
+use kittiwake_nest::{Lane, NestGate, QuerySpec};
 use kittiwake_types::{ApiError, NestId};
 use serde::{Deserialize, Serialize};
 
@@ -159,6 +160,89 @@ pub async fn signal(gate: &NestGate, deployment_id: &str) -> Option<SignalContex
 }
 
 /// The report with its signal overlay attached, which is the shape the page reads.
+/// Where a deployment says its source lives.
+///
+/// Reads the subgraph's own metadata document, the same one `/api/subgraph-names` resolves, and
+/// takes two fields off it. Every failure is `None`: a deployment with no subgraph, a metadata
+/// document that is absent or unparseable, a nest that cannot be asked. The report is what the page
+/// is for and a missing repository link must not cost it.
+pub async fn source_hint(
+    pool: &Pool,
+    ipfs: &Ipfs,
+    gate: &NestGate,
+    lane: Lane,
+    deployment_id: &str,
+) -> Option<SourceHint> {
+    let id = deployment_id.to_lowercase();
+    let ids = [id.clone()];
+    let metas = crate::search::subgraph_metadata_for_deployments(pool, ipfs, gate, lane, &ids)
+        .await
+        .ok()?;
+    let meta = metas.get(&id)?.metadata.as_ref()?;
+
+    let field = |k: &str| {
+        meta.get(k)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let hint = SourceHint {
+        code_repository: field("codeRepository"),
+        website: field("website"),
+    };
+
+    // Both absent is the same answer as no metadata at all, and the page reads the object before
+    // the fields, so an object of two nulls would look like a hint that is there and empty.
+    if hint.code_repository.is_none() && hint.website.is_none() {
+        return None;
+    }
+    Some(hint)
+}
+
+/// Where a deployment says its source lives, from the subgraph's own on-chain metadata.
+///
+/// The verification box pre-fills its repository field from this, which turns "go and find the
+/// repo" into one click. Best-effort by design: a deployment whose metadata carries neither field,
+/// or a nest that cannot be asked, gives `null` for that field rather than failing the report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceHint {
+    pub code_repository: Option<String>,
+    pub website: Option<String>,
+}
+
+pub fn with_signal_and_source(
+    report: &DisassemblyReport,
+    signal: Option<&SignalContext>,
+    source_hint: Option<&SourceHint>,
+) -> serde_json::Value {
+    with_source(with_signal(report, signal), source_hint)
+}
+
+/// Attach the hint to an assembled report.
+///
+/// Separate from the wrapper above so it can be tested without building a whole
+/// `DisassemblyReport`, and because the thing worth pinning is this one key rather than the report
+/// around it.
+///
+/// Null rather than absent, as the incumbent sends it: the page reads
+/// `data.sourceHint?.codeRepository`, and a key that is sometimes missing and sometimes null is two
+/// shapes for one answer.
+pub fn with_source(
+    mut value: serde_json::Value,
+    source_hint: Option<&SourceHint>,
+) -> serde_json::Value {
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "sourceHint".into(),
+            source_hint
+                .and_then(|h| serde_json::to_value(h).ok())
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
+    value
+}
+
 pub fn with_signal(
     report: &DisassemblyReport,
     signal: Option<&SignalContext>,
@@ -255,5 +339,59 @@ mod signal_context_names {
             json.get("queryFeesGrt").is_none(),
             "the camelCase spelling must not appear"
         );
+    }
+}
+
+#[cfg(test)]
+mod source_hint_shape {
+    //! The shape the page reads, pinned.
+    //!
+    //! `DisassemblyClient` reads `data.sourceHint?.codeRepository`. Three things have to hold for
+    //! that to work and none of them is checked by the compiler: the key is `sourceHint`, the
+    //! fields are camelCase, and the key is present-and-null rather than absent when there is no
+    //! hint, because a key that is sometimes missing and sometimes null is two shapes for one
+    //! answer.
+
+    use super::{SourceHint, with_source};
+
+    fn assembled() -> serde_json::Value {
+        serde_json::json!({ "deploymentId": "Qm…", "signal": null })
+    }
+
+    #[test]
+    fn a_hint_serialises_as_the_page_reads_it() {
+        let hint = SourceHint {
+            code_repository: Some("https://github.com/Uniswap/v4-subgraph".into()),
+            website: None,
+        };
+        let v = with_source(assembled(), Some(&hint));
+        let sh = v.get("sourceHint").expect("the key is always present");
+        assert_eq!(
+            sh.get("codeRepository").and_then(|x| x.as_str()),
+            Some("https://github.com/Uniswap/v4-subgraph")
+        );
+        assert!(
+            sh.get("website")
+                .expect("declared even when empty")
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn no_hint_is_null_rather_than_absent() {
+        let v = with_source(assembled(), None);
+        assert!(
+            v.get("sourceHint")
+                .expect("the key is always present")
+                .is_null()
+        );
+    }
+
+    #[test]
+    fn the_signal_key_still_survives_the_wrapper() {
+        // A wrapper that dropped what it wrapped would be a quiet way to lose the signal panel.
+        let v = with_source(assembled(), None);
+        assert!(v.get("signal").is_some());
+        assert!(v.get("deploymentId").is_some());
     }
 }
