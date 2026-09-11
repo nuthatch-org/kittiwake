@@ -1014,6 +1014,128 @@ pub async fn scuttle_ban(
     .await?)
 }
 
+const SCHEMA: &str = include_str!("../../../db/schema.sql");
+/// Every table this service's own statements name, worked out once.
+///
+/// `schema_gaps` checks against this rather than against everything `db/schema.sql` declares. That
+/// file describes the whole database, including tables only the platform touches - `community_votes`
+/// from a feature that has been deleted, `servability_rounds`, `indexer_scores` - and reporting
+/// those as gaps asks an operator to grant privileges nothing here will ever use. A check that
+/// lists things nobody intends to fix teaches people to skip reading it.
+fn tables_we_use() -> &'static std::collections::HashSet<String> {
+    static USED: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    USED.get_or_init(|| SOURCES.iter().flat_map(|(_, src)| tables_in(src)).collect())
+}
+
+const SOURCES: &[(&str, &str)] = &[
+    ("crates/db/src/lib.rs", include_str!("lib.rs")),
+    (
+        "crates/ingest/src/lib.rs",
+        include_str!("../../ingest/src/lib.rs"),
+    ),
+    (
+        "crates/ingest/src/rav.rs",
+        include_str!("../../ingest/src/rav.rs"),
+    ),
+    (
+        "crates/ingest/src/refresh.rs",
+        include_str!("../../ingest/src/refresh.rs"),
+    ),
+    (
+        "crates/ingest/src/state.rs",
+        include_str!("../../ingest/src/state.rs"),
+    ),
+    (
+        "crates/ingest/src/live.rs",
+        include_str!("../../ingest/src/live.rs"),
+    ),
+    (
+        "crates/ext/src/lib.rs",
+        include_str!("../../ext/src/lib.rs"),
+    ),
+    (
+        "crates/read/src/search.rs",
+        include_str!("../../read/src/search.rs"),
+    ),
+];
+/// Words that follow `FROM` and are not Postgres tables: SQL's own, and the short aliases
+/// these statements use.
+const NOT_A_TABLE: &[&str] = &[
+    "unnest", "lateral", "select", "insert", "update", "delete", "set", "from", "where", "t", "n",
+    "e", "f", "o", "a", "c", "i", "d",
+];
+/// A nest table rather than a Postgres one. The nest owns its own schema and this file does
+/// not describe it: `lodestar_*` are the mounted views, and `__` is nuthatch's separator
+/// between a contract and its event.
+fn is_nest_table(t: &str) -> bool {
+    t.starts_with("lodestar_")
+        || t.contains("__")
+        || t == "subgraph_current"
+        || t == "deployment_subgraphs"
+}
+fn tables_in(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    // This module is excluded from its own scan: its prose contains the words it looks for,
+    // and a check that trips over its own explanation is no use to anybody. Only this one -
+    // truncating at the first `#[cfg(test)]` would cut off real statements that happen to sit
+    // below an earlier test module, which is how the first version of this managed to find
+    // nothing in half the file.
+    let mut rest = match src.find("mod schema_coverage {") {
+        Some(i) => &src[..i],
+        None => src,
+    };
+    while let Some(i) = rest.find("sqlx::query") {
+        rest = &rest[i + "sqlx::query".len()..];
+        // Back the window off to a word boundary. Cutting mid-identifier invents a table: a
+        // window ending at `UPDATE scu` reports `scu` as missing from the schema, which is a
+        // failure about this function rather than about the database.
+        let cut = rest.len().min(4000);
+        let window = &rest[..cut];
+        let window = match window.rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+            Some(i) if cut == 4000 => &window[..=i],
+            _ => window,
+        };
+        // The statement, reassembled from the literals in this call. Only literals that look
+        // like SQL, so a doc comment sitting inside the window cannot contribute a "table".
+        let mut sql = String::new();
+        for (n, part) in window.split('"').enumerate() {
+            if n % 2 == 1 {
+                let upper = part.to_uppercase();
+                if ["SELECT", "INSERT", "UPDATE", "DELETE", "WITH", "FROM"]
+                    .iter()
+                    .any(|k| upper.contains(k))
+                {
+                    sql.push(' ');
+                    sql.push_str(part);
+                }
+            }
+        }
+        let words: Vec<String> = sql
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .filter(|w| !w.is_empty())
+            .map(|w| w.to_lowercase())
+            .collect();
+        for (n, w) in words.iter().enumerate() {
+            // `a IS DISTINCT FROM b` is an operator, not a table reference, and the `b` is a
+            // column. Reading it as a table reported `new_value` as missing from the schema.
+            if n > 0 && words[n - 1] == "distinct" {
+                continue;
+            }
+            if matches!(w.as_str(), "from" | "into" | "update" | "join")
+                && let Some(next) = words.get(n + 1)
+                && !NOT_A_TABLE.contains(&next.as_str())
+                && !is_nest_table(next)
+            {
+                out.push(next.clone());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 #[cfg(test)]
 mod schema_coverage {
     //! Every Postgres table this service names must exist in `db/schema.sql`.
@@ -1027,117 +1149,7 @@ mod schema_coverage {
     //! So this reads the source, pulls the table names out of every `sqlx::query` literal, and
     //! checks each against the schema. It covers exactly the statements the macro cannot.
 
-    const SCHEMA: &str = include_str!("../../../db/schema.sql");
-    const SOURCES: &[(&str, &str)] = &[
-        ("crates/db/src/lib.rs", include_str!("lib.rs")),
-        (
-            "crates/ingest/src/lib.rs",
-            include_str!("../../ingest/src/lib.rs"),
-        ),
-        (
-            "crates/ingest/src/rav.rs",
-            include_str!("../../ingest/src/rav.rs"),
-        ),
-        (
-            "crates/ingest/src/refresh.rs",
-            include_str!("../../ingest/src/refresh.rs"),
-        ),
-        (
-            "crates/ingest/src/state.rs",
-            include_str!("../../ingest/src/state.rs"),
-        ),
-        (
-            "crates/ingest/src/live.rs",
-            include_str!("../../ingest/src/live.rs"),
-        ),
-        (
-            "crates/ext/src/lib.rs",
-            include_str!("../../ext/src/lib.rs"),
-        ),
-        (
-            "crates/read/src/search.rs",
-            include_str!("../../read/src/search.rs"),
-        ),
-    ];
-
-    /// Words that follow `FROM` and are not Postgres tables: SQL's own, and the short aliases
-    /// these statements use.
-    const NOT_A_TABLE: &[&str] = &[
-        "unnest", "lateral", "select", "insert", "update", "delete", "set", "from", "where", "t",
-        "n", "e", "f", "o", "a", "c", "i", "d",
-    ];
-
-    /// A nest table rather than a Postgres one. The nest owns its own schema and this file does
-    /// not describe it: `lodestar_*` are the mounted views, and `__` is nuthatch's separator
-    /// between a contract and its event.
-    fn is_nest_table(t: &str) -> bool {
-        t.starts_with("lodestar_")
-            || t.contains("__")
-            || t == "subgraph_current"
-            || t == "deployment_subgraphs"
-    }
-
-    fn tables_in(src: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        // This module is excluded from its own scan: its prose contains the words it looks for,
-        // and a check that trips over its own explanation is no use to anybody. Only this one -
-        // truncating at the first `#[cfg(test)]` would cut off real statements that happen to sit
-        // below an earlier test module, which is how the first version of this managed to find
-        // nothing in half the file.
-        let mut rest = match src.find("mod schema_coverage {") {
-            Some(i) => &src[..i],
-            None => src,
-        };
-        while let Some(i) = rest.find("sqlx::query") {
-            rest = &rest[i + "sqlx::query".len()..];
-            // Back the window off to a word boundary. Cutting mid-identifier invents a table: a
-            // window ending at `UPDATE scu` reports `scu` as missing from the schema, which is a
-            // failure about this function rather than about the database.
-            let cut = rest.len().min(4000);
-            let window = &rest[..cut];
-            let window = match window.rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
-                Some(i) if cut == 4000 => &window[..=i],
-                _ => window,
-            };
-            // The statement, reassembled from the literals in this call. Only literals that look
-            // like SQL, so a doc comment sitting inside the window cannot contribute a "table".
-            let mut sql = String::new();
-            for (n, part) in window.split('"').enumerate() {
-                if n % 2 == 1 {
-                    let upper = part.to_uppercase();
-                    if ["SELECT", "INSERT", "UPDATE", "DELETE", "WITH", "FROM"]
-                        .iter()
-                        .any(|k| upper.contains(k))
-                    {
-                        sql.push(' ');
-                        sql.push_str(part);
-                    }
-                }
-            }
-            let words: Vec<String> = sql
-                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .filter(|w| !w.is_empty())
-                .map(|w| w.to_lowercase())
-                .collect();
-            for (n, w) in words.iter().enumerate() {
-                // `a IS DISTINCT FROM b` is an operator, not a table reference, and the `b` is a
-                // column. Reading it as a table reported `new_value` as missing from the schema.
-                if n > 0 && words[n - 1] == "distinct" {
-                    continue;
-                }
-                if matches!(w.as_str(), "from" | "into" | "update" | "join")
-                    && let Some(next) = words.get(n + 1)
-                    && !NOT_A_TABLE.contains(&next.as_str())
-                    && !is_nest_table(next)
-                {
-                    out.push(next.clone());
-                }
-            }
-        }
-        out.sort();
-        out.dedup();
-        out
-    }
+    use super::{NOT_A_TABLE, SCHEMA, SOURCES, is_nest_table, tables_in};
 
     #[test]
     fn every_table_a_statement_names_is_in_the_schema() {
@@ -1583,8 +1595,11 @@ pub async fn schema_gaps(pool: &Pool) -> Result<Vec<SchemaGap>, DbError> {
     let existing_tables: std::collections::HashSet<String> =
         existing.into_iter().map(|(t,)| t).collect();
 
+    let used = tables_we_use();
+
     Ok(declared_columns(SCHEMA_SQL)
         .into_iter()
+        .filter(|(table, _)| used.contains(table))
         .filter_map(|(table, column)| {
             if !visible_tables.contains(&table) {
                 let kind = if existing_tables.contains(&table) {
@@ -1720,6 +1735,61 @@ mod schema_declaration {
             tables.len(),
             created,
             "every created table should contribute at least one column: {tables:?}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod gaps_are_about_us {
+    //! `schema_gaps` asks about the tables this service uses, and no others.
+    //!
+    //! Its first deployment reported five tables nobody here touches - `community_votes` from a
+    //! deleted feature, `servability_rounds`, `indexer_scores`, `delegations`,
+    //! `roadmap_community_updates` - because `db/schema.sql` describes the whole database rather
+    //! than this service's share of it. Asking an operator to grant privileges on tables nothing
+    //! will ever read is how a health check stops being read.
+
+    use super::{SCHEMA_SQL, declared_columns, tables_we_use};
+
+    #[test]
+    fn includes_tables_our_statements_name() {
+        let used = tables_we_use();
+        for t in [
+            "ingestion_state",
+            "cron_runs",
+            "sync_bounties",
+            "scuttlebutt_messages",
+        ] {
+            assert!(
+                used.contains(t),
+                "{t} is named by this service and should be checked"
+            );
+        }
+    }
+
+    #[test]
+    fn excludes_tables_only_the_platform_touches() {
+        let used = tables_we_use();
+        for t in ["community_votes", "roadmap_community_updates"] {
+            assert!(!used.contains(t), "{t} is nothing to do with this service");
+        }
+    }
+
+    #[test]
+    fn every_table_we_use_is_declared_in_the_schema() {
+        // The other direction, and the one that would bite: a table we name and the file does not
+        // declare is invisible to the gap check entirely, because the check walks the file.
+        let declared: std::collections::HashSet<String> = declared_columns(SCHEMA_SQL)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        let missing: Vec<&String> = tables_we_use()
+            .iter()
+            .filter(|t| !declared.contains(*t) && !super::is_nest_table(t))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "named by this service, absent from db/schema.sql: {missing:?}"
         );
     }
 }
