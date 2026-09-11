@@ -40,8 +40,11 @@ echo "reading the production environment from Vercel ($LODESTAR_DIR)"
 
 val() { grep -m1 "^$1=" "$ENVFILE" | cut -d= -f2- | sed -E 's/^"(.*)"$/\1/'; }
 
+. "$(dirname "$0")/secret-guard.sh"
+
 SIGNER=$(val TAP_SIGNER_PRIVATE_KEY)
 [ -n "$SIGNER" ] || { echo "TAP_SIGNER_PRIVATE_KEY is not set in the production environment" >&2; exit 1; }
+refuse_placeholder TAP_SIGNER_PRIVATE_KEY "$SIGNER" || exit 1
 
 # The service's own rule, mirrored: 32 bytes of hexadecimal, `0x` optional. Checked here so a bad
 # value is a sentence from this script rather than a process that will not start after the config
