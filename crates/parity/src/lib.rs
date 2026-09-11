@@ -387,11 +387,11 @@ pub mod coverage {
              \
              The blanket exclusion is why a fourth, undeclared difference lived here until \
              2026-09-11: `signalledGrt` and `queryFeesGrt` against the incumbent's `signalledGRT` \
-             and `queryFeesGRT`, which the frontend destructures. This wants narrowing to \
-             ValuesOnly - a GET over immutable bytes is comparable in shape - and the one thing \
-             stopping that is `sourceHint`, whose only reader lodestar#144 was to delete and has \
-             not: the reader is still there, so omitting the field is a live regression rather \
-             than a ported-away one",
+             and `queryFeesGRT`, which the frontend destructures. Both are fixed, and `sourceHint` \
+             is now ported rather than waiting on lodestar#144 - its reader was still live, so \
+             omitting it was a regression rather than a tidy-up. What is left is values, not shape, \
+             so this should narrow to ValuesOnly once a shape diff has been taken against the \
+             deployed build",
         ),
         (
             "/api/disassembly/diff",
