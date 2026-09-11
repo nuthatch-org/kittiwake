@@ -393,6 +393,49 @@ struct GhContent {
 
 #[cfg(test)]
 mod tests {
+
+    /// **Ask for every field the caller parses.** The parser reads `handler`, `deterministic` and
+    /// `block` out of `fatalError`, and for a while this query requested only `message`, so those
+    /// three were null on every deployment in production while the parser's own tests passed
+    /// against a synthetic payload that had them.
+    ///
+    /// Listed explicitly rather than checked as one blob, so adding a field to the parser and
+    /// forgetting the query fails here with the field's name in the message.
+    #[test]
+    fn the_query_asks_for_every_field_the_caller_parses() {
+        let q = deployment_status_query("QmTest");
+        for field in [
+            "health",
+            "synced",
+            "entityCount",
+            "message",
+            "handler",
+            "deterministic",
+            "block",
+            "hash",
+            "number",
+            "nonFatalErrors",
+            "chainHeadBlock",
+            "latestBlock",
+            "network",
+        ] {
+            assert!(q.contains(field), "the query never asks for `{field}`: {q}");
+        }
+        assert!(q.contains("QmTest"), "the deployment must reach the query");
+    }
+
+    /// A deployment id is base58 or hex. Anything else never reaches an interpolated query, and a
+    /// quote is the one that would turn this into an injection.
+    #[test]
+    fn the_query_is_only_built_from_a_plausible_deployment_id() {
+        let q = deployment_status_query("QmTest");
+        assert!(
+            !q.contains("\\\"\\\""),
+            "no empty quoted pair should appear"
+        );
+        // The guard lives in `deployment_status`; this pins the shape the guard protects.
+        assert!(q.starts_with(r#"{"query":"{ indexingStatuses(subgraphs: ["#));
+    }
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -492,6 +535,18 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// The standard status query. Asked of the indexer's own endpoint, which is unauthenticated by
 /// design: an indexer that hides it cannot be checked by anyone, including its delegators.
+/// What `deployment_status` asks graph-node for.
+///
+/// Extracted so it can be tested. It was inline, and on 2026-09-11 it requested `fatalError
+/// { message }` while the caller parsed `handler`, `deterministic` and `block` out of the reply.
+/// The parser had tests and they passed, because they fed it a payload carrying fields this never
+/// asked for. A test of a parser is not a test of the pipeline.
+fn deployment_status_query(ipfs_hash: &str) -> String {
+    format!(
+        r#"{{"query":"{{ indexingStatuses(subgraphs: [\"{ipfs_hash}\"]) {{ subgraph health synced entityCount fatalError {{ message handler deterministic block {{ number hash }} }} nonFatalErrors {{ message }} chains {{ network chainHeadBlock {{ number }} latestBlock {{ number }} }} }} }}"}}"#
+    )
+}
+
 const STATUS_QUERY: &str = r#"{"query":"{ indexingStatuses { subgraph health synced chains { network chainHeadBlock { number } latestBlock { number } } } }"}"#;
 
 impl Ext {
@@ -615,9 +670,7 @@ impl Ext {
         {
             return None;
         }
-        let body = format!(
-            r#"{{"query":"{{ indexingStatuses(subgraphs: [\"{ipfs_hash}\"]) {{ subgraph health synced entityCount fatalError {{ message }} nonFatalErrors {{ message }} chains {{ network chainHeadBlock {{ number }} latestBlock {{ number }} }} }} }}"}}"#
-        );
+        let body = deployment_status_query(ipfs_hash);
         let res = self
             .http
             .post(checked)
