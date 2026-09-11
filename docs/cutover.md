@@ -22,6 +22,12 @@ Checked against the live database, not inferred:
 | `clickthrough_events` | none | INSERT |
 | `parameter_changes` | SELECT | INSERT |
 
+**All of the above were granted on 2026-09-11** and the table is kept as the record of what each
+needs and why. `/health` now reports five remaining gaps - `community_votes`, `delegations`,
+`indexer_scores`, `roadmap_community_updates`, `servability_rounds` - which are declared in
+`db/schema.sql` because that file describes the whole database, not the subset this service uses.
+Whether those want granting or want excluding from the check is an open question.
+
 The verbs are derived from the statements in `crates/db`, not chosen generously.
 
 `parameter_changes` is not waiting for a cutover at all: the directory refresh writes the parameter
@@ -39,7 +45,11 @@ table and sequence names are known good.
 
 Two things to know before running it. It rotates the role's password and restarts the unit on every
 run - by design, and safe, because the new password goes straight into the config - so it is not a
-grant on its own. And `GRANT_WRITER=1` wants running too: the ingest tables have their writes, but
+grant on its own. It also refuses outright when `scheduler_enabled` is true, and that check now runs
+before anything is changed rather than after the password has already been rotated: run on
+2026-09-11 it refused at the end, leaving Postgres holding a new password and the config the old
+one, which does not fail until the next restart because the pool's open connections keep working.
+And `GRANT_WRITER=1` wants running too: the ingest tables have their writes, but
 `parameter_changes` does not, which means the writer block was applied by hand at some point and
 that line was missed. That is why the directory refresh has been failing to write the parameter
 trail on every run.

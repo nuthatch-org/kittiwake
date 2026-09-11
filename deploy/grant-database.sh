@@ -71,7 +71,24 @@ CFG=/etc/kittiwake/config.toml
 
 psql() { sudo -u postgres psql -v ON_ERROR_STOP=1 -qAt "$@"; }
 
+# The SQL below goes through unquoted heredocs, because it interpolates $ROLE and $DB. That means a
+# backtick in a SQL comment is a command substitution: it prints "command not found" and deletes
+# the quoted words from the comment. Harmless here only because it happened inside comments; a pair
+# spanning a statement would have eaten the statement. Keep backticks out of these heredocs.
+
 [ -f "$CFG" ] || { echo "no $CFG - run deploy/install.sh first" >&2; exit 1; }
+
+# Checked here, before anything is changed. It used to sit at the end, next to the config write -
+# after the role's password had already been rotated. Refusing there left Postgres holding a new
+# password and the config holding the old one, which does not fail: the pool's established
+# connections keep working, so the service looks well until the next restart and then cannot
+# authenticate at all. A guard that fires after the damage is not a guard. 2026-09-11.
+if grep -qE '^\s*scheduler_enabled\s*=\s*true' "$CFG"; then
+  echo "refusing: scheduler_enabled is true, and a pool plus the scheduler makes this a second" >&2
+  echo "writer to the platform's tables. Take that decision on its own." >&2
+  echo "Nothing has been changed." >&2
+  exit 1
+fi
 
 # A fresh password every run. 32 bytes of urandom, base64, stripped of characters that would need
 # percent-encoding in a URL - a password that has to be escaped is a password that eventually is not.
@@ -107,12 +124,12 @@ GRANT INSERT ON cron_runs TO $ROLE;
 -- sequence, and the sequence is a separate object with its own permissions. Every job run failed to
 -- record itself until this was added, and it failed as a warning rather than an error, which is the
 -- quietest possible way for an audit trail to stop existing.
--- Every sequence, not one at a time. `INSERT` on a table with a serial primary key draws from a
+-- Every sequence, not one at a time. INSERT on a table with a serial primary key draws from a
 -- sequence, and the sequence is a separate object with its own permissions. Granting them
--- individually is how this was done first, and it meant `cron_runs` worked while
--- `network_snapshots` failed the moment the scheduler was turned on - the same bug twice, because
+-- individually is how this was done first, and it meant cron_runs worked while
+-- network_snapshots failed the moment the scheduler was turned on - the same bug twice, because
 -- the fix had been applied to the instance rather than the class. A sequence grant confers
--- `nextval` and nothing else, so there is no reason to be miserly with it.
+-- nextval and nothing else, so there is no reason to be miserly with it.
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO $ROLE;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE ON SEQUENCES TO $ROLE;
 SQL
@@ -149,7 +166,7 @@ GRANT INSERT, UPDATE, DELETE ON indexers, indexer_snapshots, epochs, delegation_
 -- should edit or remove one. Repairing bad history is a deliberate act by a human at a superuser
 -- prompt, not a privilege this role carries about with it.
 GRANT INSERT ON parameter_changes TO $ROLE;
--- The bounty cache. SELECT and UPDATE, nothing else: `reconcile-bounties` reads the BountyBoard
+-- The bounty cache. SELECT and UPDATE, nothing else: reconcile-bounties reads the BountyBoard
 -- contract and corrects a status the UI's best-effort PATCH never received - an indexer claiming
 -- through Arbiscan, a developer cancelling directly. Creating and deleting bounties stays with the
 -- Dock, so this role cannot do either even by accident.
@@ -176,7 +193,7 @@ GRANT SELECT, INSERT, UPDATE ON studio_deploy_keys TO $ROLE;
 -- never removed, or the board would disagree with the contract and look right doing it.
 GRANT INSERT ON sync_bounties TO $ROLE;
 
--- Scuttlebutt. UPDATE is the soft delete - `deleted = true` - which is why there is no DELETE here
+-- Scuttlebutt. UPDATE is the soft delete - deleted = true - which is why there is no DELETE here
 -- either: moderation hides a message and the record of it having been said stays.
 GRANT SELECT, INSERT, UPDATE ON scuttlebutt_messages TO $ROLE;
 
@@ -187,9 +204,9 @@ GRANT SELECT, INSERT ON scuttlebutt_bans TO $ROLE;
 -- Append-only. Nothing reads these back here, and a click that happened is not editable.
 GRANT INSERT ON clickthrough_events TO $ROLE;
 
--- Sequences for the tables above. `GRANT USAGE ON ALL SEQUENCES` earlier in this script covers
+-- Sequences for the tables above. GRANT USAGE ON ALL SEQUENCES earlier in this script covers
 -- every sequence that existed when it last ran, and the default-privileges line only reaches
--- sequences this role creates. A table owned by `lodestar` and created since is covered by
+-- sequences this role creates. A table owned by lodestar and created since is covered by
 -- neither, and an INSERT refused for its sequence reports a different-looking fault than it is.
 GRANT USAGE, SELECT ON SEQUENCE
   studio_subgraphs_id_seq,
@@ -227,11 +244,6 @@ sys.stdout.write("".join(out))
 PY
 unset PGURL PW
 grep -q '^database_url' "$TMP" || { echo "the rewrite produced no database_url line" >&2; rm -f "$TMP"; exit 1; }
-if grep -qE '^\s*scheduler_enabled\s*=\s*true' "$TMP"; then
-  echo "refusing: scheduler_enabled is true, and a pool plus the scheduler makes this a second" >&2
-  echo "writer to the platform's tables. Take that decision on its own." >&2
-  rm -f "$TMP"; exit 1
-fi
 install -m 0640 -o root -g kittiwake "$TMP" "$CFG"
 rm -f "$TMP"
 
