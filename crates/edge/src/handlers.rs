@@ -2029,14 +2029,22 @@ pub struct ScuttleDelete {
     pub reason: Option<String>,
 }
 
+/// The body is optional, because the moderator's delete button sends none.
+///
+/// It was `Json<ScuttleDelete>`, which makes a body mandatory: axum answers 400 before the handler
+/// runs, so a moderator pressing delete got a refusal and the message stayed. The incumbent reads
+/// the body through a `.catch()` and tolerates its absence, and the client has never sent one - it
+/// sends only the `x-sb-admin` header. Found the day this route was cut over, by trying to delete a
+/// message the cutover test had posted.
 pub async fn scuttle_delete(
     State(st): State<AppState>,
     Path(id): Path<i64>,
     headers: HeaderMap,
-    axum::Json(body): axum::Json<ScuttleDelete>,
+    body: Option<axum::Json<ScuttleDelete>>,
 ) -> Result<Response, ErrorResponse> {
     scuttle_admin(&st, &headers, true)?;
-    if !kittiwake_db::scuttle_delete(pool(&st)?, id, body.reason.as_deref())
+    let reason = body.and_then(|axum::Json(b)| b.reason);
+    if !kittiwake_db::scuttle_delete(pool(&st)?, id, reason.as_deref())
         .await
         .map_err(|e| ApiError::Unavailable(e.to_string()))?
     {
