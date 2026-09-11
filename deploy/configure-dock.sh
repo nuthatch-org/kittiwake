@@ -27,12 +27,23 @@ set -euo pipefail
 HOST=${HOST:-root@167.235.29.213}
 KEY=${KEY:-$HOME/.ssh/hetzner_drpc}
 
+# `vercel env pull` reads the project linked to the working directory, and the linked project is
+# lodestar's - this repository is not linked to anything, so running it here fails with "your
+# codebase isn't linked to a project". Default to the sibling checkout and say so plainly when it
+# is somewhere else.
+LODESTAR_DIR=${LODESTAR_DIR:-$(cd "$(dirname "$0")/../../lodestar" 2>/dev/null && pwd || true)}
+if [ -z "$LODESTAR_DIR" ] || [ ! -d "$LODESTAR_DIR/.vercel" ]; then
+  echo "cannot find a Vercel-linked lodestar checkout." >&2
+  echo "Set LODESTAR_DIR to it, e.g. LODESTAR_DIR=~/Projects/lodestar bash $0" >&2
+  exit 1
+fi
+
 ENVFILE=$(mktemp)
 trap 'rm -f "$ENVFILE"' EXIT
 chmod 600 "$ENVFILE"
 
-echo "reading the production environment from Vercel"
-vercel env pull "$ENVFILE" --environment=production --yes >/dev/null
+echo "reading the production environment from Vercel ($LODESTAR_DIR)"
+( cd "$LODESTAR_DIR" && vercel env pull "$ENVFILE" --environment=production --yes >/dev/null )
 
 # Everything after the first `=`, with surrounding quotes removed. A value may legitimately contain
 # `=`, so `cut -f2` would truncate one and the failure would look like a wrong secret.
