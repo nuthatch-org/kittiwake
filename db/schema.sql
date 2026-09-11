@@ -194,16 +194,6 @@ CREATE INDEX IF NOT EXISTS idx_delegation_events_indexer   ON delegation_events 
 CREATE INDEX IF NOT EXISTS idx_delegation_events_delegator ON delegation_events (delegator);
 CREATE INDEX IF NOT EXISTS idx_delegation_events_timestamp ON delegation_events (timestamp DESC);
 
-CREATE TABLE IF NOT EXISTS delegations (
-  id              TEXT PRIMARY KEY,
-  delegator       TEXT NOT NULL,
-  indexer_address TEXT NOT NULL,
-  tokens_grt      NUMERIC,
-  updated_at      TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_delegations_indexer ON delegations (indexer_address);
-
 CREATE TABLE IF NOT EXISTS disputes (
   id                  TEXT PRIMARY KEY,
   dispute_type        TEXT,
@@ -286,33 +276,6 @@ CREATE INDEX IF NOT EXISTS idx_indexer_scores_period ON indexer_scores (period_t
 
 -- ── Community features ────────────────────────────────────────────────────────
 
-CREATE TABLE IF NOT EXISTS community_votes (
-  id               SERIAL PRIMARY KEY,
-  period           TEXT NOT NULL,
-  voter_address    TEXT NOT NULL,
-  indexer_address  TEXT NOT NULL,
-  is_delegator     BOOLEAN DEFAULT FALSE,
-  vote_weight      NUMERIC DEFAULT 1,
-  signature        TEXT,
-  message          TEXT,
-  created_at       TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_community_votes_period   ON community_votes (period);
-CREATE INDEX IF NOT EXISTS idx_community_votes_voter    ON community_votes (voter_address);
-CREATE INDEX IF NOT EXISTS idx_community_votes_indexer  ON community_votes (indexer_address);
-
-CREATE TABLE IF NOT EXISTS roadmap_community_updates (
-  id           SERIAL PRIMARY KEY,
-  item_id      TEXT NOT NULL,
-  status       TEXT NOT NULL CHECK (status IN ('on_track', 'delayed', 'shipped', 'uncertain')),
-  note         TEXT,
-  submitted_by TEXT,
-  created_at   TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_roadmap_updates_item_id ON roadmap_community_updates (item_id, created_at DESC);
-
 -- ── Operations ────────────────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS cron_runs (
@@ -384,13 +347,10 @@ ALTER TABLE indexer_snapshots OWNER TO lodestar;
 ALTER TABLE allocations OWNER TO lodestar;
 ALTER TABLE rav_redemptions OWNER TO lodestar;
 ALTER TABLE delegation_events OWNER TO lodestar;
-ALTER TABLE delegations OWNER TO lodestar;
 ALTER TABLE disputes OWNER TO lodestar;
 ALTER TABLE parameter_changes OWNER TO lodestar;
 ALTER TABLE network_snapshots OWNER TO lodestar;
 ALTER TABLE indexer_scores OWNER TO lodestar;
-ALTER TABLE community_votes OWNER TO lodestar;
-ALTER TABLE roadmap_community_updates OWNER TO lodestar;
 ALTER TABLE cron_runs OWNER TO lodestar;
 ALTER TABLE servability_rounds OWNER TO lodestar;
 
