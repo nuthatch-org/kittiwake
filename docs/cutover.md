@@ -28,28 +28,21 @@ The verbs are derived from the statements in `crates/db`, not chosen generously.
 trail on every run and has been failing on it, logging "the parameter trail could not be written;
 the directory refresh continues without it" and carrying on. That one is a live fault today.
 
-```sql
-GRANT SELECT, INSERT, UPDATE         ON sync_bounties        TO kittiwake;
-GRANT SELECT, INSERT, UPDATE, DELETE ON studio_subgraphs     TO kittiwake;
-GRANT SELECT, INSERT, UPDATE         ON studio_deploy_keys   TO kittiwake;
-GRANT SELECT, INSERT, UPDATE         ON scuttlebutt_messages TO kittiwake;
-GRANT SELECT, INSERT                 ON scuttlebutt_bans     TO kittiwake;
-GRANT INSERT                         ON clickthrough_events  TO kittiwake;
-GRANT INSERT                         ON parameter_changes    TO kittiwake;
-
--- A table whose id is a SERIAL needs its sequence too, or the INSERT is refused
--- with a message about the sequence rather than the table, which reads as a
--- different fault than it is.
-GRANT USAGE, SELECT ON SEQUENCE
-  sync_bounties_id_seq,
-  studio_subgraphs_id_seq,
-  studio_deploy_keys_id_seq,
-  scuttlebutt_messages_id_seq,
-  scuttlebutt_bans_id_seq,
-  clickthrough_events_id_seq,
-  parameter_changes_id_seq
-  TO kittiwake;
+```sh
+GRANT_DOCK=1 bash deploy/grant-database.sh
 ```
+
+`deploy/grant-database.sh` is the sanctioned path and now carries these, with the verbs derived
+from the statements in `crates/db` rather than chosen generously, and a line of reasoning beside
+each. The SQL was dry-run against the live database inside a transaction and rolled back, so the
+table and sequence names are known good.
+
+Two things to know before running it. It rotates the role's password and restarts the unit on every
+run - by design, and safe, because the new password goes straight into the config - so it is not a
+grant on its own. And `GRANT_WRITER=1` wants running too: the ingest tables have their writes, but
+`parameter_changes` does not, which means the writer block was applied by hand at some point and
+that line was missed. That is why the directory refresh has been failing to write the parameter
+trail on every run.
 
 Run as a role that owns them (`lodestar`, or `postgres`). Nothing in this service asks for DDL
 rights and nothing should: `schema_gaps` checks the schema and refuses to reshape it.
