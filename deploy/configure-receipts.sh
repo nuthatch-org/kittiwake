@@ -39,16 +39,54 @@ echo "reading the production environment from Vercel ($LODESTAR_DIR)"
 
 val() { grep -m1 "^$1=" "$ENVFILE" | cut -d= -f2- | sed -E 's/^"(.*)"$/\1/'; }
 
-ISSUER=$(val TATTLER_ISSUER_KEY)
-[ -n "$ISSUER" ] || { echo "TATTLER_ISSUER_KEY is not set in the production environment" >&2; exit 1; }
+RAW=$(val TATTLER_ISSUER_KEY)
+if [ -z "$RAW" ]; then
+  # Two different faults wearing the same empty string, and they need different answers.
+  if grep -q '^TATTLER_ISSUER_KEY=' "$ENVFILE"; then
+    echo "TATTLER_ISSUER_KEY was pulled with an empty value." >&2
+    echo >&2
+    echo "The name is in the file and the value is not, which is what a write-only secret looks" >&2
+    echo "like from out here. Set it on the box directly instead:" >&2
+    echo >&2
+    echo "  ssh root@167.235.29.213" >&2
+    echo "  # then append to /etc/kittiwake/config.toml, restart, and check /api/sql/receipt:" >&2
+    echo "  #   [receipt]" >&2
+    echo '  #   issuer_key = "<the 64 hex characters>"' >&2
+  else
+    echo "TATTLER_ISSUER_KEY is not in the pulled production environment at all." >&2
+    echo >&2
+    echo "These names were pulled, so you can see whether it is absent or spelled differently:" >&2
+    # Names only. The values are the thing this script exists to keep off a terminal.
+    grep -o '^[A-Z_0-9]*' "$ENVFILE" | sort | sed 's/^/  /' >&2
+  fi
+  exit 1
+fi
+
+# `0x` is how the value is written in half the places it appears, and `x` is not a hex digit, so a
+# prefixed key failed the check below with "not hexadecimal" - which reads as a corrupt key rather
+# than a prefix. configure-tap.sh already stripped it; this did not.
+ISSUER=${RAW#0x}
 
 # The service's own rule, mirrored: 32 bytes of hexadecimal. Checked here so a bad value is a
 # sentence from this script rather than a process that will not start after the config is replaced.
+#
+# The diagnostics describe the value without printing it: its length, and the offending characters
+# reduced to a class. A refusal nobody can act on is the same as a silent one.
 case "$ISSUER" in
-  *[!0-9a-fA-F]*) echo "TATTLER_ISSUER_KEY is not hexadecimal" >&2; exit 1 ;;
+  *[!0-9a-fA-F]*)
+    echo "TATTLER_ISSUER_KEY is not hexadecimal." >&2
+    echo "  length: ${#ISSUER} characters" >&2
+    echo "  it contains: $(printf '%s' "$ISSUER" | tr -d '0-9a-fA-F' | fold -w1 | sort -u | tr -d '\n' | sed 's/./& /g')" >&2
+    echo "  expected: 64 hex characters, an ed25519 seed, with or without a 0x prefix" >&2
+    exit 1 ;;
 esac
 [ "${#ISSUER}" -eq 64 ] || {
-  echo "TATTLER_ISSUER_KEY is ${#ISSUER} hex characters; kittiwake wants 64 (32 bytes)" >&2; exit 1; }
+  echo "TATTLER_ISSUER_KEY is ${#ISSUER} hex characters; kittiwake wants 64 (32 bytes)." >&2
+  echo "If the incumbent is happy with it, kittiwake will not be, and they must agree: every" >&2
+  echo "receipt already issued names the public half of this exact key." >&2
+  exit 1; }
+
+echo "the key is 64 hex characters, as expected"
 
 echo "writing [receipt] to $HOST"
 
