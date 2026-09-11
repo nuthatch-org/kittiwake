@@ -173,7 +173,12 @@ pub async fn source_hint(
     lane: Lane,
     deployment_id: &str,
 ) -> Option<SourceHint> {
-    let id = deployment_id.to_lowercase();
+    // The lookup keys on the bytes32 form, not the CID. `subgraph_metadata_for_deployments`
+    // filters anything that is not 64 hex characters, so passing a `Qm…` returns an empty map and
+    // this returned `None` for every deployment, silently, with the report otherwise perfect. The
+    // incumbent converts first and so must this. Caught by diffing the two services rather than by
+    // anything in the build.
+    let id = crate::shape::ipfs_hash_to_bytes32(deployment_id)?.to_lowercase();
     let ids = [id.clone()];
     let metas = crate::search::subgraph_metadata_for_deployments(pool, ipfs, gate, lane, &ids)
         .await
@@ -385,6 +390,24 @@ mod source_hint_shape {
                 .expect("the key is always present")
                 .is_null()
         );
+    }
+
+    #[test]
+    fn the_lookup_key_is_the_bytes32_and_not_the_cid() {
+        // The shape of the bug this had: `subgraph_metadata_for_deployments` silently drops any id
+        // that is not 64 hex characters, so a CID passed straight through finds nothing and reads
+        // as "this deployment has no source hint". Asserting the conversion produces the right
+        // shape is the cheapest thing that fails if somebody removes the call.
+        let cid = "QmZsgJLiLQKpb8hxTmQ5LWyrFVvfWzVaL4WK8dfFBn7EeK";
+        let id = crate::shape::ipfs_hash_to_bytes32(cid).expect("a real CIDv0 converts");
+        let hex = id.strip_prefix("0x").unwrap_or(&id);
+        assert_eq!(
+            hex.len(),
+            64,
+            "the metadata lookup filters anything that is not 64 hex"
+        );
+        assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(crate::shape::ipfs_hash_to_bytes32("not-a-cid").is_none());
     }
 
     #[test]
