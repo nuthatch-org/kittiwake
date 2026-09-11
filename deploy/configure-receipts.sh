@@ -34,6 +34,8 @@ KEY=${KEY:-$HOME/.ssh/hetzner_drpc}
 # that passes the checks is one the script then writes to production. That is exactly what
 # happened on 2026-09-11: a zeroed test key reached /etc/kittiwake/config.toml and was reverted
 # from the backup two minutes later. Anything that validates must be able to stop before it acts.
+. "$(dirname "$0")/secret-guard.sh"
+
 ASK_ONLY=0
 DRY_RUN=0
 for arg in "$@"; do
@@ -68,6 +70,9 @@ if [ "$ASK_ONLY" = "0" ]; then
           echo "TATTLER_ISSUER_KEY is not in the pulled environment. These names are:" >&2
           grep -o '^[A-Z_0-9]*' "$ENVFILE" | sort | sed 's/^/  /' >&2
         fi
+      elif ! refuse_placeholder TATTLER_ISSUER_KEY "$RAW"; then
+        # Sensitive in the dashboard, so the pull returned a placeholder. Fall through and ask.
+        RAW=""
       else
         echo "got the key from Vercel"
       fi

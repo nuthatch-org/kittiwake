@@ -49,19 +49,48 @@ echo "reading the production environment from Vercel ($LODESTAR_DIR)"
 # `=`, so `cut -f2` would truncate one and the failure would look like a wrong secret.
 val() { grep -m1 "^$1=" "$ENVFILE" | cut -d= -f2- | sed -E 's/^"(.*)"$/\1/'; }
 
+. "$(dirname "$0")/secret-guard.sh"
+
+# Three of these four are marked Sensitive, so the pull returns `[SENSITIVE]` for them and the loop
+# below refuses it. That leaves no way to set them from here at all, which is why each value falls
+# back to being typed: `ask_for` reads from stdin with echo off, never an argument.
+#
+# Pasting the incumbent's own values is the point. A fresh trip salt orphans every tripcode in the
+# room's history; the originals restore it, and only the window since 2026-09-11 is lost.
+ask_for() {
+  local name="$1"
+  printf 'paste %s (input hidden): ' "$name" >&2
+  local v
+  read -rs v
+  printf '\n' >&2
+  printf '%s' "$v"
+}
+
+declare -A SECRET
 for k in SESSION_SECRET SCUTTLEBUTT_TRIP_SALT SCUTTLEBUTT_IP_PEPPER SCUTTLEBUTT_ADMIN_SECRET; do
-  [ -n "$(val "$k")" ] || { echo "$k is not set in the production environment" >&2; exit 1; }
+  v="$(val "$k")"
+  if [ -z "$v" ] || ! refuse_placeholder "$k" "$v" 2>/dev/null; then
+    echo "$k could not be read from Vercel." >&2
+    v="$(ask_for "$k")"
+  fi
+  [ -n "$v" ] || { echo "$k is empty; nothing was changed" >&2; exit 1; }
+  refuse_placeholder "$k" "$v" || exit 1
+  SECRET[$k]="$v"
 done
 
 # The service's own rules, mirrored exactly, so a value it will refuse is a sentence from here
 # rather than a process that will not start after the config has been replaced.
 #
-# Only the session secret has a length floor. The salt, the pepper and the admin secret need only
-# be non-empty, and inventing a minimum for them would be worse than useless: whatever length the
-# incumbent's trip salt happens to be is the length that derives every tripcode in the room, and a
-# check that refused to copy it would guarantee the outcome it was meant to prevent. This script
-# refused a perfectly good salt on exactly that mistake, 2026-09-11.
-SS=$(val SESSION_SECRET)
+# Only the session secret has a length floor, and that is still right: whatever length the
+# incumbent's trip salt happens to be is the length that derives every tripcode in the room, so a
+# minimum invented here could refuse a good salt.
+#
+# What was wrong was concluding from that that a short value must be fine. On 2026-09-11 this
+# script refused an eleven-character trip salt, the floor was removed, and eleven characters went
+# to production - because `vercel env pull` had returned `[SENSITIVE]` rather than the secret. The
+# value was not short, it was absent. `refuse_placeholder` checks for that by name; length is not
+# the thing that can catch it.
+SS="${SECRET[SESSION_SECRET]}"
 [ "${#SS}" -ge 32 ] || {
   echo "SESSION_SECRET is shorter than 32 characters; kittiwake will refuse it" >&2; exit 1; }
 unset SS
@@ -73,10 +102,10 @@ echo "writing [studio] and [scuttle] to $HOST"
 # the command runs; and not through `SendEnv`, which needs a matching `AcceptEnv` in the server's
 # sshd config and silently sends nothing when there isn't one.
 {
-  val SESSION_SECRET
-  val SCUTTLEBUTT_TRIP_SALT
-  val SCUTTLEBUTT_IP_PEPPER
-  val SCUTTLEBUTT_ADMIN_SECRET
+  printf '%s\n' "${SECRET[SESSION_SECRET]}"
+  printf '%s\n' "${SECRET[SCUTTLEBUTT_TRIP_SALT]}"
+  printf '%s\n' "${SECRET[SCUTTLEBUTT_IP_PEPPER]}"
+  printf '%s\n' "${SECRET[SCUTTLEBUTT_ADMIN_SECRET]}"
   cat <<'BOX'
 set -euo pipefail
 export LC_ALL=C
