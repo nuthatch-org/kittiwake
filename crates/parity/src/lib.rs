@@ -242,6 +242,11 @@ pub mod coverage {
             "a write. Comparing it against the incumbent would mean inserting a row into the shared analytics table on every parity run, and its answer is a fixed {ok:true} that says nothing about what was stored",
         ),
         (
+            "/api/health",
+            Excused::Entirely,
+            "reports on the deployment answering it, so the two can only ever disagree: the incumbent describes a Vercel function and its Redis, this describes a box and its scheduler. The parity run itself would be comparing two different machines' weather",
+        ),
+        (
             "/api/studio/auth",
             Excused::Entirely,
             "session cookies and wallet signatures make the frozen public incumbent unsuitable as a fixture; covered by Dock compatibility tests",

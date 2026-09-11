@@ -712,7 +712,8 @@ async fn get_openapi() -> Response {
 ///
 /// `ok` is false when either is present, so anything already watching this endpoint inherits both
 /// without being told about them.
-async fn get_health(State(st): State<AppState>) -> Response {
+/// What both health surfaces look at. Returns `ok` and the detail behind it.
+async fn assess_health(st: &AppState) -> (bool, serde_json::Map<String, serde_json::Value>) {
     let mut body = serde_json::Map::new();
     body.insert(
         "uptime_seconds".into(),
@@ -788,8 +789,73 @@ async fn get_health(State(st): State<AppState>) -> Response {
         }
     }
 
+    (ok, body)
+}
+
+async fn get_health(State(st): State<AppState>) -> Response {
+    let (ok, mut body) = assess_health(&st).await;
     body.insert("ok".into(), ok.into());
     axum::Json(serde_json::Value::Object(body)).into_response()
+}
+
+/// The same assessment in the shape the platform's `/api/health` used, because that URL is what
+/// anything watching this deployment already points at.
+///
+/// Only two things out there actually read a health endpoint: the `status` string and the status
+/// code. Both are kept exactly. What is dropped is the Redis component, which described a
+/// dependency this service does not have, and the per-feed ingestion ages, which were a way of
+/// inferring that a job had stopped from the far side of a network - `silentJobs` answers that
+/// question directly and from inside the scheduler that would know.
+async fn get_api_health(State(st): State<AppState>) -> Response {
+    let started = std::time::Instant::now();
+    let (ok, detail) = assess_health(&st).await;
+
+    // Postgres is the one dependency whose absence is fatal rather than degrading, so it is probed
+    // separately and reported as a component rather than inferred from the checks above.
+    let (pg_up, pg_latency, pg_error) = match st.pool.as_ref() {
+        None => (false, 0u64, Some("no database configured".to_string())),
+        Some(pool) => {
+            let t = std::time::Instant::now();
+            match kittiwake_db::ping(pool).await {
+                Ok(_) => (true, t.elapsed().as_millis() as u64, None),
+                Err(e) => (false, t.elapsed().as_millis() as u64, Some(e.to_string())),
+            }
+        }
+    };
+
+    let status = if !pg_up {
+        "unhealthy"
+    } else if !ok {
+        "degraded"
+    } else {
+        "healthy"
+    };
+
+    let mut components = serde_json::Map::new();
+    components.insert(
+        "postgres".into(),
+        serde_json::json!({
+            "status": if pg_up { "up" } else { "down" },
+            "latency_ms": pg_latency,
+            "error": pg_error,
+        }),
+    );
+
+    let body = serde_json::json!({
+        "status": status,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "latency_ms": started.elapsed().as_millis() as u64,
+        "uptime_seconds": st.started.elapsed().as_secs(),
+        "components": components,
+        "checks": detail,
+    });
+
+    let code = if pg_up {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, axum::Json(body)).into_response()
 }
 
 /// Readiness: what every nest says about itself. The archive is reported without judgement,
@@ -843,6 +909,9 @@ pub fn router(state: AppState) -> Router {
         // checked from a browser rather than only from the box.
         .route("/api/whoami", get(get_whoami))
         .route("/health", get(get_health))
+        // The URL anything watching this deployment already points at, answering in the shape it
+        // has always answered in. See `get_api_health`.
+        .route("/api/health", get(get_api_health))
         .route("/ready", get(get_ready))
         .route("/metrics", get(get_metrics))
         .route("/openapi.json", get(get_openapi))
