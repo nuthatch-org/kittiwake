@@ -21,46 +21,78 @@ set -euo pipefail
 HOST=${HOST:-root@167.235.29.213}
 KEY=${KEY:-$HOME/.ssh/hetzner_drpc}
 
-# `vercel env pull` reads the project linked to the working directory, and the linked project is
-# lodestar's; this repository is linked to nothing.
-LODESTAR_DIR=${LODESTAR_DIR:-$(cd "$(dirname "$0")/../../lodestar" 2>/dev/null && pwd || true)}
-if [ -z "$LODESTAR_DIR" ] || [ ! -d "$LODESTAR_DIR/.vercel" ]; then
-  echo "cannot find a Vercel-linked lodestar checkout." >&2
-  echo "Set LODESTAR_DIR to it, e.g. LODESTAR_DIR=~/Projects/lodestar bash $0" >&2
-  exit 1
-fi
+# Two ways in, because the first one has failed three times in a row for reasons that never made
+# it back off the terminal it printed on. Vercel first when it is available, and the key typed in
+# when it is not; a deploy script whose only path runs through another vendor's CLI has two
+# failure modes and can only report one of them.
+#
+#   bash deploy/configure-receipts.sh            # try Vercel, fall back to asking
+#   bash deploy/configure-receipts.sh --ask      # skip Vercel entirely
+#   bash deploy/configure-receipts.sh --dry-run  # check the key, write nothing
+#
+# `--dry-run` exists because testing the refusals meant feeding this a fake key, and a fake key
+# that passes the checks is one the script then writes to production. That is exactly what
+# happened on 2026-09-11: a zeroed test key reached /etc/kittiwake/config.toml and was reverted
+# from the backup two minutes later. Anything that validates must be able to stop before it acts.
+ASK_ONLY=0
+DRY_RUN=0
+for arg in "$@"; do
+  case "$arg" in
+    --ask) ASK_ONLY=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    *) echo "unknown argument: $arg" >&2; exit 2 ;;
+  esac
+done
 
-ENVFILE=$(mktemp)
-trap 'rm -f "$ENVFILE"' EXIT
-chmod 600 "$ENVFILE"
+RAW=""
 
-echo "reading the production environment from Vercel ($LODESTAR_DIR)"
-( cd "$LODESTAR_DIR" && vercel env pull "$ENVFILE" --environment=production --yes >/dev/null )
-
-val() { grep -m1 "^$1=" "$ENVFILE" | cut -d= -f2- | sed -E 's/^"(.*)"$/\1/'; }
-
-RAW=$(val TATTLER_ISSUER_KEY)
-if [ -z "$RAW" ]; then
-  # Two different faults wearing the same empty string, and they need different answers.
-  if grep -q '^TATTLER_ISSUER_KEY=' "$ENVFILE"; then
-    echo "TATTLER_ISSUER_KEY was pulled with an empty value." >&2
-    echo >&2
-    echo "The name is in the file and the value is not, which is what a write-only secret looks" >&2
-    echo "like from out here. Set it on the box directly instead:" >&2
-    echo >&2
-    echo "  ssh root@167.235.29.213" >&2
-    echo "  # then append to /etc/kittiwake/config.toml, restart, and check /api/sql/receipt:" >&2
-    echo "  #   [receipt]" >&2
-    echo '  #   issuer_key = "<the 64 hex characters>"' >&2
+if [ "$ASK_ONLY" = "0" ]; then
+  LODESTAR_DIR=${LODESTAR_DIR:-$(cd "$(dirname "$0")/../../lodestar" 2>/dev/null && pwd || true)}
+  if [ -z "$LODESTAR_DIR" ] || [ ! -d "$LODESTAR_DIR/.vercel" ]; then
+    echo "no Vercel-linked lodestar checkout found; will ask for the key instead." >&2
   else
-    echo "TATTLER_ISSUER_KEY is not in the pulled production environment at all." >&2
-    echo >&2
-    echo "These names were pulled, so you can see whether it is absent or spelled differently:" >&2
-    # Names only. The values are the thing this script exists to keep off a terminal.
-    grep -o '^[A-Z_0-9]*' "$ENVFILE" | sort | sed 's/^/  /' >&2
+    ENVFILE=$(mktemp)
+    trap 'rm -f "$ENVFILE"' EXIT
+    chmod 600 "$ENVFILE"
+
+    echo "reading the production environment from Vercel ($LODESTAR_DIR)"
+    # Not fatal, and not silent. `set -e` used to abort the whole script here with whatever the
+    # CLI happened to print, which is the shape of the failure nobody could describe afterwards.
+    if ( cd "$LODESTAR_DIR" && vercel env pull "$ENVFILE" --environment=production --yes >/dev/null 2>&1 ); then
+      RAW=$(grep -m1 "^TATTLER_ISSUER_KEY=" "$ENVFILE" | cut -d= -f2- | sed -E 's/^"(.*)"$/\1/')
+      if [ -z "$RAW" ]; then
+        if grep -q '^TATTLER_ISSUER_KEY=' "$ENVFILE"; then
+          echo "Vercel returned TATTLER_ISSUER_KEY with an empty value, which is what a write-only" >&2
+          echo "secret looks like from out here." >&2
+        else
+          echo "TATTLER_ISSUER_KEY is not in the pulled environment. These names are:" >&2
+          grep -o '^[A-Z_0-9]*' "$ENVFILE" | sort | sed 's/^/  /' >&2
+        fi
+      else
+        echo "got the key from Vercel"
+      fi
+    else
+      echo "vercel env pull did not succeed; will ask for the key instead." >&2
+    fi
   fi
-  exit 1
 fi
+
+if [ -z "$RAW" ]; then
+  echo >&2
+  echo "Paste the issuer key. It is TATTLER_ISSUER_KEY in the Lodestar project's production" >&2
+  echo "environment on Vercel: Settings, Environment Variables, reveal, copy." >&2
+  echo >&2
+  # From the terminal, with echo off. Not an argument, which `ps` shows to every user on this
+  # machine and which lands in shell history.
+  printf 'issuer key (input hidden): ' >&2
+  # Plain stdin: the terminal when run by hand, the pipe when driven by a test. `< /dev/tty` was
+  # here and fails outright where there is no controlling terminal, which is every environment
+  # that could have checked this path before you ran it.
+  read -rs RAW
+  printf '\n' >&2
+fi
+
+[ -n "$RAW" ] || { echo "no key given; nothing was changed" >&2; exit 1; }
 
 # `0x` is how the value is written in half the places it appears, and `x` is not a hex digit, so a
 # prefixed key failed the check below with "not hexadecimal" - which reads as a corrupt key rather
@@ -87,6 +119,11 @@ esac
   exit 1; }
 
 echo "the key is 64 hex characters, as expected"
+
+if [ "$DRY_RUN" = "1" ]; then
+  echo "--dry-run: the key would be accepted. Nothing was written and $HOST was not contacted."
+  exit 0
+fi
 
 echo "writing [receipt] to $HOST"
 
