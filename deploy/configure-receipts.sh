@@ -177,13 +177,53 @@ systemctl is-active kittiwake
 
 # Starting is not the proof. An absent key starts perfectly happily and answers "this deployment
 # does not issue receipts" for ever, which is the same thing it said before this script ran.
-echo "receipt route (want a signed answer, not 'does not issue receipts'):"
+#
+# Nor is a signed answer the proof. A receipt signed by the *wrong* key is well formed and
+# verifies against nothing, which is the failure this whole script exists to avoid, and it looks
+# identical to success from here. So the answer's public key is what gets printed.
+echo "PUBKEY:"
 curl -fsS --max-time 30 -X POST http://127.0.0.1:8080/api/sql/receipt \
   -H 'content-type: application/json' \
-  -d '{"name":"delegations_to_indexer","args":{}}' 2>/dev/null | head -c 200 || true
-echo
+  -d '{"name":"delegations_to_indexer","args":{"indexer":"0x0000000000000000000000000000000000000000","before_block":0}}' \
+  2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("pubkey",""))' 2>/dev/null || echo ""
 BOX
-} | ssh -i "$KEY" "$HOST" 'read -r ISSUER_KEY; export ISSUER_KEY; bash -s'
+} | ssh -i "$KEY" "$HOST" 'read -r ISSUER_KEY; export ISSUER_KEY; bash -s' | tee /tmp/kittiwake-receipt-out.$$ >&2
+OURS=$(sed -n '/^PUBKEY:$/{n;p;}' /tmp/kittiwake-receipt-out.$$ | tr -d '[:space:]')
+rm -f /tmp/kittiwake-receipt-out.$$
+
+# The incumbent publishes its issuer key in every receipt it signs, so the comparison needs no
+# secret: ask it for one and read the public half.
+echo
+echo "checking the key is the incumbent's, not merely a valid one"
+THEIRS=$(curl -fsS --max-time 40 -X POST https://www.lodestar-dashboard.com/api/sql/receipt \
+  -H 'content-type: application/json' \
+  -d '{"name":"delegations_to_indexer","args":{"indexer":"0x0000000000000000000000000000000000000000","before_block":0}}' \
+  2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("data") or d).get("pubkey",""))' 2>/dev/null || echo "")
+
+if [ -z "$OURS" ]; then
+  echo "kittiwake did not return a public key; see the output above." >&2
+  exit 1
+fi
+if [ -z "$THEIRS" ]; then
+  echo "could not read the incumbent's public key, so the two were not compared." >&2
+  echo "kittiwake is now issuing under: $OURS" >&2
+  echo "Check that against a receipt the incumbent signed before trusting it." >&2
+  exit 1
+fi
+
+echo "  kittiwake: $OURS"
+echo "  incumbent: $THEIRS"
+if [ "$OURS" != "$THEIRS" ]; then
+  echo >&2
+  echo "THESE DO NOT MATCH. The key that was just installed is not the one the incumbent signs" >&2
+  echo "with, so every receipt already issued names a public key this deployment cannot produce." >&2
+  echo "Those receipts do not look invalid; they become unverifiable, which is worse." >&2
+  echo >&2
+  echo "Run this again with the incumbent's own TATTLER_ISSUER_KEY. The previous config is in the" >&2
+  echo "timestamped backup beside /etc/kittiwake/config.toml." >&2
+  exit 1
+fi
+echo "  they match: every receipt already issued stays verifiable."
 
 cat <<'NEXT'
 
