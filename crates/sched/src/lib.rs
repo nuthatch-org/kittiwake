@@ -272,6 +272,39 @@ mod tests {
         NestGate::new(kittiwake_nest::NestConfig::new("http://127.0.0.1:1")).unwrap()
     }
 
+    /// An empty registry is a real state, not an error: a read-only replica schedules nothing. It
+    /// must be distinguishable from a healthy fleet though, which is why `/health` publishes the
+    /// count beside the verdict rather than only an empty list. What this pins is that the count
+    /// can only ever come from spawning.
+    ///
+    /// Asserted on this job rather than on a count delta: the registry is process-wide and the
+    /// other tests spawn into it in parallel, so a delta is a race. The first draft of this test
+    /// had exactly that bug.
+    #[tokio::test]
+    async fn only_spawning_puts_a_job_in_the_registry() {
+        const NAME: &str = "a-job-that-only-this-test-spawns";
+        assert!(
+            !scheduled_jobs().iter().any(|j| j.name == NAME),
+            "nothing may be in the registry before it is spawned"
+        );
+
+        let recorder: Arc<dyn RunRecorder> = Arc::new(Collect::default());
+        let mut sched = Scheduler::new(gate(), recorder);
+        let handles = sched.spawn_all(vec![JobDef::every(
+            NAME,
+            Duration::from_secs(300),
+            Arc::new(|_| Box::pin(async { Ok(JobOutcome { rows_written: 0 }) })),
+        )]);
+
+        assert!(
+            scheduled_jobs().iter().any(|j| j.name == NAME),
+            "spawning must be what puts it there"
+        );
+        for h in handles {
+            h.abort();
+        }
+    }
+
     /// `/health` judges a job by the period recorded here, so a job that is running and not
     /// registered is a job nothing can tell has stopped. Asserting on this one job rather than on
     /// the whole list, because the registry is process-wide and the other tests spawn into it too.

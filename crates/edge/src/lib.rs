@@ -759,6 +759,12 @@ async fn assess_health(st: &AppState) -> (bool, serde_json::Map<String, serde_js
                 .into_iter()
                 .map(|j| (j.name.to_string(), j.period.as_secs() as i64))
                 .collect();
+            // Reported alongside the verdict, because an empty `silent_jobs` has two causes and
+            // only one of them is good news: nothing is silent, or nothing is scheduled and there
+            // was nothing to ask about. A process with no scheduler is a legitimate state, so this
+            // cannot be an error - but it must not read as a clean bill of health either.
+            body.insert("scheduled_jobs".into(), scheduled.len().into());
+
             match kittiwake_db::silent_jobs(pool, &scheduled, st.started.elapsed()).await {
                 Ok(jobs) => {
                     if !jobs.is_empty() {
