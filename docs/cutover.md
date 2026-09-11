@@ -62,7 +62,16 @@ rights and nothing should: `schema_gaps` checks the schema and refuses to reshap
 ### The Dock — nine routes
 
 Grants above, plus `session_secret` in `/etc/kittiwake/config.toml` matching Vercel's
-`SESSION_SECRET` **exactly**. The box has no `[dock]` section at all today.
+`SESSION_SECRET` **exactly**, and a `[scuttle]` section for the room. Both are written by:
+
+```sh
+bash deploy/configure-dock.sh
+```
+
+It reads the four values from the Lodestar project's production environment, writes them straight
+to the box over ssh, and echoes none of them. They travel as the first lines of the remote script's
+stdin rather than as arguments, which `ps` would show to every user on the box, or through
+`SendEnv`, which silently sends nothing when the server has no matching `AcceptEnv`.
 
 Then, before the switch and not after:
 
