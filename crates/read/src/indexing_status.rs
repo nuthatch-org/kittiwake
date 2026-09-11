@@ -60,6 +60,40 @@ impl SyncState {
     }
 }
 
+/// A fatal error, as graph-node reports it and not merely its message.
+///
+/// `deterministic` is the field that matters and the one a message cannot carry: a deterministic
+/// failure means this subgraph is broken at this block for everyone and will stay broken, while a
+/// non-deterministic one means an indexer's host had a bad minute. `block` says where to look.
+/// Reporting only the message collapses those into one sentence a reader has to guess about.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FatalError {
+    pub message: String,
+    /// The mapping handler that raised it, when graph-node names one.
+    pub handler: Option<String>,
+    pub block: Option<ErrorBlock>,
+    pub deterministic: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ErrorBlock {
+    pub number: Option<i64>,
+    pub hash: Option<String>,
+}
+
+impl FatalError {
+    /// A fatal error known only by its message, which is all some graph-node versions give.
+    pub fn message(m: impl Into<String>) -> Self {
+        Self {
+            message: m.into(),
+            handler: None,
+            block: None,
+            deterministic: None,
+        }
+    }
+}
+
 /// One `indexingStatuses` entry as graph-node reports it, reduced to what decides a verdict.
 #[derive(Debug, Clone, Default)]
 pub struct RawStatus {
@@ -69,7 +103,7 @@ pub struct RawStatus {
     pub latest_block: Option<i64>,
     pub network: Option<String>,
     pub entity_count: Option<String>,
-    pub fatal_error: Option<String>,
+    pub fatal_error: Option<FatalError>,
     pub non_fatal_errors: Vec<String>,
 }
 
@@ -89,7 +123,7 @@ pub struct IndexerStatus {
     pub latest_block: Option<i64>,
     pub network: Option<String>,
     pub entity_count: Option<String>,
-    pub fatal_error: Option<String>,
+    pub fatal_error: Option<FatalError>,
     pub non_fatal_errors: Vec<String>,
     pub non_fatal_error_count: usize,
     pub sync_progress: Option<f64>,
@@ -650,7 +684,7 @@ mod tests {
     #[test]
     fn a_fatal_error_beats_being_at_the_head() {
         let mut r = raw("healthy", true, 100, 100);
-        r.fatal_error = Some("handler panicked".into());
+        r.fatal_error = Some(FatalError::message("handler panicked"));
         assert_eq!(
             build_indexer_status("0xa", None, "u", "0", Some(&r)).state,
             SyncState::Failed
@@ -1092,10 +1126,29 @@ pub fn parse_raw_status(v: &serde_json::Value) -> RawStatus {
             .get("entityCount")
             .and_then(|e| e.as_str())
             .map(str::to_string),
-        fatal_error: v
-            .pointer("/fatalError/message")
-            .and_then(|m| m.as_str())
-            .map(str::to_string),
+        fatal_error: v.get("fatalError").and_then(|f| {
+            // Keyed on the message: graph-node has no fatal error without one, and an object
+            // carrying only a block number is not something to report as a failure.
+            let message = f.get("message")?.as_str()?.to_string();
+            let block = f.get("block").filter(|b| !b.is_null()).map(|b| ErrorBlock {
+                // A block number arrives as a string from some graph-node versions and a number
+                // from others, which is the same trap `parse_raw_status` already handles for the
+                // chain head.
+                number: b
+                    .get("number")
+                    .and_then(|n| n.as_i64().or_else(|| n.as_str()?.parse().ok())),
+                hash: b.get("hash").and_then(|h| h.as_str()).map(str::to_string),
+            });
+            Some(FatalError {
+                message,
+                handler: f
+                    .get("handler")
+                    .and_then(|h| h.as_str())
+                    .map(str::to_string),
+                block,
+                deterministic: f.get("deterministic").and_then(|d| d.as_bool()),
+            })
+        }),
         non_fatal_errors: v
             .get("nonFatalErrors")
             .and_then(|e| e.as_array())
@@ -1255,6 +1308,70 @@ mod probe_tests {
         );
     }
 
+    /// **The whole error, not the sentence.** A shape diff against the incumbent on 2026-09-11
+    /// found this route dropping `deterministic`, `handler` and `block` from every fatal error, so
+    /// a subgraph permanently broken at a known block read the same as one whose indexer's store
+    /// had a bad minute. This fixture is the payload production actually returned.
+    #[test]
+    fn a_fatal_error_keeps_the_fields_its_message_cannot_carry() {
+        let v = serde_json::json!({
+            "health": "failed",
+            "fatalError": {
+                "message": "Failed to transact block operations: store error",
+                "handler": serde_json::Value::Null,
+                "block": {
+                    "number": 504138418i64,
+                    "hash": "0xb01b6ee77e3e1b6e5f463b21aa78b1983dd7ddab67e16d3a95503fa7b9eab2a2"
+                },
+                "deterministic": false
+            },
+            "chains": []
+        });
+        let f = parse_raw_status(&v).fatal_error.expect("a fatal error");
+        assert_eq!(
+            f.deterministic,
+            Some(false),
+            "the field that decides what to do"
+        );
+        assert_eq!(f.block.as_ref().unwrap().number, Some(504138418));
+        assert!(
+            f.block
+                .as_ref()
+                .unwrap()
+                .hash
+                .as_deref()
+                .unwrap()
+                .starts_with("0xb01b6e")
+        );
+        assert_eq!(f.handler, None);
+    }
+
+    /// Some graph-node versions send the block number as a string, which is the same trap the
+    /// chain head already has a test for.
+    #[test]
+    fn a_string_error_block_number_reads_the_same_as_a_numeric_one() {
+        let as_text = serde_json::json!({
+            "fatalError": {"message": "x", "block": {"number": "504138418"}}, "chains": []
+        });
+        let as_number = serde_json::json!({
+            "fatalError": {"message": "x", "block": {"number": 504138418i64}}, "chains": []
+        });
+        assert_eq!(
+            parse_raw_status(&as_text).fatal_error.unwrap().block,
+            parse_raw_status(&as_number).fatal_error.unwrap().block
+        );
+    }
+
+    /// A fatal error with no message is not a fatal error. Reporting an object that carries only a
+    /// block as a failure would mark a healthy deployment broken.
+    #[test]
+    fn an_error_object_without_a_message_is_not_one() {
+        let v = serde_json::json!({"fatalError": {"block": {"number": 1}}, "chains": []});
+        assert!(parse_raw_status(&v).fatal_error.is_none());
+        let null = serde_json::json!({"fatalError": serde_json::Value::Null, "chains": []});
+        assert!(parse_raw_status(&null).fatal_error.is_none());
+    }
+
     #[test]
     fn a_fatal_error_and_the_non_fatal_list_are_both_read() {
         let v = serde_json::json!({
@@ -1265,7 +1382,10 @@ mod probe_tests {
             "chains": []
         });
         let raw = parse_raw_status(&v);
-        assert_eq!(raw.fatal_error.as_deref(), Some("handler panicked"));
+        assert_eq!(
+            raw.fatal_error.as_ref().map(|f| f.message.as_str()),
+            Some("handler panicked")
+        );
         assert_eq!(raw.non_fatal_errors, ["a", "b"]);
         assert_eq!(raw.entity_count.as_deref(), Some("1234"));
     }
@@ -1398,7 +1518,7 @@ fn indexer_json(i: &IndexerStatus) -> serde_json::Value {
         "fatalError",
         i.fatal_error
             .as_ref()
-            .map(|m| serde_json::json!({ "message": m })),
+            .and_then(|f| serde_json::to_value(f).ok()),
     );
     maybe(
         &mut o,
@@ -1594,7 +1714,7 @@ mod shape_tests {
     #[test]
     fn a_fatal_error_is_an_object_with_a_message() {
         let mut i = one("0xa", SyncState::Failed, None);
-        i.fatal_error = Some("handler panicked".into());
+        i.fatal_error = Some(FatalError::message("handler panicked"));
         let out = shape(
             &dep(1),
             &[i],
