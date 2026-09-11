@@ -98,6 +98,9 @@ pub struct AppState {
     /// The escrow-funded payer a serving probe signs with. Absent means probes go out unpaid and
     /// an indexer that wants a receipt is reported as unverified rather than as broken.
     pub tap_payer: Option<Arc<kittiwake_chain::tap::Payer>>,
+    /// The credential that opens a graph-support issue. Absent means this deployment reads the
+    /// forms and refuses to file, and says so through `canFile`.
+    pub support_token: Option<Arc<str>>,
     /// The secret the edge proxy presents. Absent means no request is ever trusted to name a client
     /// other than the one that connected - safe, and wrong once traffic arrives through Vercel.
     pub edge_secret: Option<Arc<str>>,
@@ -936,6 +939,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/curators", get(handlers::curators))
         .route("/api/support", get(handlers::support))
         .route("/api/support/templates", get(handlers::support_templates))
+        .route("/api/issue-forms", get(handlers::issue_forms))
+        .route("/api/file-issue", post(handlers::file_issue))
         .route("/api/support/{number}", get(handlers::support_issue))
         .route("/api/epochs", get(handlers::epochs))
         .route("/api/network-stats", get(handlers::network_stats))
@@ -1113,6 +1118,7 @@ pub fn state(
     indexer_agent: Option<kittiwake_config::IndexerAgentSettings>,
     receipt_key: Option<Arc<ed25519_dalek::SigningKey>>,
     tap_payer: Option<Arc<kittiwake_chain::tap::Payer>>,
+    support_token: Option<String>,
 ) -> AppState {
     AppState {
         chain: read.chain.clone(),
@@ -1125,6 +1131,7 @@ pub fn state(
         indexer_agent,
         receipt_key,
         tap_payer,
+        support_token: support_token.map(|t| Arc::from(t.as_str())),
         edge_secret: edge_secret.map(|s| Arc::from(s.as_str())),
         pool,
         limits: Arc::new(limits),

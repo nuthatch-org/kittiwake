@@ -1,0 +1,13 @@
+[package]
+name = "kittiwake-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serde_yaml_ng = "0.10.0"
+
+[dev-dependencies]
+serde_json = "1.0.151"

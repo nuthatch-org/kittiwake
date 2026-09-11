@@ -26,6 +26,7 @@ kittiwake-score = { version = "0.1.0", path = "../score" }
 kittiwake-scuttle = { version = "0.1.0", path = "../scuttle" }
 kittiwake-sqlplay = { version = "0.1.0", path = "../sqlplay" }
 kittiwake-ssrf = { version = "0.1.0", path = "../ssrf" }
+kittiwake-support = { version = "0.1.0", path = "../support" }
 kittiwake-types = { version = "0.1.0", path = "../types" }
 # The receipt format, rather than a second implementation of it. Issuing and verifying must
 # share one canonical encoding: two implementations are two sets of decisions about key ordering

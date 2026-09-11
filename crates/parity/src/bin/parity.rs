@@ -57,6 +57,11 @@ fn routes() -> Vec<Route> {
         both("/api/dips/agreements"),
         both("/api/qos/capture"),
         both("/api/service-census"),
+        // The parsed forms, both sides over the same mirrored YAML. This is what proves the Rust
+        // parser reads a template the same way the incumbent's does; the fixture test beside the
+        // parser pins the rendering, which a shape diff cannot see because both sides return a
+        // string.
+        both("/api/issue-forms"),
         // The sliders are sent explicitly rather than left to default, so a change to either
         // side's default shows up here as a value diff instead of cancelling out.
         both("/api/delegate/recommend?returns=5&stability=5&safety=5&network=5"),

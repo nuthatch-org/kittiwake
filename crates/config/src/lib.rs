@@ -174,6 +174,26 @@ impl std::fmt::Debug for ReceiptSettings {
     }
 }
 
+/// The credential that opens an issue in `nightswatchhq/graph-support`.
+///
+/// Absent means this deployment reads the forms and refuses to file, which is what it does today:
+/// the token has never been minted, so the incumbent's filing route has answered "not configured"
+/// to every request it has ever had. The compose page is told so through `canFile` and sends people
+/// to GitHub's own chooser rather than accepting typing it cannot deliver.
+#[derive(Clone, Deserialize)]
+pub struct SupportSettings {
+    /// A fine-grained token with `issues:write` on that repository and nothing else.
+    pub issue_token: String,
+}
+
+impl std::fmt::Debug for SupportSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SupportSettings")
+            .field("issue_token", &"<redacted>")
+            .finish()
+    }
+}
+
 /// The key that pays for a serving probe. Absent means probes go out unpaid, which is a weaker
 /// question rather than a broken one: an indexer that wants a receipt answers "pay me", and the
 /// probe reports that it could not tell whether the deployment serves.
@@ -245,6 +265,7 @@ pub struct Config {
     #[serde(default)]
     pub receipt: Option<ReceiptSettings>,
     pub tap: Option<TapSettings>,
+    pub support: Option<SupportSettings>,
     /// Turns the in-process scheduler on. Off by default so a second instance, or a staging box,
     /// cannot start writing to the same Postgres behind your back.
     #[serde(default)]
@@ -373,6 +394,7 @@ mod tests {
             indexer_agent: None,
             receipt: None,
             tap: None,
+            support: None,
             arbitrum_rpc_url: None,
             mainnet_rpc_url: None,
             bounty_board_address: None,

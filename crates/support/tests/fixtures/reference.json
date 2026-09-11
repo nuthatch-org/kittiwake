@@ -1,0 +1,262 @@
+{
+  "01-query-error.yml": {
+    "name": "Query fails or returns wrong data",
+    "description": "A query against a subgraph errors, returns nothing, or returns data you know is wrong or stale.",
+    "titlePrefix": "[query] ",
+    "labels": [
+      "status/triage"
+    ],
+    "fieldIds": [
+      null,
+      "deployment",
+      "chain",
+      "endpoint",
+      "error",
+      "query",
+      "expected",
+      "context"
+    ],
+    "fieldTypes": [
+      "markdown",
+      "input",
+      "input",
+      "dropdown",
+      "textarea",
+      "textarea",
+      "textarea",
+      "textarea"
+    ],
+    "required": [
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false
+    ],
+    "errors": [],
+    "body": "### Deployment ID\n\nanswer for deployment\n\n### Chain\n\nanswer for chain\n\n### Where are you querying?\n\nThe decentralised network gateway (gateway.thegraph.com)\n\n### The exact response\n\n```json\nanswer for error\n```\n\n### The query\n\n```graphql\nanswer for query\n```\n\n### What you expected instead\n\nanswer for expected\n\n### When it started, and what you have already tried\n\nanswer for context",
+    "emptyBody": "### Deployment ID\n\n_No response_\n\n### Chain\n\n_No response_\n\n### Where are you querying?\n\n_No response_\n\n### The exact response\n\n_No response_\n\n### The query\n\n_No response_\n\n### What you expected instead\n\n_No response_\n\n### When it started, and what you have already tried\n\n_No response_",
+    "emptyErrors": [
+      "Deployment ID is required",
+      "Chain is required",
+      "Where are you querying? is required",
+      "The exact response is required",
+      "The query is required",
+      "What you expected instead is required"
+    ]
+  },
+  "02-subgraph.yml": {
+    "name": "Subgraph will not deploy, sync, or has failed",
+    "description": "Deployment errors, a subgraph stuck syncing, stuck at 99%, or a failed deployment.",
+    "titlePrefix": "[subgraph] ",
+    "labels": [
+      "status/triage"
+    ],
+    "fieldIds": [
+      null,
+      "deployment",
+      "chain",
+      "where",
+      "symptom",
+      "error",
+      "repo",
+      "context"
+    ],
+    "fieldTypes": [
+      "markdown",
+      "input",
+      "input",
+      "dropdown",
+      "dropdown",
+      "textarea",
+      "textarea",
+      "textarea"
+    ],
+    "required": [
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false
+    ],
+    "errors": [],
+    "body": "### Deployment ID\n\nanswer for deployment\n\n### Chain\n\nanswer for chain\n\n### Where is it running?\n\nSubgraph Studio\n\n### Symptom\n\nDeploy command fails\n\n### Exact error text or status output\n\n```shell\nanswer for error\n```\n\n### Manifest and mappings\n\nanswer for repo\n\n### What changed\n\nanswer for context",
+    "emptyBody": "### Deployment ID\n\n_No response_\n\n### Chain\n\n_No response_\n\n### Where is it running?\n\n_No response_\n\n### Symptom\n\n_No response_\n\n### Exact error text or status output\n\n_No response_\n\n### Manifest and mappings\n\n_No response_\n\n### What changed\n\n_No response_",
+    "emptyErrors": [
+      "Deployment ID is required",
+      "Chain is required",
+      "Where is it running? is required",
+      "Symptom is required",
+      "Exact error text or status output is required"
+    ]
+  },
+  "03-indexer.yml": {
+    "name": "Indexer or operator problem",
+    "description": "For people running indexers. Chain clients, RPC, snapshots, PoI divergence, allocations, Horizon, staking.",
+    "titlePrefix": "[indexer] ",
+    "labels": [
+      "status/triage",
+      "area/indexer"
+    ],
+    "fieldIds": [
+      null,
+      "topic",
+      "symptom",
+      "logs",
+      "deployment",
+      "environment",
+      "tried"
+    ],
+    "fieldTypes": [
+      "markdown",
+      "dropdown",
+      "textarea",
+      "textarea",
+      "input",
+      "textarea",
+      "textarea"
+    ],
+    "required": [
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      false
+    ],
+    "errors": [],
+    "body": "### Area\n\nChain client, RPC or snapshot\n\n### What is happening\n\nanswer for symptom\n\n### Logs or output\n\n```shell\nanswer for logs\n```\n\n### Deployment ID, if one is involved\n\nanswer for deployment\n\n### Environment\n\nanswer for environment\n\n### What you have already tried\n\nanswer for tried",
+    "emptyBody": "### Area\n\n_No response_\n\n### What is happening\n\n_No response_\n\n### Logs or output\n\n_No response_\n\n### Deployment ID, if one is involved\n\n_No response_\n\n### Environment\n\n_No response_\n\n### What you have already tried\n\n_No response_",
+    "emptyErrors": [
+      "Area is required",
+      "What is happening is required",
+      "Environment is required"
+    ]
+  },
+  "04-docs.yml": {
+    "name": "The documentation is wrong or unclear",
+    "description": "Something in the official docs is incorrect, ambiguous, or led you into a mistake.",
+    "titlePrefix": "[docs] ",
+    "labels": [
+      "status/triage",
+      "area/docs",
+      "owner/upstream"
+    ],
+    "fieldIds": [
+      null,
+      "url",
+      "says",
+      "reality",
+      "suggestion"
+    ],
+    "fieldTypes": [
+      "markdown",
+      "input",
+      "textarea",
+      "textarea",
+      "textarea"
+    ],
+    "required": [
+      false,
+      true,
+      true,
+      true,
+      false
+    ],
+    "errors": [],
+    "body": "### Page\n\nanswer for url\n\n### What it says\n\nanswer for says\n\n### What actually happens\n\nanswer for reality\n\n### Suggested wording\n\nanswer for suggestion",
+    "emptyBody": "### Page\n\n_No response_\n\n### What it says\n\n_No response_\n\n### What actually happens\n\n_No response_\n\n### Suggested wording\n\n_No response_",
+    "emptyErrors": [
+      "Page is required",
+      "What it says is required",
+      "What actually happens is required"
+    ]
+  },
+  "05-question.yml": {
+    "name": "A question",
+    "description": "Not obviously broken, you just want to know how something works or what the right approach is.",
+    "titlePrefix": "[question] ",
+    "labels": [
+      "status/triage",
+      "kind/question"
+    ],
+    "fieldIds": [
+      null,
+      "question",
+      "context",
+      "found"
+    ],
+    "fieldTypes": [
+      "markdown",
+      "textarea",
+      "textarea",
+      "textarea"
+    ],
+    "required": [
+      false,
+      true,
+      false,
+      false
+    ],
+    "errors": [],
+    "body": "### The question\n\nanswer for question\n\n### What you are trying to do\n\nanswer for context\n\n### What you have already read or tried\n\nanswer for found",
+    "emptyBody": "### The question\n\n_No response_\n\n### What you are trying to do\n\n_No response_\n\n### What you have already read or tried\n\n_No response_",
+    "emptyErrors": [
+      "The question is required"
+    ]
+  },
+  "06-symptom.yml": {
+    "name": "A symptom missing from the diagnostic index",
+    "description": "Something broke in a way the Academy's symptom index does not cover, and the next person should not have to work it out again.",
+    "titlePrefix": "[symptom] ",
+    "labels": [
+      "status/triage",
+      "kind/symptom"
+    ],
+    "fieldIds": [
+      null,
+      "symptom",
+      "who",
+      "quiet",
+      "cause",
+      "tell",
+      "deployment",
+      "chain"
+    ],
+    "fieldTypes": [
+      "markdown",
+      "textarea",
+      "dropdown",
+      "textarea",
+      "textarea",
+      "textarea",
+      "input",
+      "input"
+    ],
+    "required": [
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false
+    ],
+    "errors": [],
+    "body": "### What you saw\n\nanswer for symptom\n\n### Who hits this\n\nReading data\n\n### How did it present itself?\n\nanswer for quiet\n\n### What it turned out to be, if you know\n\nanswer for cause\n\n### How would somebody tell it was this and not something else?\n\nanswer for tell\n\n### Deployment ID, if one is involved\n\nanswer for deployment\n\n### Chain, if one is involved\n\nanswer for chain",
+    "emptyBody": "### What you saw\n\n_No response_\n\n### Who hits this\n\n_No response_\n\n### How did it present itself?\n\n_No response_\n\n### What it turned out to be, if you know\n\n_No response_\n\n### How would somebody tell it was this and not something else?\n\n_No response_\n\n### Deployment ID, if one is involved\n\n_No response_\n\n### Chain, if one is involved\n\n_No response_",
+    "emptyErrors": [
+      "What you saw is required",
+      "Who hits this is required",
+      "How did it present itself? is required"
+    ]
+  }
+}
