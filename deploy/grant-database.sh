@@ -17,12 +17,11 @@
 #
 # WHAT IT GRANTS, AND WHAT IT DELIBERATELY DOES NOT
 #
-#   SELECT on the protocol tables the read routes actually read - named, not ALL TABLES. The Dock's
-#     sessions, push_subscriptions and the Scuttlebutt tables are user data that no route here
-#     touches, and they are deliberately left out.
+#   SELECT on the protocol tables the read routes actually read - named, not ALL TABLES.
 #   SELECT and UPDATE on sync_bounties, under the writer flag. `reconcile-bounties` corrects the
 #     cached status of a bounty against the BountyBoard contract (#30). No INSERT and no DELETE:
-#     the Dock creates and removes bounties, this service only ever says a stored one is wrong.
+#     that was written when the Dock lived in Next and only ever said a stored bounty was wrong.
+#     GRANT_DOCK lifts it, because the Dock is here now.
 #   INSERT and UPDATE on ipfs_metadata, because warm-ipfs fills it and both systems write the same
 #     document under the same CID, so they race to the same answer.
 #   INSERT on cron_runs, because every job records its run there under a `kittiwake:` prefix.
@@ -38,13 +37,32 @@
 # second writer.
 #
 # When the scheduler does go on, run this again with GRANT_WRITER=1.
+#
+# THE DOCK AND SCUTTLEBUTT — GRANT_DOCK=1
+#
+# Both are written here, registered, and answering; what stops them being routed here is that this
+# role has no privilege at all on the tables behind them. `/api/studio/bounties` answers
+# `permission denied for table sync_bounties` in production today. The flag exists rather than the
+# grants being unconditional for the same reason as the writer flag: until lodestar's `MIGRATED`
+# sends these paths here, the database refusing the write is the second lock on a one-way door.
+#
+# Verbs derived from the statements in crates/db, not chosen generously. `scuttlebutt_bans` takes
+# no DELETE because an unban is not implemented here; `clickthrough_events` and `parameter_changes`
+# take INSERT alone because both are append-only records of a thing that happened.
+#
+#   GRANT_DOCK=1 bash deploy/grant-database.sh
+#
+# Note that every run of this script rotates the role's password and restarts the unit. That is by
+# design and it is safe - the new password goes straight into the config - but it is a restart, not
+# a grant on its own.
 set -euo pipefail
 
 HOST=${HOST:-root@167.235.29.213}
 KEY=${KEY:-$HOME/.ssh/hetzner_drpc}
 GRANT_WRITER=${GRANT_WRITER:-0}
+GRANT_DOCK=${GRANT_DOCK:-0}
 
-ssh -i "$KEY" "$HOST" "GRANT_WRITER=$GRANT_WRITER bash -s" <<'BOX'
+ssh -i "$KEY" "$HOST" "GRANT_WRITER=$GRANT_WRITER GRANT_DOCK=$GRANT_DOCK bash -s" <<'BOX'
 set -euo pipefail
 export LC_ALL=C          # stops perl locale noise on stderr, per the fleet notes
 DB=lodestar
@@ -140,6 +158,51 @@ SQL
 else
   echo "writes on the platform's ingest tables NOT granted; re-run with GRANT_WRITER=1 when the"
   echo "scheduler decision is taken. Until then Postgres refuses them as well as the flag."
+fi
+
+if [ "${GRANT_DOCK:-0}" = "1" ]; then
+  echo "granting the Dock and Scuttlebutt tables"
+  psql -d "$DB" <<SQL
+-- The Dock's own rows. A subgraph can be registered, renamed, published and removed from the Dock,
+-- so this is the one table here that takes DELETE.
+GRANT SELECT, INSERT, UPDATE, DELETE ON studio_subgraphs TO $ROLE;
+
+-- A deploy key is shown once and rotated in place. No DELETE: revoking is an update, and a key row
+-- that vanished would take its audit trail with it.
+GRANT SELECT, INSERT, UPDATE ON studio_deploy_keys TO $ROLE;
+
+-- INSERT on top of the SELECT and UPDATE the writer flag grants. Posting a bounty is the Dock's
+-- act and the Dock is here now. Still no DELETE: a bounty is cancelled on chain and reconciled,
+-- never removed, or the board would disagree with the contract and look right doing it.
+GRANT INSERT ON sync_bounties TO $ROLE;
+
+-- Scuttlebutt. UPDATE is the soft delete - `deleted = true` - which is why there is no DELETE here
+-- either: moderation hides a message and the record of it having been said stays.
+GRANT SELECT, INSERT, UPDATE ON scuttlebutt_messages TO $ROLE;
+
+-- A ban is added and read. Lifting one is not implemented here, so the privilege to do it is not
+-- granted; when it is, this line changes with the code rather than ahead of it.
+GRANT SELECT, INSERT ON scuttlebutt_bans TO $ROLE;
+
+-- Append-only. Nothing reads these back here, and a click that happened is not editable.
+GRANT INSERT ON clickthrough_events TO $ROLE;
+
+-- Sequences for the tables above. `GRANT USAGE ON ALL SEQUENCES` earlier in this script covers
+-- every sequence that existed when it last ran, and the default-privileges line only reaches
+-- sequences this role creates. A table owned by `lodestar` and created since is covered by
+-- neither, and an INSERT refused for its sequence reports a different-looking fault than it is.
+GRANT USAGE, SELECT ON SEQUENCE
+  studio_subgraphs_id_seq,
+  studio_deploy_keys_id_seq,
+  sync_bounties_id_seq,
+  scuttlebutt_messages_id_seq,
+  scuttlebutt_bans_id_seq,
+  clickthrough_events_id_seq
+  TO $ROLE;
+SQL
+else
+  echo "the Dock and Scuttlebutt tables NOT granted; re-run with GRANT_DOCK=1 when lodestar's"
+  echo "MIGRATED sends /api/studio and /api/scuttlebutt here."
 fi
 
 # Into the config. Written through a temp file under a tight umask, so there is no window in which
