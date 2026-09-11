@@ -733,6 +733,18 @@ pub async fn subgraph_deployments(
     Ok(envelope(named(&st, read).await))
 }
 
+/// One deployment's directory row, by IPFS hash.
+pub async fn subgraph_deployment(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(hash): Path<String>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let read = routes::subgraph_deployment(&st.read, &hash).await?;
+    Ok(envelope(named(&st, read).await))
+}
+
 /// Put the names on a deployment list, when there is a database to read them from.
 ///
 /// Without this the list carries `displayName: null` for everything. That looked like parity for a

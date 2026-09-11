@@ -1065,6 +1065,42 @@ pub async fn subgraph_deployments(
     .await
 }
 
+/// `/api/subgraph-deployment/{hash}`: one deployment's directory row, by IPFS hash.
+///
+/// The list route exists and cannot answer this: it is ordered by signal and filtered to
+/// deployments above a threshold, so asking it for a specific hash means paging a thousand rows
+/// and hoping. A caller that wanted one deployment was reduced to composing three endpoints and
+/// still came up short of `stakedTokens` and the allocation count.
+///
+/// The preview cards are what wanted it. They render on the server for crawlers, so they cannot
+/// become client fetches, and reading the nest directly is what kept a nest credential in the
+/// frontend's environment.
+pub async fn subgraph_deployment(ctx: &ReadCtx, ipfs_hash: &str) -> Result<Read, ApiError> {
+    // Converted here rather than trusted: `deployments_by_id_sql` refuses anything that is not a
+    // deployment id, and a `Qm...` CID is not one. Getting this wrong returned an empty map for
+    // every deployment once already (kittiwake#105).
+    let id = crate::shape::ipfs_hash_to_bytes32(ipfs_hash)
+        .ok_or_else(|| ApiError::BadRequest("not a deployment hash".into()))?
+        .to_lowercase();
+    let sql = sql::deployments_by_id_sql(std::slice::from_ref(&id))
+        .ok_or_else(|| ApiError::BadRequest("not a deployment hash".into()))?;
+
+    ctx.cached(
+        "subgraph-deployment",
+        NestId::Alloc,
+        serde_json::json!({ "id": id }),
+        CachePolicy::from_poll_interval(cadence::LIVE),
+        rows_shaped(
+            NestId::Alloc,
+            sql,
+            T_FOLD,
+            |r| crate::shape::deployment(r, None),
+            None,
+        ),
+    )
+    .await
+}
+
 /// `/api/subgraph-fees-30d`: the directory rows for the deployments that earned fees, each with
 /// what it earned in the window.
 ///

@@ -190,6 +190,10 @@ const SUMMARIES: &[Operation] = &[
         "One graph-support thread: the opening post and every reply.",
     ),
     op(
+        "/api/subgraph-deployment/{hash}",
+        "One subgraph deployment's directory row, by IPFS hash.",
+    ),
+    op(
         "/api/issue-forms",
         "The graph-support issue forms, parsed into fields, and whether this deployment can file.",
     ),

@@ -986,6 +986,10 @@ pub fn router(state: AppState) -> Router {
         // The public SQL surface
         .route("/api/indexers-enriched", get(handlers::indexers_enriched))
         .route("/api/horizon/activity", get(handlers::horizon_activity))
+        .route(
+            "/api/subgraph-deployment/{hash}",
+            get(handlers::subgraph_deployment),
+        )
         .route("/api/subgraph-search", get(handlers::subgraph_search))
         .route("/api/subgraph-names", post(handlers::subgraph_names))
         .route(
