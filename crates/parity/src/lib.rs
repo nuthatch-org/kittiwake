@@ -383,7 +383,15 @@ pub mod coverage {
              that here is a linked dependency, and `sourceHint` is not ported because \
              nightswatchhq/lodestar#144 deletes its only reader. A fourth is in the diff: its \
              handler keys are joined with a literal NUL byte where its own comment says a \
-             triangle. See docs/decisions.md",
+             triangle. See docs/decisions.md. \
+             \
+             The blanket exclusion is why a fourth, undeclared difference lived here until \
+             2026-09-11: `signalledGrt` and `queryFeesGrt` against the incumbent's `signalledGRT` \
+             and `queryFeesGRT`, which the frontend destructures. This wants narrowing to \
+             ValuesOnly - a GET over immutable bytes is comparable in shape - and the one thing \
+             stopping that is `sourceHint`, whose only reader lodestar#144 was to delete and has \
+             not: the reader is still there, so omitting the field is a live regression rather \
+             than a ported-away one",
         ),
         (
             "/api/disassembly/diff",

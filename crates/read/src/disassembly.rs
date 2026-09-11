@@ -81,7 +81,15 @@ pub async fn report(
 pub struct SignalContext {
     pub signalled_tokens: String,
     pub query_fees_amount: String,
+    // `camelCase` renders these `signalledGrt` and `queryFeesGrt`, and the incumbent spells both
+    // with `GRT`. The frontend destructures the incumbent's spelling: `formatGRT(signal.signalledGRT)`
+    // would have printed a blank, and `signal.signalledGRT > 0` would have been false, so the
+    // warning that "N GRT signalled is exposed to M risk flags" would have stopped appearing at
+    // cutover with nothing else visibly wrong. Found by diffing the two services on the same
+    // deployment, which the harness excuses this route from doing.
+    #[serde(rename = "signalledGRT")]
     pub signalled_grt: f64,
+    #[serde(rename = "queryFeesGRT")]
     pub query_fees_grt: f64,
     pub curator_count: usize,
     pub curator_count_capped: bool,
@@ -209,5 +217,43 @@ mod tests {
         assert_eq!(wei_to_grt("1000000000000000000"), 1.0);
         assert_eq!(wei_to_grt("0"), 0.0);
         assert_eq!(wei_to_grt("not a number"), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod signal_context_names {
+    //! The field names a consumer destructures, pinned.
+    //!
+    //! `rename_all = "camelCase"` is right for every other field on this struct and wrong for two:
+    //! the incumbent spells them `signalledGRT` and `queryFeesGRT`, and the dashboard reads those.
+    //! It went unnoticed because the parity harness excuses this route entirely, so nothing
+    //! compared the two shapes. A rename here is silent at compile time and invisible in a test
+    //! that checks values, so the names themselves are asserted.
+
+    use super::SignalContext;
+
+    #[test]
+    fn grt_is_spelled_as_the_consumer_reads_it() {
+        let json = serde_json::to_value(SignalContext {
+            signalled_tokens: "1".into(),
+            query_fees_amount: "2".into(),
+            signalled_grt: 3.0,
+            query_fees_grt: 4.0,
+            curator_count: 1,
+            curator_count_capped: false,
+            exposure: "low",
+        })
+        .expect("a plain struct serialises");
+
+        assert_eq!(json.get("signalledGRT").and_then(|v| v.as_f64()), Some(3.0));
+        assert_eq!(json.get("queryFeesGRT").and_then(|v| v.as_f64()), Some(4.0));
+        assert!(
+            json.get("signalledGrt").is_none(),
+            "the camelCase spelling must not appear"
+        );
+        assert!(
+            json.get("queryFeesGrt").is_none(),
+            "the camelCase spelling must not appear"
+        );
     }
 }
