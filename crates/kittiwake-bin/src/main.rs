@@ -100,21 +100,28 @@ async fn main() -> anyhow::Result<()> {
             match kittiwake_db::schema_gaps(&pool).await {
                 Ok(gaps) if !gaps.is_empty() => {
                     for gap in &gaps {
-                        match &gap.column {
-                            Some(column) => tracing::error!(
+                        use kittiwake_db::GapKind;
+                        match (&gap.column, gap.kind) {
+                            (Some(column), _) => tracing::error!(
                                 table = %gap.table,
                                 column = %column,
                                 "the database is missing a column this build declares"
                             ),
-                            None => tracing::error!(
+                            (None, GapKind::Missing) => tracing::error!(
                                 table = %gap.table,
                                 "the database is missing a table this build declares"
+                            ),
+                            // Present, and invisible to this role. A GRANT is owed and no schema
+                            // change is, so saying "missing" would send somebody to write one.
+                            (None, GapKind::NoPrivilege) => tracing::error!(
+                                table = %gap.table,
+                                "this role has no privilege on a table this build declares; see deploy/grant-database.sh"
                             ),
                         }
                     }
                     tracing::error!(
                         count = gaps.len(),
-                        "schema gaps: jobs touching these will fail every run. /health reports them"
+                        "schema gaps: anything touching these fails every run. /health reports them"
                     );
                 }
                 Ok(_) => tracing::info!("schema matches this build"),
