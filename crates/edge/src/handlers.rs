@@ -240,7 +240,38 @@ pub async fn indexer(
     Path(address): Path<String>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
-    Ok(envelope(routes::indexer(&st.read, &addr(&address)).await?))
+    let read = routes::indexer(&st.read, &addr(&address)).await?;
+    Ok(envelope(named_allocations(&st, read).await))
+}
+
+/// Put the names on an indexer's allocations, when there is a database to read them from.
+///
+/// Same split and the same fresh-entry reasoning as `named` below: the allocation rows come from
+/// the allocation nest, the names from IPFS documents keyed off the GNS nest, and enriching the
+/// cached entry in place would make its contents depend on whether a database happened to be
+/// configured on the run that filled it.
+async fn named_allocations(st: &AppState, mut read: kittiwake_read::Read) -> kittiwake_read::Read {
+    let Some(pool) = st.pool.as_ref() else {
+        return read;
+    };
+    let mut data = (*read.entry.value).clone();
+    let Some(indexer) = data.get_mut("indexer") else {
+        return read;
+    };
+    kittiwake_read::search::enrich_allocation_deployments(
+        pool,
+        &st.ipfs,
+        &st.read.gate,
+        kittiwake_nest::Lane::Read,
+        indexer,
+    )
+    .await;
+    read.entry = std::sync::Arc::new(kittiwake_cache::Entry {
+        value: std::sync::Arc::new(data),
+        provenance: read.entry.provenance.clone(),
+        fetched_at: read.entry.fetched_at,
+    });
+    read
 }
 
 /// `/api/indexer-status/[address]`: what this indexer is actually serving, right now.

@@ -514,6 +514,82 @@ pub async fn display_names_for_deployments(
     Ok(out)
 }
 
+/// Put names on the deployments an indexer's allocations point at.
+///
+/// The allocation rows come from the allocation nest and carry a deployment id and nothing else;
+/// the names live in IPFS documents keyed off the GNS nest. Same split as `enrich_deployments`,
+/// different shape: here the deployments are nested one level down, inside `allocations` and
+/// `closedAllocations`, rather than being the list itself.
+///
+/// Silent when the metadata cannot be read, for the same reason as the list: an allocation table
+/// with hashes in it is a table, and one that failed because a name was missing is not.
+/// The two places an indexer profile keeps allocations. One list, so the collect and the write-back
+/// cannot drift apart and quietly name only half of them.
+const ALLOCATION_FIELDS: [&str; 2] = ["allocations", "closedAllocations"];
+
+/// Every deployment hash an indexer's allocations point at, deduplicated.
+fn allocation_deployment_hashes(indexer: &serde_json::Value) -> Vec<String> {
+    let mut hashes: Vec<String> = ALLOCATION_FIELDS
+        .iter()
+        .filter_map(|f| indexer.get(f).and_then(|v| v.as_array()))
+        .flatten()
+        .filter_map(|item| {
+            item.get("subgraphDeployment")?
+                .get("ipfsHash")?
+                .as_str()
+                .map(str::to_string)
+        })
+        .collect();
+    hashes.sort();
+    hashes.dedup();
+    hashes
+}
+
+/// Write the names back onto the allocations that asked for them.
+///
+/// A hash with no name keeps its null rather than gaining an empty string: the table renders the
+/// hash either way, and "" would claim the subgraph is called nothing.
+fn apply_allocation_names(
+    indexer: &mut serde_json::Value,
+    names: &BTreeMap<String, Option<String>>,
+) {
+    for field in ALLOCATION_FIELDS {
+        let Some(items) = indexer.get_mut(field).and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        for item in items {
+            let Some(dep) = item.get_mut("subgraphDeployment") else {
+                continue;
+            };
+            let Some(hash) = dep.get("ipfsHash").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if let Some(Some(name)) = names.get(hash) {
+                dep["displayName"] = serde_json::Value::String(name.clone());
+            }
+        }
+    }
+}
+
+pub async fn enrich_allocation_deployments(
+    pool: &Pool,
+    ipfs: &Ipfs,
+    gate: &NestGate,
+    lane: Lane,
+    indexer: &mut serde_json::Value,
+) {
+    let hashes = allocation_deployment_hashes(indexer);
+    if hashes.is_empty() {
+        return;
+    }
+    match display_names_for_deployments(pool, ipfs, gate, lane, &hashes).await {
+        Ok(names) => apply_allocation_names(indexer, &names),
+        Err(e) => {
+            tracing::debug!(err = %e, "allocation deployment names unavailable; the table keeps its hashes");
+        }
+    }
+}
+
 /// Fill in `displayName` and `categories` on a list of deployments.
 ///
 /// The names live in IPFS documents keyed off the GNS nest, which is a different nest and a
@@ -703,6 +779,81 @@ pub async fn warm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn profile() -> serde_json::Value {
+        serde_json::json!({
+            "allocations": [
+                { "subgraphDeployment": { "ipfsHash": "QmOne", "displayName": null } },
+                { "subgraphDeployment": { "ipfsHash": "QmTwo", "displayName": null } },
+            ],
+            "closedAllocations": [
+                // The same deployment as an open one: the pair is asked about once.
+                { "subgraphDeployment": { "ipfsHash": "QmOne", "displayName": null } },
+                { "subgraphDeployment": { "ipfsHash": "QmGone", "displayName": null } },
+            ],
+        })
+    }
+
+    #[test]
+    fn both_allocation_lists_are_collected_and_a_repeat_is_asked_about_once() {
+        assert_eq!(
+            allocation_deployment_hashes(&profile()),
+            vec!["QmGone", "QmOne", "QmTwo"]
+        );
+    }
+
+    /// Closed allocations are the larger list by far - 500 against 82 on the profile that found
+    /// this - so naming only the open ones would look like a fix and leave most of the page alone.
+    #[test]
+    fn names_land_on_closed_allocations_as_well_as_open_ones() {
+        let mut p = profile();
+        let names = BTreeMap::from([
+            ("QmOne".to_string(), Some("Uniswap V3".to_string())),
+            ("QmTwo".to_string(), Some("ENS".to_string())),
+            ("QmGone".to_string(), None),
+        ]);
+        apply_allocation_names(&mut p, &names);
+
+        assert_eq!(
+            p["allocations"][0]["subgraphDeployment"]["displayName"],
+            "Uniswap V3"
+        );
+        assert_eq!(
+            p["allocations"][1]["subgraphDeployment"]["displayName"],
+            "ENS"
+        );
+        assert_eq!(
+            p["closedAllocations"][0]["subgraphDeployment"]["displayName"],
+            "Uniswap V3"
+        );
+    }
+
+    /// A deployment nobody has named keeps its null. An empty string would render as a subgraph
+    /// called nothing, where a null renders as the hash, which is true and readable.
+    #[test]
+    fn an_unnamed_deployment_keeps_its_null_rather_than_gaining_an_empty_name() {
+        let mut p = profile();
+        apply_allocation_names(&mut p, &BTreeMap::from([("QmGone".to_string(), None)]));
+        assert_eq!(
+            p["closedAllocations"][1]["subgraphDeployment"]["displayName"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// The metadata lookup failing must leave the profile exactly as it was, not half-written.
+    #[test]
+    fn no_names_at_all_changes_nothing() {
+        let mut p = profile();
+        let before = p.clone();
+        apply_allocation_names(&mut p, &BTreeMap::new());
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn a_profile_with_no_allocations_asks_about_nothing() {
+        assert!(allocation_deployment_hashes(&serde_json::json!({})).is_empty());
+        assert!(allocation_deployment_hashes(&serde_json::json!({ "allocations": [] })).is_empty());
+    }
 
     /// #43. The GNS nest and the IPFS documents behind it must be asked about the rows a reader
     /// will see, not about every candidate the ranking considered.

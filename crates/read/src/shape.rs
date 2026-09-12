@@ -521,12 +521,24 @@ pub fn derived_indexer_metrics(r: &Value, delegation_ratio: f64) -> Value {
     })
 }
 
+/// The deployment an allocation points at, as much of it as the allocation row knows.
+///
+/// This used to carry `"versions": []`, always, unconditionally. The field existed so the shape
+/// matched what the incumbent's GraphQL sent and the frontend read the name out of
+/// `versions[0].subgraph.metadata.displayName`, which meant every allocation on every indexer
+/// profile rendered a shortened IPFS hash instead of a name: 82 open and 500 closed on the one I
+/// checked, and the same on all the rest. A stub that satisfies a shape check while carrying no
+/// data is worse than an absent field, because nothing about it looks wrong.
+///
+/// So it carries `displayName` instead, flat, the same as `deployment` above, and null here for the
+/// same reason: the names live in a different nest and are filled in afterwards by `named_
+/// allocations` in the edge crate. Null means nobody has looked yet or nobody has named it.
 fn deployment_stub(r: &Value, with_stats: bool) -> Value {
     let id = t(r, "subgraph_deployment");
     let mut out = json!({
         "id": id.clone(),
         "ipfsHash": ipfs_or_id(id.as_str().unwrap_or_default()),
-        "versions": json!([]),
+        "displayName": Value::Null,
     });
     if with_stats {
         out["signalledTokens"] = s0(r, "signalled_tokens");
@@ -2788,5 +2800,39 @@ mod provenance_tests {
     #[test]
     fn no_chain_reading_is_null_rather_than_agreement() {
         assert_eq!(pool_reconciliation(None, 900.0, 0.0), Value::Null);
+    }
+
+    /// An allocation has to be able to name the subgraph it is allocated to.
+    ///
+    /// The field it carried before, `versions`, was a hardcoded empty array: present, correctly
+    /// typed, and never once populated. The frontend read the name out of
+    /// `versions[0].subgraph.metadata.displayName`, so it was null for all 82 open and all 500
+    /// closed allocations on every indexer profile, and the table rendered shortened IPFS hashes.
+    /// Nothing looked wrong, which is the point of asserting it now.
+    #[test]
+    fn an_allocation_carries_a_name_field_rather_than_an_empty_versions_array() {
+        let row = json!({
+            "id": "0xalloc-1",
+            "allocated_tokens": "100",
+            "created_at_epoch": 900,
+            "subgraph_deployment":
+                "0x4d4a747d890c63f85e47b9df02a9d490284b9163cd8c23d91c956feaab063298",
+        });
+
+        for shaped in [active_allocation(&row), closed_allocation(&row)] {
+            let dep = &shaped["subgraphDeployment"];
+            assert!(
+                dep.get("versions").is_none(),
+                "the empty versions stub is back: {dep}"
+            );
+            assert!(
+                dep.get("displayName").is_some(),
+                "nothing can fill in a name that has nowhere to go: {dep}"
+            );
+            // Null until `named_allocations` has been past it. Null means unlooked-at or unnamed;
+            // it must not be invented here, where there is no metadata to invent it from.
+            assert_eq!(dep["displayName"], Value::Null);
+            assert!(dep["ipfsHash"].as_str().unwrap().starts_with("Qm"));
+        }
     }
 }
