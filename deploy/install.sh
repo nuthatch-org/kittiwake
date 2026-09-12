@@ -73,7 +73,14 @@ user = "$NEST_USER"
 password = "$NEST_PASS"
 
 [nest.permits]
-alloc = 4
+# Eight rather than four. `alloc` carries the folds with the most parts - `/api/indexer` and
+# `/api/indexer-status` are six queries each - and a fold that cannot fit inside its pool used to
+# starve itself: it took every permit and waited for parts that could never be admitted.
+#
+# That is fixed properly in `many()`, which now admits at most `lane_width - 1` at a time, so this
+# is a capacity choice again rather than a correctness one. It stays at eight because four left no
+# room at all for the warmer and the crons beside one profile request.
+alloc = 8
 gns = 2
 dips = 2
 "dips-sepolia" = 2
