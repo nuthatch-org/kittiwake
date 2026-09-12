@@ -314,6 +314,10 @@ impl NestGate {
             // number can be judged without reading the config on the box.
             metrics::counter!("nest_busy_total", "nest" => n.as_str()).increment(0);
             metrics::counter!("nest_query_total", "nest" => n.as_str()).increment(0);
+            // Same reasoning as the two above, and it cost an afternoon to learn twice: this one
+            // was not registered, so "nothing timed out" and "the counter does not exist" were the
+            // same absent line while a fold was deadlocking on every call.
+            metrics::counter!("nest_gate_timeout_total", "nest" => n.as_str()).increment(0);
             metrics::gauge!("nest_permits", "nest" => n.as_str()).set(p as f64);
             permits.insert(n, Arc::new(Semaphore::new(p)));
             cron_permits.insert(n, Arc::new(Semaphore::new(cron_width(p))));

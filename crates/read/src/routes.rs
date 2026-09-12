@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::future::join_all;
+use futures::stream::{FuturesOrdered, StreamExt};
 use kittiwake_cache::CachePolicy;
 use kittiwake_nest::{Lane, NestGate, QuerySpec};
 use kittiwake_types::{ApiError, NestId, Provenance};
@@ -86,11 +86,40 @@ pub fn many_folded(
     })
 }
 
+/// Run every part of a fold, never asking for more permits at once than the lane admits.
+///
+/// ## The deadlock this exists to prevent
+///
+/// A permit is taken per query and released when that query finishes. `join_all` started all of
+/// them at once, so a fold with more parts than its nest has permits **starved itself**: it took
+/// every permit, its remaining parts queued for one, and the permits it held were not released
+/// until every part had finished. They could not. The pool only freed when the waiters hit the
+/// gate timeout and the whole request failed.
+///
+/// `/api/indexer` and `/api/indexer-status` are six `alloc` parts each, against four permits. Both
+/// deadlocked on every cold call - and because a wedged request held the pool for the full gate
+/// timeout, raising that timeout to give slow folds room made it *worse*, not better: three
+/// seconds of starvation became twenty.
+///
+/// `lane_width` is the width the gate admits, and one fewer than that leaves a permit for the
+/// coalescer and the warmer rather than letting one fold own the nest. It is a width and not a
+/// reservation, so this does not stop contention with other requests - it stops a request
+/// contending with itself, which is the part that could never resolve.
 pub fn many(parts: Vec<Part>, timeout: Duration) -> Fetcher {
     let parts = Arc::new(parts);
     Arc::new(move |gate: NestGate, lane: Lane| {
         let parts = parts.clone();
         Box::pin(async move {
+            // The widest lane any part of this fold uses. Folds are single-nest in practice; taking
+            // the minimum is the safe reading when one ever is not.
+            let width = parts
+                .iter()
+                .map(|p| gate.lane_width(p.nest, lane))
+                .min()
+                .unwrap_or(1)
+                .saturating_sub(1)
+                .max(1);
+
             let futures = parts.iter().map(|p| {
                 let gate = gate.clone();
                 let mut spec = QuerySpec::read(p.nest, p.sql.clone()).with_timeout(timeout);
@@ -103,7 +132,25 @@ pub fn many(parts: Vec<Part>, timeout: Duration) -> Fetcher {
                 async move { gate.query_coalesced(&key, spec).await }
             });
 
-            let answers = join_all(futures).await;
+            // Admission is controlled here rather than by `buffer_unordered`, which would lose the
+            // ordering the zip below depends on. `FuturesOrdered` polls everything it holds, so the
+            // bound has to be on what goes *in*: at most `width` in flight, one more admitted each
+            // time one completes.
+            let mut pending = futures;
+            let mut queue: FuturesOrdered<_> = FuturesOrdered::new();
+            let mut answers = Vec::with_capacity(parts.len());
+            for _ in 0..width {
+                match pending.next() {
+                    Some(f) => queue.push_back(f),
+                    None => break,
+                }
+            }
+            while let Some(a) = queue.next().await {
+                answers.push(a);
+                if let Some(f) = pending.next() {
+                    queue.push_back(f);
+                }
+            }
             let mut out = serde_json::Map::new();
             let mut provenance: Option<Provenance> = None;
 
@@ -1493,6 +1540,50 @@ pub async fn dips(ctx: &ReadCtx, sepolia: bool) -> Result<Read, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The admission bound, as arithmetic rather than as a running fold.
+    ///
+    /// A fold may never ask for more permits at once than its lane admits, or it starves itself:
+    /// it takes every permit, its remaining parts queue for one, and the permits it holds are not
+    /// released until every part finishes - which cannot happen. `/api/indexer` is six `alloc`
+    /// parts and `alloc` had four permits, so it deadlocked on every cold call and only unwedged
+    /// when the waiters hit the gate timeout.
+    fn admitted(lane_width: usize) -> usize {
+        lane_width.saturating_sub(1).max(1)
+    }
+
+    #[test]
+    fn a_fold_never_asks_for_more_than_the_lane_admits() {
+        // The pool that broke, and the one it was raised to. In both cases the fold must run
+        // strictly inside the pool rather than filling it.
+        for width in [1usize, 2, 4, 6, 8, 16] {
+            assert!(
+                admitted(width) < width || width == 1,
+                "a fold admitted {} of {width} permits, which leaves nothing for anyone else",
+                admitted(width)
+            );
+            assert!(admitted(width) >= 1, "a fold must be allowed to run at all");
+        }
+    }
+
+    /// Six parts against four permits is the shape that deadlocked. Whatever the part count, the
+    /// number in flight is bounded by the pool and not by the fold.
+    #[test]
+    fn a_six_part_fold_fits_inside_a_four_permit_pool() {
+        assert_eq!(admitted(4), 3);
+        // The old behaviour, for contrast: `join_all` ran all six at once.
+        assert!(
+            admitted(4) < 6,
+            "six in flight against four permits is the deadlock"
+        );
+    }
+
+    /// One permit must still make progress rather than dividing to zero and hanging forever.
+    #[test]
+    fn a_single_permit_lane_still_runs_one_at_a_time() {
+        assert_eq!(admitted(1), 1);
+        assert_eq!(admitted(0), 1);
+    }
 
     #[test]
     fn a_composed_answer_is_dated_by_its_stalest_half() {
