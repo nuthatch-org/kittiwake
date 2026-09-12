@@ -222,7 +222,8 @@ async fn main() -> anyhow::Result<()> {
             )
         }),
         cfg.support.as_ref().map(|s| s.issue_token.clone()),
-    );
+    )
+    .with_cors(cfg.cors.as_ref().map(|c| c.allowed_origins.clone()));
     let limits_handle = state.limits.clone();
 
     // Keyed rate-limit state grows with distinct callers; sweep the idle ones periodically so a

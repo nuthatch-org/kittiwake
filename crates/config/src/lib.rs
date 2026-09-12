@@ -91,6 +91,21 @@ pub struct LimitSettings {
     pub exempt_ips: Vec<String>,
 }
 
+/// Which browser origins may call this API directly.
+///
+/// Absent means no CORS headers are sent at all, which is what this service did for its whole life
+/// and is correct while every browser request arrives through the Vercel edge on the dashboard's
+/// own origin. It becomes necessary the moment `src/proxy.ts` is deleted and the browser talks to
+/// `api.lodestar-dashboard.com` itself.
+///
+/// Listed exactly rather than by wildcard. `Access-Control-Allow-Origin: *` cannot carry
+/// credentials, and the Dock's session is a cookie, so a wildcard would silently sign every Dock
+/// user out on a cross-origin call while every unauthenticated route kept working.
+#[derive(Clone, Debug, Deserialize)]
+pub struct CorsSettings {
+    pub allowed_origins: Vec<String>,
+}
+
 /// The product surface is deliberately opt-in.  A process that has the read-side configuration
 /// but not the session key must not accidentally start accepting half-configured Dock requests.
 #[derive(Clone, Deserialize)]
@@ -233,6 +248,8 @@ pub struct Config {
     pub edge_secret: Option<String>,
     #[serde(default)]
     pub studio: Option<StudioSettings>,
+    #[serde(default)]
+    pub cors: Option<CorsSettings>,
     /// Foghorn's API, which `/api/foghorn/{*path}` proxies. Absent means that route answers 503
     /// rather than guessing at a host.
     pub foghorn_api_url: Option<String>,
@@ -302,6 +319,38 @@ impl Config {
                 ));
             }
         }
+        if let Some(cors) = &self.cors {
+            if cors.allowed_origins.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "cors.allowed_origins is present but empty; remove the section instead, or a \
+                     reader will think browsers are allowed when none are"
+                        .into(),
+                ));
+            }
+            for o in &cors.allowed_origins {
+                // An origin is scheme://host[:port] and nothing else. A trailing slash or a path
+                // makes a header no browser will ever match, and the failure is a CORS error in
+                // somebody's console rather than anything this process notices.
+                if o == "*" {
+                    return Err(ConfigError::Invalid(
+                        "cors.allowed_origins may not be \"*\": a wildcard cannot carry the Dock's \
+                         session cookie, so it would sign users out rather than let them in"
+                            .into(),
+                    ));
+                }
+                if !o.starts_with("https://") && !o.starts_with("http://localhost") {
+                    return Err(ConfigError::Invalid(format!(
+                        "cors.allowed_origins entry {o:?} is not an https origin"
+                    )));
+                }
+                if o.ends_with('/') || o[8..].contains('/') {
+                    return Err(ConfigError::Invalid(format!(
+                        "cors.allowed_origins entry {o:?} has a path or trailing slash; an origin \
+                         is scheme://host[:port] and a browser will never match this"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -334,9 +383,73 @@ impl Config {
 mod tests {
     use super::*;
 
+    fn with_cors(origins: &[&str]) -> Config {
+        let mut c = settings("https://nest.example");
+        c.cors = Some(CorsSettings {
+            allowed_origins: origins.iter().map(|s| s.to_string()).collect(),
+        });
+        c
+    }
+
+    #[test]
+    fn the_dashboard_origins_are_accepted() {
+        assert!(
+            with_cors(&[
+                "https://www.lodestar-dashboard.com",
+                "https://lodestar-dashboard.com",
+            ])
+            .validate()
+            .is_ok()
+        );
+    }
+
+    /// A wildcard cannot carry credentials, and the Dock's session is a cookie. Allowing it would
+    /// leave every unauthenticated route working and sign out anyone using the Dock, which is a
+    /// failure nobody would attribute to a CORS header.
+    #[test]
+    fn a_wildcard_origin_is_refused_because_of_the_cookie() {
+        let err = with_cors(&["*"]).validate().unwrap_err().to_string();
+        assert!(err.contains("session cookie"), "{err}");
+    }
+
+    /// An origin is scheme://host[:port]. A browser will never match one with a path on it, and
+    /// the failure surfaces in somebody's console rather than here.
+    #[test]
+    fn an_origin_with_a_path_is_refused() {
+        assert!(
+            with_cors(&["https://www.lodestar-dashboard.com/"])
+                .validate()
+                .is_err()
+        );
+        assert!(
+            with_cors(&["https://www.lodestar-dashboard.com/api"])
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_plaintext_origin_is_refused_unless_it_is_localhost() {
+        assert!(with_cors(&["http://evil.example"]).validate().is_err());
+        assert!(with_cors(&["http://localhost:3000"]).validate().is_ok());
+    }
+
+    /// Present and empty is worse than absent: it reads as "browsers are configured" while
+    /// allowing none of them.
+    #[test]
+    fn an_empty_list_is_refused_rather_than_treated_as_absent() {
+        assert!(with_cors(&[]).validate().is_err());
+    }
+
+    #[test]
+    fn no_cors_section_is_fine_and_is_what_ships_today() {
+        assert!(settings("https://nest.example").validate().is_ok());
+    }
+
     fn settings(origin: &str) -> Config {
         Config {
             bind: default_bind(),
+            cors: None,
             nest: NestSettings {
                 origin: origin.into(),
                 user: None,

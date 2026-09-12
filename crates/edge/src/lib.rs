@@ -108,6 +108,8 @@ pub struct AppState {
     pub chain: Option<kittiwake_chain::Chain>,
     /// Absent when no database is configured; the routes that need one say so.
     pub pool: Option<kittiwake_db::Pool>,
+    /// Browser origins allowed to call this API directly. Absent means no CORS headers at all.
+    pub cors_origins: Option<Arc<Vec<String>>>,
     pub limits: Arc<Limits>,
     pub metrics: Option<kittiwake_obs::PrometheusHandle>,
     pub started: std::time::Instant,
@@ -117,6 +119,14 @@ pub struct AppState {
 pub struct Studio {
     pub secret: kittiwake_dock::Secret,
     pub bounty_board_address: Option<String>,
+}
+
+impl AppState {
+    /// Allow these browser origins to call the API directly. Absent, or empty, means none may.
+    pub fn with_cors(mut self, origins: Option<Vec<String>>) -> Self {
+        self.cors_origins = origins.filter(|o| !o.is_empty()).map(Arc::new);
+        self
+    }
 }
 
 /// The client's address.
@@ -923,9 +933,66 @@ async fn get_metrics(State(st): State<AppState>) -> Response {
     }
 }
 
+/// The CORS layer, when browser origins are configured.
+///
+/// ## Why this is not on by default
+///
+/// Every browser request reaches this service through the Vercel edge today, on the dashboard's
+/// own origin, so no preflight ever happens and no header is needed. That stops being true when
+/// `src/proxy.ts` is deleted and the browser calls `api.lodestar-dashboard.com` itself.
+///
+/// ## The cookie, which is the part that is easy to get wrong
+///
+/// `Access-Control-Allow-Origin: *` and credentials are mutually exclusive by specification, and
+/// the Dock's session is an httpOnly cookie, so a wildcard would leave every unauthenticated route
+/// working and silently sign out anyone using the Dock. The configuration refuses `"*"` for that
+/// reason rather than leaving it to be discovered.
+///
+/// The cookie itself travels, which is worth stating because it looks as though it should not:
+/// `studio_session` is `SameSite=Lax`, and SameSite is about *site* rather than origin.
+/// `www.lodestar-dashboard.com` and `api.lodestar-dashboard.com` share a registrable domain, so
+/// they are the same site and Lax is satisfied. They are different origins, so CORS is still
+/// required. Both are true at once and confusing the two is how this gets built twice.
+fn cors_layer(origins: &[String]) -> Option<tower_http::cors::CorsLayer> {
+    let parsed: Vec<axum::http::HeaderValue> = origins
+        .iter()
+        .filter_map(|o| o.parse::<axum::http::HeaderValue>().ok())
+        .collect();
+    if parsed.is_empty() {
+        return None;
+    }
+    Some(
+        tower_http::cors::CorsLayer::new()
+            .allow_origin(parsed)
+            // The verbs this router actually binds. Listing them rather than `any()` means a new
+            // method is a deliberate addition here as well as on the route.
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::PATCH,
+                axum::http::Method::DELETE,
+                axum::http::Method::OPTIONS,
+            ])
+            .allow_headers([
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::ACCEPT,
+                // The Dock's mutation header, and the moderation one's successor if it returns.
+                axum::http::HeaderName::from_static("x-sb-admin"),
+            ])
+            .allow_credentials(true)
+            // Provenance is the point of this API: a caller that cannot read the envelope's
+            // headers cannot tell a sealed answer from a stale one.
+            .expose_headers([
+                axum::http::HeaderName::from_static("x-kittiwake-source"),
+                axum::http::HeaderName::from_static("x-kittiwake-age"),
+            ])
+            .max_age(std::time::Duration::from_secs(600)),
+    )
+}
+
 pub fn router(state: AppState) -> Router {
     use axum::routing::post;
-    Router::new()
+    let routes = Router::new()
         .route("/whoami", get(get_whoami))
         // Also under /api, so it can be reached through the edge rewrite and the whole chain can be
         // checked from a browser rather than only from the box.
@@ -1096,8 +1163,14 @@ pub fn router(state: AppState) -> Router {
             get(handlers::subgraph_versions),
         )
         .layer(tower_http::trace::TraceLayer::new_for_http())
-        .layer(tower_http::catch_panic::CatchPanicLayer::new())
-        .with_state(state)
+        .layer(tower_http::catch_panic::CatchPanicLayer::new());
+
+    let routes = match state.cors_origins.as_ref().and_then(|o| cors_layer(o)) {
+        Some(cors) => routes.layer(cors),
+        None => routes,
+    };
+
+    routes.with_state(state)
 }
 
 /// Build the state the router needs.
@@ -1118,6 +1191,9 @@ pub fn state(
 ) -> AppState {
     AppState {
         chain: read.chain.clone(),
+        // Set afterwards with `with_cors`, rather than as a fourteenth positional argument to a
+        // builder that already takes thirteen.
+        cors_origins: None,
         read,
         ext: kittiwake_ext::Ext::default(),
         ipfs,
@@ -1595,6 +1671,38 @@ mod tests {
     }
 
     const SECRET: &str = "an-edge-secret-nobody-else-has";
+
+    // ── CORS ─────────────────────────────────────────────────────────────────
+    //
+    // The layer is built here rather than driven through a full request, because what matters is
+    // which headers it is configured to send and a `CorsLayer` will not tell you that afterwards.
+    // The assertions are on the decision - allowed or not - rather than on tower-http's output.
+
+    #[test]
+    fn no_origins_means_no_layer_at_all() {
+        assert!(super::cors_layer(&[]).is_none());
+        // Not a blanket "then allow everything": absent must mean absent, which is what the
+        // service does today and what makes adding this safe to deploy before anything uses it.
+        assert!(super::cors_layer(&["not a header value\n".to_string()]).is_none());
+    }
+
+    #[test]
+    fn a_configured_origin_produces_a_layer() {
+        assert!(super::cors_layer(&["https://www.lodestar-dashboard.com".to_string()]).is_some());
+    }
+
+    /// One unparseable entry must not take the valid ones down with it, and must not silently
+    /// produce a layer allowing nobody either - which would read as CORS being on.
+    #[test]
+    fn a_bad_entry_beside_a_good_one_keeps_the_good_one() {
+        assert!(
+            super::cors_layer(&[
+                "https://www.lodestar-dashboard.com".to_string(),
+                "not a header value\n".to_string(),
+            ])
+            .is_some()
+        );
+    }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
