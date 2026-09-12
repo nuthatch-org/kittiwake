@@ -46,9 +46,9 @@
 # grants being unconditional for the same reason as the writer flag: until lodestar's `MIGRATED`
 # sends these paths here, the database refusing the write is the second lock on a one-way door.
 #
-# Verbs derived from the statements in crates/db, not chosen generously. `scuttlebutt_bans` takes
-# no DELETE because an unban is not implemented here; `clickthrough_events` and `parameter_changes`
-# take INSERT alone because both are append-only records of a thing that happened.
+# Verbs derived from the statements in crates/db, not chosen generously. `clickthrough_events` and
+# `parameter_changes` take INSERT alone because both are append-only records of a thing that
+# happened.
 #
 #   GRANT_DOCK=1 bash deploy/grant-database.sh
 #
@@ -198,13 +198,11 @@ GRANT SELECT, INSERT, UPDATE ON studio_deploy_keys TO $ROLE;
 -- never removed, or the board would disagree with the contract and look right doing it.
 GRANT INSERT ON sync_bounties TO $ROLE;
 
--- Scuttlebutt. UPDATE is the soft delete - deleted = true - which is why there is no DELETE here
--- either: moderation hides a message and the record of it having been said stays.
-GRANT SELECT, INSERT, UPDATE ON scuttlebutt_messages TO $ROLE;
-
--- A ban is added and read. Lifting one is not implemented here, so the privilege to do it is not
--- granted; when it is, this line changes with the code rather than ahead of it.
-GRANT SELECT, INSERT ON scuttlebutt_bans TO $ROLE;
+-- Nothing is granted on `scuttlebutt_messages` or `scuttlebutt_bans` any more. The feature is
+-- gone and this service no longer names those tables, so the grants went with the statements
+-- rather than being left behind as a standing privilege nothing exercises. The tables themselves
+-- and the 31 messages in them are untouched: removing a board is not the same decision as
+-- destroying what people wrote on it.
 
 -- Append-only. Nothing reads these back here, and a click that happened is not editable.
 GRANT INSERT ON clickthrough_events TO $ROLE;
@@ -217,14 +215,12 @@ GRANT USAGE, SELECT ON SEQUENCE
   studio_subgraphs_id_seq,
   studio_deploy_keys_id_seq,
   sync_bounties_id_seq,
-  scuttlebutt_messages_id_seq,
-  scuttlebutt_bans_id_seq,
   clickthrough_events_id_seq
   TO $ROLE;
 SQL
 else
-  echo "the Dock and Scuttlebutt tables NOT granted; re-run with GRANT_DOCK=1 when lodestar's"
-  echo "MIGRATED sends /api/studio and /api/scuttlebutt here."
+  echo "the Dock tables NOT granted; re-run with GRANT_DOCK=1 when lodestar's"
+  echo "MIGRATED sends /api/studio here."
 fi
 
 # Into the config. Written through a temp file under a tight umask, so there is no window in which
