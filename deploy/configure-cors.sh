@@ -37,7 +37,11 @@ if [ "$REMOVE" = 0 ]; then
       https://*|http://localhost*) ;;
       *) echo "$o is not an https origin" >&2; exit 1 ;;
     esac
-    case "${o#https://}" in
+    # Everything after the first `://`, whatever the scheme. `${o#https://}` left an
+    # `http://localhost:3000` untouched, so the slashes in its own scheme read as a path and a
+    # perfectly good origin was refused.
+    host=${o#*://}
+    case "$host" in
       */*) echo "$o has a path; an origin is scheme://host[:port]" >&2; exit 1 ;;
     esac
   done
