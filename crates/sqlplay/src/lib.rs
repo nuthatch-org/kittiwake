@@ -58,15 +58,6 @@ pub const DATASETS: &[Dataset] = &[
         sample: LIST_TABLES,
     },
     Dataset {
-        id: "dips-sepolia",
-        label: "DIPS (Arbitrum Sepolia)",
-        nest: NestId::DipsSepolia,
-        chain: "Arbitrum Sepolia",
-        description: "The same three DIPS contracts on the testnet where the agreement lifecycle has actually been exercised.",
-        archival: false,
-        sample: "SELECT block_number, agreementId, tokens_dec\nFROM recurring_collector__r_c_a_collected\nORDER BY block_number DESC\nLIMIT 20",
-    },
-    Dataset {
         id: "gns",
         label: "GNS / developer activity",
         nest: NestId::Gns,
@@ -179,10 +170,31 @@ mod tests {
 
     #[test]
     fn every_advertised_dataset_resolves_to_a_nest() {
-        assert_eq!(DATASETS.len(), 5);
+        // Not a count. This was `assert_eq!(DATASETS.len(), 5)`, which says nothing about whether
+        // the list is right and has to be edited every time it changes - which is how an
+        // assertion stops being read. What it guards is that the list is not empty, so the loop
+        // below cannot pass vacuously.
+        assert!(!DATASETS.is_empty());
         for d in DATASETS {
             assert!(find_dataset(d.id).is_some());
             assert_eq!(d.archival, d.nest.is_archival(), "{}", d.id);
         }
+    }
+
+    /// **A dataset offered is a promise that it answers.**
+    ///
+    /// `dips-sepolia` was advertised with a description of the lifecycle events it carried, and
+    /// the nest behind it had been retired upstream: picking it and running its own sample query
+    /// returned 502. The page surfaced that rather than an empty table, so it was honest and
+    /// useless, which is the worse half of a catalogue's job done well.
+    ///
+    /// Named here rather than left as an absence, so putting it back is a decision somebody makes
+    /// on purpose after checking the nest answers again.
+    #[test]
+    fn the_retired_sepolia_nest_is_not_advertised() {
+        assert!(
+            !DATASETS.iter().any(|d| d.nest == NestId::DipsSepolia),
+            "dips-sepolia answers HTTP 410; advertise it again only once it does not"
+        );
     }
 }
