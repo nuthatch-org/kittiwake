@@ -104,6 +104,17 @@ pub struct LimitSettings {
 #[derive(Clone, Debug, Deserialize)]
 pub struct CorsSettings {
     pub allowed_origins: Vec<String>,
+    /// Origins matched by shape rather than named, for Vercel preview deployments.
+    ///
+    /// **This widens a credentialed allowlist, so it is separate from `allowed_origins` and empty
+    /// by default.** Read the note on `preview_origin_allowed` before setting it.
+    ///
+    /// A preview lives at `https://graph-dashboard-<hash>-nbgn.vercel.app` or
+    /// `https://graph-dashboard-git-<branch>-nbgn.vercel.app`, and neither can be listed in
+    /// advance. An entry here is `prefix|suffix`: the host must begin with one and end with the
+    /// other, which is narrow enough to mean "a deployment of this project, under this team".
+    #[serde(default)]
+    pub allowed_origin_patterns: Vec<String>,
 }
 
 /// The product surface is deliberately opt-in.  A process that has the read-side configuration
@@ -320,12 +331,40 @@ impl Config {
             }
         }
         if let Some(cors) = &self.cors {
-            if cors.allowed_origins.is_empty() {
+            if cors.allowed_origins.is_empty() && cors.allowed_origin_patterns.is_empty() {
                 return Err(ConfigError::Invalid(
                     "cors.allowed_origins is present but empty; remove the section instead, or a \
                      reader will think browsers are allowed when none are"
                         .into(),
                 ));
+            }
+            for pat in &cors.allowed_origin_patterns {
+                let Some((prefix, suffix)) = pat.split_once('|') else {
+                    return Err(ConfigError::Invalid(format!(
+                        "cors.allowed_origin_patterns entry {pat:?} is not \"prefix|suffix\""
+                    )));
+                };
+                if !prefix.starts_with("https://") {
+                    return Err(ConfigError::Invalid(format!(
+                        "cors.allowed_origin_patterns prefix {prefix:?} is not https"
+                    )));
+                }
+                // A suffix that is not a whole label can be matched by a host somebody else owns:
+                // `.vercel.app` is fine, `vercel.app` is also matched by `evilvercel.app`.
+                if !suffix.starts_with('.') {
+                    return Err(ConfigError::Invalid(format!(
+                        "cors.allowed_origin_patterns suffix {suffix:?} must begin with a dot, or \
+                         a host somebody else registers can end with it"
+                    )));
+                }
+                // Both halves together have to be specific enough that the wildcard in the middle
+                // is a deployment id rather than an entire hosting provider.
+                if prefix.len() < "https://x-".len() + 4 {
+                    return Err(ConfigError::Invalid(format!(
+                        "cors.allowed_origin_patterns prefix {prefix:?} is too short to identify \
+                         one project; it would match anything on that host"
+                    )));
+                }
             }
             for o in &cors.allowed_origins {
                 // An origin is scheme://host[:port] and nothing else. A trailing slash or a path
@@ -387,6 +426,7 @@ mod tests {
         let mut c = settings("https://nest.example");
         c.cors = Some(CorsSettings {
             allowed_origins: origins.iter().map(|s| s.to_string()).collect(),
+            allowed_origin_patterns: Vec::new(),
         });
         c
     }
@@ -439,6 +479,60 @@ mod tests {
     #[test]
     fn an_empty_list_is_refused_rather_than_treated_as_absent() {
         assert!(with_cors(&[]).validate().is_err());
+    }
+
+    fn with_patterns(patterns: &[&str]) -> Config {
+        let mut c = settings("https://nest.example");
+        c.cors = Some(CorsSettings {
+            allowed_origins: vec!["https://www.lodestar-dashboard.com".into()],
+            allowed_origin_patterns: patterns.iter().map(|s| s.to_string()).collect(),
+        });
+        c
+    }
+
+    #[test]
+    fn a_preview_pattern_pinned_at_both_ends_is_accepted() {
+        assert!(
+            with_patterns(&["https://graph-dashboard-|.vercel.app"])
+                .validate()
+                .is_ok()
+        );
+    }
+
+    /// `vercel.app` without the leading dot is also the ending of `evilvercel.app`, which somebody
+    /// else can register. A suffix has to be a whole label.
+    #[test]
+    fn a_suffix_that_is_not_a_whole_label_is_refused() {
+        let err = with_patterns(&["https://graph-dashboard-|vercel.app"])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("begin with a dot"), "{err}");
+    }
+
+    /// A prefix of `https://` with nothing after it matches every https host on the suffix.
+    #[test]
+    fn a_prefix_too_short_to_name_a_project_is_refused() {
+        assert!(with_patterns(&["https://|.vercel.app"]).validate().is_err());
+    }
+
+    #[test]
+    fn a_pattern_without_a_separator_is_refused() {
+        assert!(
+            with_patterns(&["https://graph-dashboard-.vercel.app"])
+                .validate()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn patterns_alone_are_enough_to_be_a_configured_section() {
+        let mut c = settings("https://nest.example");
+        c.cors = Some(CorsSettings {
+            allowed_origins: Vec::new(),
+            allowed_origin_patterns: vec!["https://graph-dashboard-|.vercel.app".into()],
+        });
+        assert!(c.validate().is_ok());
     }
 
     #[test]
