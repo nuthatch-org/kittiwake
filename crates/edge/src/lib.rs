@@ -872,6 +872,17 @@ async fn get_api_health(State(st): State<AppState>) -> Response {
 
 /// Readiness: what every nest says about itself. The archive is reported without judgement,
 /// because it is stalled by design and alerting on it would cry wolf from day one.
+///
+/// A nest answering **410 Gone** is reported the same way, for the same reason. 410 is not a nest
+/// having a bad morning; it is one that has been retired, and it will answer 410 tomorrow too. On
+/// 2026-09-12 `dips-sepolia` was retired upstream and this endpoint went to 503 and stayed there,
+/// which is a permanent alarm about a decision somebody made on purpose. That is the retired-cron
+/// problem in a different costume, and this codebase has now had it three times: a surface that
+/// cries wolf about something deliberate teaches people to stop reading it, and the next real
+/// stoppage goes unread with it.
+///
+/// Still reported, and named `retired` rather than quietly dropped: a nest that has gone is worth
+/// seeing, it is just not worth paging about.
 async fn get_ready(State(st): State<AppState>) -> Response {
     let mut nests = serde_json::Map::new();
     let mut all_ready = true;
@@ -885,10 +896,20 @@ async fn get_ready(State(st): State<AppState>) -> Response {
                 "sealed_through": body.sealed_through,
             }),
             Err(e) => {
-                if !nest.is_archival() {
+                // The variant and the status, not the rendered sentence. Matching `"410"` in the
+                // message would break the day anyone rewords it, and would match a nest whose
+                // *lag* happened to contain those digits.
+                let retired = matches!(e, kittiwake_nest::NestError::Http(410));
+                let reason = e.to_string();
+                if !nest.is_archival() && !retired {
                     all_ready = false;
                 }
-                serde_json::json!({ "ready": false, "archival": nest.is_archival(), "reason": e.to_string() })
+                serde_json::json!({
+                    "ready": false,
+                    "retired": retired,
+                    "archival": nest.is_archival(),
+                    "reason": reason,
+                })
             }
         };
         nests.insert(nest.as_str().to_string(), entry);
@@ -1940,5 +1961,35 @@ mod tests {
     fn a_clock_is_available_for_the_retry_hint() {
         // Guards the governor API used above; a version bump that changes it fails here loudly.
         let _ = DefaultClock::default().now();
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    /// **410 Gone is a decision, not an outage.**
+    ///
+    /// `dips-sepolia` was retired upstream on 2026-09-12 and `/ready` went to 503 and stayed
+    /// there. Nothing gates on that endpoint today, which is the only reason it was merely noise
+    /// rather than an outage of our own making, and a permanent alarm about somebody's deliberate
+    /// decision is the thing that teaches people to stop reading an alarm at all.
+    ///
+    /// This pins the discrimination itself rather than the handler, which needs a live gate: a
+    /// retired nest is matched on its error variant, and every other failure still counts.
+    #[test]
+    fn a_retired_nest_is_told_apart_from_a_broken_one() {
+        use kittiwake_nest::NestError;
+        let retired = |e: &NestError| matches!(e, NestError::Http(410));
+
+        assert!(retired(&NestError::Http(410)));
+
+        // Everything else is a nest that should still hold readiness down.
+        assert!(!retired(&NestError::Http(500)));
+        assert!(!retired(&NestError::Http(503)));
+        assert!(!retired(&NestError::Timeout));
+        assert!(!retired(&NestError::Transport("connection refused".into())));
+        assert!(!retired(&NestError::Decode("not json".into())));
+
+        // And the message is not what decides it: this one says 410 and is not a retirement.
+        assert!(!retired(&NestError::Transport("410 blocks behind".into())));
     }
 }
