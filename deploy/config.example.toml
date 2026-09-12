@@ -45,14 +45,16 @@ password = ""
 # read_queue_timeout_secs = 20
 
 [nest.permits]
-# Eight rather than four. `alloc` carries the folds with the most parts - `/api/indexer` and
-# `/api/indexer-status` are six queries each - and a fold that cannot fit inside its pool used to
-# starve itself: it took every permit and waited for parts that could never be admitted.
+# Four, because that is what the nest admits: `NUTHATCH_SQL_MAX_CONCURRENCY=4` on the allocations
+# nest. The rule above is not advice - a pool wider than the nest means the surplus is sent anyway
+# and shed, and `nest_busy` climbs while every page shows a console error for work the backend was
+# never able to take.
 #
-# That is fixed properly in `many()`, which now admits at most `lane_width - 1` at a time, so this
-# is a capacity choice again rather than a correctness one. It stays at eight because four left no
-# room at all for the warmer and the crons beside one profile request.
-alloc = 8
+# It was briefly eight, as a mitigation for a fold that starved itself by needing more permits than
+# existed. That is fixed properly in `many()`, which admits at most `lane_width - 1` at a time, so
+# a six-part fold fits inside four permits and the mitigation is no longer needed. Raising this
+# again only moves the shedding from kittiwake's gate to the nest's.
+alloc = 4
 gns = 2
 dips = 2
 "dips-sepolia" = 2
