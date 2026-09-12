@@ -36,10 +36,27 @@ pub struct NestSettings {
     pub cron_queue_timeout_secs: u64,
 }
 
-/// A user waiting three seconds for a *slot* has already had a bad time; beyond that, telling them
-/// the nest is busy is kinder than making them wait for a fold that may also be slow.
+/// How long a read may wait for a nest permit before it is told the nest is busy.
+///
+/// This was three seconds, on the reasoning that a user waiting longer than that for a *slot* has
+/// already had a bad time. The reasoning is fine and the number was wrong, because it was chosen
+/// against a warm cache and the failure only appears on a cold one.
+///
+/// What happened on 2026-09-12, after three restarts inside an hour emptied the cache: a cold
+/// `/api/portfolio` fold takes **15.4 seconds** against `alloc`, which has four permits. Four such
+/// folds hold every permit for fifteen seconds, and everything else - including the warmer whose
+/// whole job is ending the cold state - gave up after three. So the cache could not fill, every
+/// request stayed cold, every fold stayed slow, and the condition sustained itself: `cached_entries`
+/// sat at exactly 62 for several minutes while `failing_jobs` climbed from two to three.
+///
+/// The metrics said it plainly once read the right way round: 159 alloc queries **completed** and
+/// 163 timed out *waiting for a permit*, with zero rejected as busy. Nothing was stuck. Everything
+/// was queued behind something slower than the queue was allowed to be.
+///
+/// Twenty seconds is longer than the slowest fold measured. A timeout shorter than the work it
+/// guards does not shed load, it prevents the work from ever finishing.
 fn default_read_queue_secs() -> u64 {
-    3
+    20
 }
 /// Nothing is waiting on a cron, so it may queue as long as it likes.
 fn default_cron_queue_secs() -> u64 {
