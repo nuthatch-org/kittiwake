@@ -3,7 +3,12 @@
 #
 #   bash deploy/configure-cors.sh                       # the two dashboard origins
 #   ORIGINS="https://a.example,https://b.example" bash deploy/configure-cors.sh
+#   PATTERNS="https://graph-dashboard-|.vercel.app" bash deploy/configure-cors.sh   # + previews
 #   bash deploy/configure-cors.sh --remove              # back to sending no CORS headers at all
+#
+# PATTERNS widens a credentialed allowlist and is empty unless you pass it. Each entry is
+# `prefix|suffix` and the service refuses one loose enough to name a whole hosting provider. Read
+# the note on `matches_pattern` in crates/edge before using it.
 #
 # Additive and reversible. Every request today arrives through the Vercel edge server-to-server
 # with no `Origin` header, so a browser-facing header changes nothing about the traffic that
@@ -45,6 +50,12 @@ TOML=""
 if [ "$REMOVE" = 0 ]; then
   QUOTED=$(printf '"%s", ' "${LIST[@]}")
   TOML=$(printf '\n[cors]\nallowed_origins = [%s]\n' "${QUOTED%, }")
+  if [ -n "${PATTERNS:-}" ]; then
+    IFS=',' read -r -a PLIST <<< "$PATTERNS"
+    PQ=$(printf '"%s", ' "${PLIST[@]}")
+    TOML="$TOML$(printf 'allowed_origin_patterns = [%s]\n' "${PQ%, }")"
+    echo "and, by shape: ${PLIST[*]}"
+  fi
 fi
 
 {

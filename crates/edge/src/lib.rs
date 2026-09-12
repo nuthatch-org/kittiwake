@@ -110,6 +110,8 @@ pub struct AppState {
     pub pool: Option<kittiwake_db::Pool>,
     /// Browser origins allowed to call this API directly. Absent means no CORS headers at all.
     pub cors_origins: Option<Arc<Vec<String>>>,
+    /// `prefix|suffix` shapes, for hosts that cannot be named in advance. See `matches_pattern`.
+    pub cors_patterns: Option<Arc<Vec<String>>>,
     pub limits: Arc<Limits>,
     pub metrics: Option<kittiwake_obs::PrometheusHandle>,
     pub started: std::time::Instant,
@@ -123,8 +125,13 @@ pub struct Studio {
 
 impl AppState {
     /// Allow these browser origins to call the API directly. Absent, or empty, means none may.
-    pub fn with_cors(mut self, origins: Option<Vec<String>>) -> Self {
+    pub fn with_cors(
+        mut self,
+        origins: Option<Vec<String>>,
+        patterns: Option<Vec<String>>,
+    ) -> Self {
         self.cors_origins = origins.filter(|o| !o.is_empty()).map(Arc::new);
+        self.cors_patterns = patterns.filter(|p| !p.is_empty()).map(Arc::new);
         self
     }
 }
@@ -953,17 +960,54 @@ async fn get_metrics(State(st): State<AppState>) -> Response {
 /// `www.lodestar-dashboard.com` and `api.lodestar-dashboard.com` share a registrable domain, so
 /// they are the same site and Lax is satisfied. They are different origins, so CORS is still
 /// required. Both are true at once and confusing the two is how this gets built twice.
-fn cors_layer(origins: &[String]) -> Option<tower_http::cors::CorsLayer> {
+/// Is this origin one of the patterns, rather than one of the names?
+///
+/// ## What a pattern is for, and what it costs
+///
+/// Vercel gives a preview deployment a generated host - `graph-dashboard-<hash>-nbgn.vercel.app`
+/// or `graph-dashboard-git-<branch>-nbgn.vercel.app` - so it cannot be named in advance, and a
+/// preview that cannot call the API is a preview nobody can review anything on.
+///
+/// **It widens a credentialed allowlist, which is why it is a separate setting and empty by
+/// default.** With `allow_credentials`, anything matched can make requests carrying a signed-in
+/// visitor's Dock cookie. The boundary that makes it defensible is that both halves are pinned:
+/// `https://graph-dashboard-` and `.vercel.app` together mean *a deployment of this project under
+/// this team*, and producing one of those hosts requires access to the team. It is not
+/// `*.vercel.app`, which would be every site on the platform.
+///
+/// The configuration refuses a suffix that is not a whole label, because `vercel.app` without the
+/// leading dot is also matched by `evilvercel.app`, which somebody else can register.
+fn matches_pattern(origin: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|p| {
+        p.split_once('|').is_some_and(|(prefix, suffix)| {
+            // Non-empty middle: the pattern must not admit the bare concatenation of its own ends,
+            // which would be a host neither half was written to describe.
+            origin.len() > prefix.len() + suffix.len()
+                && origin.starts_with(prefix)
+                && origin.ends_with(suffix)
+        })
+    })
+}
+
+fn cors_layer(origins: &[String], patterns: &[String]) -> Option<tower_http::cors::CorsLayer> {
     let parsed: Vec<axum::http::HeaderValue> = origins
         .iter()
         .filter_map(|o| o.parse::<axum::http::HeaderValue>().ok())
         .collect();
-    if parsed.is_empty() {
+    if parsed.is_empty() && patterns.is_empty() {
         return None;
     }
+
+    let owned: Vec<String> = patterns.to_vec();
+    let allow = tower_http::cors::AllowOrigin::predicate(move |origin, _| {
+        origin
+            .to_str()
+            .is_ok_and(|o| parsed.iter().any(|p| p == origin) || matches_pattern(o, &owned))
+    });
+
     Some(
         tower_http::cors::CorsLayer::new()
-            .allow_origin(parsed)
+            .allow_origin(allow)
             // The verbs this router actually binds. Listing them rather than `any()` means a new
             // method is a deliberate addition here as well as on the route.
             .allow_methods([
@@ -1165,8 +1209,20 @@ pub fn router(state: AppState) -> Router {
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(tower_http::catch_panic::CatchPanicLayer::new());
 
-    let routes = match state.cors_origins.as_ref().and_then(|o| cors_layer(o)) {
-        Some(cors) => routes.layer(cors),
+    let cors = cors_layer(
+        state
+            .cors_origins
+            .as_deref()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        state
+            .cors_patterns
+            .as_deref()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+    );
+    let routes = match cors {
+        Some(layer) => routes.layer(layer),
         None => routes,
     };
 
@@ -1194,6 +1250,7 @@ pub fn state(
         // Set afterwards with `with_cors`, rather than as a fourteenth positional argument to a
         // builder that already takes thirteen.
         cors_origins: None,
+        cors_patterns: None,
         read,
         ext: kittiwake_ext::Ext::default(),
         ipfs,
@@ -1680,15 +1737,56 @@ mod tests {
 
     #[test]
     fn no_origins_means_no_layer_at_all() {
-        assert!(super::cors_layer(&[]).is_none());
+        assert!(super::cors_layer(&[], &[]).is_none());
         // Not a blanket "then allow everything": absent must mean absent, which is what the
         // service does today and what makes adding this safe to deploy before anything uses it.
-        assert!(super::cors_layer(&["not a header value\n".to_string()]).is_none());
+        assert!(super::cors_layer(&["not a header value\n".to_string()], &[]).is_none());
+    }
+
+    /// The preview pattern, and every host it must NOT admit.
+    #[test]
+    fn a_pattern_matches_this_project_and_nothing_else() {
+        let p = ["https://graph-dashboard-|.vercel.app".to_string()];
+
+        for allowed in [
+            "https://graph-dashboard-83cavk4bw-nbgn.vercel.app",
+            "https://graph-dashboard-git-pete-a-branch-nbgn.vercel.app",
+        ] {
+            assert!(
+                super::matches_pattern(allowed, &p),
+                "{allowed} should match"
+            );
+        }
+
+        for refused in [
+            // Somebody else's project on the same platform.
+            "https://someone-elses-app-nbgn.vercel.app",
+            // A host that ends with the suffix but is registered by someone else. This is why the
+            // suffix must be a whole label.
+            "https://graph-dashboard-x-nbgnvercel.app",
+            // http, and a lookalike apex.
+            "http://graph-dashboard-x-nbgn.vercel.app",
+            "https://graph-dashboard-x-nbgn.vercel.app.evil.example",
+            // The two halves with nothing between them: a host neither end was written to name.
+            "https://graph-dashboard-.vercel.app",
+        ] {
+            assert!(
+                !super::matches_pattern(refused, &p),
+                "{refused} must not match"
+            );
+        }
+    }
+
+    #[test]
+    fn no_patterns_matches_nothing() {
+        assert!(!super::matches_pattern("https://anything.example", &[]));
     }
 
     #[test]
     fn a_configured_origin_produces_a_layer() {
-        assert!(super::cors_layer(&["https://www.lodestar-dashboard.com".to_string()]).is_some());
+        assert!(
+            super::cors_layer(&["https://www.lodestar-dashboard.com".to_string()], &[]).is_some()
+        );
     }
 
     /// One unparseable entry must not take the valid ones down with it, and must not silently
@@ -1696,10 +1794,13 @@ mod tests {
     #[test]
     fn a_bad_entry_beside_a_good_one_keeps_the_good_one() {
         assert!(
-            super::cors_layer(&[
-                "https://www.lodestar-dashboard.com".to_string(),
-                "not a header value\n".to_string(),
-            ])
+            super::cors_layer(
+                &[
+                    "https://www.lodestar-dashboard.com".to_string(),
+                    "not a header value\n".to_string(),
+                ],
+                &[],
+            )
             .is_some()
         );
     }
