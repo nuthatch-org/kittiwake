@@ -572,8 +572,32 @@ impl NestGate {
                 existing.clone()
             } else {
                 let gate = self.clone();
-                let fut: BoxFuture<'static, Result<Arc<SqlAnswer>, NestError>> =
-                    async move { gate.query(&spec).await.map(Arc::new) }.boxed();
+                // **Spawned, not merely shared.**
+                //
+                // A `Shared` future only advances while somebody polls it. The leader used to be
+                // polled by whichever caller held it, so when every waiter gave up - each on its
+                // own outer timeout - the future was left suspended *inside* `query`, after it had
+                // taken a nest permit and before it released one. The `inflight` map kept it alive,
+                // so the permit was never dropped either.
+                //
+                // Eight of those and the pool is gone for good: on 2026-09-12 `nest_query_total`
+                // did not move for 51 seconds while `nest_gate_timeout_total` climbed, with no
+                // connections open to the nest and the box at 0.01 load. Nothing was slow. The
+                // permits were held by futures nobody was polling.
+                //
+                // A spawned task runs to completion whether or not anyone is still waiting, so the
+                // permit is always released - which is the property the gate depends on and the
+                // one `shared()` alone cannot give it.
+                let handle = tokio::spawn(async move { gate.query(&spec).await.map(Arc::new) });
+                let fut: BoxFuture<'static, Result<Arc<SqlAnswer>, NestError>> = async move {
+                    match handle.await {
+                        Ok(r) => r,
+                        // The task was cancelled or panicked. Reported as transport rather than
+                        // swallowed: a caller that gets no answer must not read it as an empty one.
+                        Err(e) => Err(NestError::Transport(format!("query task failed: {e}"))),
+                    }
+                }
+                .boxed();
                 let shared = fut.shared();
                 map.insert(key.to_string(), shared.clone());
                 shared
@@ -598,6 +622,76 @@ impl NestGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A permit must come back even when nobody is left waiting for the answer.
+    ///
+    /// This is the shape that killed the pool: a caller starts a query, the query takes a permit,
+    /// and then the caller goes away - its own timeout fires, or the request is dropped. If the
+    /// work only advances while somebody polls it, it stops mid-query holding the permit, and the
+    /// in-flight map keeps it alive so nothing is ever dropped. Repeat until the pool is empty and
+    /// the service is wedged with no connections open and nothing to show for it.
+    ///
+    /// Asserted on a plain semaphore, because that is the invariant the gate rests on and it holds
+    /// regardless of how the query is spelled: work that owns a permit must be driven to
+    /// completion by something that outlives the caller.
+    #[tokio::test]
+    async fn a_permit_survives_its_caller_going_away() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+
+        // The leader: takes the permit, then yields as a real query would while waiting on the net.
+        let s = sem.clone();
+        let handle = tokio::spawn(async move {
+            let _permit = s.acquire_owned().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        });
+
+        // The caller gives up long before the work finishes.
+        let gave_up = tokio::time::timeout(std::time::Duration::from_millis(5), async {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        })
+        .await;
+        assert!(
+            gave_up.is_err(),
+            "the caller must have given up for this to mean anything"
+        );
+
+        // The spawned work finishes anyway, and the permit comes back.
+        handle.await.unwrap();
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the permit was not returned after its caller went away"
+        );
+    }
+
+    /// The counterpart, and the bug: work that is only polled by its caller stops when the caller
+    /// does, and its permit stops with it.
+    #[tokio::test]
+    async fn an_unpolled_future_never_gives_its_permit_back() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let s = sem.clone();
+
+        let leader = async move {
+            let _permit = s.acquire_owned().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        };
+
+        // Polled once, briefly, then abandoned - but held, exactly as the in-flight map held it.
+        let mut boxed = Box::pin(leader);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(20), &mut boxed).await;
+
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "this is the leak: the permit is still held by a future nobody is polling"
+        );
+        drop(boxed);
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "dropping it is the only way it came back"
+        );
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
