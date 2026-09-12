@@ -382,7 +382,15 @@ impl Config {
                         "cors.allowed_origins entry {o:?} is not an https origin"
                     )));
                 }
-                if o.ends_with('/') || o[8..].contains('/') {
+                // Strip whichever scheme it has rather than slicing at 8. `https://` is eight
+                // characters and `http://` is seven, so a fixed offset drops a character from a
+                // localhost origin and then looks for a path in the remains - `ocalhost:3000`,
+                // which has none, so the check passed for the wrong reason and would have missed a
+                // real path on a plaintext origin.
+                let host = o
+                    .strip_prefix("https://")
+                    .or_else(|| o.strip_prefix("http://"));
+                if o.ends_with('/') || host.is_some_and(|h| h.contains('/')) {
                     return Err(ConfigError::Invalid(format!(
                         "cors.allowed_origins entry {o:?} has a path or trailing slash; an origin \
                          is scheme://host[:port] and a browser will never match this"
@@ -471,6 +479,23 @@ mod tests {
     #[test]
     fn a_plaintext_origin_is_refused_unless_it_is_localhost() {
         assert!(with_cors(&["http://evil.example"]).validate().is_err());
+        assert!(with_cors(&["http://localhost:3000"]).validate().is_ok());
+    }
+
+    /// A scheme is not always eight characters.
+    ///
+    /// The path check sliced at `o[8..]`, which is right for `https://` and drops a character from
+    /// `http://`: a localhost origin became `ocalhost:3000`, which contains no slash, so it passed
+    /// for the wrong reason - and a plaintext origin that genuinely had a path would have passed
+    /// too. The shell script had the same bug the other way round and refused a good origin.
+    #[test]
+    fn a_path_is_found_on_a_plaintext_origin_too() {
+        assert!(
+            with_cors(&["http://localhost:3000/api"])
+                .validate()
+                .is_err()
+        );
+        assert!(with_cors(&["http://localhost:3000/"]).validate().is_err());
         assert!(with_cors(&["http://localhost:3000"]).validate().is_ok());
     }
 
