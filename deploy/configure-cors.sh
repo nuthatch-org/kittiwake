@@ -97,5 +97,12 @@ carries the header. A CorsLayer will not tell you afterwards what it was built t
     https://api.lodestar-dashboard.com/api/health | grep -i access-control
 
 Want `access-control-allow-origin` echoing the origin back, and `access-control-allow-credentials:
-true`. An origin that is not on the list must get neither.
+true`.
+
+An origin that is NOT on the list still gets `access-control-allow-credentials` and
+`access-control-expose-headers` - tower-http sends those unconditionally - and does **not** get
+`access-control-allow-origin`. That last one is the header the browser decides on, and without it
+the response is refused no matter what the other two say, so this is untidy rather than permissive.
+Checked from a real browser rather than reasoned about: a page on an allowed origin reads the body,
+a page on example.com gets `TypeError: Failed to fetch`.
 NEXT
