@@ -424,10 +424,23 @@ pub fn document(version: &str) -> serde_json::Value {
                  nuthatch nests rather than from a subgraph. Every answer carries a provenance \
                  envelope saying which block it was sealed through.\n\n\
                  Paths are generated from the router, so this document cannot describe a route \
-                 that does not exist or omit one that does.",
+                 that does not exist or omit one that does. A few routes are served but not \
+                 described, because documenting them would advertise something that is not a \
+                 public protocol read; those are listed under `x-withheld` with the reason, so \
+                 this document is still a complete inventory of what is served.",
         },
         "servers": [{ "url": "https://api.lodestar-dashboard.com" }],
         "paths": paths,
+        // Served, deliberately undescribed, and named anyway.
+        //
+        // Without this the document answers "which routes exist?" with a subset, and a reader
+        // cannot tell a withheld route from a deleted one. That distinction is the whole point for
+        // a caller checking its own call sites: the frontend names seventeen of these, and a check
+        // built on `paths` alone would report every one as a route that no longer exists.
+        "x-withheld": WITHHELD
+            .iter()
+            .map(|(path, why)| serde_json::json!({ "path": path, "reason": why }))
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -510,6 +523,50 @@ mod tests {
     }
 
     /// Withholding is a decision, so it carries a reason somebody can disagree with.
+    /// **The document is an inventory, not only a description.**
+    ///
+    /// A caller checking its own call sites against `paths` alone sees every withheld route as
+    /// one that does not exist. The frontend names seventeen of them, so that check would report
+    /// seventeen phantom failures and be switched off, and the real signal it exists for - a call
+    /// site naming a route that has actually been deleted - would go with it.
+    #[test]
+    fn x_withheld_makes_the_document_a_complete_inventory() {
+        let doc = document("test");
+        let withheld = doc["x-withheld"]
+            .as_array()
+            .expect("x-withheld is an array");
+        assert_eq!(withheld.len(), WITHHELD.len());
+
+        let named: std::collections::HashSet<&str> = withheld
+            .iter()
+            .map(|e| e["path"].as_str().expect("each entry names a path"))
+            .collect();
+        for (path, _) in WITHHELD {
+            assert!(named.contains(path), "{path} is withheld but not named");
+        }
+        for e in withheld {
+            assert!(
+                !e["reason"].as_str().unwrap_or_default().is_empty(),
+                "a withheld route must carry its reason into the document too"
+            );
+        }
+
+        // Together they are everything the router serves, which is the property that makes this an
+        // inventory rather than two partial lists.
+        let published: std::collections::HashSet<&str> = doc["paths"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        for path in served_paths() {
+            assert!(
+                published.contains(path.as_str()) || named.contains(path.as_str()),
+                "{path} is served and appears in neither paths nor x-withheld"
+            );
+        }
+    }
+
     #[test]
     fn every_withheld_route_says_why() {
         for (path, reason) in WITHHELD {
