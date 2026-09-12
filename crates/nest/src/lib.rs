@@ -206,7 +206,9 @@ impl NestConfig {
             password: None,
             base_paths,
             permits,
-            read_queue_timeout: Duration::from_secs(3),
+            // See `default_read_queue_secs` in kittiwake-config: three seconds is shorter
+            // than a cold fold, which stops the cache ever filling. Keep the two in step.
+            read_queue_timeout: Duration::from_secs(20),
             cron_queue_timeout: Duration::from_secs(120),
         }
     }
