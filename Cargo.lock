@@ -3122,7 +3122,6 @@ dependencies = [
  "kittiwake-obs",
  "kittiwake-read",
  "kittiwake-sched",
- "kittiwake-scuttle",
  "kittiwake-sqlplay",
  "kittiwake-types",
  "kittiwake-warmer",
@@ -3251,7 +3250,6 @@ dependencies = [
  "kittiwake-rewards",
  "kittiwake-sched",
  "kittiwake-score",
- "kittiwake-scuttle",
  "kittiwake-sqlplay",
  "kittiwake-ssrf",
  "kittiwake-support",
@@ -3427,19 +3425,6 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "kittiwake-scuttle"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "hex",
- "hmac 0.12.1",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
 ]
 
 [[package]]

@@ -23,7 +23,6 @@ kittiwake-read = { version = "0.1.0", path = "../read" }
 kittiwake-rewards = { version = "0.1.0", path = "../rewards" }
 kittiwake-sched = { version = "0.1.0", path = "../sched" }
 kittiwake-score = { version = "0.1.0", path = "../score" }
-kittiwake-scuttle = { version = "0.1.0", path = "../scuttle" }
 kittiwake-sqlplay = { version = "0.1.0", path = "../sqlplay" }
 kittiwake-ssrf = { version = "0.1.0", path = "../ssrf" }
 kittiwake-support = { version = "0.1.0", path = "../support" }

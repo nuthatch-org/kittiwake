@@ -105,22 +105,6 @@ pub const WITHHELD: &[(&str, &str)] = &[
         "a pass-through to Foghorn's QoS API; its shape is Foghorn's rather than ours, and it is \
          documented where that service is",
     ),
-    (
-        "/api/scuttlebutt/admin/login",
-        "validates a moderation credential; it is not a public data operation",
-    ),
-    (
-        "/api/scuttlebutt/admin/messages",
-        "the moderation view of room history, protected by the administrator credential",
-    ),
-    (
-        "/api/scuttlebutt/bans",
-        "reads and writes moderation bans, protected by the administrator credential",
-    ),
-    (
-        "/api/scuttlebutt/messages/{id}",
-        "deletes a message and is protected by the administrator credential",
-    ),
 ];
 
 /// One published operation.
@@ -332,14 +316,6 @@ const SUMMARIES: &[Operation] = &[
     op(
         "/api/indexer-node-health",
         "Whether an indexer's own endpoints answer.",
-    ),
-    op(
-        "/api/scuttlebutt/messages",
-        "The anonymous room's durable message history, newest first.",
-    ),
-    op(
-        "/api/scuttlebutt/stream",
-        "The anonymous room's live Server-Sent Event stream. A gap event means refetch history.",
     ),
 ];
 

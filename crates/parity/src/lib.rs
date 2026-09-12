@@ -360,36 +360,6 @@ pub mod coverage {
             "POST with a body, and it signs what it returns; the harness only issues GETs and must not mint receipts against production",
         ),
         (
-            "/api/scuttlebutt/messages",
-            Excused::Entirely,
-            "anonymous user content that changes between two calls by design; the incumbent room and this one are different rooms, so a shape diff would compare two unrelated sets of messages",
-        ),
-        (
-            "/api/scuttlebutt/messages/{id}",
-            Excused::Entirely,
-            "administrator-only DELETE of user content; the GET-only parity harness cannot safely exercise it",
-        ),
-        (
-            "/api/scuttlebutt/stream",
-            Excused::Entirely,
-            "an infinite Server-Sent Event stream rather than a JSON document; it needs a stream-specific integration test",
-        ),
-        (
-            "/api/scuttlebutt/bans",
-            Excused::Entirely,
-            "administrator-only moderation state; comparing it would require credentials and could alter bans",
-        ),
-        (
-            "/api/scuttlebutt/admin/login",
-            Excused::Entirely,
-            "administrator login mints a session cookie and must not be exercised against production by the parity harness",
-        ),
-        (
-            "/api/scuttlebutt/admin/messages",
-            Excused::Entirely,
-            "the same history behind the moderator session; the harness holds no moderator credential and would only ever record the refusal",
-        ),
-        (
             "/api/disassembly",
             Excused::Entirely,
             "both sides analyse the same immutable bytes, and three differences are deliberate: \

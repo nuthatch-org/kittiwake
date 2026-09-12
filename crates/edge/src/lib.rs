@@ -89,7 +89,6 @@ pub struct AppState {
     pub ipfs: kittiwake_ext::Ipfs,
     /// Present only when the Dock has its independently managed session secret.
     pub studio: Option<Studio>,
-    pub scuttle: Option<Scuttle>,
     /// Foghorn's API base, for the QoS proxy. Absent means that route answers 503.
     pub foghorn_api_url: Option<Arc<str>>,
     pub indexer_agent: Option<kittiwake_config::IndexerAgentSettings>,
@@ -118,16 +117,6 @@ pub struct AppState {
 pub struct Studio {
     pub secret: kittiwake_dock::Secret,
     pub bounty_board_address: Option<String>,
-}
-
-#[derive(Clone)]
-pub struct Scuttle {
-    pub salt: kittiwake_scuttle::Salt,
-    pub ip_pepper: Arc<str>,
-    pub admin_secret: Arc<str>,
-    pub admin_session_secret: kittiwake_dock::Secret,
-    pub flood: Arc<kittiwake_scuttle::FloodGuard>,
-    pub room: kittiwake_scuttle::Room,
 }
 
 /// The client's address.
@@ -1106,33 +1095,6 @@ pub fn router(state: AppState) -> Router {
             "/api/subgraph-versions/{hash}",
             get(handlers::subgraph_versions),
         )
-        // Scuttlebutt is deliberately separate from the provenance envelope routes above: messages
-        // are primary user data in Postgres, not a view of a sealed protocol nest.
-        .route(
-            "/api/scuttlebutt/messages",
-            get(handlers::scuttle_messages).post(handlers::scuttle_post),
-        )
-        .route(
-            "/api/scuttlebutt/messages/{id}",
-            axum::routing::delete(handlers::scuttle_delete),
-        )
-        .route("/api/scuttlebutt/stream", get(handlers::scuttle_stream))
-        .route(
-            "/api/scuttlebutt/bans",
-            get(handlers::scuttle_bans).post(handlers::scuttle_ban),
-        )
-        .route(
-            "/api/scuttlebutt/admin/messages",
-            get(handlers::scuttle_admin_messages),
-        )
-        .route(
-            "/api/scuttlebutt/admin/login",
-            // Three methods on one path, as the incumbent had it: the board asks GET on load,
-            // POST signs in, DELETE signs out. Binding only POST made the other two 405.
-            get(handlers::scuttle_admin_session)
-                .post(handlers::scuttle_admin_login)
-                .delete(handlers::scuttle_admin_logout),
-        )
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(tower_http::catch_panic::CatchPanicLayer::new())
         .with_state(state)
@@ -1148,7 +1110,6 @@ pub fn state(
     edge_secret: Option<String>,
     studio: Option<Studio>,
     ipfs: kittiwake_ext::Ipfs,
-    scuttle: Option<Scuttle>,
     foghorn_api_url: Option<String>,
     indexer_agent: Option<kittiwake_config::IndexerAgentSettings>,
     receipt_key: Option<Arc<ed25519_dalek::SigningKey>>,
@@ -1161,7 +1122,6 @@ pub fn state(
         ext: kittiwake_ext::Ext::default(),
         ipfs,
         studio,
-        scuttle,
         foghorn_api_url: foghorn_api_url.map(|u| Arc::from(u.as_str())),
         indexer_agent,
         receipt_key,
@@ -1512,99 +1472,6 @@ mod tests {
         );
     }
 
-    // ── Scuttlebutt moderation ───────────────────────────────────────────────
-    //
-    // The parity harness excuses every administrator route, so these are the only thing standing
-    // between the moderation surface and nobody having checked it.
-
-    fn admin_secret() -> kittiwake_dock::Secret {
-        kittiwake_dock::Secret::new("a-scuttlebutt-session-secret-of-adequate-length").unwrap()
-    }
-
-    fn cookie(value: &str) -> HeaderMap {
-        headers(&[("cookie", value)])
-    }
-
-    const NOW: i64 = 1_760_000_000;
-
-    #[test]
-    fn a_moderator_with_a_valid_cookie_may_read() {
-        let token = kittiwake_dock::create_session(&admin_secret(), "admin", NOW);
-        let h = cookie(&format!("sb_admin={token}"));
-        assert!(crate::handlers::scuttle_admin_ok(
-            &admin_secret(),
-            &h,
-            false,
-            NOW
-        ));
-    }
-
-    /// A cookie rides along on any same-site request, so reading is not enough to authorise a
-    /// deletion. Without the header the same valid session must buy nothing.
-    #[test]
-    fn a_mutation_needs_the_header_as_well_as_the_cookie() {
-        let token = kittiwake_dock::create_session(&admin_secret(), "admin", NOW);
-        let signed_in = cookie(&format!("sb_admin={token}"));
-        assert!(!crate::handlers::scuttle_admin_ok(
-            &admin_secret(),
-            &signed_in,
-            true,
-            NOW
-        ));
-
-        let mut with_header = signed_in.clone();
-        with_header.insert("x-sb-admin", HeaderValue::from_static("1"));
-        assert!(crate::handlers::scuttle_admin_ok(
-            &admin_secret(),
-            &with_header,
-            true,
-            NOW
-        ));
-    }
-
-    #[test]
-    fn nothing_short_of_a_valid_session_gets_in() {
-        let token = kittiwake_dock::create_session(&admin_secret(), "admin", NOW);
-        let other = kittiwake_dock::Secret::new("a-different-secret-of-adequate-length!!").unwrap();
-        let cases: Vec<(&str, HeaderMap)> = vec![
-            ("no cookie at all", HeaderMap::new()),
-            (
-                "a cookie for some other name",
-                cookie(&format!("sb_session={token}")),
-            ),
-            // `sb_adminish` starts with `sb_admin`, and a prefix match would accept it.
-            (
-                "a cookie whose name merely starts the same",
-                cookie(&format!("sb_adminish={token}")),
-            ),
-            (
-                "a truncated token",
-                cookie(&format!("sb_admin={}", &token[..token.len() - 1])),
-            ),
-            (
-                "a token signed for somebody else",
-                cookie(&format!(
-                    "sb_admin={}",
-                    kittiwake_dock::create_session(&admin_secret(), "not-admin", NOW)
-                )),
-            ),
-            (
-                "a token signed with another secret",
-                cookie(&format!(
-                    "sb_admin={}",
-                    kittiwake_dock::create_session(&other, "admin", NOW)
-                )),
-            ),
-            ("no token, just the name", cookie("sb_admin=")),
-        ];
-        for (what, h) in cases {
-            assert!(
-                !crate::handlers::scuttle_admin_ok(&admin_secret(), &h, false, NOW),
-                "{what} must not authorise a moderator"
-            );
-        }
-    }
-
     // ── The Dock ─────────────────────────────────────────────────────────────
     //
     // The nine Studio routes landed in #64 without coverage for the three things standing between
@@ -1650,37 +1517,6 @@ mod tests {
                 "{bad:?} is not a valid slug"
             );
         }
-    }
-
-    /// A session that has run out is refused rather than renewed by being presented.
-    #[test]
-    fn a_session_older_than_its_lifetime_is_refused() {
-        let token = kittiwake_dock::create_session(&admin_secret(), "admin", NOW);
-        let h = cookie(&format!("sb_admin={token}"));
-        let expired = NOW + kittiwake_dock::SESSION_TTL_SECS + 1;
-        assert!(crate::handlers::scuttle_admin_ok(
-            &admin_secret(),
-            &h,
-            false,
-            expired - 2
-        ));
-        assert!(!crate::handlers::scuttle_admin_ok(
-            &admin_secret(),
-            &h,
-            false,
-            expired
-        ));
-    }
-
-    /// Cookies arrive as one header, and the moderation cookie is rarely the only one in it.
-    #[test]
-    fn the_cookie_is_found_among_its_neighbours() {
-        let h = cookie("theme=dark; sb_admin=wanted; other=x");
-        assert_eq!(
-            crate::handlers::scuttle_cookie(&h, "sb_admin"),
-            Some("wanted")
-        );
-        assert_eq!(crate::handlers::scuttle_cookie(&h, "absent"), None);
     }
 
     /// The regression this test exists for. `amount_grt` is text in the table and the public board

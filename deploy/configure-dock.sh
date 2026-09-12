@@ -1,27 +1,21 @@
 #!/usr/bin/env bash
-# Give kittiwake the Dock's and Scuttlebutt's secrets, copied from Vercel rather than typed.
+# Give kittiwake the Dock's session secret, copied from Vercel rather than typed.
 #
 #   bash deploy/configure-dock.sh
 #
-# Run from a machine logged into both Vercel and the box. The four values are read from the
-# Lodestar project's production environment and written straight into /etc/kittiwake/config.toml
-# over ssh. They are never echoed, and the pulled file is deleted on exit including on failure.
+# Run from a machine logged into both Vercel and the box. The value is read from the Lodestar
+# project's production environment and written straight into /etc/kittiwake/config.toml over ssh.
+# It is never echoed, and the pulled file is deleted on exit including on failure.
 #
-# WHY THEY MUST BE THE INCUMBENT'S EXACT VALUES
+# WHY IT MUST BE THE INCUMBENT'S EXACT VALUE
 #
-# Each one signs or derives something that already exists in somebody's browser.
+# `SESSION_SECRET` signs the studio_session cookie, which is stateless. A secret differing by one
+# byte does not error: it silently signs out every logged-in user the moment the edge points here.
+# So this copies. It does not generate. `verify-session` at the end is what proves the copy took.
 #
-#   SESSION_SECRET            signs the studio_session cookie, which is stateless. A secret
-#                             differing by one byte does not error: it silently signs out every
-#                             logged-in user the moment the edge points here.
-#   SCUTTLEBUTT_TRIP_SALT     derives the tripcode that identifies a poster across posts. Change it
-#                             and every existing tripcode stops matching its author.
-#   SCUTTLEBUTT_IP_PEPPER     derives the hash a ban is recorded against. Change it and every
-#                             existing ban stops matching anybody.
-#   SCUTTLEBUTT_ADMIN_SECRET  the moderator login.
-#
-# So this copies. It does not generate. `verify-session` at the end is what proves the copy took,
-# and it is worth running before the routes are switched rather than after.
+# It also REMOVES any `[scuttle]` section it finds. Scuttlebutt is gone, the binary no longer reads
+# that section, and TOML parsing here is not strict - so four unread secrets would otherwise sit in
+# the config indefinitely, looking live to anyone who opened it.
 set -euo pipefail
 
 HOST=${HOST:-root@167.235.29.213}
@@ -51,12 +45,9 @@ val() { grep -m1 "^$1=" "$ENVFILE" | cut -d= -f2- | sed -E 's/^"(.*)"$/\1/'; }
 
 . "$(dirname "$0")/secret-guard.sh"
 
-# Three of these four are marked Sensitive, so the pull returns `[SENSITIVE]` for them and the loop
-# below refuses it. That leaves no way to set them from here at all, which is why each value falls
-# back to being typed: `ask_for` reads from stdin with echo off, never an argument.
-#
-# Pasting the incumbent's own values is the point. A fresh trip salt orphans every tripcode in the
-# room's history; the originals restore it, and only the window since 2026-09-11 is lost.
+# A Sensitive variable comes back as the literal `[SENSITIVE]` and `refuse_placeholder` catches it,
+# which leaves no way to set it from here at all - hence the fallback to being typed. `ask_for`
+# reads from stdin with echo off, never from an argument, which `ps` would show to the whole box.
 ask_for() {
   local name="$1"
   printf 'paste %s (input hidden): ' "$name" >&2
@@ -66,12 +57,9 @@ ask_for() {
   printf '%s' "$v"
 }
 
-# Four plain variables rather than an associative array. macOS ships bash 3.2, where `declare -A`
-# is a syntax error, and this is a script whose whole job is to be run from a laptop.
+# A plain variable rather than an associative array. macOS ships bash 3.2, where `declare -A` is a
+# syntax error, and this is a script whose whole job is to be run from a laptop.
 SECRET_SESSION=""
-SECRET_TRIP=""
-SECRET_PEPPER=""
-SECRET_ADMIN=""
 
 collect() {
   local name="$1" v
@@ -86,38 +74,28 @@ collect() {
 }
 
 SECRET_SESSION="$(collect SESSION_SECRET)" || exit 1
-SECRET_TRIP="$(collect SCUTTLEBUTT_TRIP_SALT)" || exit 1
-SECRET_PEPPER="$(collect SCUTTLEBUTT_IP_PEPPER)" || exit 1
-SECRET_ADMIN="$(collect SCUTTLEBUTT_ADMIN_SECRET)" || exit 1
 
 # The service's own rules, mirrored exactly, so a value it will refuse is a sentence from here
 # rather than a process that will not start after the config has been replaced.
 #
-# Only the session secret has a length floor, and that is still right: whatever length the
-# incumbent's trip salt happens to be is the length that derives every tripcode in the room, so a
-# minimum invented here could refuse a good salt.
-#
-# What was wrong was concluding from that that a short value must be fine. On 2026-09-11 this
-# script refused an eleven-character trip salt, the floor was removed, and eleven characters went
-# to production - because `vercel env pull` had returned `[SENSITIVE]` rather than the secret. The
-# value was not short, it was absent. `refuse_placeholder` checks for that by name; length is not
-# the thing that can catch it.
+# The floor here is the service's own, mirrored. It is worth remembering why it is the only one:
+# on 2026-09-11 this script refused an eleven-character trip salt, the floor was argued away, and
+# eleven characters went to production - because `vercel env pull` had returned `[SENSITIVE]`
+# rather than the secret. The value was not short, it was absent. `refuse_placeholder` checks for
+# that by name; length is not the thing that can catch it.
 SS="$SECRET_SESSION"
 [ "${#SS}" -ge 32 ] || {
   echo "SESSION_SECRET is shorter than 32 characters; kittiwake will refuse it" >&2; exit 1; }
 unset SS
 
-echo "writing [studio] and [scuttle] to $HOST"
+echo "writing [studio] to $HOST, and removing [scuttle] if it is still there"
 
-# The four values travel as the first four lines of the remote script's stdin, ahead of the script
-# itself. Not as command-line arguments, which `ps` shows to every user on the box for as long as
-# the command runs; and not through `SendEnv`, which needs a matching `AcceptEnv` in the server's
-# sshd config and silently sends nothing when there isn't one.
+# The value travels as the first line of the remote script's stdin, ahead of the script itself.
+# Not as a command-line argument, which `ps` shows to every user on the box for as long as the
+# command runs; and not through `SendEnv`, which needs a matching `AcceptEnv` in the server's sshd
+# config and silently sends nothing when there isn't one.
 {
   printf '%s\n' "$SECRET_SESSION"
-  printf '%s\n' "$SECRET_TRIP"
-  printf '%s\n' "$SECRET_PEPPER"
-  printf '%s\n' "$SECRET_ADMIN"
   cat <<'BOX'
 set -euo pipefail
 export LC_ALL=C
@@ -132,8 +110,9 @@ TMP=$(mktemp)
 python3 - "$CFG" > "$TMP" <<'PY'
 import os, re, sys
 
-# Both sections are replaced wholesale rather than edited key by key. A half-written section is
-# exactly what the service refuses to start on, and a rewrite cannot leave one.
+# `[studio]` is replaced wholesale rather than edited key by key: a half-written section is exactly
+# what the service refuses to start on, and a rewrite cannot leave one. `[scuttle]` is removed and
+# not written back, which is how the four secrets behind a deleted feature stop living here.
 #
 # `(?m)` and deliberately not `(?s)`. With DOTALL the `.*` swallows the rest of the file in one
 # bite and the per-line lookahead never fires, so removing [studio] took [nest] and its credentials
@@ -147,23 +126,18 @@ src = src.rstrip() + """
 
 [studio]
 session_secret = "{session}"
-
-[scuttle]
-trip_salt = "{trip}"
-ip_pepper = "{pepper}"
-admin_secret = "{admin}"
-session_secret = "{session}"
-""".format(
-    session=os.environ['SESSION_SECRET'],
-    trip=os.environ['TRIP_SALT'],
-    pepper=os.environ['IP_PEPPER'],
-    admin=os.environ['ADMIN_SECRET'],
-)
+""".format(session=os.environ['SESSION_SECRET'])
 sys.stdout.write(src)
 PY
 
-grep -q '^\[studio\]' "$TMP" && grep -q '^\[scuttle\]' "$TMP" \
-  || { echo "the rewrite produced no [studio]/[scuttle]" >&2; rm -f "$TMP"; exit 1; }
+grep -q '^\[studio\]' "$TMP" || { echo "the rewrite produced no [studio]" >&2; rm -f "$TMP"; exit 1; }
+# `if` rather than `grep … && { … }`: under `set -e` the latter kills the script on the success
+# path, because a grep that finds nothing exits 1 and that is the status of the whole expression.
+if grep -q '^\[scuttle\]' "$TMP"; then
+  echo "[scuttle] survived the rewrite; nothing was installed" >&2
+  rm -f "$TMP"
+  exit 1
+fi
 
 install -m 0640 -o root -g kittiwake "$TMP" "$CFG"
 rm -f "$TMP"
@@ -177,15 +151,13 @@ systemctl is-active kittiwake
 # the log, and the route answers the same "unavailable" it did before.
 echo "studio auth (want {\"address\":null} rather than an error):"
 curl -fsS --max-time 15 http://127.0.0.1:8080/api/studio/auth | head -c 120; echo
-echo "scuttlebutt (want a messages array rather than 'not configured'):"
-curl -fsS --max-time 15 http://127.0.0.1:8080/api/scuttlebutt/messages | head -c 120; echo
 BOX
-} | ssh -i "$KEY" "$HOST" 'read -r SESSION_SECRET; read -r TRIP_SALT; read -r IP_PEPPER; read -r ADMIN_SECRET; export SESSION_SECRET TRIP_SALT IP_PEPPER ADMIN_SECRET; bash -s'
+} | ssh -i "$KEY" "$HOST" 'read -r SESSION_SECRET; export SESSION_SECRET; bash -s'
 
 cat <<'NEXT'
 
-Both sections are in. One thing left before the routes are switched, and it is the one that fails
-silently if it is skipped: prove this service parses a cookie the incumbent minted.
+[studio] is in and [scuttle] is gone. One thing left, and it is the one that fails silently if it
+is skipped: prove this service parses a cookie the incumbent minted.
 
   1. Mint one with Lodestar's own implementation, on a machine with SESSION_SECRET:
 
