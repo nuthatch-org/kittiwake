@@ -1,0 +1,24 @@
+# Phase 0 pilot. Estimates are conservative placeholders, not measured billing caps.
+# Enabled only after migration, export measurement, ownership and schedule review.
+monthly_budget_microcredits = 4000000000
+
+[allocations]
+A = 2100000000
+B = 800000000
+C = 600000000
+D = 300000000
+reserve = 200000000
+
+[[query]]
+id = "grt_price_daily"
+dune_query_id = 8699345
+owner = "lodestar"
+workstream = "A"
+enabled = false
+schedule_seconds = 86400
+poll_seconds = 86400
+execution_estimate_microcredits = 1000000
+export_estimate_microcredits = 1000000
+result_limit = 31
+target_table = "dune_grt_price_daily"
+freshness_seconds = 129600

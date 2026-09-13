@@ -305,6 +305,73 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        if let Some(dune_cfg) = &cfg.dune {
+            tracing::info!(registry_dir = %dune_cfg.registry_dir, "loading Dune registry");
+            match dune_registry::Registry::load_dir(&dune_cfg.registry_dir) {
+                Ok(registry) => {
+                    let tables: std::collections::BTreeSet<String> = if let Some(p) = &pool {
+                        let rows: Vec<(String,)> = sqlx::query_as(
+                            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+                        )
+                        .fetch_all(p)
+                        .await
+                        .unwrap_or_default();
+                        rows.into_iter().map(|(t,)| t).collect()
+                    } else {
+                        Default::default()
+                    };
+                    match registry.validate(&tables) {
+                        Ok(totals) => {
+                            tracing::info!(
+                                workstreams = totals.len(),
+                                queries = registry.query.len(),
+                                "Dune registry validated"
+                            );
+                            if dune_cfg.poller_enabled {
+                                match &pool {
+                                    Some(p) => {
+                                        match dune_client::DuneClient::new(
+                                            dune_cfg.api_key.clone().into(),
+                                        ) {
+                                            Ok(client) => {
+                                                let ledger = dune_ledger::Ledger::new(p.clone());
+                                                let dj = jobs::dune_jobs(
+                                                    Arc::new(client),
+                                                    p.clone(),
+                                                    ledger,
+                                                    dune_cfg.account.clone(),
+                                                    registry,
+                                                );
+                                                tracing::info!(
+                                                    count = dj.len(),
+                                                    "Dune poller jobs scheduled"
+                                                );
+                                                jobs.extend(dj);
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(error = %e, "building Dune client failed");
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        tracing::warn!(
+                                            "dune.poller_enabled with no database_url: poller jobs cannot write"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "Dune registry validation failed");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Dune registry directory could not be loaded");
+                }
+            }
+        }
+
         handles.extend(scheduler.spawn_all(jobs));
         std::mem::forget(scheduler);
     }

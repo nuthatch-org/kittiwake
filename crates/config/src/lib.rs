@@ -243,6 +243,36 @@ fn default_mutation_per_min() -> u32 {
     30
 }
 
+#[derive(Clone, Deserialize)]
+pub struct DuneSettings {
+    pub api_key: String,
+    #[serde(default = "default_dune_registry_dir")]
+    pub registry_dir: String,
+    #[serde(default = "default_dune_account")]
+    pub account: String,
+    #[serde(default)]
+    pub poller_enabled: bool,
+}
+
+impl std::fmt::Debug for DuneSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DuneSettings")
+            .field("api_key", &"<redacted>")
+            .field("registry_dir", &self.registry_dir)
+            .field("account", &self.account)
+            .field("poller_enabled", &self.poller_enabled)
+            .finish()
+    }
+}
+
+fn default_dune_registry_dir() -> String {
+    "registry/dune".to_string()
+}
+
+fn default_dune_account() -> String {
+    "nightswatch".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default = "default_bind")]
@@ -287,6 +317,8 @@ pub struct Config {
     pub receipt: Option<ReceiptSettings>,
     pub tap: Option<TapSettings>,
     pub support: Option<SupportSettings>,
+    #[serde(default)]
+    pub dune: Option<DuneSettings>,
     /// Turns the in-process scheduler on. Off by default so a second instance, or a staging box,
     /// cannot start writing to the same Postgres behind your back.
     #[serde(default)]
@@ -414,6 +446,15 @@ impl Config {
                     )));
                 }
             }
+        }
+        if self
+            .dune
+            .as_ref()
+            .is_some_and(|d| d.api_key.trim().is_empty())
+        {
+            return Err(ConfigError::Invalid(
+                "dune.api_key is present but empty".into(),
+            ));
         }
         Ok(())
     }
@@ -609,6 +650,7 @@ mod tests {
             database_max_connections: 16,
             cache: None,
             limits: None,
+            dune: None,
             scheduler_enabled: false,
             warmer_enabled: false,
         }
