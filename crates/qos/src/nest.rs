@@ -1,14 +1,15 @@
-//! The QoS nest's rollups, shaped for the scorer.
+//! The QoS nest's `qos_allocation_daily`, shaped for the scorer.
 //!
-//! Both are summed from Edge & Node's five-minute oracle buckets into UTC days. The scorer was
-//! written against Lodestar's old `qos_daily` and `deployment_daily`, so this is the only place the
-//! two shapes meet.
-
-use std::collections::HashMap;
+//! Summed from Edge & Node's five-minute oracle buckets into UTC days. The scorer was written against
+//! Lodestar's old `qos_daily`, so this is the only place the two shapes meet.
+//!
+//! The nest's `qos_deployment_daily`, the gateway's own query counts, has no reader here. It was the
+//! served-share denominator, and served share is now attempts over attempts: see
+//! [`crate::aggregate::aggregate_indexer_metrics`].
 
 use serde::{Deserialize, Serialize};
 
-use crate::aggregate::{DeploymentTotalRow, QosDailyRow};
+use crate::aggregate::QosDailyRow;
 
 /// Days are counted from The Graph's mainnet launch, 2020-12-17, as the oracle numbers them.
 pub const GRAPH_EPOCH_DAYS: i64 = 18_613;
@@ -57,46 +58,9 @@ impl From<&AllocationDaily> for QosDailyRow {
     }
 }
 
-/// `qos_deployment_daily`: a deployment on a chain and gateway for one day, from the
-/// `gateway_query_result_qos_5_minutes_prod_v3` topic.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DeploymentDaily {
-    pub deployment: String,
-    pub chain: Option<String>,
-    pub gateway_id: String,
-    /// Start of the UTC day, in unix seconds.
-    pub day_start: i64,
-    /// Queries the gateway answered on this deployment, whichever indexer served them.
-    pub query_count: f64,
-}
-
-/// Served-share denominators: each deployment's gateway query count over the window, summed across
-/// chains, gateways and days as the old `deployment_daily` query did.
-///
-/// Summing indexer attempts instead would count a query the gateway retried on a second indexer
-/// twice, and understate every served share on that deployment.
-pub fn deployment_totals(rows: &[DeploymentDaily]) -> Vec<DeploymentTotalRow> {
-    let mut out: Vec<DeploymentTotalRow> = Vec::new();
-    let mut index: HashMap<&str, usize> = HashMap::new();
-    for r in rows {
-        match index.get(r.deployment.as_str()) {
-            Some(&i) => out[i].total_query_count += r.query_count,
-            None => {
-                index.insert(&r.deployment, out.len());
-                out.push(DeploymentTotalRow {
-                    deployment_id: r.deployment.clone(),
-                    total_query_count: r.query_count,
-                });
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aggregate::{AggregateOpts, aggregate_indexer_metrics};
 
     const DAY: i64 = 1_789_171_200;
 
@@ -118,21 +82,6 @@ mod tests {
             blocks_behind: Some(3.0),
             total_query_fees: 0.5,
             buckets: 288,
-        }
-    }
-
-    fn gateway_day(
-        deployment: &str,
-        gateway: &str,
-        day_start: i64,
-        queries: f64,
-    ) -> DeploymentDaily {
-        DeploymentDaily {
-            deployment: deployment.into(),
-            chain: Some("arbitrum-one".into()),
-            gateway_id: gateway.into(),
-            day_start,
-            query_count: queries,
         }
     }
 
@@ -158,45 +107,5 @@ mod tests {
             QosDailyRow::from(&daily("0xa", "QmX", 1_000.0, None)).success_count,
             None
         );
-    }
-
-    #[test]
-    fn totals_sum_gateway_queries_across_gateways_and_days() {
-        let rows = [
-            gateway_day("QmX", "0xgw1", DAY, 700.0),
-            gateway_day("QmX", "0xgw2", DAY, 300.0),
-            gateway_day("QmX", "0xgw1", DAY + 86_400, 250.0),
-            gateway_day("QmY", "0xgw1", DAY, 5.0),
-        ];
-        let t = deployment_totals(&rows);
-        assert_eq!(
-            t,
-            vec![
-                DeploymentTotalRow {
-                    deployment_id: "QmX".into(),
-                    total_query_count: 1_250.0
-                },
-                DeploymentTotalRow {
-                    deployment_id: "QmY".into(),
-                    total_query_count: 5.0
-                },
-            ]
-        );
-    }
-
-    /// Two indexers attempted 1,100 queries on a deployment the gateway answered 1,000 on, because
-    /// it retried 100 on a second indexer. Served share is measured against the gateway's 1,000.
-    #[test]
-    fn served_share_is_against_the_gateway_count_not_attempts() {
-        let attempts = [
-            daily("0xa", "QmX", 800.0, Some(700.0)),
-            daily("0xb", "QmX", 300.0, Some(300.0)),
-        ];
-        let totals = deployment_totals(&[gateway_day("QmX", "0xgw1", DAY, 1_000.0)]);
-        let rows: Vec<QosDailyRow> = attempts.iter().map(QosDailyRow::from).collect();
-        let m = aggregate_indexer_metrics(&rows, &totals, &AggregateOpts::today(day_number(DAY)));
-        let share = |ix: &str| m.iter().find(|(i, _)| i == ix).unwrap().1[0].served_share;
-        assert_eq!(share("0xa"), 0.8);
-        assert_eq!(share("0xb"), 0.3);
     }
 }

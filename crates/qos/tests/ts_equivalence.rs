@@ -3,10 +3,17 @@
 //! `fixtures/ts-equivalence.json` is Lodestar's `qos-score.ts` and `qos-aggregate.ts` at `cb61cea~1`
 //! run over seeded random inputs (seed `0x5eed1160`), thinned to every sixteenth case. Point
 //! `KITTIWAKE_QOS_FIXTURE` at an unthinned file to check the lot.
+//!
+//! Two figures differ on purpose. The TypeScript divided an indexer's attempts by the gateway's query
+//! count, so a query hedged across indexers pushed served share past 1; the port divides by every
+//! indexer's attempts. `servedShare` and the `servedGap` built on it are left out of the comparison,
+//! and served share is checked against its own definition instead. Everything else must still match.
+
+use std::collections::HashMap;
 
 use kittiwake_qos::aggregate::{
-    AggregateOpts, AllocationRow, DeploymentTotalRow, QosDailyRow, aggregate_indexer_metrics,
-    compute_phase2_metrics, score_indexers,
+    AggregateOpts, AllocationRow, QosDailyRow, aggregate_indexer_metrics, compute_phase2_metrics,
+    score_indexers,
 };
 use kittiwake_qos::score::{
     DEFAULTS, DeploymentMetrics, QualityOpts, block_time_sec, cohort_adjusted_reliability,
@@ -86,22 +93,86 @@ fn run(kind: &str, input: &Value) -> Value {
         }
         "aggregate" | "scoreIndexers" => {
             let rows: Vec<QosDailyRow> = field(input, "qosRows");
-            let totals: Vec<DeploymentTotalRow> = field(input, "deploymentTotals");
             let opts: AggregateOpts = field(input, "opts");
             if kind == "aggregate" {
-                json!(aggregate_indexer_metrics(&rows, &totals, &opts))
+                json!(aggregate_indexer_metrics(&rows, &opts))
             } else {
-                json!(score_indexers(&rows, &totals, &opts))
+                json!(score_indexers(&rows, &opts))
             }
         }
         "phase2" => {
             let allocations: Vec<AllocationRow> = field(input, "allocations");
             let rows: Vec<QosDailyRow> = field(input, "qosRows");
-            let totals: Vec<DeploymentTotalRow> = field(input, "deploymentTotals");
-            json!(compute_phase2_metrics(&allocations, &rows, &totals))
+            json!(compute_phase2_metrics(&allocations, &rows))
         }
         other => panic!("unknown case kind {other}"),
     }
+}
+
+/// `v` with `key` removed from every object in it.
+fn without(v: &Value, key: &str) -> Value {
+    match v {
+        Value::Object(m) => Value::Object(
+            m.iter()
+                .filter(|(k, _)| k.as_str() != key)
+                .map(|(k, x)| (k.clone(), without(x, key)))
+                .collect(),
+        ),
+        Value::Array(a) => Value::Array(a.iter().map(|x| without(x, key)).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Every served share in an aggregate answer, against attempts over every indexer's attempts
+/// recomputed from the case's rows. Returns how many shares the TypeScript put somewhere else.
+fn check_served_share(input: &Value, ours: &Value, theirs: &Value) -> usize {
+    let rows: Vec<QosDailyRow> = field(input, "qosRows");
+    let mut pair: HashMap<(&str, &str), f64> = HashMap::new();
+    let mut deployment: HashMap<&str, f64> = HashMap::new();
+    for r in &rows {
+        *pair
+            .entry((&r.indexer_address, &r.deployment_id))
+            .or_default() += r.query_count;
+        *deployment.entry(&r.deployment_id).or_default() += r.query_count;
+    }
+    let shares = |v: &Value| -> Vec<(String, String, f64)> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|entry| {
+                let ix = entry[0].as_str().unwrap().to_string();
+                entry[1]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(move |d| {
+                        (
+                            ix.clone(),
+                            d["deployment"].as_str().unwrap().to_string(),
+                            d["servedShare"].as_f64().unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    for (ix, dep, share) in shares(ours) {
+        let total = deployment[dep.as_str()];
+        let expected = if total > 0.0 {
+            pair[&(ix.as_str(), dep.as_str())] / total
+        } else {
+            0.0
+        };
+        assert!(
+            (share - expected).abs() <= TOLERANCE && (0.0..=1.0).contains(&share),
+            "{ix} on {dep}: share {share}, attempts over attempts {expected}"
+        );
+    }
+    shares(ours)
+        .iter()
+        .zip(shares(theirs))
+        .filter(|(a, b)| (a.2 - b.2).abs() > TOLERANCE)
+        .count()
 }
 
 /// Structural equality with numbers compared to a tolerance scaled by magnitude, returning the
@@ -151,16 +222,32 @@ fn the_port_matches_the_typescript() {
     let fixture: Fixture = serde_json::from_str(&text).expect("fixture parses");
     assert!(!fixture.cases.is_empty());
     let mut worst = 0.0f64;
+    let mut shares_moved = 0;
     for (i, case) in fixture.cases.iter().enumerate() {
         let ours = run(&case.kind, &case.input);
+        let (ours, theirs) = match case.kind.as_str() {
+            "aggregate" => {
+                shares_moved += check_served_share(&case.input, &ours, &case.output);
+                (
+                    without(&ours, "servedShare"),
+                    without(&case.output, "servedShare"),
+                )
+            }
+            "phase2" => (
+                without(&ours, "servedGap"),
+                without(&case.output, "servedGap"),
+            ),
+            _ => (ours, case.output.clone()),
+        };
         worst = worst.max(compare(
             &format!("case {i} ({})", case.kind),
             &ours,
-            &case.output,
+            &theirs,
         ));
     }
     eprintln!(
-        "{} cases, largest absolute deviation {worst:e}",
+        "{} cases, largest absolute deviation {worst:e}; {shares_moved} served shares moved by the \
+         change of denominator",
         fixture.cases.len()
     );
 }

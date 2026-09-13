@@ -26,12 +26,6 @@ pub struct QosDailyRow {
     pub chain_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DeploymentTotalRow {
-    pub deployment_id: String,
-    pub total_query_count: f64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AggregateOpts {
@@ -96,9 +90,13 @@ fn push_grouped<K: Eq + std::hash::Hash + Clone, V>(
 
 /// Group daily rows into per-indexer deployment metrics: EWMA day decay, query-weighted latency and
 /// freshness, the cohort's latency tau, best reliability and lag floor, and served share.
+///
+/// Served share is an indexer's attempts on a deployment over every indexer's attempts on it in
+/// these rows: one unit, within [0, 1], summing to 1 across the deployment's indexers, so `qos_rows`
+/// must carry every indexer on each deployment it names. The incumbent divided by the gateway's
+/// query count instead, and every query the gateway hedged across indexers pushed shares past 1.
 pub fn aggregate_indexer_metrics(
     qos_rows: &[QosDailyRow],
-    deployment_totals: &[DeploymentTotalRow],
     opts: &AggregateOpts,
 ) -> Vec<(String, Vec<DeploymentMetrics>)> {
     let half_life = opts.half_life_days.unwrap_or(DEFAULTS.half_life_days);
@@ -191,17 +189,17 @@ pub fn aggregate_indexer_metrics(
         .map(|(dep, lags)| (*dep, lags.iter().copied().fold(f64::INFINITY, f64::min)))
         .collect();
 
-    let total_by_deployment: HashMap<&str, f64> = deployment_totals
-        .iter()
-        .map(|d| (d.deployment_id.as_str(), d.total_query_count))
-        .collect();
+    let mut attempts_by_deployment: HashMap<&str, f64> = HashMap::new();
+    for p in &pairs {
+        *attempts_by_deployment.entry(&p.deployment).or_default() += p.raw_query;
+    }
 
     let mut out = Vec::new();
     let mut out_index = HashMap::new();
     for p in pairs.iter().filter(|p| p.w_query > 0.0) {
         let avg_lat = p.w_lat_numer / p.w_query;
         let avg_blocks = p.w_blocks_numer / p.w_query;
-        let dep_total = total_by_deployment
+        let dep_total = attempts_by_deployment
             .get(p.deployment.as_str())
             .copied()
             .unwrap_or(0.0);
@@ -257,10 +255,12 @@ pub struct Phase2Metric {
 
 /// Served gap and efficiency, keyed by the lowercased address of every indexer holding an
 /// allocation, because a leech by definition holds allocations.
+///
+/// Served share is attempts over every indexer's attempts, as in [`aggregate_indexer_metrics`], so
+/// the gap compares two shares that each sum to 1 across a deployment.
 pub fn compute_phase2_metrics(
     allocations: &[AllocationRow],
     qos_rows: &[QosDailyRow],
-    deployment_totals: &[DeploymentTotalRow],
 ) -> Vec<(String, Phase2Metric)> {
     let mut alloc_by_pair: HashMap<(String, &str), f64> = HashMap::new();
     let mut total_alloc_by_dep: HashMap<&str, f64> = HashMap::new();
@@ -284,20 +284,18 @@ pub fn compute_phase2_metrics(
     }
 
     let mut served_by_pair: HashMap<(String, &str), f64> = HashMap::new();
+    let mut total_served_by_dep: HashMap<&str, f64> = HashMap::new();
     let mut success_by_indexer: HashMap<String, f64> = HashMap::new();
     for r in qos_rows {
         let ix = r.indexer_address.to_lowercase();
         *served_by_pair
             .entry((ix.clone(), &r.deployment_id))
             .or_default() += r.query_count;
+        *total_served_by_dep.entry(&r.deployment_id).or_default() += r.query_count;
         if let Some(s) = r.success_count {
             *success_by_indexer.entry(ix).or_default() += s;
         }
     }
-    let total_served_by_dep: HashMap<&str, f64> = deployment_totals
-        .iter()
-        .map(|d| (d.deployment_id.as_str(), d.total_query_count))
-        .collect();
 
     deps_by_indexer
         .into_iter()
@@ -346,16 +344,12 @@ pub struct IndexerQuality {
 }
 
 /// Raw rows to one quality result per indexer. Only `scale` reaches the scorer, as before.
-pub fn score_indexers(
-    qos_rows: &[QosDailyRow],
-    deployment_totals: &[DeploymentTotalRow],
-    opts: &AggregateOpts,
-) -> Vec<IndexerQuality> {
+pub fn score_indexers(qos_rows: &[QosDailyRow], opts: &AggregateOpts) -> Vec<IndexerQuality> {
     let quality_opts = QualityOpts {
         scale: opts.scale,
         ..QualityOpts::default()
     };
-    aggregate_indexer_metrics(qos_rows, deployment_totals, opts)
+    aggregate_indexer_metrics(qos_rows, opts)
         .into_iter()
         .map(|(indexer, rows)| IndexerQuality {
             indexer,
@@ -406,13 +400,6 @@ mod tests {
             .1[0]
     }
 
-    fn total(deployment: &str, queries: f64) -> DeploymentTotalRow {
-        DeploymentTotalRow {
-            deployment_id: deployment.into(),
-            total_query_count: queries,
-        }
-    }
-
     const TODAY: i64 = 100;
 
     #[test]
@@ -429,13 +416,15 @@ mod tests {
                 ..served("0xa", "X", 90, 1_000.0, Some(500.0))
             },
         ];
-        let m =
-            aggregate_indexer_metrics(&rows, &[total("X", 5_000.0)], &AggregateOpts::today(TODAY));
+        let m = aggregate_indexer_metrics(&rows, &AggregateOpts::today(TODAY));
         let a = only(&m, "0xa");
         assert!(close(a.n, 1_500.0, 6));
         assert!(close(a.successes.unwrap(), 1_250.0, 6));
         assert!(close(a.avg_latency_ms, 83.333, 2));
-        assert!(close(a.served_share, 0.4, 6));
+        assert!(
+            close(a.served_share, 1.0, 6),
+            "alone on X, it served all of X"
+        );
         assert!(close(a.time_behind_sec.unwrap(), 2.5, 6));
     }
 
@@ -450,7 +439,6 @@ mod tests {
             .collect();
         let raw = aggregate_indexer_metrics(
             &rows,
-            &[],
             &AggregateOpts {
                 latency_tau_mult: Some(1.0),
                 ..AggregateOpts::today(TODAY)
@@ -460,7 +448,7 @@ mod tests {
             raw.iter()
                 .all(|(_, m)| close(m[0].latency_tau_ms, 150.0, 6))
         );
-        let lenient = aggregate_indexer_metrics(&rows, &[], &AggregateOpts::today(TODAY));
+        let lenient = aggregate_indexer_metrics(&rows, &AggregateOpts::today(TODAY));
         assert!(
             lenient
                 .iter()
@@ -474,7 +462,7 @@ mod tests {
             served("0xa", "X", 100, 1_000.0, Some(990.0)),
             served("0xa", "X", 100, 500.0, None),
         ];
-        let m = aggregate_indexer_metrics(&rows, &[], &AggregateOpts::today(TODAY));
+        let m = aggregate_indexer_metrics(&rows, &AggregateOpts::today(TODAY));
         let a = only(&m, "0xa");
         assert!(close(a.n, 1_000.0, 6));
         assert!(close(a.successes.unwrap(), 990.0, 6));
@@ -484,7 +472,6 @@ mod tests {
     fn a_deployment_with_no_success_figure_is_unmeasured_not_failed() {
         let m = aggregate_indexer_metrics(
             &[served("0xa", "X", 100, 800.0, None)],
-            &[],
             &AggregateOpts::today(TODAY),
         );
         let a = only(&m, "0xa");
@@ -499,7 +486,7 @@ mod tests {
             chain_id: Some("some-new-rollup".into()),
             ..served("0xa", "X", 100, 1_000.0, Some(1_000.0))
         };
-        let m = aggregate_indexer_metrics(&[r], &[], &AggregateOpts::today(TODAY));
+        let m = aggregate_indexer_metrics(&[r], &AggregateOpts::today(TODAY));
         assert_eq!(only(&m, "0xa").time_behind_sec, None);
     }
 
@@ -510,7 +497,7 @@ mod tests {
             chain_id: Some("xdai".into()),
             ..served("0xa", "X", 100, 10.0, Some(10.0))
         };
-        let m = aggregate_indexer_metrics(&[r], &[], &AggregateOpts::today(TODAY));
+        let m = aggregate_indexer_metrics(&[r], &AggregateOpts::today(TODAY));
         assert!(close(only(&m, "0xa").time_behind_sec.unwrap(), 20.0, 6));
     }
 
@@ -528,7 +515,7 @@ mod tests {
             ..served(ix, "X", TODAY, 5_000.0, Some(s))
         })
         .collect();
-        let m = aggregate_indexer_metrics(&rows, &[], &AggregateOpts::today(TODAY));
+        let m = aggregate_indexer_metrics(&rows, &AggregateOpts::today(TODAY));
         let a = only(&m, "0xa");
         let best = a.cohort_best_reliability.unwrap();
         assert!(best > 0.58 && best < 0.6);
@@ -542,20 +529,54 @@ mod tests {
             served("0xb", "X", TODAY, 5_000.0, Some(4_000.0)),
             served("0xc", "X", TODAY, 20.0, Some(20.0)),
         ];
-        let m = aggregate_indexer_metrics(&rows, &[], &AggregateOpts::today(TODAY));
+        let m = aggregate_indexer_metrics(&rows, &AggregateOpts::today(TODAY));
         let a = only(&m, "0xa");
         assert_eq!(a.cohort_best_reliability, None);
         assert_eq!(a.cohort_floor_time_behind_sec, None);
     }
 
     #[test]
-    fn served_share_is_zero_when_the_deployment_total_is_unknown() {
-        let m = aggregate_indexer_metrics(
-            &[served("0xa", "Z", 100, 500.0, Some(500.0))],
-            &[],
-            &AggregateOpts::today(TODAY),
-        );
-        assert_eq!(only(&m, "0xa").served_share, 0.0);
+    fn served_shares_sum_to_one_per_deployment_day() {
+        let rows = [
+            served("0xa", "X", TODAY, 700.0, Some(700.0)),
+            served("0xb", "X", TODAY, 200.0, Some(150.0)),
+            served("0xc", "X", TODAY, 100.0, None),
+            served("0xa", "Y", TODAY, 5.0, Some(5.0)),
+            served("0xb", "Y", TODAY, 15.0, Some(15.0)),
+        ];
+        let m = aggregate_indexer_metrics(&rows, &AggregateOpts::today(TODAY));
+        for dep in ["X", "Y"] {
+            let shares: Vec<f64> = m
+                .iter()
+                .flat_map(|(_, ds)| ds)
+                .filter(|d| d.deployment == dep)
+                .map(|d| d.served_share)
+                .collect();
+            assert!(
+                shares.iter().all(|s| (0.0..=1.0).contains(s)),
+                "{dep}: {shares:?}"
+            );
+            assert!(close(shares.iter().sum(), 1.0, 12), "{dep}: {shares:?}");
+        }
+        assert!(close(only(&m, "0xc").served_share, 0.1, 12));
+    }
+
+    /// The gateway hedged one query across two indexers. Against its one query each held a share of
+    /// 1, the deployment summed to 2, and two equal allocations read as both being routed to.
+    #[test]
+    fn a_hedged_query_does_not_push_a_share_over_one() {
+        let rows = [
+            served("0xa", "X", TODAY, 1.0, Some(1.0)),
+            served("0xb", "X", TODAY, 1.0, Some(1.0)),
+        ];
+        let m = aggregate_indexer_metrics(&rows, &AggregateOpts::today(TODAY));
+        assert_eq!(only(&m, "0xa").served_share, 0.5);
+        assert_eq!(only(&m, "0xb").served_share, 0.5);
+
+        let gaps =
+            compute_phase2_metrics(&[alloc("0xa", "X", 500.0), alloc("0xb", "X", 500.0)], &rows);
+        assert_eq!(phase2(&gaps, "0xa").served_gap, 0.0);
+        assert_eq!(phase2(&gaps, "0xb").served_gap, 0.0);
     }
 
     #[test]
@@ -564,7 +585,7 @@ mod tests {
             served("0xa", "X", 100, 100.0, Some(100.0)),
             served("0xa", "Y", 100, 100.0, Some(100.0)),
         ];
-        let m = aggregate_indexer_metrics(&rows, &[], &AggregateOpts::today(TODAY));
+        let m = aggregate_indexer_metrics(&rows, &AggregateOpts::today(TODAY));
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].1.len(), 2);
     }
@@ -602,10 +623,11 @@ mod tests {
                 ..served("0xleech", "X", 100, 100.0, Some(50.0))
             },
         ];
-        let m = compute_phase2_metrics(&allocations, &qos, &[total("X", 10_000.0)]);
+        let m = compute_phase2_metrics(&allocations, &qos);
         let (leech, worker) = (phase2(&m, "0xleech"), phase2(&m, "0xworker"));
-        assert!(leech.served_gap > 0.8);
-        assert!(worker.served_gap < 0.0);
+        // Allocation shares 0.9 and 0.1 against served shares 0.01 and 0.99.
+        assert!(close(leech.served_gap, 0.89, 12));
+        assert!(close(worker.served_gap, -0.89, 12));
         assert!(leech.efficiency > worker.efficiency);
     }
 
@@ -618,15 +640,13 @@ mod tests {
                 blocks_behind: Some(1.0),
                 ..served("0xa", "X", 100, 100.0, Some(99.0))
             }],
-            &[total("X", 100.0)],
         );
         assert!(close(phase2(&m, "0xa").efficiency, 10.0, 6));
     }
 
     #[test]
     fn allocated_but_never_served_has_the_maximum_gap() {
-        let m =
-            compute_phase2_metrics(&[alloc("0xghost", "X", 500.0)], &[], &[total("X", 5_000.0)]);
+        let m = compute_phase2_metrics(&[alloc("0xghost", "X", 500.0)], &[]);
         let g = phase2(&m, "0xghost");
         assert!(close(g.served_gap, 1.0, 6));
         assert_eq!(g.successful_queries, 0.0);
@@ -646,7 +666,7 @@ mod tests {
                 ..served("0xleech", "X", 100, 12.0, Some(12.0))
             },
         ];
-        let results = score_indexers(&rows, &[total("X", 10_012.0)], &AggregateOpts::today(100));
+        let results = score_indexers(&rows, &AggregateOpts::today(100));
         assert_eq!(results.len(), 2);
         let q = |ix: &str| {
             results
