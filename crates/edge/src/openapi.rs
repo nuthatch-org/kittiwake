@@ -266,6 +266,10 @@ const SUMMARIES: &[Operation] = &[
         "Query fees and indexing rewards over a rolling window, by day and by deployment.",
     ),
     op(
+        "/api/indexer/{address}/trends",
+        "Indexing rewards, split between the indexer and its delegators, and query fees gross, to curators, to the protocol and net, per UTC day. Dated by the event that paid them, not by allocation close.",
+    ),
+    op(
         "/api/indexer/{address}/pnl",
         "That revenue netted against a modelled infrastructure cost. The cost side is an estimate the caller may override, not a measurement.",
     ),

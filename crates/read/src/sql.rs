@@ -350,6 +350,22 @@ pub fn indexer_stake_history_sql(addr: &str, cutoffs: &[i64]) -> Option<String> 
     ))
 }
 
+/// An indexer's rewards and query fees per UTC day, newest first, from `since` (a day start).
+pub fn indexer_daily_sql(addr: &str, since: i64) -> Option<String> {
+    if !is_address(addr) {
+        return None;
+    }
+    let since = since.max(0);
+    Some(format!(
+        "SELECT indexer, day_start, CAST(total_rewards AS VARCHAR) AS total_rewards, \
+         CAST(indexer_rewards AS VARCHAR) AS indexer_rewards, CAST(delegator_rewards AS VARCHAR) AS delegator_rewards, \
+         CAST(reward_count AS BIGINT) AS reward_count, CAST(fees_gross AS VARCHAR) AS fees_gross, \
+         CAST(fees_curators AS VARCHAR) AS fees_curators, CAST(fees_protocol AS VARCHAR) AS fees_protocol, \
+         CAST(fees_net AS VARCHAR) AS fees_net, CAST(fee_count AS BIGINT) AS fee_count \
+         FROM lodestar_indexer_daily WHERE indexer = '{addr}' AND day_start >= {since} ORDER BY day_start DESC"
+    ))
+}
+
 pub const DELEGATION_RATIO_SQL: &str = "SELECT delegation_ratio FROM lodestar_network_params";
 
 // ---------------------------------------------------------------------------------------------
@@ -848,6 +864,7 @@ mod tests {
         assert!(indexer_active_allocations_sql(bad).is_none());
         assert!(indexer_closed_allocations_sql(bad, 10).is_none());
         assert!(indexer_stake_history_sql(bad, &[1, 2]).is_none());
+        assert!(indexer_daily_sql(bad, 0).is_none());
         assert!(provisions_by_indexer_sql(bad).is_none());
         assert!(provisions_by_service_sql(bad, 10, 0).is_none());
         assert!(data_service_totals_sql(&[bad.to_string()]).is_none());
@@ -936,6 +953,15 @@ mod tests {
                 .unwrap()
                 .contains("HAVING")
         );
+    }
+
+    #[test]
+    fn a_daily_series_is_one_indexer_from_a_day_that_cannot_be_negative() {
+        let addr = "0x090f7382f9ea85c733cd501f4d87f16cb5b83ed3";
+        let sql = indexer_daily_sql(addr, -5).unwrap();
+        assert!(sql.contains(&format!("indexer = '{addr}'")));
+        assert!(sql.contains("day_start >= 0 "));
+        assert!(sql.contains("ORDER BY day_start DESC"));
     }
 
     #[test]

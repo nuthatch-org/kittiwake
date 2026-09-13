@@ -1181,6 +1181,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/indexer/{address}/pnl", get(handlers::indexer_pnl))
         .route(
+            "/api/indexer/{address}/trends",
+            get(handlers::indexer_trends),
+        )
+        .route(
             "/api/subgraph-schema/{hash}",
             get(handlers::subgraph_schema),
         )

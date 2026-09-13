@@ -132,6 +132,12 @@ fn d_stake_history_days() -> i64 {
 }
 
 #[derive(serde::Deserialize)]
+pub struct TrendsQuery {
+    #[serde(default = "d_days")]
+    pub days: i64,
+}
+
+#[derive(serde::Deserialize)]
 pub struct StakeHistoryQuery {
     #[serde(default = "d_stake_history_days")]
     pub days: i64,
@@ -441,6 +447,22 @@ pub async fn indexer_stake_history(
         .collect();
     Ok(envelope(
         routes::indexer_stake_history(&st.read, &addr(&address), &cutoffs).await?,
+    ))
+}
+
+/// Whole UTC days, today included, so the newest bar is the day in progress.
+pub async fn indexer_trends(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(address): Path<String>,
+    Query(q): Query<TrendsQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let days = q.days.clamp(1, 90);
+    let since = (now() / 86_400 - (days - 1)) * 86_400;
+    Ok(envelope(
+        routes::indexer_trends(&st.read, &addr(&address), since).await?,
     ))
 }
 
