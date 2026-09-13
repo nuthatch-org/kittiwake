@@ -3365,6 +3365,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kittiwake-qos"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kittiwake-read"
 version = "0.1.0"
 dependencies = [
