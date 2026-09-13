@@ -14,6 +14,7 @@ kittiwake-chain = { version = "0.1.0", path = "../chain" }
 kittiwake-db = { version = "0.1.0", path = "../db" }
 kittiwake-disasm = { version = "0.1.0", path = "../disasm" }
 kittiwake-ext = { version = "0.1.0", path = "../ext" }
+kittiwake-qos = { version = "0.1.0", path = "../qos" }
 kittiwake-rewards = { version = "0.1.0", path = "../rewards" }
 kittiwake-score = { version = "0.1.0", path = "../score" }
 kittiwake-nest = { version = "0.1.0", path = "../nest" }

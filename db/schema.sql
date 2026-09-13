@@ -509,3 +509,19 @@ CREATE TABLE IF NOT EXISTS indexer_rolling_apy (
   rolling_apy_90d  NUMERIC,
   computed_at      TIMESTAMPTZ NOT NULL
 );
+
+-- The directory's QoS Quality score, recomputed by `score-qos` over thirty days of qos-reo-nest.
+-- A side table for the same reason as the APYs, and not named `indexer_qos_score`: that was the
+-- incumbent's per-day history, and lodestar's migration 020 that drops it is run by hand.
+CREATE TABLE IF NOT EXISTS indexer_qos_quality (
+  indexer_address  TEXT PRIMARY KEY,
+  day              DATE NOT NULL,
+  q_score          DOUBLE PRECISION NOT NULL,
+  reliability      DOUBLE PRECISION NOT NULL,
+  lat_util         DOUBLE PRECISION NOT NULL,
+  fresh_util       DOUBLE PRECISION,
+  coverage         DOUBLE PRECISION NOT NULL,
+  served_gap       DOUBLE PRECISION,
+  efficiency       DOUBLE PRECISION,
+  computed_at      TIMESTAMPTZ NOT NULL
+);

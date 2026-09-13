@@ -118,6 +118,78 @@ pub async fn write_rolling_apy(
     Ok(done)
 }
 
+/// Where the directory's QoS Quality score lives.
+///
+/// Not `indexer_qos_score`: that was the incumbent's history table, keyed by day, and lodestar's
+/// migration 020 that drops it is run by hand, so it may still be there with a different key.
+pub async fn ensure_qos_quality_table(pool: &Pool) -> Result<(), DbError> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS indexer_qos_quality ( \
+           indexer_address TEXT PRIMARY KEY, \
+           day DATE NOT NULL, \
+           q_score DOUBLE PRECISION NOT NULL, \
+           reliability DOUBLE PRECISION NOT NULL, \
+           lat_util DOUBLE PRECISION NOT NULL, \
+           fresh_util DOUBLE PRECISION, \
+           coverage DOUBLE PRECISION NOT NULL, \
+           served_gap DOUBLE PRECISION, \
+           efficiency DOUBLE PRECISION, \
+           computed_at TIMESTAMPTZ NOT NULL )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// One indexer's score as the QoS job computed it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QosQualityRow {
+    pub indexer_address: String,
+    pub day: chrono::NaiveDate,
+    pub q_score: f64,
+    pub reliability: f64,
+    pub lat_util: f64,
+    pub fresh_util: Option<f64>,
+    pub coverage: f64,
+    pub served_gap: Option<f64>,
+    pub efficiency: Option<f64>,
+}
+
+/// Replace the whole table with this run's scores.
+///
+/// Every row, not an upsert of the scored ones: an indexer that no longer appears in the window has
+/// no score, and keeping yesterday's would show a grade for service nobody measured.
+pub async fn write_qos_quality(pool: &Pool, rows: &[QosQualityRow]) -> Result<u64, DbError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM indexer_qos_quality")
+        .execute(&mut *tx)
+        .await?;
+    let done = sqlx::query(
+        "INSERT INTO indexer_qos_quality (indexer_address, day, q_score, reliability, lat_util, \
+         fresh_util, coverage, served_gap, efficiency, computed_at) \
+         SELECT *, NOW() FROM UNNEST($1::text[], $2::date[], $3::float8[], $4::float8[], \
+         $5::float8[], $6::float8[], $7::float8[], $8::float8[], $9::float8[])",
+    )
+    .bind(
+        rows.iter()
+            .map(|r| r.indexer_address.clone())
+            .collect::<Vec<_>>(),
+    )
+    .bind(rows.iter().map(|r| r.day).collect::<Vec<_>>())
+    .bind(rows.iter().map(|r| r.q_score).collect::<Vec<_>>())
+    .bind(rows.iter().map(|r| r.reliability).collect::<Vec<_>>())
+    .bind(rows.iter().map(|r| r.lat_util).collect::<Vec<_>>())
+    .bind(rows.iter().map(|r| r.fresh_util).collect::<Vec<_>>())
+    .bind(rows.iter().map(|r| r.coverage).collect::<Vec<_>>())
+    .bind(rows.iter().map(|r| r.served_gap).collect::<Vec<_>>())
+    .bind(rows.iter().map(|r| r.efficiency).collect::<Vec<_>>())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(done)
+}
+
 /// The indexer every directory read leaves out.
 ///
 /// Defined here rather than beside the nest SQL because both readers need it and only one of them
@@ -154,6 +226,8 @@ pub struct EnrichedIndexer {
     pub distinct_data_services: Option<i32>,
     pub reo_status: Option<String>,
     pub last_updated: Option<chrono::DateTime<chrono::Utc>>,
+    /// The QoS Quality score, 0 to 100. Null for an indexer the oracle measured nothing for.
+    pub q_score: Option<f64>,
 }
 
 /// The directory read. Held as a constant so the exclusion below can be asserted without a
@@ -171,8 +245,9 @@ pub const ENRICHED_INDEXERS_SQL: &str = "SELECT address, url, geo_hash, self_sta
          delegation_capacity_pct::text, score::text, score_grade, allocation_count, \
          delegations_in_7d, undelegations_in_7d, net_flow_grt_7d::text, distinct_data_services, \
          reo_status, last_updated, query_fees_collected_grt::text, rewards_earned_grt::text, \
-         a.rolling_apy_30d::text, a.rolling_apy_90d::text \
+         a.rolling_apy_30d::text, a.rolling_apy_90d::text, q.q_score \
          FROM indexers i LEFT JOIN indexer_rolling_apy a ON a.indexer_address = i.address \
+         LEFT JOIN indexer_qos_quality q ON q.indexer_address = i.address \
          WHERE i.address <> $2 \
          ORDER BY i.score DESC NULLS LAST, i.self_stake_grt DESC LIMIT $1";
 

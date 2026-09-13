@@ -385,6 +385,7 @@ mod tests {
             distinct_data_services: Some(2),
             reo_status: Some("eligible".into()),
             last_updated: None,
+            q_score: None,
         }
     }
 

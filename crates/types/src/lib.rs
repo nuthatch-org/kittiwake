@@ -20,6 +20,8 @@ pub enum NestId {
     DipsSepolia,
     /// `/legacy-flows` — the frozen pre-Horizon archive. Stalled by design.
     LegacyFlows,
+    /// `/qos` — qos-reo-nest on Gnosis, Edge & Node's QoS oracle read from its own postings.
+    Qos,
 }
 
 impl NestId {
@@ -32,6 +34,7 @@ impl NestId {
             NestId::Dips => "/dips",
             NestId::DipsSepolia => "/dips-sepolia",
             NestId::LegacyFlows => "/legacy-flows",
+            NestId::Qos => "/qos",
         }
     }
 
@@ -49,15 +52,17 @@ impl NestId {
             NestId::Dips => "dips",
             NestId::DipsSepolia => "dips-sepolia",
             NestId::LegacyFlows => "legacy-flows",
+            NestId::Qos => "qos",
         }
     }
 
-    pub const ALL: [NestId; 5] = [
+    pub const ALL: [NestId; 6] = [
         NestId::Alloc,
         NestId::Gns,
         NestId::Dips,
         NestId::DipsSepolia,
         NestId::LegacyFlows,
+        NestId::Qos,
     ];
 }
 

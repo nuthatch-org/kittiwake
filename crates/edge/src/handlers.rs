@@ -428,6 +428,63 @@ pub async fn apr_provenance(
     Ok(resp)
 }
 
+#[derive(serde::Deserialize)]
+pub struct QosQuery {
+    #[serde(default = "d_qos_days")]
+    pub days: i64,
+}
+
+/// Ninety days, the window the Query Performance card always drew.
+fn d_qos_days() -> i64 {
+    90
+}
+
+/// Whole UTC days, today included, so the newest point is the day in progress.
+pub async fn indexer_qos(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(address): Path<String>,
+    Query(q): Query<QosQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let days = q.days.clamp(1, 90);
+    let today = now().div_euclid(86_400);
+    Ok(envelope(
+        kittiwake_read::qos::indexer_qos(&st.read, &addr(&address), today - (days - 1)).await?,
+    ))
+}
+
+pub async fn indexer_qos_score(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(address): Path<String>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    Ok(envelope(
+        kittiwake_read::qos::indexer_qos_score(&st.read, &addr(&address), now().div_euclid(86_400))
+            .await?,
+    ))
+}
+
+pub async fn indexer_qos_deployments(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(address): Path<String>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    Ok(envelope(
+        kittiwake_read::qos::indexer_qos_deployments(
+            &st.read,
+            &addr(&address),
+            now().div_euclid(86_400),
+        )
+        .await?,
+    ))
+}
+
 /// Weekly points over the last two years, which is what the chart draws.
 pub async fn indexer_stake_history(
     State(st): State<AppState>,

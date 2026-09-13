@@ -402,6 +402,122 @@ pub fn indexer_revenue_by_deployment_sql(addr: &str, since: i64) -> Option<Strin
 pub const DELEGATION_RATIO_SQL: &str = "SELECT delegation_ratio FROM lodestar_network_params";
 
 // ---------------------------------------------------------------------------------------------
+// The QoS nest (qos-reo-nest). `day` is a DATE there, so a clamped unix day number is added to the
+// epoch rather than a date string formatted in.
+// ---------------------------------------------------------------------------------------------
+
+fn qos_day(unix_day: i64) -> String {
+    format!("DATE '1970-01-01' + {}", unix_day.max(0))
+}
+
+const QOS_ROW_COLUMNS: &str = "indexer, deployment, chain, gateway, \
+     datediff('day', DATE '1970-01-01', day) AS unix_day, query_count, num_200, latency_ms, \
+     blocks_behind, total_query_fees, buckets";
+
+/// One indexer's `qos_indexer_daily` from `since_day`, oldest first, with seconds behind its peers.
+pub fn qos_indexer_daily_sql(addr: &str, since_day: i64) -> Option<String> {
+    if !is_address(addr) {
+        return None;
+    }
+    Some(format!(
+        "SELECT CAST(d.day AS VARCHAR) AS date, d.query_count, d.num_200, d.success_rate, d.latency_ms, \
+         d.blocks_behind, d.total_query_fees, d.avg_query_fee, d.allocations, d.buckets, d.bad_buckets, \
+         d.worst_bucket_start, d.worst_bucket_success_rate, d.worst_bucket_queries, \
+         s.seconds_behind_peers, s.share_queries_over_5min_behind, s.share_with_block_time \
+         FROM qos_indexer_daily d \
+         LEFT JOIN qos_indexer_seconds_behind s ON s.indexer = d.indexer AND s.day = d.day \
+         WHERE d.indexer = '{addr}' AND d.day >= {} ORDER BY d.day",
+        qos_day(since_day)
+    ))
+}
+
+/// The gateways that measured one indexer, per day.
+pub fn qos_indexer_gateways_sql(addr: &str, since_day: i64) -> Option<String> {
+    if !is_address(addr) {
+        return None;
+    }
+    Some(format!(
+        "SELECT CAST(day AS VARCHAR) AS date, string_agg(DISTINCT gateway, ',' ORDER BY gateway) AS gateways \
+         FROM qos_allocation_daily WHERE indexer = '{addr}' AND day >= {} GROUP BY day",
+        qos_day(since_day)
+    ))
+}
+
+/// When the publisher last posted to Gnosis. The table is named by the nest's `data_edge` alias and
+/// the `submitQoSPayload` function, so it moves only if the nest's config does.
+pub const QOS_FRESHNESS_SQL: &str =
+    "SELECT MAX(block_timestamp) AS last_post_at FROM data_edge__call_submit_qo_s_payload";
+
+/// Every indexer's rows from `start` to `end` inclusive, on the deployments `addr` served at any
+/// point since `from`: the cohort figures are meaningless without the peers.
+pub fn qos_cohort_rows_sql(addr: &str, from: i64, start: i64, end: i64) -> Option<String> {
+    if !is_address(addr) {
+        return None;
+    }
+    Some(format!(
+        "SELECT {QOS_ROW_COLUMNS} FROM qos_allocation_daily WHERE day >= {} AND day <= {} \
+         AND deployment IN (SELECT DISTINCT deployment FROM qos_allocation_daily \
+         WHERE indexer = '{addr}' AND day >= {})",
+        qos_day(start),
+        qos_day(end),
+        qos_day(from)
+    ))
+}
+
+/// Those deployments' gateway query counts per day, `start` to `end` inclusive: the served-share
+/// denominator.
+pub fn qos_cohort_totals_sql(addr: &str, from: i64, start: i64, end: i64) -> Option<String> {
+    if !is_address(addr) {
+        return None;
+    }
+    Some(format!(
+        "SELECT deployment, chain, gateway, datediff('day', DATE '1970-01-01', day) AS unix_day, query_count \
+         FROM qos_deployment_daily WHERE day >= {} AND day <= {} \
+         AND deployment IN (SELECT DISTINCT deployment FROM qos_allocation_daily \
+         WHERE indexer = '{addr}' AND day >= {})",
+        qos_day(start),
+        qos_day(end),
+        qos_day(from)
+    ))
+}
+
+/// Every indexer's rows for one day, for scoring the whole directory.
+pub fn qos_network_rows_sql(unix_day: i64) -> String {
+    format!(
+        "SELECT {QOS_ROW_COLUMNS} FROM qos_allocation_daily WHERE day = {}",
+        qos_day(unix_day)
+    )
+}
+
+/// Every deployment's gateway query counts from `start` to `end` inclusive.
+pub fn qos_network_totals_sql(start: i64, end: i64) -> String {
+    format!(
+        "SELECT deployment, chain, gateway, datediff('day', DATE '1970-01-01', day) AS unix_day, query_count \
+         FROM qos_deployment_daily WHERE day >= {} AND day <= {}",
+        qos_day(start),
+        qos_day(end)
+    )
+}
+
+/// Open stake per indexer on every deployment `addr` has an open allocation on.
+pub fn indexer_allocation_shares_sql(addr: &str) -> Option<String> {
+    if !is_address(addr) {
+        return None;
+    }
+    Some(format!(
+        "SELECT LOWER(indexer) AS indexer, subgraph_deployment, CAST(SUM(allocated_tokens) AS VARCHAR) AS allocated_tokens \
+         FROM lodestar_allocations WHERE status = 'Active' AND subgraph_deployment IN \
+         (SELECT subgraph_deployment FROM lodestar_allocations WHERE LOWER(indexer) = '{addr}' AND status = 'Active') \
+         GROUP BY 1, 2"
+    ))
+}
+
+/// Open stake per indexer and deployment, network-wide.
+pub const ALLOCATION_SHARES_ALL_SQL: &str = "SELECT LOWER(indexer) AS indexer, subgraph_deployment, \
+     CAST(SUM(allocated_tokens) AS VARCHAR) AS allocated_tokens \
+     FROM lodestar_allocations WHERE status = 'Active' GROUP BY 1, 2";
+
+// ---------------------------------------------------------------------------------------------
 // Provisions and data services
 // ---------------------------------------------------------------------------------------------
 
@@ -900,6 +1016,11 @@ mod tests {
         assert!(indexer_daily_sql(bad, 0).is_none());
         assert!(indexer_revenue_daily_sql(bad, 0).is_none());
         assert!(indexer_revenue_by_deployment_sql(bad, 0).is_none());
+        assert!(qos_indexer_daily_sql(bad, 0).is_none());
+        assert!(qos_indexer_gateways_sql(bad, 0).is_none());
+        assert!(qos_cohort_rows_sql(bad, 0, 0, 1).is_none());
+        assert!(qos_cohort_totals_sql(bad, 0, 0, 1).is_none());
+        assert!(indexer_allocation_shares_sql(bad).is_none());
         assert!(provisions_by_indexer_sql(bad).is_none());
         assert!(provisions_by_service_sql(bad, 10, 0).is_none());
         assert!(data_service_totals_sql(&[bad.to_string()]).is_none());

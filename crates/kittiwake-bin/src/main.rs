@@ -259,6 +259,9 @@ async fn main() -> anyhow::Result<()> {
             kittiwake_db::ensure_rolling_apy_table(p)
                 .await
                 .context("creating the rolling-APY table")?;
+            kittiwake_db::ensure_qos_quality_table(p)
+                .await
+                .context("creating the QoS quality table")?;
             kittiwake_db::ensure_graph_support_table(p)
                 .await
                 .context("creating the graph-support mirror table")?;

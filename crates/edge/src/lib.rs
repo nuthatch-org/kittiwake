@@ -1175,6 +1175,15 @@ pub fn router(state: AppState) -> Router {
             "/api/parameter-history/{address}",
             get(handlers::parameter_history),
         )
+        .route("/api/indexer/{address}/qos", get(handlers::indexer_qos))
+        .route(
+            "/api/indexer/{address}/qos-score",
+            get(handlers::indexer_qos_score),
+        )
+        .route(
+            "/api/indexer/{address}/qos-deployments",
+            get(handlers::indexer_qos_deployments),
+        )
         .route(
             "/api/indexer/{address}/revenue",
             get(handlers::indexer_revenue),

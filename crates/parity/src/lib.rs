@@ -312,6 +312,21 @@ pub mod coverage {
             "a diagnostic that reports the caller's own address, so it has no incumbent to match",
         ),
         (
+            "/api/indexer/{address}/qos",
+            Excused::Entirely,
+            "the incumbent's route read Ellipfra's fork of the QoS oracle subgraph through the gateway and was deleted with the key in nuthatch#1160, so nothing answers it. The figures are checked against a reference built from the raw oracle documents instead: qos-reo-nest's `checks/parity-2026-09-07.sql`",
+        ),
+        (
+            "/api/indexer/{address}/qos-score",
+            Excused::Entirely,
+            "read a Postgres table the incumbent's cron wrote from the same subgraph, both deleted in nuthatch#1160. The arithmetic is held to the incumbent's TypeScript by kittiwake-qos's equivalence test",
+        ),
+        (
+            "/api/indexer/{address}/qos-deployments",
+            Excused::Entirely,
+            "deleted with qos-score in nuthatch#1160; same arithmetic, same equivalence test",
+        ),
+        (
             "/api/sql/query",
             Excused::Entirely,
             "POST with a body; the harness only issues GETs",

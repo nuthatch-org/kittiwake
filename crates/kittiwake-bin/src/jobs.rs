@@ -214,6 +214,34 @@ pub fn ingest_jobs(
         ));
     }
 
+    // Hourly: the oracle's documents resolve half an hour behind the chain, and a thirty-day score
+    // moves by a day's weight at most.
+    {
+        let pool = pool.clone();
+        jobs.push(
+            JobDef::every(
+                "score-qos",
+                mins(60),
+                Arc::new(move |ctx| {
+                    let pool = pool.clone();
+                    Box::pin(async move {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        kittiwake_ingest::qos_score::score_qos(&pool, &ctx.gate, ctx.lane, now)
+                            .await
+                            .map(|i| JobOutcome {
+                                rows_written: i.rows,
+                            })
+                            .map_err(|e| e.to_string())
+                    })
+                }),
+            )
+            .staggered(mins(38)),
+        );
+    }
+
     {
         let pool = pool.clone();
         jobs.push(
@@ -418,6 +446,7 @@ mod tests {
             ("ingest-allocations", 60, 18),
             ("ingest-rav", 60, 28),
             ("ingest-disputes", 60, 48),
+            ("score-qos", 60, 38),
             ("refresh", 5, 0),
             ("snapshot-network", 5, 2),
             ("warm-ipfs", 10, 4),
@@ -455,6 +484,7 @@ mod tests {
             ("ingest-allocations", mins(60), mins(18)),
             ("ingest-rav", mins(60), mins(28)),
             ("ingest-disputes", mins(360), mins(48)),
+            ("score-qos", mins(60), mins(38)),
             ("refresh", mins(5), Duration::ZERO),
             ("snapshot-network", mins(5), mins(2)),
             ("warm", mins(1), Duration::ZERO),

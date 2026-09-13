@@ -11,6 +11,7 @@ pub mod dips_agreements;
 pub mod indexing_status;
 pub mod manifest;
 pub mod preflight;
+pub mod qos;
 pub mod recommend;
 pub mod sql;
 
