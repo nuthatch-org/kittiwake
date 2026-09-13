@@ -451,8 +451,22 @@ pub async fn indexer_qos(
     let days = q.days.clamp(1, 90);
     let today = now().div_euclid(86_400);
     Ok(envelope(
-        kittiwake_read::qos::indexer_qos(&st.read, &addr(&address), today - (days - 1)).await?,
+        kittiwake_read::qos::indexer_qos(
+            &st.read,
+            qos_store(&st),
+            &addr(&address),
+            today - (days - 1),
+            today,
+        )
+        .await?,
     ))
+}
+
+/// Closed QoS days live in Postgres; without it the QoS routes answer unavailable.
+fn qos_store(st: &AppState) -> Option<&dyn kittiwake_read::qos::QosStore> {
+    st.pool
+        .as_ref()
+        .map(|p| p as &dyn kittiwake_read::qos::QosStore)
 }
 
 pub async fn indexer_qos_score(
@@ -463,8 +477,13 @@ pub async fn indexer_qos_score(
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
     Ok(envelope(
-        kittiwake_read::qos::indexer_qos_score(&st.read, &addr(&address), now().div_euclid(86_400))
-            .await?,
+        kittiwake_read::qos::indexer_qos_score(
+            &st.read,
+            qos_store(&st),
+            &addr(&address),
+            now().div_euclid(86_400),
+        )
+        .await?,
     ))
 }
 
@@ -478,6 +497,7 @@ pub async fn indexer_qos_deployments(
     Ok(envelope(
         kittiwake_read::qos::indexer_qos_deployments(
             &st.read,
+            qos_store(&st),
             &addr(&address),
             now().div_euclid(86_400),
         )

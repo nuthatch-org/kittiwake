@@ -1,21 +1,23 @@
 //! Edge & Node's gateway QoS per indexer, and the QoS Quality score computed over it.
 //!
-//! Read from qos-reo-nest, which indexes the oracle's own postings on Gnosis. Only its daily views
-//! are read - `qos_indexer_daily`, `qos_allocation_daily` and the seconds-behind view - because
-//! those names and columns are the contract; the documents and five-minute rows beneath them are the
-//! nest's to reshape. `qos_deployment_daily` has no reader: served share is attempts over every
-//! indexer's attempts, not over the gateway's query count.
+//! Closed days come from Postgres, where `ingest-qos-days` keeps them; only today is asked of
+//! qos-reo-nest, one day per statement, because the nest cannot answer more inside its memory budget.
+//! Of the nest, only the contract views are read: `qos_indexer_daily`, `qos_allocation_daily`,
+//! `qos_indexer_seconds_behind` and `qos_freshness`. `qos_deployment_daily` has no reader: served
+//! share is attempts over every indexer's attempts, not over the gateway's query count.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use kittiwake_cache::CachePolicy;
+use futures::future::BoxFuture;
+use kittiwake_cache::{CachePolicy, Entry};
+use kittiwake_db::{QosAllocationDay, QosIndexerDay};
 use kittiwake_qos::aggregate::{
     AggregateOpts, AllocationRow, Phase2Metric, QosDailyRow, aggregate_indexer_metrics,
     compute_phase2_metrics,
 };
-use kittiwake_qos::nest::{AllocationDaily, GRAPH_EPOCH_DAYS};
+use kittiwake_qos::nest::{AllocationDaily, GRAPH_EPOCH_DAYS, day_number};
 use kittiwake_qos::score::{
     DeploymentContribution, QualityDetail, QualityOpts, compute_quality_detail, qos_grade,
 };
@@ -31,21 +33,72 @@ pub const SCORE_WINDOW_DAYS: i64 = 30;
 /// Days of score history the panel draws.
 pub const SCORE_HISTORY_DAYS: i64 = 30;
 
-/// Days per cohort statement. The nest caps an answer at 50,000 rows; on 2026-09-07 the peers on
-/// Ellipfra's 1,377 deployments were 4,389 rows, so five days fits.
-pub const DAYS_PER_SLICE: i64 = 5;
-
 /// The oracle posts every five minutes and its documents resolve about half an hour later, so a
 /// fresher cache would only re-ask for the same buckets.
 const POLL: Duration = Duration::from_secs(300);
 
 const TIMEOUT: Duration = Duration::from_secs(45);
 
-/// Part names for the slices: enough for the score window plus its history.
-const ROW_SLICES: [&str; 13] = [
-    "rows_0", "rows_1", "rows_2", "rows_3", "rows_4", "rows_5", "rows_6", "rows_7", "rows_8",
-    "rows_9", "rows_10", "rows_11", "rows_12",
-];
+/// Where closed QoS days are kept. Postgres in production; a map in the tests.
+pub trait QosStore: Send + Sync {
+    fn indexer_days<'a>(
+        &'a self,
+        addr: &'a str,
+        from: i64,
+        to: i64,
+    ) -> BoxFuture<'a, Result<Vec<QosIndexerDay>, ApiError>>;
+    fn cohort_days<'a>(
+        &'a self,
+        addr: &'a str,
+        from: i64,
+        to: i64,
+        also: &'a [String],
+    ) -> BoxFuture<'a, Result<Vec<QosAllocationDay>, ApiError>>;
+}
+
+fn database(e: kittiwake_db::DbError) -> ApiError {
+    ApiError::Unavailable(format!("database: {e}"))
+}
+
+impl QosStore for kittiwake_db::Pool {
+    fn indexer_days<'a>(
+        &'a self,
+        addr: &'a str,
+        from: i64,
+        to: i64,
+    ) -> BoxFuture<'a, Result<Vec<QosIndexerDay>, ApiError>> {
+        Box::pin(async move {
+            kittiwake_db::qos_indexer_days(self, addr, from, to)
+                .await
+                .map_err(database)
+        })
+    }
+    fn cohort_days<'a>(
+        &'a self,
+        addr: &'a str,
+        from: i64,
+        to: i64,
+        also: &'a [String],
+    ) -> BoxFuture<'a, Result<Vec<QosAllocationDay>, ApiError>> {
+        Box::pin(async move {
+            kittiwake_db::qos_cohort_days(self, addr, from, to, also)
+                .await
+                .map_err(database)
+        })
+    }
+}
+
+/// Without the database there are no closed days, and asking the nest for them instead is exactly
+/// the multi-day statement it refuses.
+fn store_or_unavailable(store: Option<&dyn QosStore>) -> Result<&dyn QosStore, ApiError> {
+    store.ok_or_else(|| {
+        ApiError::Unavailable(
+            "no database is configured: closed QoS days are kept there, and the nest answers one day \
+             at a time"
+                .into(),
+        )
+    })
+}
 
 fn f(v: &Value, key: &str) -> Option<f64> {
     match v.get(key)? {
@@ -62,10 +115,14 @@ fn num(x: Option<f64>) -> Value {
         .unwrap_or(Value::Null)
 }
 
-fn graph_day_date(day: i64) -> String {
-    chrono::DateTime::from_timestamp((day + GRAPH_EPOCH_DAYS) * 86_400, 0)
+fn unix_day_date(day: i64) -> String {
+    chrono::DateTime::from_timestamp(day * 86_400, 0)
         .map(|d| d.date_naive().to_string())
         .unwrap_or_default()
+}
+
+fn graph_day_date(day: i64) -> String {
+    unix_day_date(day + GRAPH_EPOCH_DAYS)
 }
 
 /// `many`, then a fold. A truncated answer is refused rather than folded: every statement here is
@@ -93,33 +150,125 @@ fn bad_address() -> ApiError {
     ApiError::BadRequest("not a valid address".into())
 }
 
+/// A merged answer, dated by the live part: the stored days are older than it by construction.
+fn merged(value: Value, live: &Read) -> Read {
+    Read {
+        entry: Arc::new(Entry::new(value, live.entry.provenance.clone())),
+        meta: live.meta.clone(),
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Query Performance
 // ---------------------------------------------------------------------------------------------
 
-/// `/api/indexer/[address]/qos`: the Query Performance card, from `since_day` (a unix day number).
-pub async fn indexer_qos(ctx: &ReadCtx, addr: &str, since_day: i64) -> Result<Read, ApiError> {
+/// `/api/indexer/[address]/qos`: the Query Performance card from `since_day` through `today` (unix day
+/// numbers), closed days from the store and today from the nest.
+pub async fn indexer_qos(
+    ctx: &ReadCtx,
+    store: Option<&dyn QosStore>,
+    addr: &str,
+    since_day: i64,
+    today: i64,
+) -> Result<Read, ApiError> {
+    let store = store_or_unavailable(store)?;
     let parts = vec![
         Part::rows(
             "days",
             NestId::Qos,
-            sql::qos_indexer_daily_sql(addr, since_day).ok_or_else(bad_address)?,
+            sql::qos_indexer_daily_sql(addr, today).ok_or_else(bad_address)?,
+        ),
+        Part::rows(
+            "behind",
+            NestId::Qos,
+            sql::qos_indexer_seconds_behind_sql(addr, today).ok_or_else(bad_address)?,
         ),
         Part::rows(
             "gateways",
             NestId::Qos,
-            sql::qos_indexer_gateways_sql(addr, since_day).ok_or_else(bad_address)?,
+            sql::qos_indexer_gateways_sql(addr, today).ok_or_else(bad_address)?,
         ),
-        Part::one("freshness", NestId::Qos, sql::QOS_FRESHNESS_SQL.to_string()),
+        Part::rows("freshness", NestId::Qos, sql::QOS_FRESHNESS_SQL.to_string()),
     ];
-    ctx.cached(
-        "indexer-qos",
-        NestId::Qos,
-        json!({"address": addr, "since": since_day}),
-        CachePolicy::from_poll_interval(POLL),
-        folded(parts, qos_answer),
-    )
-    .await
+    let closed = if since_day < today {
+        store.indexer_days(addr, since_day, today - 1).await?
+    } else {
+        Vec::new()
+    };
+    let live = ctx
+        .cached(
+            "indexer-qos-today",
+            NestId::Qos,
+            json!({"address": addr, "day": today}),
+            CachePolicy::from_poll_interval(POLL),
+            folded(parts, Value::clone),
+        )
+        .await?;
+    let input = qos_input(&closed, &live.entry.value, today);
+    Ok(merged(qos_answer(&input), &live))
+}
+
+/// A stored day in the shape the nest answers a day in.
+fn stored_day(d: &QosIndexerDay) -> Value {
+    json!({
+        "date": unix_day_date(d.day),
+        "query_count": d.query_count,
+        "num_200": d.num_200,
+        "success_rate": d.success_rate,
+        "latency_ms": d.latency_ms,
+        "blocks_behind": d.blocks_behind,
+        "total_query_fees": d.total_query_fees,
+        "avg_query_fee": d.avg_query_fee,
+        "allocations": d.allocations,
+        "buckets": d.buckets,
+        "bad_buckets": d.bad_buckets,
+        "worst_bucket_start": d.worst_bucket_start,
+        "worst_bucket_success_rate": d.worst_bucket_success_rate,
+        "worst_bucket_queries": d.worst_bucket_queries,
+        "seconds_behind_peers": d.seconds_behind_peers,
+        "share_queries_over_5min_behind": d.share_queries_over_5min_behind,
+        "share_with_block_time": d.share_with_block_time,
+    })
+}
+
+/// Closed days from the store, then today from the nest. A stored row for today is ignored: today is
+/// still arriving, and the store's copy is only as new as the job's last run.
+pub fn qos_input(closed: &[QosIndexerDay], live: &Value, today: i64) -> Value {
+    let arr = |k: &str| {
+        live.get(k)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let today_date = unix_day_date(today);
+    let mut days: Vec<Value> = closed
+        .iter()
+        .filter(|d| d.day < today)
+        .map(stored_day)
+        .collect();
+    let mut gateways: Vec<Value> = closed
+        .iter()
+        .filter(|d| d.day < today)
+        .map(|d| json!({"date": unix_day_date(d.day), "gateways": d.gateways.join(",")}))
+        .collect();
+    let behind = arr("behind");
+    for mut d in arr("days") {
+        if d.get("date").and_then(Value::as_str) != Some(today_date.as_str()) {
+            continue;
+        }
+        if let (Some(obj), Some(b)) = (d.as_object_mut(), behind.first()) {
+            for k in [
+                "seconds_behind_peers",
+                "share_queries_over_5min_behind",
+                "share_with_block_time",
+            ] {
+                obj.insert(k.into(), b.get(k).cloned().unwrap_or(Value::Null));
+            }
+        }
+        days.push(d);
+    }
+    gateways.extend(arr("gateways"));
+    json!({"days": days, "gateways": gateways, "freshness": arr("freshness")})
 }
 
 /// The card's shape: the retired route's `IndexerQoSPoint` per day, plus what it could not say.
@@ -223,7 +372,15 @@ pub fn qos_answer(v: &Value) -> Value {
     let ratio = |x: f64, d: f64| (d > 0.0).then(|| x / d);
     let latest = days.last();
     let latest_date = latest.map(|r| shape::t(r, "date")).unwrap_or(Value::Null);
-    let freshness = v.get("freshness").cloned().unwrap_or(Value::Null);
+    let freshness = v
+        .get("freshness")
+        .and_then(Value::as_array)
+        .and_then(|rows| {
+            rows.iter()
+                .find(|r| r.get("topic").and_then(Value::as_str) == Some("indexer"))
+        })
+        .cloned()
+        .unwrap_or(Value::Null);
     json!({
         "qos": qos,
         "summary": {
@@ -240,10 +397,12 @@ pub fn qos_answer(v: &Value) -> Value {
             "badBuckets": bad,
             "worstBucket": worst.map(|(rate, start, volume)| bucket(rate, start, volume)),
         },
-        // Two questions: when the publisher last posted to Gnosis, and the newest day this indexer has
-        // figures for. A publisher gone quiet shows as the first falling behind; a quiet indexer does not.
+        // Two questions: when the publisher last posted to Gnosis, and the newest bucket the nest
+        // holds. A publisher gone quiet shows as the first falling behind; a stalled resolver shows as
+        // the second falling behind the first.
         "freshness": {
-            "publisherLastPostAt": shape::i(&freshness, "last_post_at"),
+            "publisherLastPostAt": shape::i(&freshness, "last_post_time"),
+            "newestBucketStart": shape::i(&freshness, "newest_bucket_start"),
             "newestDate": latest_date,
             "newestDateBuckets": latest.and_then(|r| f(r, "buckets")).map(|b| b as i64),
         },
@@ -254,42 +413,16 @@ pub fn qos_answer(v: &Value) -> Value {
 // QoS Quality
 // ---------------------------------------------------------------------------------------------
 
-/// For one indexer from `from_day` to `to_day` (unix day numbers): every indexer's rows on the
-/// deployments it served, sliced, and the open allocations on its deployments.
-fn cohort_parts(addr: &str, from_day: i64, to_day: i64) -> Result<Vec<Part>, ApiError> {
-    let mut parts = Vec::new();
-    let mut start = from_day;
-    for rows in ROW_SLICES {
-        if start > to_day {
-            break;
-        }
-        let end = (start + DAYS_PER_SLICE - 1).min(to_day);
-        parts.push(Part::rows(
-            rows,
-            NestId::Qos,
-            sql::qos_cohort_rows_sql(addr, from_day, start, end).ok_or_else(bad_address)?,
-        ));
-        start = end + 1;
-    }
-    if start <= to_day {
-        return Err(ApiError::Internal(
-            "the score window needs more slices than are named".into(),
-        ));
-    }
-    parts.push(Part::rows(
-        "allocations",
-        NestId::Alloc,
-        sql::indexer_allocation_shares_sql(addr).ok_or_else(bad_address)?,
-    ));
-    Ok(parts)
-}
-
 /// A `qos_allocation_daily` row as the nest answered it.
 pub fn allocation_daily_from(r: &Value) -> Option<AllocationDaily> {
     Some(AllocationDaily {
         indexer: r.get("indexer")?.as_str()?.to_lowercase(),
         deployment: r.get("deployment")?.as_str()?.to_string(),
-        chain: r.get("chain").and_then(Value::as_str).map(str::to_string),
+        chain: r
+            .get("chain")
+            .and_then(Value::as_str)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string),
         gateway_id: r
             .get("gateway")
             .and_then(Value::as_str)
@@ -303,6 +436,20 @@ pub fn allocation_daily_from(r: &Value) -> Option<AllocationDaily> {
         total_query_fees: f(r, "total_query_fees").unwrap_or(0.0),
         buckets: f(r, "buckets").unwrap_or(0.0) as u32,
     })
+}
+
+/// A stored allocation day as the scorer reads it.
+pub fn daily_row(a: &QosAllocationDay) -> QosDailyRow {
+    QosDailyRow {
+        indexer_address: a.indexer.clone(),
+        deployment_id: a.deployment.clone(),
+        day_number: day_number(a.day * 86_400),
+        query_count: a.query_count,
+        success_count: a.num_200,
+        avg_latency_ms: a.latency_ms,
+        blocks_behind: a.blocks_behind,
+        chain_id: a.chain.clone(),
+    }
 }
 
 /// An open stake total, with the deployment re-spelt as the CID the oracle uses: the allocations
@@ -323,28 +470,6 @@ pub struct Cohort {
 }
 
 impl Cohort {
-    pub fn from_answer(v: &Value) -> Self {
-        let rows_of = |names: &[&str]| -> Vec<Value> {
-            names
-                .iter()
-                .filter_map(|k| v.get(*k).and_then(Value::as_array))
-                .flatten()
-                .cloned()
-                .collect()
-        };
-        Self {
-            rows: rows_of(&ROW_SLICES)
-                .iter()
-                .filter_map(allocation_daily_from)
-                .map(|r| QosDailyRow::from(&r))
-                .collect(),
-            allocations: rows_of(&["allocations"])
-                .iter()
-                .filter_map(allocation_row_from)
-                .collect(),
-        }
-    }
-
     /// The window that ends on `day` (a Graph day number), as the incumbent's cron scored that day:
     /// from thirty days before through the day itself.
     fn window(&self, day: i64) -> Vec<QosDailyRow> {
@@ -376,26 +501,111 @@ impl Cohort {
     }
 }
 
+/// Stored rows before `today` on the deployments `addr` served, today's rows from the nest on those
+/// same deployments, and the open allocations on them. Today's network-wide rows are one statement
+/// shared by every indexer's request.
+async fn cohort(
+    ctx: &ReadCtx,
+    store: &dyn QosStore,
+    addr: &str,
+    from: i64,
+    today: i64,
+) -> Result<(Cohort, Read), ApiError> {
+    let allocations_sql = sql::indexer_allocation_shares_sql(addr).ok_or_else(bad_address)?;
+    let live = ctx
+        .cached(
+            "qos-network-today",
+            NestId::Qos,
+            json!({"day": today}),
+            CachePolicy::from_poll_interval(POLL),
+            folded(
+                vec![Part::rows(
+                    "rows",
+                    NestId::Qos,
+                    sql::qos_network_rows_sql(today),
+                )],
+                Value::clone,
+            ),
+        )
+        .await?;
+    let today_rows: Vec<QosDailyRow> = live
+        .entry
+        .value
+        .get("rows")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(allocation_daily_from)
+                .map(|r| QosDailyRow::from(&r))
+                .collect()
+        })
+        .unwrap_or_default();
+    let served_today: Vec<String> = today_rows
+        .iter()
+        .filter(|r| r.indexer_address == addr)
+        .map(|r| r.deployment_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let closed = if from < today {
+        store
+            .cohort_days(addr, from, today - 1, &served_today)
+            .await?
+    } else {
+        Vec::new()
+    };
+    let deployments: BTreeSet<&str> = closed
+        .iter()
+        .map(|r| r.deployment.as_str())
+        .chain(served_today.iter().map(String::as_str))
+        .collect();
+    let mut rows: Vec<QosDailyRow> = closed
+        .iter()
+        .filter(|r| r.day < today)
+        .map(daily_row)
+        .collect();
+    rows.extend(
+        today_rows
+            .iter()
+            .filter(|r| deployments.contains(r.deployment_id.as_str()))
+            .cloned(),
+    );
+    let allocations = ctx
+        .cached(
+            "qos-allocation-shares",
+            NestId::Alloc,
+            json!({"address": addr}),
+            CachePolicy::from_poll_interval(POLL),
+            folded(
+                vec![Part::rows("allocations", NestId::Alloc, allocations_sql)],
+                Value::clone,
+            ),
+        )
+        .await?;
+    let allocations = allocations
+        .entry
+        .value
+        .get("allocations")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(allocation_row_from).collect())
+        .unwrap_or_default();
+    Ok((Cohort { rows, allocations }, live))
+}
+
 /// `/api/indexer/[address]/qos-score`: the latest score with its breakdown, and one score per day.
 pub async fn indexer_qos_score(
     ctx: &ReadCtx,
+    store: Option<&dyn QosStore>,
     addr: &str,
     today_unix_day: i64,
 ) -> Result<Read, ApiError> {
+    let store = store_or_unavailable(store)?;
     let from = today_unix_day - SCORE_WINDOW_DAYS - (SCORE_HISTORY_DAYS - 1);
-    let parts = cohort_parts(addr, from, today_unix_day)?;
-    let who = addr.to_string();
-    let today = today_unix_day - GRAPH_EPOCH_DAYS;
-    ctx.cached(
-        "indexer-qos-score",
-        NestId::Qos,
-        json!({"address": addr, "today": today_unix_day}),
-        CachePolicy::from_poll_interval(POLL),
-        folded(parts, move |v| {
-            score_answer(&Cohort::from_answer(v), &who, today)
-        }),
-    )
-    .await
+    let (c, live) = cohort(ctx, store, addr, from, today_unix_day).await?;
+    Ok(merged(
+        score_answer(&c, addr, today_unix_day - GRAPH_EPOCH_DAYS),
+        &live,
+    ))
 }
 
 /// The retired panel's shape: `latest` as its score row, `daily` as `{day, q_score}`. The history is
@@ -429,22 +639,23 @@ pub fn score_answer(cohort: &Cohort, addr: &str, today: i64) -> Value {
 /// `/api/indexer/[address]/qos-deployments`: the deployments behind today's score.
 pub async fn indexer_qos_deployments(
     ctx: &ReadCtx,
+    store: Option<&dyn QosStore>,
     addr: &str,
     today_unix_day: i64,
 ) -> Result<Read, ApiError> {
-    let parts = cohort_parts(addr, today_unix_day - SCORE_WINDOW_DAYS, today_unix_day)?;
-    let who = addr.to_string();
-    let today = today_unix_day - GRAPH_EPOCH_DAYS;
-    ctx.cached(
-        "indexer-qos-deployments",
-        NestId::Qos,
-        json!({"address": addr, "today": today_unix_day}),
-        CachePolicy::from_poll_interval(POLL),
-        folded(parts, move |v| {
-            deployments_answer(&Cohort::from_answer(v), &who, today)
-        }),
+    let store = store_or_unavailable(store)?;
+    let (c, live) = cohort(
+        ctx,
+        store,
+        addr,
+        today_unix_day - SCORE_WINDOW_DAYS,
+        today_unix_day,
     )
-    .await
+    .await?;
+    Ok(merged(
+        deployments_answer(&c, addr, today_unix_day - GRAPH_EPOCH_DAYS),
+        &live,
+    ))
 }
 
 fn drag(d: &DeploymentContribution) -> f64 {
@@ -515,12 +726,15 @@ pub fn score_network(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate, matchers::method};
 
     const A: &str = "0x00000000000000000000000000000000000000aa";
     const B: &str = "0x00000000000000000000000000000000000000bb";
     const DEP: &str = "QmdT8aMbj72gJt6RtSQFhhWbyG4C7vwGkghnvfT8Y8zLgJ";
-    /// 2026-09-12, as a Graph day number.
-    const TODAY: i64 = 20_708 - GRAPH_EPOCH_DAYS;
+    /// 2026-09-12, as a unix day number and a Graph day number.
+    const TODAY_UNIX: i64 = 20_708;
+    const TODAY: i64 = TODAY_UNIX - GRAPH_EPOCH_DAYS;
 
     fn day(date: &str, queries: f64, ok: f64, latency: f64, buckets: i64) -> Value {
         json!({
@@ -530,28 +744,6 @@ mod tests {
             "worst_bucket_start": null, "worst_bucket_success_rate": null, "worst_bucket_queries": null,
             "seconds_behind_peers": 12.0, "share_queries_over_5min_behind": 0.0, "share_with_block_time": 1.0,
         })
-    }
-
-    #[test]
-    fn a_day_the_nest_has_no_row_for_is_absent_rather_than_zero() {
-        let out = qos_answer(&json!({
-            "days": [day("2026-09-01", 10.0, 10.0, 100.0, 288), day("2026-09-03", 10.0, 10.0, 100.0, 288)],
-            "gateways": [{"date": "2026-09-03", "gateways": "0xgw1,0xgw2"}],
-            "freshness": {"last_post_at": 1_788_829_815_u64},
-        }));
-        let dates: Vec<Value> = out["qos"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| p["date"].clone())
-            .collect();
-        assert_eq!(dates, vec![json!("2026-09-01"), json!("2026-09-03")]);
-        assert_eq!(out["summary"]["days"], json!(2));
-        assert_eq!(out["qos"][1]["gatewayIds"], json!(["0xgw1", "0xgw2"]));
-        assert_eq!(
-            out["freshness"]["publisherLastPostAt"],
-            json!(1_788_829_815_u64)
-        );
     }
 
     /// The old card averaged the days, which reads 75% and 150 ms here. The window served 950 of
@@ -571,7 +763,7 @@ mod tests {
 
     #[test]
     fn an_indexer_the_oracle_never_measured_has_no_points_and_no_figures() {
-        let out = qos_answer(&json!({"days": [], "gateways": [], "freshness": null}));
+        let out = qos_answer(&json!({"days": [], "gateways": [], "freshness": []}));
         assert_eq!(out["qos"], json!([]));
         for k in [
             "successRate",
@@ -602,129 +794,271 @@ mod tests {
         );
     }
 
-    fn unix(day: i64) -> i64 {
-        day + GRAPH_EPOCH_DAYS
-    }
-
-    fn row(ix: &str, unix_day: i64, queries: f64, ok: f64) -> Value {
-        json!({
-            "indexer": ix, "deployment": DEP, "chain": "arbitrum-one", "gateway": "0xgw",
-            "unix_day": unix_day, "query_count": queries, "num_200": ok, "latency_ms": 120.0,
-            "blocks_behind": 3.0, "total_query_fees": 0.5, "buckets": 288,
-        })
-    }
-
-    /// Two indexers attempted 1,100 queries on a deployment where the gateway answered 1,000, because
-    /// it hedged 100 across both. Against the gateway's count their shares summed to 1.1.
-    fn hedged() -> Cohort {
-        let hex = shape::ipfs_hash_to_bytes32(DEP).unwrap();
-        Cohort::from_answer(&json!({
-            "rows_0": [row(A, unix(TODAY), 800.0, 700.0), row(B, unix(TODAY), 300.0, 300.0)],
-            "allocations": [
-                {"indexer": A, "subgraph_deployment": hex, "allocated_tokens": "1000000000000000000000"},
-                {"indexer": B, "subgraph_deployment": hex, "allocated_tokens": "3000000000000000000000"},
-            ],
-        }))
-    }
-
-    #[test]
-    fn served_share_is_against_every_indexers_attempts_and_the_gap_follows() {
-        let c = hedged();
-        let share = |ix: &str| {
-            deployments_answer(&c, ix, TODAY)["deployments"][0]["served_share"]
-                .as_f64()
-                .unwrap()
-        };
-        assert_eq!(share(A), 800.0 / 1_100.0);
-        assert_eq!(share(B), 300.0 / 1_100.0);
-        assert!((share(A) + share(B) - 1.0).abs() < 1e-12);
-        // An allocation share of 1,000 in 4,000 against a served share of 8 in 11.
-        let gap = c.phase2(A, TODAY).unwrap().served_gap;
-        assert!((gap - (0.25 - 800.0 / 1_100.0)).abs() < 1e-12, "{gap}");
-    }
-
-    #[test]
-    fn the_route_scores_exactly_as_the_ported_scorer_does() {
-        let c = hedged();
-        let direct =
-            kittiwake_qos::aggregate::score_indexers(&c.rows, &AggregateOpts::today(TODAY));
-        let expected = direct
-            .iter()
-            .find(|q| q.indexer == A)
-            .unwrap()
-            .quality
-            .q_score;
-        let out = score_answer(&c, A, TODAY);
-        assert_eq!(out["latest"]["q_score"], json!(expected));
-        assert_eq!(out["latest"]["day"], json!("2026-09-12"));
-        assert_eq!(out["latest"]["grade"], json!(qos_grade(expected).grade));
-    }
-
-    #[test]
-    fn history_holds_a_score_for_each_day_the_window_still_saw_the_indexer() {
-        let c = Cohort::from_answer(&json!({"rows_0": [
-            row(A, unix(TODAY - 2), 500.0, 500.0),
-            row(B, unix(TODAY - 2), 500.0, 400.0),
-        ]}));
-        let out = score_answer(&c, A, TODAY);
-        assert_eq!(out["daily"].as_array().unwrap().len(), 3, "{out}");
-        assert!(out["latest"].is_object());
-
-        let none = score_answer(&Cohort::default(), A, TODAY);
-        assert_eq!(none["latest"], Value::Null);
-        assert_eq!(none["daily"], json!([]));
-        assert_eq!(
-            deployments_answer(&Cohort::default(), A, TODAY)["total"],
-            Value::Null
-        );
-    }
-
-    #[test]
-    fn the_slices_cover_the_score_window_and_its_history_once_each() {
-        let today = 20_708;
-        let from = today - SCORE_WINDOW_DAYS - (SCORE_HISTORY_DAYS - 1);
-        let parts = cohort_parts(A, from, today).unwrap();
-        let mut next = from;
-        for p in parts.iter().filter(|p| p.name.starts_with("rows_")) {
-            let days: Vec<i64> = p
-                .sql
-                .split("DATE '1970-01-01' + ")
-                .skip(1)
-                .map(|s| {
-                    s.split(|c: char| !c.is_ascii_digit())
-                        .next()
-                        .unwrap()
-                        .parse()
-                        .unwrap()
-                })
-                .collect();
-            assert_eq!(days[0], next, "a slice starts where the last ended");
-            next = days[1] + 1;
+    fn stored(addr: &str, unix_day: i64, queries: f64) -> QosIndexerDay {
+        QosIndexerDay {
+            indexer: addr.into(),
+            day: unix_day,
+            query_count: queries,
+            num_200: Some(queries),
+            success_rate: Some(1.0),
+            latency_ms: Some(100.0),
+            total_query_fees: queries * 0.001,
+            buckets: 288,
+            gateways: vec!["0xgw".into()],
+            ..QosIndexerDay::default()
         }
-        assert_eq!(next, today + 1, "the slices reach today");
-        assert!(
-            parts
-                .iter()
-                .all(|p| !p.sql.contains("qos_deployment_daily")),
-            "served share needs no gateway totals"
-        );
-        assert!(
-            cohort_parts(A, 0, 1_000).is_err(),
-            "a range with more slices than names is refused"
-        );
     }
 
-    struct Truncating;
+    fn alloc_day(addr: &str, unix_day: i64, queries: f64) -> QosAllocationDay {
+        QosAllocationDay {
+            indexer: addr.into(),
+            deployment: DEP.into(),
+            chain: Some("arbitrum-one".into()),
+            gateway: "0xgw".into(),
+            day: unix_day,
+            query_count: queries,
+            num_200: Some(queries),
+            latency_ms: Some(120.0),
+            blocks_behind: Some(3.0),
+            total_query_fees: 0.5,
+            buckets: 288,
+        }
+    }
 
-    impl wiremock::Respond for Truncating {
-        fn respond(&self, req: &wiremock::Request) -> wiremock::ResponseTemplate {
+    #[derive(Default)]
+    struct MemStore {
+        indexer: Vec<QosIndexerDay>,
+        allocation: Vec<QosAllocationDay>,
+    }
+
+    impl QosStore for MemStore {
+        fn indexer_days<'a>(
+            &'a self,
+            addr: &'a str,
+            from: i64,
+            to: i64,
+        ) -> BoxFuture<'a, Result<Vec<QosIndexerDay>, ApiError>> {
+            let out = self
+                .indexer
+                .iter()
+                .filter(|d| d.indexer == addr && (from..=to).contains(&d.day))
+                .cloned()
+                .collect();
+            Box::pin(async move { Ok(out) })
+        }
+        fn cohort_days<'a>(
+            &'a self,
+            _addr: &'a str,
+            from: i64,
+            to: i64,
+            _also: &'a [String],
+        ) -> BoxFuture<'a, Result<Vec<QosAllocationDay>, ApiError>> {
+            let out = self
+                .allocation
+                .iter()
+                .filter(|d| (from..=to).contains(&d.day))
+                .cloned()
+                .collect();
+            Box::pin(async move { Ok(out) })
+        }
+    }
+
+    /// A stand-in nest that answers today for indexer A, and records every statement.
+    struct Nest(Arc<Mutex<Vec<String>>>);
+
+    impl Respond for Nest {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
             if req.url.path().ends_with("/ready") {
-                return wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                return ResponseTemplate::new(200).set_body_json(json!({
                     "ready": true, "lag_blocks": 0, "tip": 1, "last_block": 1,
                     "sealed_through": 1, "stalled": false
                 }));
             }
-            wiremock::ResponseTemplate::new(200).set_body_json(json!({
+            let q = req
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "q")
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default();
+            self.0.lock().unwrap().push(q.clone());
+            let today = unix_day_date(TODAY_UNIX);
+            let rows = if q.contains("qos_freshness") {
+                json!([{"topic": "indexer", "newest_bucket_start": 1_789_171_000_i64, "last_post_time": 1_789_172_000_i64}])
+            } else if q.contains("qos_indexer_seconds_behind") && q.contains(A) {
+                json!([{"indexer": A, "seconds_behind_peers": 7.0, "share_with_block_time": 1.0}])
+            } else if q.contains("string_agg") && q.contains(A) {
+                json!([{"date": today, "gateways": "0xgw"}])
+            } else if q.contains("qos_indexer_daily") && q.contains(A) {
+                json!([{"date": today, "query_count": 500.0, "num_200": 250.0, "success_rate": 0.5, "buckets": 12, "bad_buckets": 3}])
+            } else if q.contains("qos_allocation_daily") {
+                json!([
+                    {"indexer": A, "deployment": DEP, "chain": "arbitrum-one", "gateway": "0xgw", "unix_day": TODAY_UNIX,
+                     "query_count": 100.0, "num_200": 100.0, "latency_ms": 120.0, "blocks_behind": 3.0, "total_query_fees": 0.1, "buckets": 12},
+                    {"indexer": B, "deployment": DEP, "chain": "arbitrum-one", "gateway": "0xgw", "unix_day": TODAY_UNIX,
+                     "query_count": 100.0, "num_200": 50.0, "latency_ms": 120.0, "blocks_behind": 3.0, "total_query_fees": 0.1, "buckets": 12},
+                ])
+            } else {
+                json!([])
+            };
+            ResponseTemplate::new(200).set_body_json(json!({
+                "count": rows.as_array().map(Vec::len).unwrap_or(0), "rows": rows,
+                "provenance": {"registry_hash": "r1", "sealed_through": 5000, "as_of": 5100}
+            }))
+        }
+    }
+
+    async fn ctx() -> (ReadCtx, Arc<Mutex<Vec<String>>>, MockServer) {
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("GET"))
+            .respond_with(Nest(seen.clone()))
+            .mount(&server)
+            .await;
+        let mut cfg = kittiwake_nest::NestConfig::new(server.uri());
+        for n in NestId::ALL {
+            cfg.base_paths.insert(n, format!("/{}", n.as_str()));
+        }
+        let ctx = ReadCtx::new(
+            kittiwake_nest::NestGate::new(cfg).unwrap(),
+            kittiwake_cache::Store::new(64),
+            1,
+        );
+        (ctx, seen, server)
+    }
+
+    fn every_statement_names_one_day_at_most(seen: &[String]) {
+        assert!(!seen.is_empty());
+        for q in seen {
+            let days = sql::days_named(q);
+            assert!(days.len() <= 1, "spans days: {q}");
+            assert!(
+                days.iter().all(|d| *d == TODAY_UNIX),
+                "asked the nest for a closed day: {q}"
+            );
+            assert!(
+                !q.contains("BETWEEN") && !q.contains("day >") && !q.contains("day <"),
+                "a range: {q}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_days_come_from_the_store_and_only_today_from_the_nest() {
+        let (ctx, seen, _server) = ctx().await;
+        let store = MemStore {
+            indexer: vec![
+                stored(A, TODAY_UNIX - 3, 1_000.0),
+                stored(A, TODAY_UNIX - 1, 2_000.0),
+                // A stale copy of today, which must lose to the nest's.
+                stored(A, TODAY_UNIX, 9_999.0),
+            ],
+            ..MemStore::default()
+        };
+        let read = indexer_qos(&ctx, Some(&store), A, TODAY_UNIX - 3, TODAY_UNIX)
+            .await
+            .unwrap();
+        let out = &*read.entry.value;
+        let dates: Vec<&str> = out["qos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["date"].as_str().unwrap())
+            .collect();
+        assert_eq!(dates, vec!["2026-09-09", "2026-09-11", "2026-09-12"]);
+        assert_eq!(out["qos"][0]["queryCount"], json!(1_000.0));
+        assert_eq!(
+            out["qos"][2]["queryCount"],
+            json!(500.0),
+            "today is the nest's"
+        );
+        assert_eq!(out["qos"][2]["secondsBehind"], json!(7.0));
+        assert_eq!(out["qos"][2]["gatewayIds"], json!(["0xgw"]));
+        assert_eq!(
+            out["freshness"]["publisherLastPostAt"],
+            json!(1_789_172_000_i64)
+        );
+        assert_eq!(
+            out["summary"]["days"],
+            json!(3),
+            "the day with no row is absent"
+        );
+        every_statement_names_one_day_at_most(&seen.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_day_the_store_and_the_nest_both_lack_is_absent_rather_than_zero() {
+        let (ctx, _seen, _server) = ctx().await;
+        let store = MemStore {
+            indexer: vec![stored(B, TODAY_UNIX - 2, 10.0)],
+            ..MemStore::default()
+        };
+        let out = indexer_qos(&ctx, Some(&store), B, TODAY_UNIX - 5, TODAY_UNIX)
+            .await
+            .unwrap();
+        let points = out.entry.value["qos"].as_array().unwrap().clone();
+        assert_eq!(points.len(), 1, "{points:?}");
+        assert_eq!(points[0]["date"], json!("2026-09-10"));
+    }
+
+    #[tokio::test]
+    async fn the_score_reads_stored_peers_and_todays_rows_one_day_at_a_time() {
+        let (ctx, seen, _server) = ctx().await;
+        let store = MemStore {
+            allocation: vec![
+                alloc_day(A, TODAY_UNIX - 1, 800.0),
+                alloc_day(B, TODAY_UNIX - 1, 300.0),
+            ],
+            ..MemStore::default()
+        };
+        let read = indexer_qos_score(&ctx, Some(&store), A, TODAY_UNIX)
+            .await
+            .unwrap();
+        let rows: Vec<QosDailyRow> = store.allocation.iter().map(daily_row).chain([
+            QosDailyRow::from(&allocation_daily_from(&json!({"indexer": A, "deployment": DEP, "chain": "arbitrum-one", "gateway": "0xgw", "unix_day": TODAY_UNIX, "query_count": 100.0, "num_200": 100.0, "latency_ms": 120.0, "blocks_behind": 3.0, "total_query_fees": 0.1, "buckets": 12})).unwrap()),
+            QosDailyRow::from(&allocation_daily_from(&json!({"indexer": B, "deployment": DEP, "chain": "arbitrum-one", "gateway": "0xgw", "unix_day": TODAY_UNIX, "query_count": 100.0, "num_200": 50.0, "latency_ms": 120.0, "blocks_behind": 3.0, "total_query_fees": 0.1, "buckets": 12})).unwrap()),
+        ]).collect();
+        let expected =
+            kittiwake_qos::aggregate::score_indexers(&rows, &AggregateOpts::today(TODAY))
+                .into_iter()
+                .find(|q| q.indexer == A)
+                .unwrap()
+                .quality
+                .q_score;
+        assert_eq!(read.entry.value["latest"]["q_score"], json!(expected));
+        let deployments = indexer_qos_deployments(&ctx, Some(&store), A, TODAY_UNIX)
+            .await
+            .unwrap();
+        let share = deployments.entry.value["deployments"][0]["served_share"]
+            .as_f64()
+            .unwrap();
+        assert_eq!(share, 900.0 / 1_300.0);
+        every_statement_names_one_day_at_most(&seen.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn without_a_database_the_routes_are_unavailable_and_ask_the_nest_nothing() {
+        let (ctx, seen, _server) = ctx().await;
+        for result in [
+            indexer_qos(&ctx, None, A, TODAY_UNIX - 89, TODAY_UNIX).await,
+            indexer_qos_score(&ctx, None, A, TODAY_UNIX).await,
+            indexer_qos_deployments(&ctx, None, A, TODAY_UNIX).await,
+        ] {
+            assert!(matches!(result, Err(ApiError::Unavailable(_))));
+        }
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    struct Truncating;
+
+    impl Respond for Truncating {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if req.url.path().ends_with("/ready") {
+                return ResponseTemplate::new(200).set_body_json(json!({
+                    "ready": true, "lag_blocks": 0, "tip": 1, "last_block": 1,
+                    "sealed_through": 1, "stalled": false
+                }));
+            }
+            ResponseTemplate::new(200).set_body_json(json!({
                 "count": 1, "rows": [{"date": "2026-09-07", "query_count": 1.0}], "truncated": true
             }))
         }
@@ -732,8 +1066,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_truncated_answer_is_refused_rather_than_charted() {
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
             .respond_with(Truncating)
             .mount(&server)
             .await;
@@ -746,7 +1080,8 @@ mod tests {
             kittiwake_cache::Store::new(64),
             1,
         );
-        let Err(e) = indexer_qos(&ctx, A, 20_700).await else {
+        let store = MemStore::default();
+        let Err(e) = indexer_qos(&ctx, Some(&store), A, TODAY_UNIX, TODAY_UNIX).await else {
             panic!("a truncated answer was charted");
         };
         assert!(format!("{e:?}").contains("truncated"), "{e:?}");

@@ -402,69 +402,115 @@ pub fn indexer_revenue_by_deployment_sql(addr: &str, since: i64) -> Option<Strin
 pub const DELEGATION_RATIO_SQL: &str = "SELECT delegation_ratio FROM lodestar_network_params";
 
 // ---------------------------------------------------------------------------------------------
-// The QoS nest (qos-reo-nest). `day` is a DATE there, so a clamped unix day number is added to the
-// epoch rather than a date string formatted in.
+// The QoS nest (qos-reo-nest). Every statement names exactly one day, `day = <that day>`: the nest
+// refuses eight days of these views inside its memory budget. `day` is a DATE there, so a clamped
+// unix day number is added to the epoch rather than a date string formatted in.
 // ---------------------------------------------------------------------------------------------
 
+const QOS_DAY_PREFIX: &str = "DATE '1970-01-01' + ";
+
 fn qos_day(unix_day: i64) -> String {
-    format!("DATE '1970-01-01' + {}", unix_day.max(0))
+    format!("{QOS_DAY_PREFIX}{}", unix_day.max(0))
+}
+
+/// The distinct unix days a QoS statement names, so a test can hold every statement to one.
+pub fn days_named(sql: &str) -> Vec<i64> {
+    let days: std::collections::BTreeSet<i64> = sql
+        .split(QOS_DAY_PREFIX)
+        .skip(1)
+        .filter_map(|rest| {
+            rest.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
+        .collect();
+    days.into_iter().collect()
 }
 
 const QOS_ROW_COLUMNS: &str = "indexer, deployment, chain, gateway, \
      datediff('day', DATE '1970-01-01', day) AS unix_day, query_count, num_200, latency_ms, \
      blocks_behind, total_query_fees, buckets";
 
-/// One indexer's `qos_indexer_daily` from `since_day`, oldest first, with seconds behind its peers.
-pub fn qos_indexer_daily_sql(addr: &str, since_day: i64) -> Option<String> {
+const QOS_INDEXER_DAY_COLUMNS: &str = "indexer, CAST(day AS VARCHAR) AS date, query_count, num_200, \
+     success_rate, latency_ms, blocks_behind, total_query_fees, avg_query_fee, allocations, buckets, \
+     bad_buckets, worst_bucket_start, worst_bucket_success_rate, worst_bucket_queries";
+
+const QOS_BEHIND_COLUMNS: &str =
+    "indexer, seconds_behind_peers, share_queries_over_5min_behind, share_with_block_time";
+
+/// A statement that names no day, for the nest's provenance alone.
+pub const QOS_PROVENANCE_SQL: &str = "SELECT count(*) AS publishers FROM qos_publisher";
+
+/// Per topic, the newest bucket the nest holds and, separately, when the publisher last posted.
+pub const QOS_FRESHNESS_SQL: &str = "SELECT topic, newest_bucket_start, buckets, last_post_block, \
+     last_post_time FROM qos_freshness";
+
+/// What the job compares for a stored day: buckets held per topic and the highest block holding
+/// any of the day's documents.
+pub fn qos_day_probe_sql(unix_day: i64) -> String {
+    let d = qos_day(unix_day);
+    format!(
+        "SELECT (SELECT count(DISTINCT bucket_start) FROM qos_indexer_attempt WHERE day = {d}) AS indexer_buckets, \
+         (SELECT count(DISTINCT bucket_start) FROM qos_query_result WHERE day = {d}) AS query_buckets, \
+         (SELECT max(block_number) FROM (SELECT block_number FROM qos_indexer_attempt WHERE day = {d} \
+         UNION ALL SELECT block_number FROM qos_query_result WHERE day = {d})) AS closing_block"
+    )
+}
+
+/// Every indexer's `qos_indexer_daily` for one day.
+pub fn qos_indexer_day_sql(unix_day: i64) -> String {
+    format!(
+        "SELECT {QOS_INDEXER_DAY_COLUMNS} FROM qos_indexer_daily WHERE day = {}",
+        qos_day(unix_day)
+    )
+}
+
+/// Every indexer's seconds behind its peers for one day. Asked apart from the daily figures because
+/// the two joined are the statement the nest ran out of memory on.
+pub fn qos_seconds_behind_day_sql(unix_day: i64) -> String {
+    format!(
+        "SELECT {QOS_BEHIND_COLUMNS} FROM qos_indexer_seconds_behind WHERE day = {}",
+        qos_day(unix_day)
+    )
+}
+
+/// One indexer's `qos_indexer_daily` for one day.
+pub fn qos_indexer_daily_sql(addr: &str, unix_day: i64) -> Option<String> {
     if !is_address(addr) {
         return None;
     }
     Some(format!(
-        "SELECT CAST(d.day AS VARCHAR) AS date, d.query_count, d.num_200, d.success_rate, d.latency_ms, \
-         d.blocks_behind, d.total_query_fees, d.avg_query_fee, d.allocations, d.buckets, d.bad_buckets, \
-         d.worst_bucket_start, d.worst_bucket_success_rate, d.worst_bucket_queries, \
-         s.seconds_behind_peers, s.share_queries_over_5min_behind, s.share_with_block_time \
-         FROM qos_indexer_daily d \
-         LEFT JOIN qos_indexer_seconds_behind s ON s.indexer = d.indexer AND s.day = d.day \
-         WHERE d.indexer = '{addr}' AND d.day >= {} ORDER BY d.day",
-        qos_day(since_day)
+        "SELECT {QOS_INDEXER_DAY_COLUMNS} FROM qos_indexer_daily WHERE indexer = '{addr}' AND day = {}",
+        qos_day(unix_day)
     ))
 }
 
-/// The gateways that measured one indexer, per day.
-pub fn qos_indexer_gateways_sql(addr: &str, since_day: i64) -> Option<String> {
+/// One indexer's seconds behind its peers for one day.
+pub fn qos_indexer_seconds_behind_sql(addr: &str, unix_day: i64) -> Option<String> {
+    if !is_address(addr) {
+        return None;
+    }
+    Some(format!(
+        "SELECT {QOS_BEHIND_COLUMNS} FROM qos_indexer_seconds_behind WHERE indexer = '{addr}' AND day = {}",
+        qos_day(unix_day)
+    ))
+}
+
+/// The gateways that measured one indexer on one day.
+pub fn qos_indexer_gateways_sql(addr: &str, unix_day: i64) -> Option<String> {
     if !is_address(addr) {
         return None;
     }
     Some(format!(
         "SELECT CAST(day AS VARCHAR) AS date, string_agg(DISTINCT gateway, ',' ORDER BY gateway) AS gateways \
-         FROM qos_allocation_daily WHERE indexer = '{addr}' AND day >= {} GROUP BY day",
-        qos_day(since_day)
+         FROM qos_allocation_daily WHERE indexer = '{addr}' AND day = {} GROUP BY day",
+        qos_day(unix_day)
     ))
 }
 
-/// When the publisher last posted to Gnosis. The table is named by the nest's `data_edge` alias and
-/// the `submitQoSPayload` function, so it moves only if the nest's config does.
-pub const QOS_FRESHNESS_SQL: &str =
-    "SELECT MAX(block_timestamp) AS last_post_at FROM data_edge__call_submit_qo_s_payload";
-
-/// Every indexer's rows from `start` to `end` inclusive, on the deployments `addr` served at any
-/// point since `from`: the cohort figures are meaningless without the peers.
-pub fn qos_cohort_rows_sql(addr: &str, from: i64, start: i64, end: i64) -> Option<String> {
-    if !is_address(addr) {
-        return None;
-    }
-    Some(format!(
-        "SELECT {QOS_ROW_COLUMNS} FROM qos_allocation_daily WHERE day >= {} AND day <= {} \
-         AND deployment IN (SELECT DISTINCT deployment FROM qos_allocation_daily \
-         WHERE indexer = '{addr}' AND day >= {})",
-        qos_day(start),
-        qos_day(end),
-        qos_day(from)
-    ))
-}
-
-/// Every indexer's rows for one day, for scoring the whole directory.
+/// Every indexer's rows for one day.
 pub fn qos_network_rows_sql(unix_day: i64) -> String {
     format!(
         "SELECT {QOS_ROW_COLUMNS} FROM qos_allocation_daily WHERE day = {}",
@@ -990,8 +1036,8 @@ mod tests {
         assert!(indexer_revenue_daily_sql(bad, 0).is_none());
         assert!(indexer_revenue_by_deployment_sql(bad, 0).is_none());
         assert!(qos_indexer_daily_sql(bad, 0).is_none());
+        assert!(qos_indexer_seconds_behind_sql(bad, 0).is_none());
         assert!(qos_indexer_gateways_sql(bad, 0).is_none());
-        assert!(qos_cohort_rows_sql(bad, 0, 0, 1).is_none());
         assert!(indexer_allocation_shares_sql(bad).is_none());
         assert!(provisions_by_indexer_sql(bad).is_none());
         assert!(provisions_by_service_sql(bad, 10, 0).is_none());

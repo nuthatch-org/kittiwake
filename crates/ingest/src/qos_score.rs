@@ -1,12 +1,12 @@
-//! The directory's QoS Quality score: every indexer scored over thirty days of qos-reo-nest, once
-//! an hour, rather than folded on every directory load.
+//! The directory's QoS Quality score: every indexer scored over thirty days of stored QoS days, once
+//! an hour, rather than folded on every directory load. `ingest-qos-days` keeps those days, today
+//! included, so this asks the QoS nest nothing.
 
 use kittiwake_db::{Pool, QosQualityRow};
 use kittiwake_nest::{Lane, NestGate};
-use kittiwake_qos::aggregate::QosDailyRow;
 use kittiwake_qos::nest::GRAPH_EPOCH_DAYS;
 use kittiwake_read::qos::{
-    Cohort, SCORE_WINDOW_DAYS, allocation_daily_from, allocation_row_from, score_network,
+    Cohort, SCORE_WINDOW_DAYS, allocation_row_from, daily_row, score_network,
 };
 use kittiwake_read::sql;
 use kittiwake_types::NestId;
@@ -21,26 +21,14 @@ pub async fn score_qos(
 ) -> Result<Ingested, IngestError> {
     let today = now.div_euclid(86_400);
     let from = today - SCORE_WINDOW_DAYS;
-    let mut cohort = Cohort::default();
-
-    // One day per statement: a day of every indexer's allocations is a few thousand rows.
-    for day in from..=today {
-        let answer = page(
-            gate,
-            NestId::Qos,
-            sql::qos_network_rows_sql(day),
-            lane,
-            "QoS rows",
-        )
-        .await?;
-        cohort.rows.extend(
-            answer
-                .rows
-                .iter()
-                .filter_map(allocation_daily_from)
-                .map(|r| QosDailyRow::from(&r)),
-        );
-    }
+    let mut cohort = Cohort {
+        rows: kittiwake_db::qos_network_days(pool, from, today)
+            .await?
+            .iter()
+            .map(daily_row)
+            .collect(),
+        ..Cohort::default()
+    };
     let answer = page(
         gate,
         NestId::Alloc,

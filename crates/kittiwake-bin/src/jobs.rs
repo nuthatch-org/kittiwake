@@ -214,6 +214,35 @@ pub fn ingest_jobs(
         ));
     }
 
+    // The QoS days the routes and the score read. Every half hour, because today is recomputed on
+    // every run and the oracle posts every five minutes; closed days are computed only when missing
+    // or changed.
+    {
+        let pool = pool.clone();
+        jobs.push(
+            JobDef::every(
+                "ingest-qos-days",
+                mins(30),
+                Arc::new(move |ctx| {
+                    let pool = pool.clone();
+                    Box::pin(async move {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        kittiwake_ingest::qos_days::fill_qos_days(&pool, &ctx.gate, ctx.lane, now)
+                            .await
+                            .map(|i| JobOutcome {
+                                rows_written: i.rows,
+                            })
+                            .map_err(|e| e.to_string())
+                    })
+                }),
+            )
+            .staggered(mins(11)),
+        );
+    }
+
     // Hourly: the oracle's documents resolve half an hour behind the chain, and a thirty-day score
     // moves by a day's weight at most.
     {
@@ -447,6 +476,7 @@ mod tests {
             ("ingest-rav", 60, 28),
             ("ingest-disputes", 60, 48),
             ("score-qos", 60, 38),
+            ("ingest-qos-days", 30, 11),
             ("refresh", 5, 0),
             ("snapshot-network", 5, 2),
             ("warm-ipfs", 10, 4),
@@ -485,6 +515,7 @@ mod tests {
             ("ingest-rav", mins(60), mins(28)),
             ("ingest-disputes", mins(360), mins(48)),
             ("score-qos", mins(60), mins(38)),
+            ("ingest-qos-days", mins(30), mins(11)),
             ("refresh", mins(5), Duration::ZERO),
             ("snapshot-network", mins(5), mins(2)),
             ("warm", mins(1), Duration::ZERO),
