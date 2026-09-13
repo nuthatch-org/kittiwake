@@ -6,16 +6,12 @@ use kittiwake_nest::{Lane, NestGate};
 use kittiwake_qos::aggregate::QosDailyRow;
 use kittiwake_qos::nest::GRAPH_EPOCH_DAYS;
 use kittiwake_read::qos::{
-    Cohort, SCORE_WINDOW_DAYS, allocation_daily_from, allocation_row_from, deployment_daily_from,
-    score_network,
+    Cohort, SCORE_WINDOW_DAYS, allocation_daily_from, allocation_row_from, score_network,
 };
 use kittiwake_read::sql;
 use kittiwake_types::NestId;
 
 use crate::{IngestError, Ingested, page};
-
-/// Days per totals statement. About 1,200 deployments a day, so ten days stays inside the row cap.
-const TOTALS_DAYS_PER_PAGE: i64 = 10;
 
 pub async fn score_qos(
     pool: &Pool,
@@ -44,22 +40,6 @@ pub async fn score_qos(
                 .filter_map(allocation_daily_from)
                 .map(|r| QosDailyRow::from(&r)),
         );
-    }
-    let mut start = from;
-    while start <= today {
-        let end = (start + TOTALS_DAYS_PER_PAGE - 1).min(today);
-        let answer = page(
-            gate,
-            NestId::Qos,
-            sql::qos_network_totals_sql(start, end),
-            lane,
-            "QoS deployment totals",
-        )
-        .await?;
-        cohort
-            .totals
-            .extend(answer.rows.iter().filter_map(deployment_daily_from));
-        start = end + 1;
     }
     let answer = page(
         gate,

@@ -1,9 +1,10 @@
 //! Edge & Node's gateway QoS per indexer, and the QoS Quality score computed over it.
 //!
 //! Read from qos-reo-nest, which indexes the oracle's own postings on Gnosis. Only its daily views
-//! are read - `qos_indexer_daily`, `qos_allocation_daily`, `qos_deployment_daily` and the
-//! seconds-behind view - because those names and columns are the contract; the documents and
-//! five-minute rows beneath them are the nest's to reshape.
+//! are read - `qos_indexer_daily`, `qos_allocation_daily` and the seconds-behind view - because
+//! those names and columns are the contract; the documents and five-minute rows beneath them are the
+//! nest's to reshape. `qos_deployment_daily` has no reader: served share is attempts over every
+//! indexer's attempts, not over the gateway's query count.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,12 +12,10 @@ use std::time::Duration;
 
 use kittiwake_cache::CachePolicy;
 use kittiwake_qos::aggregate::{
-    AggregateOpts, AllocationRow, DeploymentTotalRow, Phase2Metric, QosDailyRow,
-    aggregate_indexer_metrics, compute_phase2_metrics,
+    AggregateOpts, AllocationRow, Phase2Metric, QosDailyRow, aggregate_indexer_metrics,
+    compute_phase2_metrics,
 };
-use kittiwake_qos::nest::{
-    AllocationDaily, DeploymentDaily, GRAPH_EPOCH_DAYS, day_number, deployment_totals,
-};
+use kittiwake_qos::nest::{AllocationDaily, GRAPH_EPOCH_DAYS};
 use kittiwake_qos::score::{
     DeploymentContribution, QualityDetail, QualityOpts, compute_quality_detail, qos_grade,
 };
@@ -33,7 +32,7 @@ pub const SCORE_WINDOW_DAYS: i64 = 30;
 pub const SCORE_HISTORY_DAYS: i64 = 30;
 
 /// Days per cohort statement. The nest caps an answer at 50,000 rows; on 2026-09-07 the peers on
-/// Ellipfra's 1,377 deployments were 4,389 rows and their gateway totals 2,550, so five days fits.
+/// Ellipfra's 1,377 deployments were 4,389 rows, so five days fits.
 pub const DAYS_PER_SLICE: i64 = 5;
 
 /// The oracle posts every five minutes and its documents resolve about half an hour later, so a
@@ -46,21 +45,6 @@ const TIMEOUT: Duration = Duration::from_secs(45);
 const ROW_SLICES: [&str; 13] = [
     "rows_0", "rows_1", "rows_2", "rows_3", "rows_4", "rows_5", "rows_6", "rows_7", "rows_8",
     "rows_9", "rows_10", "rows_11", "rows_12",
-];
-const TOTAL_SLICES: [&str; 13] = [
-    "totals_0",
-    "totals_1",
-    "totals_2",
-    "totals_3",
-    "totals_4",
-    "totals_5",
-    "totals_6",
-    "totals_7",
-    "totals_8",
-    "totals_9",
-    "totals_10",
-    "totals_11",
-    "totals_12",
 ];
 
 fn f(v: &Value, key: &str) -> Option<f64> {
@@ -271,12 +255,11 @@ pub fn qos_answer(v: &Value) -> Value {
 // ---------------------------------------------------------------------------------------------
 
 /// For one indexer from `from_day` to `to_day` (unix day numbers): every indexer's rows on the
-/// deployments it served and those deployments' gateway totals, sliced, and the open allocations on
-/// its deployments.
+/// deployments it served, sliced, and the open allocations on its deployments.
 fn cohort_parts(addr: &str, from_day: i64, to_day: i64) -> Result<Vec<Part>, ApiError> {
     let mut parts = Vec::new();
     let mut start = from_day;
-    for (rows, totals) in ROW_SLICES.into_iter().zip(TOTAL_SLICES) {
+    for rows in ROW_SLICES {
         if start > to_day {
             break;
         }
@@ -285,11 +268,6 @@ fn cohort_parts(addr: &str, from_day: i64, to_day: i64) -> Result<Vec<Part>, Api
             rows,
             NestId::Qos,
             sql::qos_cohort_rows_sql(addr, from_day, start, end).ok_or_else(bad_address)?,
-        ));
-        parts.push(Part::rows(
-            totals,
-            NestId::Qos,
-            sql::qos_cohort_totals_sql(addr, from_day, start, end).ok_or_else(bad_address)?,
         ));
         start = end + 1;
     }
@@ -327,21 +305,6 @@ pub fn allocation_daily_from(r: &Value) -> Option<AllocationDaily> {
     })
 }
 
-/// A `qos_deployment_daily` row as the nest answered it.
-pub fn deployment_daily_from(r: &Value) -> Option<DeploymentDaily> {
-    Some(DeploymentDaily {
-        deployment: r.get("deployment")?.as_str()?.to_string(),
-        chain: r.get("chain").and_then(Value::as_str).map(str::to_string),
-        gateway_id: r
-            .get("gateway")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        day_start: shape::i(r, "unix_day").as_i64()? * 86_400,
-        query_count: f(r, "query_count").unwrap_or(0.0),
-    })
-}
-
 /// An open stake total, with the deployment re-spelt as the CID the oracle uses: the allocations
 /// nest carries the bytes32 id, the oracle `Qm…`, and a mismatch would zero every allocation share.
 pub fn allocation_row_from(r: &Value) -> Option<AllocationRow> {
@@ -356,7 +319,6 @@ pub fn allocation_row_from(r: &Value) -> Option<AllocationRow> {
 #[derive(Debug, Default, Clone)]
 pub struct Cohort {
     pub rows: Vec<QosDailyRow>,
-    pub totals: Vec<DeploymentDaily>,
     pub allocations: Vec<AllocationRow>,
 }
 
@@ -376,10 +338,6 @@ impl Cohort {
                 .filter_map(allocation_daily_from)
                 .map(|r| QosDailyRow::from(&r))
                 .collect(),
-            totals: rows_of(&TOTAL_SLICES)
-                .iter()
-                .filter_map(deployment_daily_from)
-                .collect(),
             allocations: rows_of(&["allocations"])
                 .iter()
                 .filter_map(allocation_row_from)
@@ -389,28 +347,19 @@ impl Cohort {
 
     /// The window that ends on `day` (a Graph day number), as the incumbent's cron scored that day:
     /// from thirty days before through the day itself.
-    fn window(&self, day: i64) -> (Vec<QosDailyRow>, Vec<DeploymentTotalRow>) {
+    fn window(&self, day: i64) -> Vec<QosDailyRow> {
         let since = day - SCORE_WINDOW_DAYS;
-        let rows = self
-            .rows
+        self.rows
             .iter()
             .filter(|r| r.day_number >= since && r.day_number <= day)
             .cloned()
-            .collect();
-        let totals: Vec<DeploymentDaily> = self
-            .totals
-            .iter()
-            .filter(|t| (since..=day).contains(&day_number(t.day_start)))
-            .cloned()
-            .collect();
-        (rows, deployment_totals(&totals))
+            .collect()
     }
 
     /// One indexer's score on one day, or `None` when the oracle measured it on nothing in the
     /// window.
     pub fn score(&self, addr: &str, day: i64) -> Option<QualityDetail> {
-        let (rows, totals) = self.window(day);
-        let mine = aggregate_indexer_metrics(&rows, &totals, &AggregateOpts::today(day))
+        let mine = aggregate_indexer_metrics(&self.window(day), &AggregateOpts::today(day))
             .into_iter()
             .find(|(ix, _)| ix == addr)?
             .1;
@@ -420,8 +369,7 @@ impl Cohort {
     /// Served gap and efficiency on `day` against the allocations open now, which is also what the
     /// incumbent's cron had: the allocations open when it ran.
     pub fn phase2(&self, addr: &str, day: i64) -> Option<Phase2Metric> {
-        let (rows, totals) = self.window(day);
-        compute_phase2_metrics(&self.allocations, &rows, &totals)
+        compute_phase2_metrics(&self.allocations, &self.window(day))
             .into_iter()
             .find(|(ix, _)| ix == addr)
             .map(|(_, m)| m)
@@ -506,8 +454,8 @@ fn drag(d: &DeploymentContribution) -> f64 {
 /// Heaviest drag first: weight times how far short of a perfect deployment it fell, the order an
 /// operator fixes things in.
 ///
-/// Served share is real here. The incumbent's route passed no deployment totals, so every share it
-/// published was zero; weight has been queries served since 2026-08-15, so the score is unchanged.
+/// The incumbent's route passed no deployment totals, so every served share it published was zero.
+/// Weight has been queries served since 2026-08-15, so the score does not depend on the share.
 pub fn deployments_answer(cohort: &Cohort, addr: &str, today: i64) -> Value {
     let Some(detail) = cohort.score(addr, today) else {
         return json!({"window_days": SCORE_WINDOW_DAYS, "deployments": [], "total": null});
@@ -550,12 +498,11 @@ pub fn score_network(
     cohort: &Cohort,
     today: i64,
 ) -> Vec<(String, QualityDetail, Option<Phase2Metric>)> {
-    let (rows, totals) = cohort.window(today);
-    let phase2: HashMap<String, Phase2Metric> =
-        compute_phase2_metrics(&cohort.allocations, &rows, &totals)
-            .into_iter()
-            .collect();
-    aggregate_indexer_metrics(&rows, &totals, &AggregateOpts::today(today))
+    let rows = cohort.window(today);
+    let phase2: HashMap<String, Phase2Metric> = compute_phase2_metrics(&cohort.allocations, &rows)
+        .into_iter()
+        .collect();
+    aggregate_indexer_metrics(&rows, &AggregateOpts::today(today))
         .into_iter()
         .map(|(ix, metrics)| {
             let detail = compute_quality_detail(&metrics, &QualityOpts::default());
@@ -667,13 +614,12 @@ mod tests {
         })
     }
 
-    /// Two indexers attempted 1,100 queries on a deployment where the gateway answered 1,000.
-    fn retried() -> Cohort {
+    /// Two indexers attempted 1,100 queries on a deployment where the gateway answered 1,000, because
+    /// it hedged 100 across both. Against the gateway's count their shares summed to 1.1.
+    fn hedged() -> Cohort {
         let hex = shape::ipfs_hash_to_bytes32(DEP).unwrap();
         Cohort::from_answer(&json!({
             "rows_0": [row(A, unix(TODAY), 800.0, 700.0), row(B, unix(TODAY), 300.0, 300.0)],
-            "totals_0": [{"deployment": DEP, "chain": "arbitrum-one", "gateway": "0xgw",
-                          "unix_day": unix(TODAY), "query_count": 1000.0}],
             "allocations": [
                 {"indexer": A, "subgraph_deployment": hex, "allocated_tokens": "1000000000000000000000"},
                 {"indexer": B, "subgraph_deployment": hex, "allocated_tokens": "3000000000000000000000"},
@@ -682,23 +628,26 @@ mod tests {
     }
 
     #[test]
-    fn served_share_and_the_served_gap_are_against_the_gateway_total() {
-        let c = retried();
-        let out = deployments_answer(&c, A, TODAY);
-        assert_eq!(out["deployments"][0]["served_share"], json!(0.8));
-        // An allocation share of 1,000 in 4,000 against a served share of 0.8.
+    fn served_share_is_against_every_indexers_attempts_and_the_gap_follows() {
+        let c = hedged();
+        let share = |ix: &str| {
+            deployments_answer(&c, ix, TODAY)["deployments"][0]["served_share"]
+                .as_f64()
+                .unwrap()
+        };
+        assert_eq!(share(A), 800.0 / 1_100.0);
+        assert_eq!(share(B), 300.0 / 1_100.0);
+        assert!((share(A) + share(B) - 1.0).abs() < 1e-12);
+        // An allocation share of 1,000 in 4,000 against a served share of 8 in 11.
         let gap = c.phase2(A, TODAY).unwrap().served_gap;
-        assert!((gap - (0.25 - 0.8)).abs() < 1e-12, "{gap}");
+        assert!((gap - (0.25 - 800.0 / 1_100.0)).abs() < 1e-12, "{gap}");
     }
 
     #[test]
     fn the_route_scores_exactly_as_the_ported_scorer_does() {
-        let c = retried();
-        let direct = kittiwake_qos::aggregate::score_indexers(
-            &c.rows,
-            &deployment_totals(&c.totals),
-            &AggregateOpts::today(TODAY),
-        );
+        let c = hedged();
+        let direct =
+            kittiwake_qos::aggregate::score_indexers(&c.rows, &AggregateOpts::today(TODAY));
         let expected = direct
             .iter()
             .find(|q| q.indexer == A)
@@ -735,26 +684,30 @@ mod tests {
         let today = 20_708;
         let from = today - SCORE_WINDOW_DAYS - (SCORE_HISTORY_DAYS - 1);
         let parts = cohort_parts(A, from, today).unwrap();
-        for prefix in ["rows_", "totals_"] {
-            let mut next = from;
-            for p in parts.iter().filter(|p| p.name.starts_with(prefix)) {
-                let days: Vec<i64> = p
-                    .sql
-                    .split("DATE '1970-01-01' + ")
-                    .skip(1)
-                    .map(|s| {
-                        s.split(|c: char| !c.is_ascii_digit())
-                            .next()
-                            .unwrap()
-                            .parse()
-                            .unwrap()
-                    })
-                    .collect();
-                assert_eq!(days[0], next, "{prefix} slice starts where the last ended");
-                next = days[1] + 1;
-            }
-            assert_eq!(next, today + 1, "{prefix} slices reach today");
+        let mut next = from;
+        for p in parts.iter().filter(|p| p.name.starts_with("rows_")) {
+            let days: Vec<i64> = p
+                .sql
+                .split("DATE '1970-01-01' + ")
+                .skip(1)
+                .map(|s| {
+                    s.split(|c: char| !c.is_ascii_digit())
+                        .next()
+                        .unwrap()
+                        .parse()
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(days[0], next, "a slice starts where the last ended");
+            next = days[1] + 1;
         }
+        assert_eq!(next, today + 1, "the slices reach today");
+        assert!(
+            parts
+                .iter()
+                .all(|p| !p.sql.contains("qos_deployment_daily")),
+            "served share needs no gateway totals"
+        );
         assert!(
             cohort_parts(A, 0, 1_000).is_err(),
             "a range with more slices than names is refused"

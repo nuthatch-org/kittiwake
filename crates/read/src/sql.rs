@@ -464,38 +464,11 @@ pub fn qos_cohort_rows_sql(addr: &str, from: i64, start: i64, end: i64) -> Optio
     ))
 }
 
-/// Those deployments' gateway query counts per day, `start` to `end` inclusive: the served-share
-/// denominator.
-pub fn qos_cohort_totals_sql(addr: &str, from: i64, start: i64, end: i64) -> Option<String> {
-    if !is_address(addr) {
-        return None;
-    }
-    Some(format!(
-        "SELECT deployment, chain, gateway, datediff('day', DATE '1970-01-01', day) AS unix_day, query_count \
-         FROM qos_deployment_daily WHERE day >= {} AND day <= {} \
-         AND deployment IN (SELECT DISTINCT deployment FROM qos_allocation_daily \
-         WHERE indexer = '{addr}' AND day >= {})",
-        qos_day(start),
-        qos_day(end),
-        qos_day(from)
-    ))
-}
-
 /// Every indexer's rows for one day, for scoring the whole directory.
 pub fn qos_network_rows_sql(unix_day: i64) -> String {
     format!(
         "SELECT {QOS_ROW_COLUMNS} FROM qos_allocation_daily WHERE day = {}",
         qos_day(unix_day)
-    )
-}
-
-/// Every deployment's gateway query counts from `start` to `end` inclusive.
-pub fn qos_network_totals_sql(start: i64, end: i64) -> String {
-    format!(
-        "SELECT deployment, chain, gateway, datediff('day', DATE '1970-01-01', day) AS unix_day, query_count \
-         FROM qos_deployment_daily WHERE day >= {} AND day <= {}",
-        qos_day(start),
-        qos_day(end)
     )
 }
 
@@ -1019,7 +992,6 @@ mod tests {
         assert!(qos_indexer_daily_sql(bad, 0).is_none());
         assert!(qos_indexer_gateways_sql(bad, 0).is_none());
         assert!(qos_cohort_rows_sql(bad, 0, 0, 1).is_none());
-        assert!(qos_cohort_totals_sql(bad, 0, 0, 1).is_none());
         assert!(indexer_allocation_shares_sql(bad).is_none());
         assert!(provisions_by_indexer_sql(bad).is_none());
         assert!(provisions_by_service_sql(bad, 10, 0).is_none());
