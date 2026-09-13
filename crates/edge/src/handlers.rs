@@ -2068,29 +2068,18 @@ async fn read_revenue(
     address: &str,
     window_days: u32,
     by_deployment: bool,
-) -> Result<kittiwake_rewards::pnl::IndexerRevenue, ErrorResponse> {
-    let days = window_days as i32;
-    let (rav, rewards) = kittiwake_db::revenue_daily(pool(st)?, address, days)
-        .await
-        .map_err(|e| ApiError::Unavailable(e.to_string()))?;
-    let daily = kittiwake_rewards::pnl::merge_daily(&rav, &rewards);
-    let by_deployment = if by_deployment {
-        let (rav, rewards) = kittiwake_db::revenue_by_deployment(pool(st)?, address, days)
-            .await
-            .map_err(|e| ApiError::Unavailable(e.to_string()))?;
-        Some(kittiwake_rewards::pnl::merge_by_deployment(&rav, &rewards))
-    } else {
-        None
-    };
-    Ok(kittiwake_rewards::pnl::IndexerRevenue {
-        indexer: address.to_string(),
-        window_days,
-        rav_grt: rav.iter().map(|(_, grt)| grt).sum(),
-        indexing_rewards_grt: rewards.iter().map(|(_, grt)| grt).sum(),
-        total_grt: daily.iter().map(|d| d.total_grt).sum(),
-        daily,
-        by_deployment,
-    })
+) -> Result<
+    (
+        kittiwake_rewards::pnl::IndexerRevenue,
+        kittiwake_types::Meta,
+    ),
+    ErrorResponse,
+> {
+    let since = kittiwake_rewards::pnl::window_start(now(), window_days);
+    let read = routes::indexer_revenue(&st.read, address, since, by_deployment).await?;
+    let revenue =
+        kittiwake_rewards::pnl::revenue_from_nest(address, window_days, &read.entry.value);
+    Ok((revenue, read.meta))
 }
 
 pub async fn indexer_revenue(
@@ -2110,7 +2099,12 @@ pub async fn indexer_revenue(
         q.by_deployment.as_deref() == Some("1"),
     )
     .await?;
-    Ok(axum::Json(serde_json::json!({ "data": data })).into_response())
+    let (data, meta) = data;
+    let mut resp =
+        axum::Json(serde_json::json!({ "data": data, "provenance": &meta })).into_response();
+    crate::provenance_headers(resp.headers_mut(), &meta);
+    crate::no_store(resp.headers_mut());
+    Ok(resp)
 }
 
 /// The cost side is request input and is never stored.
@@ -2136,16 +2130,18 @@ pub async fn indexer_pnl(
         .and_then(|p| p.parse::<f64>().ok())
         .filter(|p| p.is_finite() && *p >= 0.0);
 
-    let revenue = read_revenue(&st, &address, window, true).await?;
+    let (revenue, meta) = read_revenue(&st, &address, window, true).await?;
     let pnl = kittiwake_rewards::pnl::compute_pnl(&revenue, &cost, grt_price, window);
     let mut response = axum::Json(serde_json::json!({
         "data": {
             "pnl": pnl,
             "costModel": cost,
             "defaultChainCosts": kittiwake_rewards::pnl::default_chain_costs_map(),
-        }
+        },
+        "provenance": &meta,
     }))
     .into_response();
+    crate::provenance_headers(response.headers_mut(), &meta);
     crate::no_store(response.headers_mut());
     Ok(response)
 }

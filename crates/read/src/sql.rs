@@ -366,6 +366,39 @@ pub fn indexer_daily_sql(addr: &str, since: i64) -> Option<String> {
     ))
 }
 
+/// An indexer's earnings per UTC day from `since` (a day start), oldest first: what it received and
+/// what was collected, for rewards and query fees alike. Dated by the event that paid, which is the
+/// view's whole reason to exist; nothing here may reach for an allocation's close.
+pub fn indexer_revenue_daily_sql(addr: &str, since: i64) -> Option<String> {
+    if !is_address(addr) {
+        return None;
+    }
+    let since = since.max(0);
+    Some(format!(
+        "SELECT day_start, CAST(indexer_rewards AS VARCHAR) AS indexer_rewards, \
+         CAST(total_rewards AS VARCHAR) AS total_rewards, CAST(fees_net AS VARCHAR) AS fees_net, \
+         CAST(fees_gross AS VARCHAR) AS fees_gross \
+         FROM lodestar_indexer_daily WHERE indexer = '{addr}' AND day_start >= {since} \
+         AND (reward_count > 0 OR fee_count > 0) ORDER BY day_start"
+    ))
+}
+
+/// The same earnings per deployment over the same days, from the view the daily figures are the
+/// sum of, so the table and the chart cannot disagree.
+pub fn indexer_revenue_by_deployment_sql(addr: &str, since: i64) -> Option<String> {
+    if !is_address(addr) {
+        return None;
+    }
+    let since = since.max(0);
+    Some(format!(
+        "SELECT deployment, CAST(SUM(indexer_rewards) AS VARCHAR) AS indexer_rewards, \
+         CAST(SUM(total_rewards) AS VARCHAR) AS total_rewards, CAST(SUM(fees_net) AS VARCHAR) AS fees_net, \
+         CAST(SUM(fees_gross) AS VARCHAR) AS fees_gross \
+         FROM lodestar_indexer_deployment_daily WHERE indexer = '{addr}' AND day_start >= {since} \
+         GROUP BY deployment"
+    ))
+}
+
 pub const DELEGATION_RATIO_SQL: &str = "SELECT delegation_ratio FROM lodestar_network_params";
 
 // ---------------------------------------------------------------------------------------------
@@ -865,6 +898,8 @@ mod tests {
         assert!(indexer_closed_allocations_sql(bad, 10).is_none());
         assert!(indexer_stake_history_sql(bad, &[1, 2]).is_none());
         assert!(indexer_daily_sql(bad, 0).is_none());
+        assert!(indexer_revenue_daily_sql(bad, 0).is_none());
+        assert!(indexer_revenue_by_deployment_sql(bad, 0).is_none());
         assert!(provisions_by_indexer_sql(bad).is_none());
         assert!(provisions_by_service_sql(bad, 10, 0).is_none());
         assert!(data_service_totals_sql(&[bad.to_string()]).is_none());
@@ -962,6 +997,20 @@ mod tests {
         assert!(sql.contains(&format!("indexer = '{addr}'")));
         assert!(sql.contains("day_start >= 0 "));
         assert!(sql.contains("ORDER BY day_start DESC"));
+    }
+
+    #[test]
+    fn revenue_is_read_by_the_day_it_was_paid_and_never_by_allocation_close() {
+        let addr = "0xf92f430dd8567b0d466358c79594ab58d919a6d4";
+        let daily = indexer_revenue_daily_sql(addr, 1_786_406_400).unwrap();
+        let by = indexer_revenue_by_deployment_sql(addr, 1_786_406_400).unwrap();
+        assert!(daily.contains("FROM lodestar_indexer_daily "));
+        assert!(by.contains("FROM lodestar_indexer_deployment_daily "));
+        for sql in [&daily, &by] {
+            assert!(sql.contains("day_start >= 1786406400"));
+            assert!(!sql.contains("closed_at"), "{sql}");
+            assert!(sql.contains("fees_net") && sql.contains("indexer_rewards"));
+        }
     }
 
     #[test]
