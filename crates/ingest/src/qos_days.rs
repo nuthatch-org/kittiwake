@@ -10,14 +10,15 @@
 //! - **missing**, a day in the window with no stored state;
 //! - **registry changed**, the nest's `registry_hash` or `nid` differs from the stored one, so the views
 //!   or decoders that produced the day are not the ones serving now;
-//! - **documents changed**, a one-day probe finds a different bucket count per topic or a different
-//!   highest block holding the day's documents: a late document resolved, or a reorg moved or dropped a
-//!   posting;
-//! - **sealed**, the day's highest block was past the nest's `sealed_through` when it was computed and
+//! - **documents changed**, a one-day probe finds a different stored bucket count per topic or a
+//!   different closing block: a late document resolved, or a reorg moved or dropped a posting;
+//! - **sealed**, the day's closing block was past the nest's `sealed_through` when it was computed and
 //!   is covered now, so this is the last answer a reorg could have changed.
 //!
-//! A day whose highest block was sealed when computed, and that ended more than [`SETTLE_AFTER_DAYS`]
-//! ago, settles: it is not probed again, and only a registry change reopens it. `as_of` is stored but
+//! A day settles, and is not probed again until a registry change reopens it, only on evidence from its
+//! probe ([`settles`]): sealing covers its closing block, every document its postings name is stored,
+//! and the publisher has posted a bucket starting at or after the day's end. A document the resolver
+//! gave up on is never stored, so its day stays open and keeps being probed. `as_of` is stored but
 //! never compared, because it moves with every block whether or not the day did.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -33,10 +34,6 @@ use crate::{IngestError, Ingested, i, page, s};
 
 /// The window the Query Performance card draws, today included.
 pub const WINDOW_DAYS: i64 = 90;
-
-/// How long after a day ends it stays open to late documents: the resolver retries a failed fetch
-/// out of band, and a document it then stores changes the day.
-pub const SETTLE_AFTER_DAYS: i64 = 2;
 
 /// Where computed days go. Postgres in production; a map in the tests.
 pub trait QosDayStore: Send + Sync {
@@ -90,9 +87,15 @@ pub enum Decision {
 /// What a one-day probe found.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DayProbe {
+    /// Buckets whose document is stored, per topic.
     pub indexer_buckets: i64,
     pub query_buckets: i64,
+    /// Postings for the day whose document is not stored, given-up documents included.
+    pub unresolved_documents: i64,
+    /// The highest block holding one of the day's postings.
     pub closing_block: Option<i64>,
+    /// The newest bucket the publisher has posted, for any day.
+    pub newest_posted_bucket_start: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,17 +133,19 @@ fn sealed(closing_block: Option<i64>, sealed_through: Option<i64>) -> bool {
     closing_block.is_none_or(|c| sealed_through.is_some_and(|t| t >= c))
 }
 
-fn settle_time(day: i64) -> i64 {
-    (day + 1 + SETTLE_AFTER_DAYS) * 86_400
+/// Whether a day can no longer change, on the evidence of its probe: sealing covers its closing block,
+/// no posting for it is waiting on a document, and the publisher has posted past its end, so no bucket
+/// of it is still to come. A day inside a publisher outage fails the last and stays open.
+pub fn settles(day: i64, probe: &DayProbe, sealed_through: Option<i64>) -> bool {
+    sealed(probe.closing_block, sealed_through)
+        && probe.unresolved_documents == 0
+        && probe
+            .newest_posted_bucket_start
+            .is_some_and(|b| b >= (day + 1) * 86_400)
 }
 
 /// Decide an unsettled day from what the probe found.
-pub fn after_probe(
-    stored: &QosDayState,
-    probe: &DayProbe,
-    current: &Provenance,
-    now: i64,
-) -> AfterProbe {
+pub fn after_probe(stored: &QosDayState, probe: &DayProbe, current: &Provenance) -> AfterProbe {
     if probe.indexer_buckets != stored.indexer_buckets
         || probe.query_buckets != stored.query_buckets
         || probe.closing_block != stored.closing_block
@@ -151,7 +156,7 @@ pub fn after_probe(
     if !sealed_then && sealed(stored.closing_block, current.sealed_through) {
         return AfterProbe::Compute(Recompute::Sealed);
     }
-    if sealed_then && now >= settle_time(stored.day) {
+    if settles(stored.day, probe, current.sealed_through) {
         AfterProbe::Settle
     } else {
         AfterProbe::Wait
@@ -192,8 +197,8 @@ pub async fn fill_qos_days<S: QosDayStore>(
                 let Some(state) = stored.get(&day) else {
                     continue;
                 };
-                let (probe, _) = probe_day(gate, lane, day).await?;
-                match after_probe(state, &probe, &current, now) {
+                let (probe, probe_prov) = probe_day(gate, lane, day).await?;
+                match after_probe(state, &probe, &probe_prov) {
                     AfterProbe::Compute(r) => r,
                     AfterProbe::Settle => {
                         store.settle(day).await?;
@@ -204,7 +209,7 @@ pub async fn fill_qos_days<S: QosDayStore>(
             }
         };
         tracing::info!(day, ?reason, "computing a QoS day");
-        rows += compute_day(store, gate, lane, day, now).await?;
+        rows += compute_day(store, gate, lane, day).await?;
     }
     Ok(Ingested { rows })
 }
@@ -234,7 +239,9 @@ async fn probe_day(
     let probe = DayProbe {
         indexer_buckets: i(&row, "indexer_buckets").unwrap_or(0),
         query_buckets: i(&row, "query_buckets").unwrap_or(0),
+        unresolved_documents: i(&row, "unresolved_documents").unwrap_or(0),
         closing_block: i(&row, "closing_block"),
+        newest_posted_bucket_start: i(&row, "newest_posted_bucket_start"),
     };
     Ok((probe, answer.provenance))
 }
@@ -263,7 +270,6 @@ async fn compute_day<S: QosDayStore>(
     gate: &NestGate,
     lane: Lane,
     day: i64,
-    now: i64,
 ) -> Result<u64, IngestError> {
     let (probe, probe_prov) = probe_day(gate, lane, day).await?;
     let indexer = page(
@@ -308,9 +314,7 @@ async fn compute_day<S: QosDayStore>(
         closing_block: probe.closing_block,
         indexer_buckets: probe.indexer_buckets,
         query_buckets: probe.query_buckets,
-        settled: day < now.div_euclid(86_400)
-            && sealed(probe.closing_block, provenance.sealed_through)
-            && now >= settle_time(day),
+        settled: settles(day, &probe, provenance.sealed_through),
     };
     store.write(&state, &indexers, &allocations).await
 }
@@ -421,11 +425,14 @@ mod tests {
         }
     }
 
+    /// A probe of a finished day: every document stored, and the publisher well into the next day.
     fn probe(closing: i64) -> DayProbe {
         DayProbe {
             indexer_buckets: 288,
             query_buckets: 288,
+            unresolved_documents: 0,
             closing_block: Some(closing),
+            newest_posted_bucket_start: Some(TODAY * 86_400),
         }
     }
 
@@ -471,7 +478,7 @@ mod tests {
             ..prov("r1", 700)
         };
         assert_eq!(decide(s.day, TODAY, Some(&s), &later), Decision::Probe);
-        assert_eq!(after_probe(&s, &probe(800), &later, NOW), AfterProbe::Wait);
+        assert_eq!(after_probe(&s, &probe(800), &later), AfterProbe::Wait);
     }
 
     #[test]
@@ -482,11 +489,11 @@ mod tests {
             ..probe(800)
         };
         assert_eq!(
-            after_probe(&s, &late, &prov("r1", 900), NOW),
+            after_probe(&s, &late, &prov("r1", 900)),
             AfterProbe::Compute(Recompute::DocumentsChanged)
         );
         assert_eq!(
-            after_probe(&s, &probe(812), &prov("r1", 900), NOW),
+            after_probe(&s, &probe(812), &prov("r1", 900)),
             AfterProbe::Compute(Recompute::DocumentsChanged)
         );
     }
@@ -495,22 +502,94 @@ mod tests {
     fn a_day_computed_unsealed_is_computed_once_more_when_sealing_covers_it() {
         let unsealed = state(TODAY - 1, 700, 800, false);
         assert_eq!(
-            after_probe(&unsealed, &probe(800), &prov("r1", 799), NOW),
-            AfterProbe::Wait
+            after_probe(&unsealed, &probe(800), &prov("r1", 799)),
+            AfterProbe::Wait,
+            "not sealed: open, however complete it looks"
         );
         assert_eq!(
-            after_probe(&unsealed, &probe(800), &prov("r1", 800), NOW),
+            after_probe(&unsealed, &probe(800), &prov("r1", 800)),
             AfterProbe::Compute(Recompute::Sealed)
         );
-        let sealed_recent = state(TODAY - 1, 800, 800, false);
+        let sealed = state(TODAY - 1, 800, 800, false);
         assert_eq!(
-            after_probe(&sealed_recent, &probe(800), &prov("r1", 900), NOW),
-            AfterProbe::Wait,
-            "sealed, but still inside the resolver's retries"
+            after_probe(&sealed, &probe(800), &prov("r1", 900)),
+            AfterProbe::Settle
         );
-        let sealed_old = state(TODAY - 4, 800, 800, false);
+    }
+
+    /// The resolver gave up on one of the day's documents, or has not fetched it yet. Nothing about
+    /// the day's age settles it.
+    #[test]
+    fn a_day_with_an_unresolved_document_never_settles() {
+        let s = state(TODAY - 60, 800, 800, false);
+        let waiting = DayProbe {
+            unresolved_documents: 1,
+            ..probe(800)
+        };
         assert_eq!(
-            after_probe(&sealed_old, &probe(800), &prov("r1", 900), NOW),
+            after_probe(&s, &waiting, &prov("r1", 1_000_000)),
+            AfterProbe::Wait
+        );
+        assert!(!settles(s.day, &waiting, Some(1_000_000)));
+    }
+
+    #[test]
+    fn a_day_settles_once_its_last_document_arrives() {
+        let day = TODAY - 3;
+        let before = state(day, 800, 800, false);
+        let stored_287 = QosDayState {
+            indexer_buckets: 287,
+            ..before.clone()
+        };
+        let one_missing = DayProbe {
+            indexer_buckets: 287,
+            unresolved_documents: 1,
+            ..probe(800)
+        };
+        assert_eq!(
+            after_probe(&stored_287, &one_missing, &prov("r1", 900)),
+            AfterProbe::Wait
+        );
+        let arrived = probe(800);
+        assert_eq!(
+            after_probe(&stored_287, &arrived, &prov("r1", 900)),
+            AfterProbe::Compute(Recompute::DocumentsChanged),
+            "the document changes the day's figures"
+        );
+        assert!(
+            settles(day, &arrived, Some(900)),
+            "and the recompute stores it settled"
+        );
+        assert_eq!(
+            after_probe(&before, &arrived, &prov("r1", 900)),
+            AfterProbe::Settle
+        );
+    }
+
+    /// The publisher's last post for the day may simply not have happened: inside an outage, the rest
+    /// of the day's buckets arrive when it resumes, if ever.
+    #[test]
+    fn a_day_with_no_posting_past_its_end_stays_open() {
+        let day = TODAY - 2;
+        let s = state(day, 800, 800, false);
+        let day_end = (day + 1) * 86_400;
+        for newest in [None, Some(day_end - 300)] {
+            let quiet = DayProbe {
+                newest_posted_bucket_start: newest,
+                ..probe(800)
+            };
+            assert_eq!(
+                after_probe(&s, &quiet, &prov("r1", 900)),
+                AfterProbe::Wait,
+                "{newest:?}"
+            );
+        }
+        let resumed = DayProbe {
+            newest_posted_bucket_start: Some(day_end),
+            ..probe(800)
+        };
+        assert_eq!(
+            after_probe(&s, &resumed, &prov("r1", 900)),
             AfterProbe::Settle
         );
     }
@@ -581,7 +660,8 @@ mod tests {
                 let extra = sql::days_named(&q) == vec![self.changed_day];
                 serde_json::json!([{
                     "indexer_buckets": if extra { 289 } else { 288 },
-                    "query_buckets": 288, "closing_block": 800
+                    "query_buckets": 288, "closing_block": 800, "unresolved_documents": 0,
+                    "newest_posted_bucket_start": TODAY * 86_400 + 1_800
                 }])
             } else if q.contains("qos_allocation_daily") {
                 serde_json::json!([{"indexer": "0xA", "deployment": "QmX", "chain": "mainnet",
@@ -655,7 +735,10 @@ mod tests {
             .insert(TODAY - 2, state(TODAY - 2, 5_000, 800, false));
         run(&store, changed).await;
         assert_eq!(*store.written.lock().unwrap(), vec![changed, TODAY]);
-        assert!(!store.days.lock().unwrap()[&(TODAY - 2)].settled);
+        assert!(
+            store.days.lock().unwrap()[&(TODAY - 2)].settled,
+            "unchanged, sealed, resolved and posted past: settled on the evidence, not rewritten"
+        );
     }
 
     #[tokio::test]

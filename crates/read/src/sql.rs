@@ -447,15 +447,17 @@ pub const QOS_PROVENANCE_SQL: &str = "SELECT count(*) AS publishers FROM qos_pub
 pub const QOS_FRESHNESS_SQL: &str = "SELECT topic, newest_bucket_start, buckets, last_post_block, \
      last_post_time FROM qos_freshness";
 
-/// What the job compares for a stored day: buckets held per topic and the highest block holding
-/// any of the day's documents.
+/// What the job compares for a stored day, from `qos_day_resolution`: buckets stored per topic,
+/// postings whose document is not stored, and the day's closing block; and, naming no day, the newest
+/// bucket the publisher has posted.
 pub fn qos_day_probe_sql(unix_day: i64) -> String {
     let d = qos_day(unix_day);
     format!(
-        "SELECT (SELECT count(DISTINCT bucket_start) FROM qos_indexer_attempt WHERE day = {d}) AS indexer_buckets, \
-         (SELECT count(DISTINCT bucket_start) FROM qos_query_result WHERE day = {d}) AS query_buckets, \
-         (SELECT max(block_number) FROM (SELECT block_number FROM qos_indexer_attempt WHERE day = {d} \
-         UNION ALL SELECT block_number FROM qos_query_result WHERE day = {d})) AS closing_block"
+        "SELECT (SELECT sum(buckets_stored) FROM qos_day_resolution WHERE day = {d} AND topic = 'indexer') AS indexer_buckets, \
+         (SELECT sum(buckets_stored) FROM qos_day_resolution WHERE day = {d} AND topic = 'query') AS query_buckets, \
+         (SELECT sum(unresolved_documents) FROM qos_day_resolution WHERE day = {d}) AS unresolved_documents, \
+         (SELECT max(closing_block) FROM qos_day_resolution WHERE day = {d}) AS closing_block, \
+         (SELECT max(bucket_start) FROM qos_posting) AS newest_posted_bucket_start"
     )
 }
 
