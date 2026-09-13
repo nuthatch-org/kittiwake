@@ -985,6 +985,28 @@ mod tests {
         every_statement_names_one_day_at_most(&seen.lock().unwrap());
     }
 
+    /// The job writes today on every run, so the store may hold a copy of it; the route must still
+    /// chart the nest's, which is newer than any copy.
+    #[test]
+    fn a_stored_copy_of_today_loses_to_the_nests_answer() {
+        let live = json!({"days": [{"date": unix_day_date(TODAY_UNIX), "query_count": 500.0, "buckets": 12}]});
+        let input = qos_input(
+            &[
+                stored(A, TODAY_UNIX - 1, 1.0),
+                stored(A, TODAY_UNIX, 9_999.0),
+            ],
+            &live,
+            TODAY_UNIX,
+        );
+        let counts: Vec<f64> = input["days"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["query_count"].as_f64().unwrap())
+            .collect();
+        assert_eq!(counts, vec![1.0, 500.0]);
+    }
+
     #[tokio::test]
     async fn a_day_the_store_and_the_nest_both_lack_is_absent_rather_than_zero() {
         let (ctx, _seen, _server) = ctx().await;
