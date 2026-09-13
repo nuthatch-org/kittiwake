@@ -1965,8 +1965,9 @@ mod stake_history_tests {
 /// answered: two lists, newest first, each holding only the days that had one of its events.
 ///
 /// `timestamp` is microseconds because that is what the subgraph's `Timestamp` scalar carried.
-/// `totalCollected` stays gross; the net figure and the protocol's cut are fields of their own
-/// rather than a quiet redefinition, and the cut is null for the era whose events never stated it.
+/// `totalCollected` stays gross. `totalCollectedNet` is what the indexer received, after the
+/// protocol, the curators and the delegators, and the protocol's cut is null for the era whose
+/// events never stated it.
 pub fn indexer_trends(v: &Value) -> Value {
     let rows = v
         .get("rows")

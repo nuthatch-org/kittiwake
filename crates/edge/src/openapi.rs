@@ -267,7 +267,7 @@ const SUMMARIES: &[Operation] = &[
     ),
     op(
         "/api/indexer/{address}/trends",
-        "Indexing rewards, split between the indexer and its delegators, and query fees gross, to curators, to the protocol and net, per UTC day. Dated by the event that paid them, not by allocation close.",
+        "Indexing rewards, split between the indexer and its delegators, and query fees collected, to curators, to the protocol and what the indexer received after the delegators' cut, per UTC day. Dated by the event that paid them, not by allocation close.",
     ),
     op(
         "/api/indexer/{address}/pnl",
