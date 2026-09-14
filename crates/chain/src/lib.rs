@@ -12,7 +12,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use alloy::ens::{EnsError, ProviderEnsExt};
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::sol;
 use kittiwake_types::ApiError;
@@ -78,6 +78,21 @@ sol! {
         function balanceOf(address account) external view returns (uint256);
     }
 
+    #[sol(rpc)]
+    interface IEnsRegistry {
+        function owner(bytes32 node) external view returns (address);
+    }
+
+}
+
+/// The ENS node a Graph `SetDefaultName` may claim, or `None` when the network subgraph would have
+/// refused it: ENS only (`nameSystem` 0), a bare `.eth` label, and an identifier that is its node.
+pub fn default_name_node(name: &str, name_system: i64, identifier: &str) -> Option<B256> {
+    if name_system != 0 || name.is_empty() || name.contains('.') {
+        return None;
+    }
+    let node = alloy::ens::namehash(&format!("{name}.eth"));
+    (B256::from_str(identifier).ok()? == node).then_some(node)
 }
 
 /// The oracle's network-wide state. None of this varies by indexer.
@@ -311,6 +326,41 @@ impl Chain {
         Err(ApiError::Unavailable(format!("ENS lookup failed: {last}")))
     }
 
+    /// A Graph default name, if the account owns its ENS node on mainnet today.
+    ///
+    /// The network subgraph made the same check on Arbitrum against an ENS address of zero, so on
+    /// L2 it never passed. Asked on mainnet, where the registry is, it can.
+    pub async fn verified_default_name(
+        &self,
+        account: &str,
+        name: &str,
+        name_system: i64,
+        identifier: &str,
+    ) -> Result<Option<String>, ApiError> {
+        let Some(node) = default_name_node(name, name_system, identifier) else {
+            return Ok(None);
+        };
+        let account = Address::from_str(account)
+            .map_err(|_| ApiError::BadRequest("not a 20-byte address".into()))?;
+        let mut last = String::from("no mainnet endpoint configured");
+        for url in &self.mainnet {
+            let Ok(parsed) = url.parse() else { continue };
+            let registry = IEnsRegistry::new(
+                alloy::ens::ENS_ADDRESS,
+                ProviderBuilder::new().connect_http(parsed),
+            );
+            let owner = registry.owner(node);
+            match tokio::time::timeout(Duration::from_secs(10), owner.call()).await {
+                Ok(Ok(owner)) => return Ok((owner == account).then(|| name.to_string())),
+                Ok(Err(e)) => last = e.to_string(),
+                Err(_) => last = "timed out".into(),
+            }
+        }
+        Err(ApiError::Unavailable(format!(
+            "ENS owner lookup failed: {last}"
+        )))
+    }
+
     /// Supply across both chains. Three reads; a failure in any of them makes the whole breakdown
     /// absent rather than partial, because a global supply computed from two of three figures is a
     /// plausible wrong number.
@@ -503,6 +553,21 @@ mod tests {
         );
     }
     use super::*;
+
+    /// The one live `SetDefaultName` on L2GNS, log at block 125,605,436, as the chain has it.
+    #[test]
+    fn a_default_name_claims_exactly_the_node_of_its_eth_label() {
+        let node = "0xa8f88ec42c70e80659f57464661c91d195ac316fdec07a4944b47abd807cf048";
+        assert!(default_name_node("grassets-tech-2", 0, node).is_some());
+        assert_eq!(default_name_node("grassets-tech-1", 0, node), None);
+        assert_eq!(default_name_node("grassets-tech-2", 1, node), None);
+        assert_eq!(default_name_node("sub.grassets-tech-2", 0, node), None);
+        // A reset: nameIdentifier zero and an empty name.
+        assert_eq!(
+            default_name_node("", 0, &format!("0x{}", "0".repeat(64))),
+            None
+        );
+    }
 
     /// Bridged tokens exist on both sides of the bridge; counting them twice would overstate the
     /// supply by the whole escrow balance.

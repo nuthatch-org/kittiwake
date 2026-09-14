@@ -360,6 +360,32 @@ pub fn ingest_jobs(
         );
     }
 
+    // Names need mainnet for ENS, so without a chain there is nothing honest to write.
+    if let Some(chain) = chain.clone() {
+        let pool = pool.clone();
+        jobs.push(
+            JobDef::every(
+                "ingest-names",
+                mins(60),
+                Arc::new(move |ctx| {
+                    let pool = pool.clone();
+                    let chain = chain.clone();
+                    Box::pin(async move {
+                        kittiwake_ingest::names::names(&pool, &ctx.gate, ctx.lane, &chain)
+                            .await
+                            .map(|i| JobOutcome {
+                                rows_written: i.rows,
+                            })
+                            .map_err(|e| e.to_string())
+                    })
+                }),
+            )
+            // Hourly at minute 11, the earliest free one. Until its first run every reader treats the
+            // name columns as empty; see `kittiwake_db::NAMES_CURSOR_KEY`.
+            .staggered(mins(11)),
+        );
+    }
+
     // The seventeenth cron, and the last one outside the product layer. It reads the chain and
     // writes `sync_bounties`; no signing key and nothing spent, which is the whole difference
     // between this and `tap-provision`. #30.
@@ -416,6 +442,7 @@ mod tests {
             ("ingest-epochs", 10, 3),
             ("ingest-delegations", 15, 1),
             ("ingest-allocations", 60, 18),
+            ("ingest-names", 60, 11),
             ("ingest-rav", 60, 28),
             ("ingest-disputes", 60, 48),
             ("refresh", 5, 0),
@@ -453,6 +480,7 @@ mod tests {
             ("ingest-epochs", mins(10), mins(3)),
             ("ingest-delegations", mins(15), mins(1)),
             ("ingest-allocations", mins(60), mins(18)),
+            ("ingest-names", mins(60), mins(11)),
             ("ingest-rav", mins(60), mins(28)),
             ("ingest-disputes", mins(360), mins(48)),
             ("refresh", mins(5), Duration::ZERO),
