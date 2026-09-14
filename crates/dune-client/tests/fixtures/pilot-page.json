@@ -1,0 +1,49 @@
+{
+  "execution_id": "01M2DYKBS3WHDN1ZW6W393XES4",
+  "query_id": 8699345,
+  "is_execution_finished": true,
+  "state": "QUERY_STATE_COMPLETED",
+  "submitted_at": "2026-09-13T17:56:18.340191Z",
+  "expires_at": "2026-12-12T17:56:24.711426Z",
+  "execution_started_at": "2026-09-13T17:56:18.763212Z",
+  "execution_ended_at": "2026-09-13T17:56:24.71142Z",
+  "result": {
+    "rows": [
+      {
+        "close": 0.019051,
+        "day": "2026-09-13 00:00:00.000 UTC",
+        "high": 0.019149,
+        "low": 0.018109,
+        "open": 0.018215,
+        "samples": 1065
+      }
+    ],
+    "metadata": {
+      "column_names": [
+        "day",
+        "open",
+        "high",
+        "low",
+        "close",
+        "samples"
+      ],
+      "column_types": [
+        "timestamp(3) with time zone",
+        "double",
+        "double",
+        "double",
+        "double",
+        "bigint"
+      ],
+      "row_count": 1,
+      "result_set_bytes": 114,
+      "total_row_count": 31,
+      "total_result_set_bytes": 1488,
+      "datapoint_count": 6,
+      "pending_time_millis": 423,
+      "execution_time_millis": 5948
+    }
+  },
+  "next_uri": "https://api.dune.com/api/v1/execution/01M2DYKBS3WHDN1ZW6W393XES4/results?limit=1&offset=1",
+  "next_offset": 1
+}

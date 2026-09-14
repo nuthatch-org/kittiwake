@@ -1,0 +1,16 @@
+[package]
+name = "dune-poller"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dune-client = { path = "../dune-client" }
+dune-ledger = { path = "../dune-ledger" }
+dune-registry = { path = "../dune-registry" }
+chrono = "0.4.45"
+serde_json = "1.0.151"
+sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring", "chrono", "json"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+

@@ -1865,6 +1865,53 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
+name = "dune-client"
+version = "0.1.0"
+dependencies = [
+ "dune-ledger",
+ "reqwest",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
+name = "dune-ledger"
+version = "0.1.0"
+dependencies = [
+ "sqlx",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "dune-poller"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dune-client",
+ "dune-ledger",
+ "dune-registry",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "dune-registry"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2993,6 +3040,10 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "dune-client",
+ "dune-ledger",
+ "dune-poller",
+ "dune-registry",
  "futures",
  "kittiwake-cache",
  "kittiwake-chain",
@@ -3008,6 +3059,7 @@ dependencies = [
  "kittiwake-sqlplay",
  "kittiwake-types",
  "kittiwake-warmer",
+ "sqlx",
  "tokio",
  "tracing",
 ]

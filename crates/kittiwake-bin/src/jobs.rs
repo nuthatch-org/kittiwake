@@ -367,6 +367,62 @@ pub fn ingest_jobs(
     jobs
 }
 
+/// Dune feed poller jobs driven by the query registry.
+pub fn dune_jobs(
+    client: Arc<dune_client::DuneClient>,
+    pool: Pool,
+    ledger: dune_ledger::Ledger,
+    account: String,
+    registry: dune_registry::Registry,
+) -> Vec<JobDef> {
+    let mut jobs = Vec::new();
+    for (i, query) in registry.query.into_iter().enumerate() {
+        if !query.enabled {
+            continue;
+        }
+        let client = client.clone();
+        let pool = pool.clone();
+        let ledger = ledger.clone();
+        let account = account.clone();
+        let period = Duration::from_secs(query.poll_seconds);
+        // Stagger Dune queries across half-minutes so they don't fire simultaneously
+        let stagger = Duration::from_secs((i as u64 * 30) % 300);
+        let name: &'static str = Box::leak(format!("dune-poll-{}", query.id).into_boxed_str());
+
+        jobs.push(
+            JobDef::every(
+                name,
+                period,
+                Arc::new(move |_ctx| {
+                    let client = client.clone();
+                    let pool = pool.clone();
+                    let ledger = ledger.clone();
+                    let account = account.clone();
+                    let query = query.clone();
+                    Box::pin(async move {
+                        match dune_poller::poll_and_materialize(
+                            &client,
+                            &pool,
+                            Some(&ledger),
+                            &account,
+                            &query,
+                        )
+                        .await
+                        {
+                            Ok(changed) => Ok(JobOutcome {
+                                rows_written: if changed { 1 } else { 0 },
+                            }),
+                            Err(e) => Err(format!("Dune poll failed for {}: {e}", query.id)),
+                        }
+                    })
+                }),
+            )
+            .staggered(stagger),
+        );
+    }
+    jobs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
