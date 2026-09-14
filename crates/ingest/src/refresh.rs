@@ -401,20 +401,16 @@ struct ParamChange {
     epoch: Option<i32>,
 }
 
-/// The cuts as they stood before this run.
-///
-/// Cast to `float8` in the statement rather than decoded as `NUMERIC`. The values are integral PPM
-/// and an `f64` holds every one of them exactly, so the alternative is a decimal crate for a column
-/// that has never had a fractional part. It is also the cast `provenance_rows` already uses to read
-/// the same numbers back out.
-/// `(name, ens_name)` as the `names` job last verified them. Read rather than looked up, because
-/// the lookups are mainnet round trips and this job runs every five minutes.
+/// Empty until `ingest-names` has run once, so a name the platform left behind is never scored.
+const KNOWN_NAMES_SQL: &str = "SELECT address, name, ens_name FROM indexers \
+     WHERE EXISTS (SELECT 1 FROM ingestion_state WHERE key = 'kittiwake:names')";
+
+/// `(name, ens_name)` as `ingest-names` last verified them. Read, not looked up: refresh runs every
+/// five minutes and the lookups are mainnet round trips, so they live in the hourly job.
 async fn known_names(pool: &Pool) -> HashMap<String, (Option<String>, Option<String>)> {
-    match sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-        "SELECT address, name, ens_name FROM indexers",
-    )
-    .fetch_all(pool)
-    .await
+    match sqlx::query_as::<_, (String, Option<String>, Option<String>)>(KNOWN_NAMES_SQL)
+        .fetch_all(pool)
+        .await
     {
         Ok(rows) => rows
             .into_iter()
@@ -435,6 +431,12 @@ fn transparency(names: Option<&(Option<String>, Option<String>)>) -> (bool, bool
     }
 }
 
+/// The cuts as they stood before this run.
+///
+/// Cast to `float8` in the statement rather than decoded as `NUMERIC`. The values are integral PPM
+/// and an `f64` holds every one of them exactly, so the alternative is a decimal crate for a column
+/// that has never had a fractional part. It is also the cast `provenance_rows` already uses to read
+/// the same numbers back out.
 async fn previous_cuts(
     pool: &Pool,
 ) -> Result<HashMap<String, (Option<f64>, Option<f64>)>, IngestError> {
@@ -657,6 +659,14 @@ async fn write_rows(pool: &Pool, rows: &[Row]) -> Result<(), sqlx::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_are_not_scored_before_ingest_names_has_run() {
+        assert!(KNOWN_NAMES_SQL.contains(&format!(
+            "EXISTS (SELECT 1 FROM ingestion_state WHERE key = '{}')",
+            kittiwake_db::NAMES_CURSOR_KEY
+        )));
+    }
 
     /// Both were hardcoded false, which cost every indexer up to 70 of 100 in Transparency.
     #[test]

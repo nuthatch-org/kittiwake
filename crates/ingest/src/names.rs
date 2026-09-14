@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use futures::StreamExt;
 use kittiwake_chain::Chain;
-use kittiwake_db::Pool;
+use kittiwake_db::{NAMES_CURSOR_KEY, Pool};
 use kittiwake_nest::{Lane, NestGate};
 use kittiwake_types::{ApiError, NestId};
 
@@ -20,6 +20,16 @@ const CONCURRENCY: usize = 8;
 /// The gns nest's newest `SetDefaultName` per account. One row today.
 pub const DEFAULT_NAMES_SQL: &str =
     "SELECT account, name, name_system, name_identifier FROM account_default_names";
+
+/// The platform's values are not ours to vouch for, so the first run starts from nothing.
+const CLEAR_SQL: &str = "UPDATE indexers SET name = NULL, ens_name = NULL";
+
+const WRITE_SQL: &str = "UPDATE indexers SET name = t.name, ens_name = t.ens_name \
+     FROM UNNEST($1::text[], $2::text[], $3::text[]) AS t(address, name, ens_name) \
+     WHERE indexers.address = t.address";
+
+const MARK_SQL: &str = "INSERT INTO ingestion_state (key, updated_at) VALUES ($1, NOW()) \
+     ON CONFLICT (key) DO UPDATE SET updated_at = NOW()";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Names {
@@ -120,25 +130,34 @@ fn settle(looked_up: Vec<(String, Result<Names, ApiError>)>) -> (Vec<(String, Na
     (settled, failed)
 }
 
+/// One transaction, so the readers' gate opens on verified values and never on the platform's.
 async fn write(pool: &Pool, rows: &[(String, Names)]) -> Result<(), sqlx::Error> {
-    if rows.is_empty() {
-        return Ok(());
+    let mut tx = pool.begin().await?;
+    let first_run: bool =
+        sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM ingestion_state WHERE key = $1)")
+            .bind(NAMES_CURSOR_KEY)
+            .fetch_one(&mut *tx)
+            .await?;
+    if first_run {
+        sqlx::query(CLEAR_SQL).execute(&mut *tx).await?;
     }
-    sqlx::query(
-        "UPDATE indexers SET name = t.name, ens_name = t.ens_name \
-         FROM UNNEST($1::text[], $2::text[], $3::text[]) AS t(address, name, ens_name) \
-         WHERE indexers.address = t.address",
-    )
-    .bind(rows.iter().map(|(a, _)| a.clone()).collect::<Vec<_>>())
-    .bind(rows.iter().map(|(_, n)| n.display()).collect::<Vec<_>>())
-    .bind(
-        rows.iter()
-            .map(|(_, n)| n.ens_name.clone())
-            .collect::<Vec<_>>(),
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
+    if !rows.is_empty() {
+        sqlx::query(WRITE_SQL)
+            .bind(rows.iter().map(|(a, _)| a.clone()).collect::<Vec<_>>())
+            .bind(rows.iter().map(|(_, n)| n.display()).collect::<Vec<_>>())
+            .bind(
+                rows.iter()
+                    .map(|(_, n)| n.ens_name.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query(MARK_SQL)
+        .bind(NAMES_CURSOR_KEY)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
 }
 
 #[cfg(test)]
@@ -176,5 +195,16 @@ mod tests {
         assert_eq!(failed, 1);
         let written: Vec<&str> = settled.iter().map(|(a, _)| a.as_str()).collect();
         assert_eq!(written, ["0xa", "0xc"]);
+    }
+
+    /// The readers' gate is this key, and the first run clears every row, not only those it verified.
+    #[test]
+    fn the_first_run_clears_both_columns_everywhere_and_marks_the_gate() {
+        assert_eq!(NAMES_CURSOR_KEY, "kittiwake:names");
+        assert_eq!(
+            CLEAR_SQL,
+            "UPDATE indexers SET name = NULL, ens_name = NULL"
+        );
+        assert!(MARK_SQL.starts_with("INSERT INTO ingestion_state (key"));
     }
 }

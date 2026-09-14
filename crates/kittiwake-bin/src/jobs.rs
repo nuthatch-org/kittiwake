@@ -380,8 +380,8 @@ pub fn ingest_jobs(
                     })
                 }),
             )
-            // The earliest free minute, since until the first run the score reads whatever the
-            // platform last left in `name` and `ens_name`.
+            // Hourly at minute 11, the earliest free one. Until its first run every reader treats the
+            // name columns as empty; see `kittiwake_db::NAMES_CURSOR_KEY`.
             .staggered(mins(11)),
         );
     }
