@@ -1,9 +1,10 @@
 //! What an indexer actually earns, netted against what it costs to run.
 //!
-//! The sibling of the delegator arithmetic next door. Two revenue streams, both already in
-//! Postgres: query fees realised as RAV redemptions, and indexing rewards realised when an
-//! allocation closes. The cost side is a model rather than a measurement, and saying so is part of
-//! the answer. #67
+//! The sibling of the delegator arithmetic next door. Two revenue streams, both read from the nest
+//! by the event that paid them: query fees as collected, and indexing rewards as collected. Each is
+//! what the indexer received - query fees after the protocol's cut, the curators' share and the
+//! delegators' cut, rewards after the delegators' share - with the collected figure beside it. The
+//! cost side is a model rather than a measurement, and saying so is part of the answer. #67
 
 use std::collections::BTreeMap;
 
@@ -142,12 +143,17 @@ pub fn resolve_cost_model(
     }
 }
 
+/// `rav_grt` and `indexing_rewards_grt` keep the incumbent's names and now mean what the indexer
+/// received. They used to be the collected query fees and the rewards including the delegators'
+/// share, which is why the `*_gross_grt` fields exist: the old figures are still there, named.
 #[derive(Debug, Clone, Serialize)]
 pub struct RevenueDay {
     pub date: String,
     pub rav_grt: f64,
     pub indexing_rewards_grt: f64,
     pub total_grt: f64,
+    pub query_fees_gross_grt: f64,
+    pub indexing_rewards_gross_grt: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -156,6 +162,8 @@ pub struct DeploymentRevenue {
     pub rav_grt: f64,
     pub indexing_rewards_grt: f64,
     pub total_grt: f64,
+    pub query_fees_gross_grt: f64,
+    pub indexing_rewards_gross_grt: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -166,58 +174,105 @@ pub struct IndexerRevenue {
     pub rav_grt: f64,
     pub indexing_rewards_grt: f64,
     pub total_grt: f64,
+    pub query_fees_gross_grt: f64,
+    pub indexing_rewards_gross_grt: f64,
     pub daily: Vec<RevenueDay>,
     #[serde(rename = "byDeployment", skip_serializing_if = "Option::is_none")]
     pub by_deployment: Option<Vec<DeploymentRevenue>>,
 }
 
-/// Fold two per-day series into one.
-///
-/// A day present in either stream is a day in the answer. Intersecting them instead would drop
-/// every day an indexer collected fees and closed no allocation, which is most of them.
-pub fn merge_daily(rav: &[(String, f64)], rewards: &[(String, f64)]) -> Vec<RevenueDay> {
-    let mut by_date: BTreeMap<&str, (f64, f64)> = BTreeMap::new();
-    for (date, grt) in rav {
-        by_date.entry(date).or_default().0 += grt;
+/// A wei figure the nest sent as a decimal string, in GRT. Absent is zero: a day or deployment row
+/// exists only because something was paid on it, so a missing column is a column with nothing in it.
+fn grt(row: &serde_json::Value, key: &str) -> f64 {
+    match row.get(key) {
+        Some(serde_json::Value::String(s)) => s.parse::<f64>().unwrap_or(0.0) / 1e18,
+        Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0) / 1e18,
+        _ => 0.0,
     }
-    for (date, grt) in rewards {
-        by_date.entry(date).or_default().1 += grt;
-    }
-    by_date
-        .into_iter()
-        .map(|(date, (rav_grt, indexing_rewards_grt))| RevenueDay {
-            date: date.to_string(),
-            rav_grt,
-            indexing_rewards_grt,
-            total_grt: rav_grt + indexing_rewards_grt,
-        })
-        .collect()
 }
 
-/// The same fold, per deployment. `None` is a real key: a redemption can carry no deployment, and
-/// collapsing those into one another's totals would misattribute them.
-pub fn merge_by_deployment(
-    rav: &[(Option<String>, f64)],
-    rewards: &[(Option<String>, f64)],
-) -> Vec<DeploymentRevenue> {
-    let mut by_deployment: BTreeMap<Option<String>, (f64, f64)> = BTreeMap::new();
-    for (id, grt) in rav {
-        by_deployment.entry(id.clone()).or_default().0 += grt;
+/// A UTC day start as `YYYY-MM-DD`, without a date library for one conversion (Hinnant's
+/// civil-from-days).
+fn iso_day(day_start: i64) -> String {
+    let z = day_start.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// The revenue answer from the nest's rows: `daily` from `lodestar_indexer_daily`, and
+/// `by_deployment` from `lodestar_indexer_deployment_daily` when it was asked for.
+pub fn revenue_from_nest(
+    indexer: &str,
+    window_days: u32,
+    answer: &serde_json::Value,
+) -> IndexerRevenue {
+    let rows = |key: &str| {
+        answer
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+    };
+    let daily: Vec<RevenueDay> = rows("daily")
+        .unwrap_or_default()
+        .iter()
+        .map(|r| {
+            let (fees, rewards) = (grt(r, "fees_net"), grt(r, "indexer_rewards"));
+            RevenueDay {
+                date: iso_day(
+                    r.get("day_start")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0),
+                ),
+                rav_grt: fees,
+                indexing_rewards_grt: rewards,
+                total_grt: fees + rewards,
+                query_fees_gross_grt: grt(r, "fees_gross"),
+                indexing_rewards_gross_grt: grt(r, "total_rewards"),
+            }
+        })
+        .collect();
+    let by_deployment = rows("by_deployment").map(|rows| {
+        rows.iter()
+            .map(|r| {
+                let (fees, rewards) = (grt(r, "fees_net"), grt(r, "indexer_rewards"));
+                DeploymentRevenue {
+                    deployment_id: r
+                        .get("deployment")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    rav_grt: fees,
+                    indexing_rewards_grt: rewards,
+                    total_grt: fees + rewards,
+                    query_fees_gross_grt: grt(r, "fees_gross"),
+                    indexing_rewards_gross_grt: grt(r, "total_rewards"),
+                }
+            })
+            .collect()
+    });
+    let sum = |f: fn(&RevenueDay) -> f64| daily.iter().map(f).sum::<f64>();
+    IndexerRevenue {
+        indexer: indexer.to_string(),
+        window_days,
+        rav_grt: sum(|d| d.rav_grt),
+        indexing_rewards_grt: sum(|d| d.indexing_rewards_grt),
+        total_grt: sum(|d| d.total_grt),
+        query_fees_gross_grt: sum(|d| d.query_fees_gross_grt),
+        indexing_rewards_gross_grt: sum(|d| d.indexing_rewards_gross_grt),
+        daily,
+        by_deployment,
     }
-    for (id, grt) in rewards {
-        by_deployment.entry(id.clone()).or_default().1 += grt;
-    }
-    by_deployment
-        .into_iter()
-        .map(
-            |(deployment_id, (rav_grt, indexing_rewards_grt))| DeploymentRevenue {
-                deployment_id,
-                rav_grt,
-                indexing_rewards_grt,
-                total_grt: rav_grt + indexing_rewards_grt,
-            },
-        )
-        .collect()
+}
+
+/// The first UTC day of a window that ends today, as a day start.
+pub fn window_start(now: i64, window_days: u32) -> i64 {
+    (now.div_euclid(86_400) - (i64::from(window_days) - 1)) * 86_400
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -347,35 +402,66 @@ mod tests {
         assert_eq!(priced.total_monthly_usd, 550.0);
     }
 
+    /// An allocation collected on the 1st and the 2nd while open and closed on the 3rd. Dated by
+    /// close, all of it lands on the 3rd and neither day it was paid appears.
     #[test]
-    fn a_day_in_either_stream_is_a_day_in_the_answer() {
-        let daily = merge_daily(
-            &[("2026-09-01".into(), 10.0), ("2026-09-02".into(), 5.0)],
-            &[("2026-09-02".into(), 2.0), ("2026-09-03".into(), 7.0)],
-        );
-        assert_eq!(daily.len(), 3, "three distinct days");
-        assert_eq!(daily[0].total_grt, 10.0);
-        assert_eq!(daily[1].total_grt, 7.0, "the day both streams touched");
-        assert_eq!(daily[2].indexing_rewards_grt, 7.0);
-        // Sorted, because a chart drawn in map order is a chart drawn wrong.
-        assert_eq!(daily[0].date, "2026-09-01");
+    fn each_day_is_the_day_it_was_paid() {
+        let answer = serde_json::json!({"daily": [
+            {"day_start": 1_788_220_800, "indexer_rewards": "60000000000000000000", "total_rewards": "100000000000000000000", "fees_net": "0", "fees_gross": "0"},
+            {"day_start": 1_788_307_200, "indexer_rewards": "30000000000000000000", "total_rewards": "50000000000000000000", "fees_net": "0", "fees_gross": "0"},
+        ]});
+        let r = revenue_from_nest("0xaa", 30, &answer);
+        let dates: Vec<&str> = r.daily.iter().map(|d| d.date.as_str()).collect();
+        assert_eq!(dates, ["2026-09-01", "2026-09-02"]);
+        assert_eq!(r.indexing_rewards_grt, 90.0);
+        assert_eq!(r.indexing_rewards_gross_grt, 150.0);
     }
 
-    /// A redemption with no deployment is its own bucket rather than somebody else's.
+    /// What the indexer kept is the revenue, and what was collected is beside it rather than
+    /// instead of it. The figures are one real `GraphPaymentCollected` split.
     #[test]
-    fn an_unattributed_redemption_keeps_its_own_line() {
-        let by = merge_by_deployment(
-            &[(None, 4.0), (Some("Qm1".into()), 6.0)],
-            &[(Some("Qm1".into()), 1.0)],
+    fn revenue_is_what_the_indexer_received_and_the_collected_figure_is_kept() {
+        let answer = serde_json::json!({"daily": [
+            {"day_start": 1_788_393_600, "indexer_rewards": "0", "total_rewards": "0",
+             "fees_net": "7105116309131241", "fees_gross": "8860352050294604"},
+        ], "by_deployment": [
+            {"deployment": "0xd1", "indexer_rewards": "0", "total_rewards": "0",
+             "fees_net": "7105116309131241", "fees_gross": "8860352050294604"},
+        ]});
+        let r = revenue_from_nest("0xaa", 30, &answer);
+        assert_eq!(r.rav_grt, 0.007_105_116_309_131_241);
+        assert_eq!(r.query_fees_gross_grt, 0.008_860_352_050_294_604);
+        assert_eq!(r.total_grt, r.rav_grt);
+        let by = r.by_deployment.unwrap();
+        assert_eq!(by[0].deployment_id.as_deref(), Some("0xd1"));
+        assert_eq!(
+            by[0].total_grt, r.total_grt,
+            "the table and the chart are one definition"
         );
-        assert_eq!(by.len(), 2);
-        let unattributed = by.iter().find(|d| d.deployment_id.is_none()).unwrap();
-        assert_eq!(unattributed.total_grt, 4.0);
-        let qm1 = by
-            .iter()
-            .find(|d| d.deployment_id.as_deref() == Some("Qm1"))
-            .unwrap();
-        assert_eq!(qm1.total_grt, 7.0);
+    }
+
+    /// A collection that paid nothing is a day with nothing earned, not an absent day and not an
+    /// error; and a deployment table is absent unless it was asked for.
+    #[test]
+    fn a_zero_reward_collection_is_a_day_that_earned_nothing() {
+        let answer = serde_json::json!({"daily": [
+            {"day_start": 1_788_480_000, "indexer_rewards": "0", "total_rewards": "0", "fees_net": "0", "fees_gross": "0"},
+        ]});
+        let r = revenue_from_nest("0xaa", 7, &answer);
+        assert_eq!(r.daily.len(), 1);
+        assert_eq!(r.daily[0].date, "2026-09-04");
+        assert_eq!(r.total_grt, 0.0);
+        assert!(r.by_deployment.is_none());
+    }
+
+    #[test]
+    fn a_window_ends_today_and_starts_at_a_utc_midnight() {
+        let now = 1_789_317_526; // 2026-09-13 16:38:46 UTC
+        assert_eq!(window_start(now, 1), 1_789_257_600);
+        assert_eq!(window_start(now, 30), 1_789_257_600 - 29 * 86_400);
+        assert_eq!(iso_day(window_start(now, 30)), "2026-08-15");
+        assert_eq!(iso_day(0), "1970-01-01");
+        assert_eq!(iso_day(951_782_400), "2000-02-29");
     }
 
     fn revenue(total: f64) -> IndexerRevenue {
@@ -385,6 +471,8 @@ mod tests {
             rav_grt: total,
             indexing_rewards_grt: 0.0,
             total_grt: total,
+            query_fees_gross_grt: total,
+            indexing_rewards_gross_grt: 0.0,
             daily: Vec::new(),
             by_deployment: None,
         }
@@ -457,6 +545,8 @@ mod tests {
             "rav_grt",
             "indexing_rewards_grt",
             "total_grt",
+            "query_fees_gross_grt",
+            "indexing_rewards_gross_grt",
             "daily",
             "byDeployment",
         ] {
@@ -507,6 +597,8 @@ mod ordering_tests {
             rav_grt: 0.0,
             indexing_rewards_grt: 0.0,
             total_grt: pairs.iter().map(|(_, grt)| grt).sum(),
+            query_fees_gross_grt: 0.0,
+            indexing_rewards_gross_grt: 0.0,
             daily: Vec::new(),
             by_deployment: Some(
                 pairs
@@ -516,6 +608,8 @@ mod ordering_tests {
                         rav_grt: 0.0,
                         indexing_rewards_grt: *grt,
                         total_grt: *grt,
+                        query_fees_gross_grt: 0.0,
+                        indexing_rewards_gross_grt: *grt,
                     })
                     .collect(),
             ),

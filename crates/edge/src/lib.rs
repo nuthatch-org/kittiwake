@@ -260,7 +260,7 @@ pub(crate) fn no_store(headers: &mut HeaderMap) {
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
 }
 
-fn provenance_headers(headers: &mut HeaderMap, meta: &Meta) {
+pub(crate) fn provenance_headers(headers: &mut HeaderMap, meta: &Meta) {
     let set = |h: &mut HeaderMap, k: &'static str, v: String| {
         if let Ok(val) = HeaderValue::from_str(&v) {
             h.insert(k, val);

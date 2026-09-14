@@ -263,7 +263,7 @@ const SUMMARIES: &[Operation] = &[
     ),
     op(
         "/api/indexer/{address}/revenue",
-        "Query fees and indexing rewards over a rolling window, by day and by deployment.",
+        "What an indexer received over a window ending today, by UTC day and by deployment: query fees after the protocol, curators and delegators, and rewards after the delegators, each dated by the collection that paid it, with the collected figures beside them.",
     ),
     op(
         "/api/indexer/{address}/trends",

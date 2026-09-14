@@ -678,6 +678,39 @@ pub async fn indexer_trends(ctx: &ReadCtx, addr: &str, since: i64) -> Result<Rea
     .await
 }
 
+/// `/api/indexer/[address]/revenue` and the P&L built on it: earnings per day, and per deployment
+/// when asked, from `since`.
+pub async fn indexer_revenue(
+    ctx: &ReadCtx,
+    addr: &str,
+    since: i64,
+    by_deployment: bool,
+) -> Result<Read, ApiError> {
+    let mut parts = vec![Part::rows(
+        "daily",
+        NestId::Alloc,
+        addr_or_400!(sql::indexer_revenue_daily_sql(addr, since), "address"),
+    )];
+    if by_deployment {
+        parts.push(Part::rows(
+            "by_deployment",
+            NestId::Alloc,
+            addr_or_400!(
+                sql::indexer_revenue_by_deployment_sql(addr, since),
+                "address"
+            ),
+        ));
+    }
+    ctx.cached(
+        "indexer-revenue",
+        NestId::Alloc,
+        serde_json::json!({"address": addr, "since": since, "byDeployment": by_deployment}),
+        CachePolicy::from_poll_interval(cadence::SLOW),
+        many(parts, T_FOLD),
+    )
+    .await
+}
+
 // ---------------------------------------------------------------------------------------------
 // Portfolios
 // ---------------------------------------------------------------------------------------------
