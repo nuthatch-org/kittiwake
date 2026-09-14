@@ -27,7 +27,9 @@ kittiwake-sched = { version = "0.1.0", path = "../sched" }
 kittiwake-sqlplay = { version = "0.1.0", path = "../sqlplay" }
 kittiwake-types = { version = "0.1.0", path = "../types" }
 kittiwake-warmer = { version = "0.1.0", path = "../warmer" }
-dune-client = { path = "../dune-client" }
+# `ledger`, deliberately not `executions`: this binary must be able to read what the account has
+# spent without gaining the ability to spend. `DuneClient::execute` is not compiled in here.
+dune-client = { path = "../dune-client", features = ["ledger"] }
 dune-ledger = { path = "../dune-ledger" }
 dune-poller = { path = "../dune-poller" }
 dune-registry = { path = "../dune-registry" }

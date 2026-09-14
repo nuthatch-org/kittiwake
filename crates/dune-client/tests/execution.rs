@@ -31,10 +31,9 @@ async fn execution_requires_committed_matching_reservation_and_never_retries() {
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::raw_sql(dune_ledger::MIGRATION)
-        .execute(&pool)
-        .await
-        .unwrap();
+    for migration in dune_ledger::MIGRATIONS {
+        sqlx::raw_sql(*migration).execute(&pool).await.unwrap();
+    }
     let period: i64 = sqlx::query_scalar("INSERT INTO dune_budget_periods(account, starts_at, ends_at, limit_microcredits) VALUES ('fixture', now() - interval '1 day', now() + interval '1 day', 1000000) RETURNING id").fetch_one(&pool).await.unwrap();
     sqlx::query("INSERT INTO dune_budget_allocations VALUES ($1, 'D', 1000000)")
         .bind(period)

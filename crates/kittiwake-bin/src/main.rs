@@ -251,9 +251,27 @@ async fn main() -> anyhow::Result<()> {
                                             dune_cfg.api_key.clone().into(),
                                         ) {
                                             Ok(client) => {
-                                                let ledger = dune_ledger::Ledger::new(p.clone());
+                                                let client = Arc::new(client);
+                                                // The ceiling is a fixed monthly subscription with
+                                                // no overage appetite, so admission refuses
+                                                // outright once the account's usage has not been
+                                                // confirmed recently enough.
+                                                let ledger = dune_ledger::Ledger::new(p.clone())
+                                                    .requiring_fresh_observation(
+                                                        std::time::Duration::from_secs(
+                                                            dune_cfg.usage_max_age_seconds,
+                                                        ),
+                                                    );
+                                                let sync = jobs::dune_usage_sync_job(
+                                                    client.clone(),
+                                                    ledger.clone(),
+                                                    dune_cfg.account.clone(),
+                                                    std::time::Duration::from_secs(
+                                                        dune_cfg.usage_sync_seconds,
+                                                    ),
+                                                );
                                                 let dj = jobs::dune_jobs(
-                                                    Arc::new(client),
+                                                    client,
                                                     p.clone(),
                                                     ledger,
                                                     dune_cfg.account.clone(),
@@ -261,8 +279,13 @@ async fn main() -> anyhow::Result<()> {
                                                 );
                                                 tracing::info!(
                                                     count = dj.len(),
+                                                    usage_sync_seconds =
+                                                        dune_cfg.usage_sync_seconds,
+                                                    usage_max_age_seconds =
+                                                        dune_cfg.usage_max_age_seconds,
                                                     "Dune poller jobs scheduled"
                                                 );
+                                                jobs.push(sync);
                                                 jobs.extend(dj);
                                             }
                                             Err(e) => {

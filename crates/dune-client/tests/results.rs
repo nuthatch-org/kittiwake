@@ -114,13 +114,56 @@ async fn transient_failure_has_bounded_retries() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(503).insert_header("Retry-After", "0"))
-        .expect(3)
+        // Four attempts, not three: Dune's rate limiter sends no Retry-After and a 429 measured
+        // on 2026-09-14 took up to 15s to clear, so the budget was widened. Bounded either way.
+        .expect(4)
         .mount(&server)
         .await;
     assert!(matches!(
         client(&server).latest_results(8699345, 1).await,
         Err(Error::Http(503))
     ));
+    server.verify().await;
+}
+
+/// A rate limit is retried like a transient failure, and still gives up rather than hammering.
+/// `Retry-After: 0` keeps the test quick; the real endpoint sends no such header, which is why
+/// the client carries its own seconds-scale schedule for 429 specifically.
+#[tokio::test]
+async fn rate_limit_is_retried_and_still_bounded() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+        .expect(4)
+        .mount(&server)
+        .await;
+    assert!(matches!(
+        client(&server).latest_results(8699345, 1).await,
+        Err(Error::Http(429))
+    ));
+    server.verify().await;
+}
+
+/// A rate limit that clears partway through is not surfaced to the caller at all.
+#[tokio::test]
+async fn rate_limit_that_clears_is_invisible_to_the_caller() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+        .up_to_n_times(2)
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(fixture()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let page = client(&server)
+        .latest_results(8699345, 1)
+        .await
+        .expect("a cleared rate limit should not reach the caller");
+    assert_eq!(page.query_id, 8699345);
     server.verify().await;
 }
 

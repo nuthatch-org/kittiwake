@@ -221,9 +221,24 @@ mod tests {
     #[test]
     fn load_file_and_load_dir_read_workspace_registry() {
         let file_reg = Registry::load_file("../../registry/dune/lodestar.toml").unwrap();
-        assert_eq!(file_reg.monthly_budget_microcredits, 4_000_000_000);
+        // 3,600 credits, not the 4,000 included allowance. The account is a fixed monthly
+        // subscription that must never buy an extra credit, so the ledger deliberately declines to
+        // spend the last 10%: that margin covers spend which never passes through it, estimates
+        // that undershoot, and the lag in Dune's usage counter.
+        assert_eq!(file_reg.monthly_budget_microcredits, 3_600_000_000);
         let dir_reg = Registry::load_dir("../../registry/dune").unwrap();
-        assert_eq!(dir_reg.monthly_budget_microcredits, 4_000_000_000);
+        assert_eq!(dir_reg.monthly_budget_microcredits, 3_600_000_000);
         assert_eq!(dir_reg.query.len(), file_reg.query.len());
+
+        // The headroom is the point, so it is asserted rather than left to arithmetic by eye.
+        let allocated: u64 = file_reg.allocations.values().sum();
+        assert!(
+            allocated <= file_reg.monthly_budget_microcredits,
+            "allocations must fit the ledger budget"
+        );
+        assert!(
+            file_reg.monthly_budget_microcredits <= 3_600_000_000,
+            "the ledger budget must stay at or below 90% of the 4,000-credit allowance"
+        );
     }
 }

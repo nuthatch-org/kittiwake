@@ -367,6 +367,46 @@ pub fn ingest_jobs(
     jobs
 }
 
+/// Refreshes the ledger's record of what Dune says the account has actually spent.
+///
+/// This is what makes the subscription ceiling real rather than notional. The ledger's own books
+/// only cover work it admitted; an execution started from the Dune web UI, a Dune-side schedule,
+/// or another holder of the key spends the same allowance invisibly. The usage endpoint is not
+/// billed, so this job costs nothing to run often.
+///
+/// If it fails, the stored figure and its timestamp are left alone, so a ledger configured with
+/// `requiring_fresh_observation` will start refusing work rather than spend against a number
+/// nobody has confirmed.
+pub fn dune_usage_sync_job(
+    client: Arc<dune_client::DuneClient>,
+    ledger: dune_ledger::Ledger,
+    account: String,
+    period: Duration,
+) -> JobDef {
+    JobDef::every(
+        "dune-usage-sync",
+        period,
+        Arc::new(move |_ctx| {
+            let client = client.clone();
+            let ledger = ledger.clone();
+            let account = account.clone();
+            Box::pin(async move {
+                match ledger.sync_active_period(&account, client.as_ref()).await {
+                    Ok(used) => {
+                        tracing::debug!(
+                            account = %account,
+                            used_microcredits = used,
+                            "Dune account usage refreshed"
+                        );
+                        Ok(JobOutcome { rows_written: 0 })
+                    }
+                    Err(e) => Err(format!("Dune usage sync failed for {account}: {e}")),
+                }
+            })
+        }),
+    )
+}
+
 /// Dune feed poller jobs driven by the query registry.
 pub fn dune_jobs(
     client: Arc<dune_client::DuneClient>,
@@ -492,5 +532,145 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A registry with one enabled and two disabled queries. `enabled = false` is the only thing
+    /// standing between a pilot entry and a live schedule that spends real credits, so the
+    /// distinction is worth a test.
+    fn registry_fixture() -> dune_registry::Registry {
+        dune_registry::Registry::parse(
+            r#"
+monthly_budget_microcredits = 4000000000
+[allocations]
+A = 2100000000
+
+[[query]]
+id = "grt_price_daily"
+dune_query_id = 8699345
+owner = "pete44"
+workstream = "A"
+enabled = true
+schedule_seconds = 86400
+poll_seconds = 3600
+execution_estimate_microcredits = 1000000
+export_estimate_microcredits = 1000000
+result_limit = 1000
+target_table = "dune_grt_price_daily"
+freshness_seconds = 172800
+
+[[query]]
+id = "grt_whale_moves"
+dune_query_id = 8699346
+owner = "pete44"
+workstream = "A"
+enabled = false
+schedule_seconds = 43200
+poll_seconds = 3600
+execution_estimate_microcredits = 1000000
+export_estimate_microcredits = 1000000
+result_limit = 1000
+target_table = "dune_grt_whale_moves"
+freshness_seconds = 172800
+
+[[query]]
+id = "grt_bridge_flow"
+dune_query_id = 8699347
+owner = "pete44"
+workstream = "A"
+enabled = false
+schedule_seconds = 86400
+poll_seconds = 7200
+execution_estimate_microcredits = 1000000
+export_estimate_microcredits = 1000000
+result_limit = 1000
+target_table = "dune_grt_bridge_flow"
+freshness_seconds = 172800
+"#,
+        )
+        .expect("registry fixture parses")
+    }
+
+    /// A lazy pool never opens a connection, so the job shapes can be built without a database.
+    fn lazy_pool() -> Pool {
+        sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://unused@127.0.0.1:1/unused")
+            .expect("lazy pool")
+    }
+
+    fn dune_fixture_jobs() -> Vec<JobDef> {
+        let client =
+            Arc::new(dune_client::DuneClient::new("fixture-key".into()).expect("client builds"));
+        let pool = lazy_pool();
+        dune_jobs(
+            client,
+            pool.clone(),
+            dune_ledger::Ledger::new(pool),
+            "pete44".into(),
+            registry_fixture(),
+        )
+    }
+
+    #[tokio::test]
+    async fn only_enabled_queries_are_scheduled() {
+        let jobs = dune_fixture_jobs();
+        assert_eq!(
+            jobs.len(),
+            1,
+            "a disabled registry entry must never reach the scheduler"
+        );
+        assert_eq!(jobs[0].name, "dune-poll-grt_price_daily");
+    }
+
+    #[tokio::test]
+    async fn a_poll_job_uses_the_registry_poll_interval_not_its_schedule() {
+        let jobs = dune_fixture_jobs();
+        // 3600 is poll_seconds; 86400 is schedule_seconds. Polling on the schedule interval would
+        // leave results stale for a day, and polling is free, so the two must not be confused.
+        assert!(matches!(
+            jobs[0].schedule,
+            kittiwake_sched::Schedule::Every(p) if p == Duration::from_secs(3600)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dune_poll_jobs_do_not_share_an_offset_with_each_other() {
+        // Force several enabled entries to check the stagger actually separates them.
+        let mut registry = registry_fixture();
+        for q in registry.query.iter_mut() {
+            q.enabled = true;
+            q.poll_seconds = 3600;
+        }
+        let client =
+            Arc::new(dune_client::DuneClient::new("fixture-key".into()).expect("client builds"));
+        let pool = lazy_pool();
+        let jobs = dune_jobs(
+            client,
+            pool.clone(),
+            dune_ledger::Ledger::new(pool),
+            "pete44".into(),
+            registry,
+        );
+        assert_eq!(jobs.len(), 3);
+        let mut offsets: Vec<Duration> = jobs.iter().map(|j| j.stagger).collect();
+        offsets.sort();
+        offsets.dedup();
+        assert_eq!(offsets.len(), 3, "staggered jobs must not converge");
+    }
+
+    #[tokio::test]
+    async fn the_usage_sync_job_is_named_and_paced_as_configured() {
+        let client =
+            Arc::new(dune_client::DuneClient::new("fixture-key".into()).expect("client builds"));
+        let job = dune_usage_sync_job(
+            client,
+            dune_ledger::Ledger::new(lazy_pool()),
+            "pete44".into(),
+            Duration::from_secs(900),
+        );
+        assert_eq!(job.name, "dune-usage-sync");
+        assert!(matches!(
+            job.schedule,
+            kittiwake_sched::Schedule::Every(p) if p == Duration::from_secs(900)
+        ));
     }
 }

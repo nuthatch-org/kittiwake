@@ -1,4 +1,4 @@
-use dune_ledger::{Ledger, MIGRATION};
+use dune_ledger::{Ledger, MIGRATIONS};
 use sqlx::postgres::PgPoolOptions;
 
 #[tokio::test]
@@ -38,7 +38,9 @@ async fn concurrent_reservations_share_account_budget_and_uncertainty_stays_char
         .connect(&url)
         .await
         .unwrap();
-    sqlx::raw_sql(MIGRATION).execute(&pool).await.unwrap();
+    for migration in MIGRATIONS {
+        sqlx::raw_sql(*migration).execute(&pool).await.unwrap();
+    }
     let period: i64 = sqlx::query_scalar("INSERT INTO dune_budget_periods(account, starts_at, ends_at, limit_microcredits) VALUES ('fixture', now() - interval '1 day', now() + interval '1 day', 1000000) RETURNING id").fetch_one(&pool).await.unwrap();
     sqlx::query(
         "INSERT INTO dune_budget_allocations VALUES ($1, 'A', 1000000), ($1, 'B', 1000000)",

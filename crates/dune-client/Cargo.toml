@@ -5,7 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-executions = ["dep:dune-ledger"]
+# Read-only ledger integration: look up what an execution cost, and what the account has spent.
+# Neither can start a query, so a binary can enforce a spending ceiling without gaining the
+# ability to spend.
+ledger = ["dep:dune-ledger"]
+# Adds `execute`. Implies `ledger`. Only enable it where starting a paid query is intended.
+executions = ["ledger"]
 
 [dependencies]
 dune-ledger = { path = "../dune-ledger", optional = true }

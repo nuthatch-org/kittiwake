@@ -113,6 +113,15 @@ pub struct DuneSettings {
     pub account: String,
     #[serde(default)]
     pub poller_enabled: bool,
+    /// How often to refresh the ledger's copy of Dune's own usage figure. The endpoint is not
+    /// billed, so this is cheap; the only cost of a short interval is an HTTP request.
+    #[serde(default = "default_dune_usage_sync_seconds")]
+    pub usage_sync_seconds: u64,
+    /// Refuse to admit any Dune work when the account's usage has not been confirmed within this
+    /// long. The account is on a fixed monthly plan with no appetite for overage, so not knowing
+    /// the balance is a reason to stop, not a reason to carry on and hope.
+    #[serde(default = "default_dune_usage_max_age_seconds")]
+    pub usage_max_age_seconds: u64,
 }
 
 /// Hand-written so the key cannot reach a log line through the derive.
@@ -123,6 +132,8 @@ impl std::fmt::Debug for DuneSettings {
             .field("registry_dir", &self.registry_dir)
             .field("account", &self.account)
             .field("poller_enabled", &self.poller_enabled)
+            .field("usage_sync_seconds", &self.usage_sync_seconds)
+            .field("usage_max_age_seconds", &self.usage_max_age_seconds)
             .finish()
     }
 }
@@ -133,6 +144,16 @@ fn default_dune_registry_dir() -> String {
 
 fn default_dune_account() -> String {
     "pete44".to_string()
+}
+
+fn default_dune_usage_sync_seconds() -> u64 {
+    900
+}
+
+/// Four times the default refresh interval, so a single failed sync does not halt the poller but a
+/// sustained outage does.
+fn default_dune_usage_max_age_seconds() -> u64 {
+    3600
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -208,14 +229,25 @@ impl Config {
                 self.nest.origin
             )));
         }
-        if self
-            .dune
-            .as_ref()
-            .is_some_and(|d| d.api_key.trim().is_empty())
-        {
-            return Err(ConfigError::Invalid(
-                "dune.api_key is present but empty".into(),
-            ));
+        if let Some(dune) = self.dune.as_ref() {
+            if dune.api_key.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "dune.api_key is present but empty".into(),
+                ));
+            }
+            if dune.usage_sync_seconds == 0 || dune.usage_max_age_seconds == 0 {
+                return Err(ConfigError::Invalid(
+                    "dune usage sync interval and max age must both be non-zero".into(),
+                ));
+            }
+            // A max age below the sync interval guarantees the ledger spends most of its life
+            // refusing work: the observation is stale before the next refresh is even due.
+            if dune.usage_max_age_seconds <= dune.usage_sync_seconds {
+                return Err(ConfigError::Invalid(format!(
+                    "dune.usage_max_age_seconds ({}) must exceed dune.usage_sync_seconds ({})",
+                    dune.usage_max_age_seconds, dune.usage_sync_seconds
+                )));
+            }
         }
         Ok(())
     }

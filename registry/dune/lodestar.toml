@@ -1,13 +1,25 @@
-# Phase 0 pilot. Estimates are conservative placeholders, not measured billing caps.
-# Enabled only after migration, export measurement, ownership and schedule review.
-monthly_budget_microcredits = 4000000000
+# Phase 0 pilot.
+#
+# The account is a fixed monthly subscription and must never buy an extra credit, so the budget
+# here is deliberately NOT the 4,000-credit included allowance. It is 3,600 credits, leaving 400
+# (10%) of headroom that this ledger will not spend. That margin absorbs the three things the
+# ledger cannot control:
+#
+#   - spend that never passes through it (a query run from the Dune web UI, a Dune-side schedule,
+#     ad-hoc exploration: 7.1 credits went that way on 2026-09-14 alone);
+#   - an execution costing more than its estimate, which settlement records after the fact;
+#   - the lag between an execution finishing and Dune's usage counter reflecting it.
+#
+# This is admission control, not a hard stop. The only real ceiling is the Dune-side account cap,
+# which must be set in the Dune web UI; see plans/dune/07-credit-budget.md in nightswatch-misc.
+monthly_budget_microcredits = 3600000000
 
 [allocations]
-A = 2100000000
-B = 800000000
-C = 600000000
-D = 300000000
-reserve = 200000000
+A = 1890000000
+B = 720000000
+C = 540000000
+D = 270000000
+reserve = 180000000
 
 [[query]]
 id = "grt_price_daily"
@@ -17,7 +29,16 @@ workstream = "A"
 enabled = false
 schedule_seconds = 86400
 poll_seconds = 86400
+# Measured 2026-09-14 across three runs of this exact SQL: 0.064029412, 0.152970589 and
+# 0.094852942 credits. The estimate below is 1 credit, roughly 6.5x the observed maximum, and
+# deliberately so: an over-estimate only makes the ledger refuse work sooner, while an
+# under-estimate lets spending through. With ~4,000 credits against a ~0.1-credit query there is
+# no throughput worth trading for that risk. Settlement replaces this with the real cost.
 execution_estimate_microcredits = 1000000
+# Measured 2026-09-14: results reads are not billed. Roughly 85 reads and some 7,000 datapoints
+# moved account usage by zero, while executions moved it by exactly their reported cost. Kept at a
+# nominal 1 credit rather than 0, because "free today on this plan" is an observation about one
+# billing period, not a guarantee, and this estimate costs nothing to hold.
 export_estimate_microcredits = 1000000
 result_limit = 31
 target_table = "dune_grt_price_daily"

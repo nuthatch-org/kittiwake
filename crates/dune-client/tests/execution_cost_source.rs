@@ -1,4 +1,4 @@
-#![cfg(feature = "executions")]
+#![cfg(feature = "ledger")]
 use dune_client::DuneClient;
 use dune_ledger::{ExecutionCost, ExecutionCostSource};
 use wiremock::{
