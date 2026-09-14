@@ -224,6 +224,7 @@ pub async fn refresh(
         None => (HashMap::new(), None),
     };
     let _ = oracle;
+    let names = known_names(pool).await;
 
     let mut rows = Vec::with_capacity(indexers.rows.len());
     let mut apys: Vec<(String, Option<f64>, Option<f64>)> = Vec::with_capacity(indexers.rows.len());
@@ -292,6 +293,7 @@ pub async fn refresh(
             Some(Some(false)) => sc::Reo::Ineligible,
             _ => sc::Reo::Unknown,
         };
+        let (has_ens, has_display_name) = transparency(names.get(&id));
 
         let score = sc::calculate(&sc::Input {
             reo,
@@ -306,9 +308,9 @@ pub async fn refresh(
                 None
             },
             delegation_utilization: capacity.utilization_percent,
-            has_ens: false,
+            has_ens,
             has_url: s(r, "url").is_some_and(|u| !u.is_empty()),
-            has_display_name: false,
+            has_display_name,
             reward_cut_ppm,
             query_fee_cut_ppm,
             effective_cut_percent: Some(apr.effective_cut * 100.0),
@@ -397,6 +399,36 @@ struct ParamChange {
     old: f64,
     new: f64,
     epoch: Option<i32>,
+}
+
+/// Empty until `ingest-names` has run once, so a name the platform left behind is never scored.
+const KNOWN_NAMES_SQL: &str = "SELECT address, name, ens_name FROM indexers \
+     WHERE EXISTS (SELECT 1 FROM ingestion_state WHERE key = 'kittiwake:names')";
+
+/// `(name, ens_name)` as `ingest-names` last verified them. Read, not looked up: refresh runs every
+/// five minutes and the lookups are mainnet round trips, so they live in the hourly job.
+async fn known_names(pool: &Pool) -> HashMap<String, (Option<String>, Option<String>)> {
+    match sqlx::query_as::<_, (String, Option<String>, Option<String>)>(KNOWN_NAMES_SQL)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(a, name, ens)| (a.to_lowercase(), (name, ens)))
+            .collect(),
+        Err(e) => {
+            tracing::warn!("indexer names unreadable, scoring without them: {e}");
+            HashMap::new()
+        }
+    }
+}
+
+/// `(has_ens, has_display_name)`. Both come from verified names only; an unknown indexer has neither.
+fn transparency(names: Option<&(Option<String>, Option<String>)>) -> (bool, bool) {
+    match names {
+        Some((name, ens)) => (ens.is_some(), name.is_some()),
+        None => (false, false),
+    }
 }
 
 /// The cuts as they stood before this run.
@@ -627,6 +659,25 @@ async fn write_rows(pool: &Pool, rows: &[Row]) -> Result<(), sqlx::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_are_not_scored_before_ingest_names_has_run() {
+        assert!(KNOWN_NAMES_SQL.contains(&format!(
+            "EXISTS (SELECT 1 FROM ingestion_state WHERE key = '{}')",
+            kittiwake_db::NAMES_CURSOR_KEY
+        )));
+    }
+
+    /// Both were hardcoded false, which cost every indexer up to 70 of 100 in Transparency.
+    #[test]
+    fn transparency_reads_the_verified_names() {
+        let ens = (Some("pinax.eth".to_string()), Some("pinax.eth".to_string()));
+        let default_only = (Some("grassets-tech-2".to_string()), None);
+        assert_eq!(transparency(Some(&ens)), (true, true));
+        assert_eq!(transparency(Some(&default_only)), (false, true));
+        assert_eq!(transparency(Some(&(None, None))), (false, false));
+        assert_eq!(transparency(None), (false, false));
+    }
 
     /// A row carrying only the two fields the trail compares. Everything else is inert here.
     fn row(id: &str, reward_cut: f64, query_fee_cut: f64) -> Row {

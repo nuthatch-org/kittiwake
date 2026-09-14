@@ -181,7 +181,7 @@ pub async fn indexers(
         },
     )
     .await?;
-    Ok(envelope(read))
+    Ok(envelope(named_indexers(&st, read).await))
 }
 
 pub async fn indexer(
@@ -192,7 +192,35 @@ pub async fn indexer(
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
     let read = routes::indexer(&st.read, &addr(&address)).await?;
+    let read = named_indexers(&st, read).await;
     Ok(envelope(named_allocations(&st, read).await))
+}
+
+/// Put the verified indexer names from Postgres on the accounts. A failed read leaves them null:
+/// a name is decoration on the figures, and must not turn the route into a 502.
+async fn named_indexers(st: &AppState, mut read: kittiwake_read::Read) -> kittiwake_read::Read {
+    let Some(pool) = st.pool.as_ref() else {
+        return read;
+    };
+    let ids = kittiwake_read::shape::indexer_account_ids(&read.entry.value);
+    if ids.is_empty() {
+        return read;
+    }
+    let names = match kittiwake_db::indexer_names(pool, &ids).await {
+        Ok(names) => names,
+        Err(e) => {
+            tracing::warn!("indexer names unreadable, serving without them: {e}");
+            return read;
+        }
+    };
+    let mut data = (*read.entry.value).clone();
+    kittiwake_read::shape::put_indexer_names(&mut data, &names);
+    read.entry = std::sync::Arc::new(kittiwake_cache::Entry {
+        value: std::sync::Arc::new(data),
+        provenance: read.entry.provenance.clone(),
+        fetched_at: read.entry.fetched_at,
+    });
+    read
 }
 
 /// Put the names on an indexer's allocations, when there is a database to read them from.
