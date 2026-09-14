@@ -169,6 +169,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "a refreshed observation permits admission again"
     );
 
+    // 11. The spend audit on real figures. Until the Dune-side extra-credit limit is set, this is
+    //     the whole warning system, so it is worth seeing against live numbers rather than only
+    //     against fixtures.
+    let audit = strict.spend_audit(period_id).await?;
+    let uc = 1_000_000.0;
+    println!("\nspend audit (live figures):");
+    println!(
+        "  dune reported      {:>12.3} credits",
+        audit.dune_reported_microcredits as f64 / uc
+    );
+    println!(
+        "  ledger settled     {:>12.3} credits",
+        audit.ledger_settled_microcredits as f64 / uc
+    );
+    println!(
+        "  unaccounted        {:>12.3} credits  <- spend that never passed through the ledger",
+        audit.unaccounted_microcredits as f64 / uc
+    );
+    println!(
+        "  period elapsed     {:>12.1}%",
+        audit.elapsed_fraction * 100.0
+    );
+    println!("  ceiling used       {:>12.2}%", audit.pct_of_ceiling());
+    println!(
+        "  projected at end   {:>12.3} credits (meaningful: {})",
+        audit.projected_period_end_microcredits as f64 / uc,
+        audit.projection_is_meaningful()
+    );
+    println!("  alarm              {:>12?}", audit.alarm());
+
     // Audited: same generated identifier as above.
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)

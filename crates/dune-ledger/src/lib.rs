@@ -434,6 +434,141 @@ impl Ledger {
         let (limit, committed) = row.ok_or(Error::Refused("unknown billing period"))?;
         Ok(limit - committed)
     }
+
+    /// The full spending picture for a period, for alarms rather than admission.
+    ///
+    /// Admission already refuses work once the ceiling is reached, but that only constrains work
+    /// this ledger admits. The account is on a fixed subscription that charges overage
+    /// automatically, and two things can spend it without ever touching this ledger: a query
+    /// scheduled on Dune's side, and a human in the Dune web UI. Neither can be blocked from here.
+    /// What can be done is to see them, early and unambiguously, which is what this is for.
+    pub async fn spend_audit(&self, period: i64) -> Result<SpendAudit, Error> {
+        let row: Option<(i64, Option<i64>, i64, i64, i64, f64)> = sqlx::query_as(
+            "SELECT p.limit_microcredits, \
+                    p.observed_included_microcredits, \
+                    p.observed_used_microcredits, \
+                    coalesce(sum(r.actual_microcredits) FILTER (WHERE r.state = 'settled'), 0)::bigint, \
+                    coalesce(sum(r.estimate_microcredits) \
+                        FILTER (WHERE r.state IN ('reserved', 'submitted')), 0)::bigint, \
+                    greatest(0.0, least(1.0, \
+                        extract(epoch FROM (now() - p.starts_at)) \
+                        / nullif(extract(epoch FROM (p.ends_at - p.starts_at)), 0)))::double precision \
+             FROM dune_budget_periods p \
+             LEFT JOIN dune_reservations r ON r.period_id = p.id \
+             WHERE p.id = $1 \
+             GROUP BY p.id",
+        )
+        .bind(period)
+        .fetch_optional(&self.pool)
+        .await?;
+        let (ceiling, included, dune_reported, settled, outstanding, elapsed) =
+            row.ok_or(Error::Refused("unknown billing period"))?;
+
+        // Spend Dune billed that this ledger never settled. On a system that has admitted nothing,
+        // this is simply all of it, which is correct and is the point: it is the number that goes
+        // up when something outside the ledger is spending.
+        let unaccounted = (dune_reported - settled).max(0);
+
+        // Straight-line projection to period end. Early in a period the denominator is small and
+        // the projection is wild, so it is only meaningful once some of the period has elapsed;
+        // `projection_is_meaningful` says when.
+        let projected = if elapsed > 0.0 {
+            ((dune_reported as f64) / elapsed).min(i64::MAX as f64) as i64
+        } else {
+            dune_reported
+        };
+
+        Ok(SpendAudit {
+            period_id: period,
+            ceiling_microcredits: ceiling,
+            included_microcredits: included,
+            dune_reported_microcredits: dune_reported,
+            ledger_settled_microcredits: settled,
+            ledger_outstanding_microcredits: outstanding,
+            unaccounted_microcredits: unaccounted,
+            elapsed_fraction: elapsed,
+            projected_period_end_microcredits: projected,
+        })
+    }
+}
+
+/// Everything known about one period's spending, for alarms.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpendAudit {
+    pub period_id: i64,
+    /// The ledger's own ceiling, deliberately below the plan's included allowance.
+    pub ceiling_microcredits: i64,
+    /// What Dune says the plan includes. `None` until a usage sync has run.
+    pub included_microcredits: Option<i64>,
+    /// What Dune says has actually been billed.
+    pub dune_reported_microcredits: i64,
+    /// What this ledger admitted and has confirmed a real cost for.
+    pub ledger_settled_microcredits: i64,
+    /// What this ledger admitted but has not yet settled.
+    pub ledger_outstanding_microcredits: i64,
+    /// Billed spend this ledger cannot account for: Dune-side schedules, the web UI, another key.
+    pub unaccounted_microcredits: i64,
+    /// How far through the billing period we are, 0.0 to 1.0.
+    pub elapsed_fraction: f64,
+    /// Straight-line projection of period-end spend at the current rate.
+    pub projected_period_end_microcredits: i64,
+}
+
+/// How alarmed to be. Ordered, so `>=` comparisons work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SpendAlarm {
+    /// Inside the ceiling and on track.
+    Nominal,
+    /// Half the ceiling used, or the projection is heading for the ceiling.
+    Elevated,
+    /// Three quarters used, or the projection is heading past the included allowance. This is the
+    /// level at which somebody should look, because overage is charged automatically.
+    High,
+    /// The ceiling is reached. Admission is already refusing everything.
+    Breached,
+}
+
+impl SpendAudit {
+    pub fn pct_of_ceiling(&self) -> f64 {
+        if self.ceiling_microcredits <= 0 {
+            return 0.0;
+        }
+        (self.dune_reported_microcredits as f64 / self.ceiling_microcredits as f64) * 100.0
+    }
+
+    /// A projection from a sliver of elapsed period is arithmetic, not information. Below roughly
+    /// a day of a month it is ignored rather than allowed to cry wolf.
+    pub fn projection_is_meaningful(&self) -> bool {
+        self.elapsed_fraction >= 0.03
+    }
+
+    /// True when the current rate, carried to period end, would exceed the plan's included
+    /// allowance - which is the point at which Dune starts charging for extra credits.
+    pub fn projection_exceeds_included(&self) -> bool {
+        match self.included_microcredits {
+            Some(included) if self.projection_is_meaningful() => {
+                self.projected_period_end_microcredits > included
+            }
+            _ => false,
+        }
+    }
+
+    pub fn alarm(&self) -> SpendAlarm {
+        let pct = self.pct_of_ceiling();
+        if pct >= 100.0 {
+            return SpendAlarm::Breached;
+        }
+        if pct >= 75.0 || self.projection_exceeds_included() {
+            return SpendAlarm::High;
+        }
+        if pct >= 50.0
+            || (self.projection_is_meaningful()
+                && self.projected_period_end_microcredits > self.ceiling_microcredits)
+        {
+            return SpendAlarm::Elevated;
+        }
+        SpendAlarm::Nominal
+    }
 }
 
 /// The account's own billing figures, as Dune reports them for the current period.

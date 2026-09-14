@@ -223,6 +223,17 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if let Some(dune_cfg) = &cfg.dune {
+            // This binary is built against `dune-client/ledger`, not `executions`, so
+            // `DuneClient::execute` is not compiled in and nothing here can start a paid query.
+            // That is the strongest guarantee available while the Dune-side extra-credit limit is
+            // unset, so enabling the feature must be a deliberate, noisy act rather than a stray
+            // `--all-features` in a build script.
+            #[cfg(feature = "dune-executions")]
+            tracing::error!(
+                "built with Dune execution support: this binary CAN spend credits. The account \
+                 charges overage automatically, so do not run this in production until the \
+                 Dune-side monthly extra-credit limit is set to zero."
+            );
             tracing::info!(registry_dir = %dune_cfg.registry_dir, "loading Dune registry");
             match dune_registry::Registry::load_dir(&dune_cfg.registry_dir) {
                 Ok(registry) => {

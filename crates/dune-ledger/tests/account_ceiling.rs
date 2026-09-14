@@ -404,3 +404,180 @@ async fn a_renewal_starts_a_new_period_rather_than_extending_the_old_one() {
         "the new period starts from the new period's spend, not the old period's"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Spend alarms. The Dune-side extra-credit limit is not set, so these log lines
+// are currently the only warning before an automatic overage charge. An alarm
+// that does not fire is worse than no alarm, so each threshold is pinned.
+// ---------------------------------------------------------------------------
+
+/// Builds a period with explicit dates so the elapsed fraction, and therefore the projection,
+/// is deterministic rather than dependent on when the suite runs.
+async fn dated_fixture(
+    tag: &str,
+    elapsed_days: i64,
+    total_days: i64,
+    ceiling: i64,
+) -> (sqlx::PgPool, i64) {
+    let pool = empty_fixture(tag).await;
+    let period: i64 = sqlx::query_scalar(
+        "INSERT INTO dune_budget_periods(account, starts_at, ends_at, limit_microcredits) \
+         VALUES ('fixture', now() - make_interval(days => $1), \
+                             now() + make_interval(days => $2), $3) \
+         RETURNING id",
+    )
+    .bind(elapsed_days as i32)
+    .bind((total_days - elapsed_days) as i32)
+    .bind(ceiling)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO dune_budget_allocations VALUES ($1, 'A', $2)")
+        .bind(period)
+        .bind(ceiling)
+        .execute(&pool)
+        .await
+        .unwrap();
+    (pool, period)
+}
+
+#[tokio::test]
+#[ignore = "requires isolated DUNE_TEST_DATABASE_URL; creates its own schema"]
+async fn spend_outside_the_ledger_shows_up_as_unaccounted() {
+    // Half a 30-day period gone, 3,600-credit ceiling, 4,000 included.
+    let (pool, period) = dated_fixture("unaccounted", 15, 30, 3_600_000_000).await;
+    let ledger = Ledger::new(pool.clone());
+
+    // Dune has billed 100 credits. Nothing went through the ledger, which is exactly the shape of
+    // a Dune-side schedule or somebody using the web UI.
+    let usage = FakeUsage::reporting(100_000_000, 4_000_000_000);
+    ledger.sync_account_usage(period, &usage).await.unwrap();
+
+    let audit = ledger.spend_audit(period).await.unwrap();
+    assert_eq!(audit.dune_reported_microcredits, 100_000_000);
+    assert_eq!(audit.ledger_settled_microcredits, 0);
+    assert_eq!(
+        audit.unaccounted_microcredits, 100_000_000,
+        "spend the ledger never admitted must be visible as unaccounted"
+    );
+    // ~100 credits at the halfway point projects to ~200 by period end: nowhere near 3,600.
+    assert_eq!(audit.alarm(), dune_ledger::SpendAlarm::Nominal);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated DUNE_TEST_DATABASE_URL; creates its own schema"]
+async fn the_alarm_escalates_with_the_share_of_the_ceiling_used() {
+    let (pool, period) = dated_fixture("escalate", 15, 30, 1_000_000_000).await;
+    let ledger = Ledger::new(pool.clone());
+    let usage = FakeUsage::reporting(0, 4_000_000_000);
+
+    for (used, expected) in [
+        (100_000_000_i64, dune_ledger::SpendAlarm::Nominal), // 10%
+        (500_000_000, dune_ledger::SpendAlarm::Elevated),    // 50%
+        (800_000_000, dune_ledger::SpendAlarm::High),        // 80%
+        (1_000_000_000, dune_ledger::SpendAlarm::Breached),  // 100%
+    ] {
+        usage.set(used, 4_000_000_000);
+        ledger.sync_account_usage(period, &usage).await.unwrap();
+        let audit = ledger.spend_audit(period).await.unwrap();
+        assert_eq!(
+            audit.alarm(),
+            expected,
+            "at {} microcredits ({:.0}% of ceiling)",
+            used,
+            audit.pct_of_ceiling()
+        );
+    }
+}
+
+/// The point of the projection: catch a burn rate heading past the included allowance *before* the
+/// allowance is gone, because overage is charged automatically the moment it is.
+#[tokio::test]
+#[ignore = "requires isolated DUNE_TEST_DATABASE_URL; creates its own schema"]
+async fn a_burn_rate_heading_past_the_included_allowance_raises_a_high_alarm() {
+    // One tenth of the period elapsed, ceiling 3,600 credits, 4,000 included.
+    let (pool, period) = dated_fixture("burn", 3, 30, 3_600_000_000).await;
+    let ledger = Ledger::new(pool.clone());
+
+    // 500 credits in the first tenth projects to ~5,000 by period end: past the 4,000 included,
+    // and therefore into automatic overage, despite only 14% of the ceiling being used so far.
+    let usage = FakeUsage::reporting(500_000_000, 4_000_000_000);
+    ledger.sync_account_usage(period, &usage).await.unwrap();
+    let audit = ledger.spend_audit(period).await.unwrap();
+
+    assert!(
+        audit.pct_of_ceiling() < 20.0,
+        "still well inside the ceiling"
+    );
+    assert!(audit.projection_is_meaningful());
+    assert!(
+        audit.projected_period_end_microcredits > 4_000_000_000,
+        "projected {} should exceed the included allowance",
+        audit.projected_period_end_microcredits
+    );
+    assert!(audit.projection_exceeds_included());
+    assert_eq!(
+        audit.alarm(),
+        dune_ledger::SpendAlarm::High,
+        "a burn rate heading into overage must alarm before the ceiling is anywhere near"
+    );
+}
+
+/// A projection from a sliver of elapsed time is arithmetic, not information, and must not alarm.
+#[tokio::test]
+#[ignore = "requires isolated DUNE_TEST_DATABASE_URL; creates its own schema"]
+async fn a_projection_from_almost_no_elapsed_period_does_not_cry_wolf() {
+    // Half a day into a 30-day period: 1.7% elapsed, below the 3% meaningfulness floor.
+    let (pool, period) = dated_fixture("early", 0, 30, 3_600_000_000).await;
+    sqlx::query(
+        "UPDATE dune_budget_periods SET starts_at = now() - interval '12 hours' WHERE id = $1",
+    )
+    .bind(period)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let ledger = Ledger::new(pool.clone());
+    let usage = FakeUsage::reporting(20_000_000, 4_000_000_000);
+    ledger.sync_account_usage(period, &usage).await.unwrap();
+
+    let audit = ledger.spend_audit(period).await.unwrap();
+    assert!(
+        !audit.projection_is_meaningful(),
+        "1.7% elapsed is too little to project from"
+    );
+    assert!(!audit.projection_exceeds_included());
+    assert_eq!(audit.alarm(), dune_ledger::SpendAlarm::Nominal);
+}
+
+/// Settled ledger spend is accounted for and must not be double-counted as unaccounted.
+#[tokio::test]
+#[ignore = "requires isolated DUNE_TEST_DATABASE_URL; creates its own schema"]
+async fn ledger_admitted_spend_is_not_reported_as_unaccounted() {
+    let (pool, period) = dated_fixture("accounted", 15, 30, 1_000_000_000).await;
+    let ledger = Ledger::new(pool.clone());
+
+    let permit = ledger
+        .reserve(period, "A", 8699345, "fixture", 50_000_000)
+        .await
+        .expect("fits");
+    let submitted = permit.claim(8699345).await.expect("claimed");
+    submitted
+        .attach_execution("01AUDIT0000000000000000001")
+        .await
+        .expect("attached");
+    ledger
+        .settle("01AUDIT0000000000000000001", 40_000_000)
+        .await
+        .expect("settled");
+
+    // Dune reports exactly that 40 credits and nothing else.
+    let usage = FakeUsage::reporting(40_000_000, 4_000_000_000);
+    ledger.sync_account_usage(period, &usage).await.unwrap();
+
+    let audit = ledger.spend_audit(period).await.unwrap();
+    assert_eq!(audit.ledger_settled_microcredits, 40_000_000);
+    assert_eq!(
+        audit.unaccounted_microcredits, 0,
+        "spend this ledger admitted and settled is accounted for"
+    );
+}

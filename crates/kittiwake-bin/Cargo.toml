@@ -8,6 +8,11 @@ license.workspace = true
 name = "kittiwake"
 path = "src/main.rs"
 
+[features]
+# Off, and meant to stay off. Turning it on compiles `DuneClient::execute` into the service, which
+# is the only thing here capable of spending credits. Startup logs an error if it is set.
+dune-executions = ["dune-client/executions"]
+
 [dependencies]
 anyhow = "1.0.104"
 axum = "0.8.9"
@@ -30,6 +35,8 @@ kittiwake-warmer = { version = "0.1.0", path = "../warmer" }
 # `ledger`, deliberately not `executions`: this binary must be able to read what the account has
 # spent without gaining the ability to spend. `DuneClient::execute` is not compiled in here.
 dune-client = { path = "../dune-client", features = ["ledger"] }
+# Opt-in re-export of the execution feature, so turning it on is a visible edit here rather than a
+# side effect of someone's `--all-features`. Startup shouts if it is ever set.
 dune-ledger = { path = "../dune-ledger" }
 dune-poller = { path = "../dune-poller" }
 dune-registry = { path = "../dune-registry" }

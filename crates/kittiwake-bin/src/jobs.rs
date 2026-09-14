@@ -400,28 +400,75 @@ pub fn dune_usage_sync_job(
                     .ensure_period(&account, client.as_ref(), ceiling_microcredits)
                     .await
                     .map_err(|e| format!("Dune usage sync failed for {account}: {e}"))?;
-                match ledger.remaining_headroom(period_id).await {
-                    Ok(headroom) => {
-                        if headroom <= 0 {
-                            tracing::error!(
-                                account = %account,
-                                headroom_microcredits = headroom,
-                                "Dune budget ceiling reached: admission will refuse all work"
-                            );
-                        }
-                        tracing::debug!(
-                            account = %account,
-                            period_id,
-                            headroom_microcredits = headroom,
-                            "Dune account usage refreshed"
-                        );
-                        Ok(JobOutcome { rows_written: 0 })
-                    }
-                    Err(e) => Err(format!("Dune headroom query failed for {account}: {e}")),
-                }
+                let headroom = ledger
+                    .remaining_headroom(period_id)
+                    .await
+                    .map_err(|e| format!("Dune headroom query failed for {account}: {e}"))?;
+                let audit = ledger
+                    .spend_audit(period_id)
+                    .await
+                    .map_err(|e| format!("Dune spend audit failed for {account}: {e}"))?;
+                report_spend(&account, headroom, &audit);
+                Ok(JobOutcome { rows_written: 0 })
             })
         }),
     )
+}
+
+/// Logs the spending picture at a severity matching how worrying it is.
+///
+/// The account charges overage automatically, and the Dune-side extra-credit limit is the only
+/// thing that can actually stop a charge. Until that is set, this log line is the warning system,
+/// so it is deliberately shouty near the ceiling and deliberately quiet below half.
+fn report_spend(account: &str, headroom: i64, audit: &dune_ledger::SpendAudit) {
+    use dune_ledger::SpendAlarm;
+    let pct = audit.pct_of_ceiling();
+    let uc = 1_000_000.0;
+
+    // Spend that never passed through this ledger cannot be prevented from here, only noticed.
+    // A Dune-side schedule or a web-UI query is exactly what this catches.
+    if audit.unaccounted_microcredits > 0 {
+        tracing::warn!(
+            account = %account,
+            unaccounted_credits = audit.unaccounted_microcredits as f64 / uc,
+            dune_reported_credits = audit.dune_reported_microcredits as f64 / uc,
+            ledger_settled_credits = audit.ledger_settled_microcredits as f64 / uc,
+            "Dune spend this ledger did not admit: a Dune-side schedule, the web UI, or another \
+             key holder. It cannot be blocked from here, only accounted for."
+        );
+    }
+
+    match audit.alarm() {
+        SpendAlarm::Breached => tracing::error!(
+            account = %account,
+            pct_of_ceiling = pct,
+            headroom_credits = headroom as f64 / uc,
+            "Dune budget ceiling reached: admission is refusing all work. The account may still be \
+             charged by anything outside this ledger."
+        ),
+        SpendAlarm::High => tracing::error!(
+            account = %account,
+            pct_of_ceiling = pct,
+            headroom_credits = headroom as f64 / uc,
+            projected_period_end_credits = audit.projected_period_end_microcredits as f64 / uc,
+            included_credits = audit.included_microcredits.map(|c| c as f64 / uc),
+            "Dune spend is heading for the included allowance; overage is charged automatically"
+        ),
+        SpendAlarm::Elevated => tracing::warn!(
+            account = %account,
+            pct_of_ceiling = pct,
+            headroom_credits = headroom as f64 / uc,
+            projected_period_end_credits = audit.projected_period_end_microcredits as f64 / uc,
+            "Dune spend is over half the ceiling"
+        ),
+        SpendAlarm::Nominal => tracing::debug!(
+            account = %account,
+            period_id = audit.period_id,
+            pct_of_ceiling = pct,
+            headroom_credits = headroom as f64 / uc,
+            "Dune account usage refreshed"
+        ),
+    }
 }
 
 /// Dune feed poller jobs driven by the query registry.
