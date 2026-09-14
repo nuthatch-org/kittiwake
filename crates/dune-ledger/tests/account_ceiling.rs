@@ -16,22 +16,40 @@ impl FakeUsage {
         Self(std::sync::Mutex::new(Some(AccountUsage {
             used_microcredits: used,
             included_microcredits: included,
+            period_start: "2026-09-13".into(),
+            period_end: "2026-10-13".into(),
         })))
     }
     fn failing() -> Self {
         Self(std::sync::Mutex::new(None))
     }
     fn set(&self, used: i64, included: i64) {
+        let mut guard = self.0.lock().unwrap();
+        let (start, end) = guard
+            .as_ref()
+            .map(|u| (u.period_start.clone(), u.period_end.clone()))
+            .unwrap_or_else(|| ("2026-09-13".into(), "2026-10-13".into()));
+        *guard = Some(AccountUsage {
+            used_microcredits: used,
+            included_microcredits: included,
+            period_start: start,
+            period_end: end,
+        });
+    }
+    /// Move the reported billing period on, as Dune does at a renewal.
+    fn roll_period(&self, start: &str, end: &str, used: i64, included: i64) {
         *self.0.lock().unwrap() = Some(AccountUsage {
             used_microcredits: used,
             included_microcredits: included,
+            period_start: start.into(),
+            period_end: end.into(),
         });
     }
 }
 
 impl AccountUsageSource for FakeUsage {
     async fn account_usage(&self) -> Option<AccountUsage> {
-        *self.0.lock().unwrap()
+        self.0.lock().unwrap().clone()
     }
 }
 
@@ -249,5 +267,140 @@ async fn admission_refuses_when_the_usage_observation_is_missing_or_stale() {
             .reserve(period, "A", 8699345, "fixture", 1_000)
             .await
             .is_ok()
+    );
+}
+
+/// A database with no period row at all is where every deployment starts. `ensure_period` is the
+/// only thing that gets it out of that state, so it is tested from empty.
+async fn empty_fixture(schema_tag: &str) -> sqlx::PgPool {
+    let (pool, period) = fixture(schema_tag).await;
+    // Drop the seeded period so the test starts from genuinely nothing.
+    sqlx::query("DELETE FROM dune_budget_allocations WHERE period_id = $1")
+        .bind(period)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM dune_budget_periods WHERE id = $1")
+        .bind(period)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool
+}
+
+#[tokio::test]
+#[ignore = "requires isolated DUNE_TEST_DATABASE_URL; creates its own schema"]
+async fn ensure_period_seeds_from_dunes_own_billing_dates() {
+    let pool = empty_fixture("seed").await;
+    let ledger = Ledger::new(pool.clone());
+    let usage = FakeUsage::reporting(7_113_000, 4_000_000_000);
+
+    // Nothing exists yet, so admission has nothing to bind to.
+    assert!(
+        ledger.sync_active_period("fixture", &usage).await.is_err(),
+        "no period means nothing to sync"
+    );
+
+    let period = ledger
+        .ensure_period("fixture", &usage, 3_600_000_000)
+        .await
+        .expect("seeds");
+
+    let (starts, ends, limit, observed): (String, String, i64, i64) = sqlx::query_as(
+        "SELECT starts_at::date::text, ends_at::date::text, limit_microcredits, \
+         observed_used_microcredits FROM dune_budget_periods WHERE id = $1",
+    )
+    .bind(period)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    // Dune's dates, not calendar months.
+    assert_eq!(starts, "2026-09-13");
+    assert_eq!(ends, "2026-10-13");
+    assert_eq!(
+        limit, 3_600_000_000,
+        "the configured ceiling, below included"
+    );
+    assert_eq!(observed, 7_113_000, "real spend carried in at seed time");
+
+    // Idempotent: a second call returns the same period rather than a duplicate.
+    let again = ledger
+        .ensure_period("fixture", &usage, 3_600_000_000)
+        .await
+        .unwrap();
+    assert_eq!(again, period);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM dune_budget_periods")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+/// A plan downgrade must tighten the ceiling, never leave the ledger authorising spend the plan no
+/// longer includes.
+#[tokio::test]
+#[ignore = "requires isolated DUNE_TEST_DATABASE_URL; creates its own schema"]
+async fn the_ceiling_is_capped_by_dunes_included_allowance() {
+    let pool = empty_fixture("downgrade").await;
+    let ledger = Ledger::new(pool.clone());
+
+    // Dune includes only 1,000 credits, well below the configured 3,600.
+    let usage = FakeUsage::reporting(0, 1_000_000_000);
+    let period = ledger
+        .ensure_period("fixture", &usage, 3_600_000_000)
+        .await
+        .unwrap();
+    let limit: i64 =
+        sqlx::query_scalar("SELECT limit_microcredits FROM dune_budget_periods WHERE id = $1")
+            .bind(period)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(limit, 1_000_000_000, "the plan caps the configured ceiling");
+
+    // And a later, larger reading must not raise it back up.
+    usage.set(0, 4_000_000_000);
+    ledger
+        .ensure_period("fixture", &usage, 3_600_000_000)
+        .await
+        .unwrap();
+    let limit: i64 =
+        sqlx::query_scalar("SELECT limit_microcredits FROM dune_budget_periods WHERE id = $1")
+            .bind(period)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(limit, 1_000_000_000, "a ceiling only ever tightens");
+}
+
+/// When Dune renews, a new period row must appear rather than the old one absorbing new spend.
+#[tokio::test]
+#[ignore = "requires isolated DUNE_TEST_DATABASE_URL; creates its own schema"]
+async fn a_renewal_starts_a_new_period_rather_than_extending_the_old_one() {
+    let pool = empty_fixture("rollover").await;
+    let ledger = Ledger::new(pool.clone());
+    let usage = FakeUsage::reporting(3_500_000_000, 4_000_000_000);
+    let first = ledger
+        .ensure_period("fixture", &usage, 3_600_000_000)
+        .await
+        .unwrap();
+
+    usage.roll_period("2026-10-13", "2026-11-13", 2_000_000, 4_000_000_000);
+    let second = ledger
+        .ensure_period("fixture", &usage, 3_600_000_000)
+        .await
+        .unwrap();
+
+    assert_ne!(first, second, "a renewal is a new period");
+    let observed: i64 = sqlx::query_scalar(
+        "SELECT observed_used_microcredits FROM dune_budget_periods WHERE id = $1",
+    )
+    .bind(second)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        observed, 2_000_000,
+        "the new period starts from the new period's spend, not the old period's"
     );
 }

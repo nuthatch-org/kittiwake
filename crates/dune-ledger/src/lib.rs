@@ -339,6 +339,62 @@ impl Ledger {
         stored.ok_or(Error::Refused("unknown billing period"))
     }
 
+    /// Creates or refreshes the budget period for `account` from Dune's own billing dates, and
+    /// returns its ID.
+    ///
+    /// This is what makes the ceiling real. Without a period row there is no active period,
+    /// admission refuses everything, and nothing else in this crate has anything to bind to.
+    /// Because it keys on Dune's own `start_date`, it also handles period rollover: when Dune moves
+    /// to the next billing period a new row appears on the next call, rather than the ledger
+    /// silently continuing to account against a period that has ended.
+    ///
+    /// The ceiling stored is `min(configured, Dune's included allowance)`. The configured figure is
+    /// the registry's `monthly_budget_microcredits`, which already holds back a margin; the `min`
+    /// means a plan downgrade tightens the ceiling automatically instead of leaving the ledger
+    /// authorising spend the plan no longer includes. It can only ever tighten.
+    pub async fn ensure_period(
+        &self,
+        account: &str,
+        source: &impl AccountUsageSource,
+        configured_ceiling_microcredits: i64,
+    ) -> Result<i64, Error> {
+        if account.trim().is_empty() || configured_ceiling_microcredits <= 0 {
+            return Err(Error::Refused("account or ceiling"));
+        }
+        let Some(usage) = source.account_usage().await else {
+            return Err(Error::Refused("account usage lookup failed"));
+        };
+        if usage.used_microcredits < 0 || usage.included_microcredits < 0 {
+            return Err(Error::Refused("negative account usage"));
+        }
+        let ceiling = configured_ceiling_microcredits.min(usage.included_microcredits);
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO dune_budget_periods \
+                 (account, starts_at, ends_at, limit_microcredits, \
+                  observed_used_microcredits, observed_included_microcredits, observed_at) \
+             VALUES ($1, $2::date, $3::date, $4, $5, $6, now()) \
+             ON CONFLICT (account, starts_at) DO UPDATE SET \
+                 ends_at = excluded.ends_at, \
+                 limit_microcredits = least(dune_budget_periods.limit_microcredits, \
+                                            excluded.limit_microcredits), \
+                 observed_used_microcredits = greatest( \
+                     dune_budget_periods.observed_used_microcredits, \
+                     excluded.observed_used_microcredits), \
+                 observed_included_microcredits = excluded.observed_included_microcredits, \
+                 observed_at = now() \
+             RETURNING id",
+        )
+        .bind(account)
+        .bind(&usage.period_start)
+        .bind(&usage.period_end)
+        .bind(ceiling)
+        .bind(usage.used_microcredits)
+        .bind(usage.included_microcredits)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
     /// `sync_account_usage` for whichever period is active for `account` right now. The scheduler
     /// knows an account name, not a period ID, so this is what a background refresh job calls.
     pub async fn sync_active_period(
@@ -381,13 +437,18 @@ impl Ledger {
 }
 
 /// The account's own billing figures, as Dune reports them for the current period.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountUsage {
     /// Credits Dune has billed this period, in microcredits, rounded up.
     pub used_microcredits: i64,
     /// The plan's included allowance this period, in microcredits. Recorded so a plan change
     /// under a configured ceiling is visible rather than silent.
     pub included_microcredits: i64,
+    /// Dune's own period boundaries, as `YYYY-MM-DD`. These are **not** calendar months: the live
+    /// account's period runs 2026-09-13 to 2026-10-13. Seeding a period from the first of the
+    /// month would put the ledger and the bill on different clocks.
+    pub period_start: String,
+    pub period_end: String,
 }
 
 /// Reads the account's real usage from Dune. Implemented by the HTTP client; the trait lives here

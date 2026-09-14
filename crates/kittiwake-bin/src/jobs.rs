@@ -377,10 +377,15 @@ pub fn ingest_jobs(
 /// If it fails, the stored figure and its timestamp are left alone, so a ledger configured with
 /// `requiring_fresh_observation` will start refusing work rather than spend against a number
 /// nobody has confirmed.
+///
+/// It calls `ensure_period` rather than a plain refresh, which means it also creates the budget
+/// period on first run and starts a fresh one when Dune renews. Nothing else creates that row, and
+/// without it admission refuses everything.
 pub fn dune_usage_sync_job(
     client: Arc<dune_client::DuneClient>,
     ledger: dune_ledger::Ledger,
     account: String,
+    ceiling_microcredits: i64,
     period: Duration,
 ) -> JobDef {
     JobDef::every(
@@ -391,16 +396,28 @@ pub fn dune_usage_sync_job(
             let ledger = ledger.clone();
             let account = account.clone();
             Box::pin(async move {
-                match ledger.sync_active_period(&account, client.as_ref()).await {
-                    Ok(used) => {
+                let period_id = ledger
+                    .ensure_period(&account, client.as_ref(), ceiling_microcredits)
+                    .await
+                    .map_err(|e| format!("Dune usage sync failed for {account}: {e}"))?;
+                match ledger.remaining_headroom(period_id).await {
+                    Ok(headroom) => {
+                        if headroom <= 0 {
+                            tracing::error!(
+                                account = %account,
+                                headroom_microcredits = headroom,
+                                "Dune budget ceiling reached: admission will refuse all work"
+                            );
+                        }
                         tracing::debug!(
                             account = %account,
-                            used_microcredits = used,
+                            period_id,
+                            headroom_microcredits = headroom,
                             "Dune account usage refreshed"
                         );
                         Ok(JobOutcome { rows_written: 0 })
                     }
-                    Err(e) => Err(format!("Dune usage sync failed for {account}: {e}")),
+                    Err(e) => Err(format!("Dune headroom query failed for {account}: {e}")),
                 }
             })
         }),
@@ -665,6 +682,7 @@ freshness_seconds = 172800
             client,
             dune_ledger::Ledger::new(lazy_pool()),
             "pete44".into(),
+            3_600_000_000,
             Duration::from_secs(900),
         );
         assert_eq!(job.name, "dune-usage-sync");

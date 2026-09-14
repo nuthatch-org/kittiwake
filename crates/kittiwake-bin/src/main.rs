@@ -262,10 +262,18 @@ async fn main() -> anyhow::Result<()> {
                                                             dune_cfg.usage_max_age_seconds,
                                                         ),
                                                     );
+                                                // The sync job also creates the budget period
+                                                // and rolls it over at renewal, so it must be
+                                                // scheduled even when no feed is enabled.
+                                                let ceiling = i64::try_from(
+                                                    registry.monthly_budget_microcredits,
+                                                )
+                                                .unwrap_or(i64::MAX);
                                                 let sync = jobs::dune_usage_sync_job(
                                                     client.clone(),
                                                     ledger.clone(),
                                                     dune_cfg.account.clone(),
+                                                    ceiling,
                                                     std::time::Duration::from_secs(
                                                         dune_cfg.usage_sync_seconds,
                                                     ),

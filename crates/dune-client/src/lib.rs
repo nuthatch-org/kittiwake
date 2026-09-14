@@ -482,6 +482,8 @@ impl dune_ledger::AccountUsageSource for DuneClient {
         Some(dune_ledger::AccountUsage {
             used_microcredits: used,
             included_microcredits: included,
+            period_start: period.start_date.clone(),
+            period_end: period.end_date.clone(),
         })
     }
 }
