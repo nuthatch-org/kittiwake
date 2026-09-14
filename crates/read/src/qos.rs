@@ -21,7 +21,7 @@ use kittiwake_qos::nest::{AllocationDaily, GRAPH_EPOCH_DAYS, day_number};
 use kittiwake_qos::score::{
     DeploymentContribution, QualityDetail, QualityOpts, compute_quality_detail, qos_grade,
 };
-use kittiwake_types::{ApiError, NestId};
+use kittiwake_types::{ApiError, Meta, NestId, ServedFrom};
 use serde_json::{Value, json};
 
 use crate::routes::{Part, many};
@@ -150,12 +150,47 @@ fn bad_address() -> ApiError {
     ApiError::BadRequest("not a valid address".into())
 }
 
-/// A merged answer, dated by the live part: the stored days are older than it by construction.
-fn merged(value: Value, live: &Read) -> Read {
-    Read {
-        entry: Arc::new(Entry::new(value, live.entry.provenance.clone())),
-        meta: live.meta.clone(),
-    }
+/// A live read, or `None` when the nest could not give it. Closed days are in Postgres, so a refused
+/// statement costs the answer the figures it carried, never the route.
+async fn live(
+    ctx: &ReadCtx,
+    route: &'static str,
+    nest: NestId,
+    params: Value,
+    parts: Vec<Part>,
+) -> Option<Read> {
+    ctx.cached(
+        route,
+        nest,
+        params,
+        CachePolicy::from_poll_interval(POLL),
+        folded(parts, Value::clone),
+    )
+    .await
+    .inspect_err(
+        |e| tracing::warn!(route, error = %e, "live QoS read failed; its figures are left out"),
+    )
+    .ok()
+}
+
+/// A merged answer, dated by the first live read (the stored days are older than it by construction)
+/// and degraded when any live read is missing. Only the first dates it: the others may be another
+/// nest's blocks.
+fn merged(value: Value, live: &[Option<&Read>]) -> Read {
+    let first = live.first().copied().flatten();
+    let mut provenance = first
+        .map(|r| r.entry.provenance.clone())
+        .unwrap_or_default();
+    provenance.degraded |= live.iter().any(Option::is_none);
+    let entry = Arc::new(Entry::new(value, provenance));
+    let meta = match first {
+        Some(r) => Meta {
+            provenance: entry.provenance.clone(),
+            ..r.meta.clone()
+        },
+        None => entry.meta(ServedFrom::Postgres, false),
+    };
+    Read { entry, meta }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -172,40 +207,55 @@ pub async fn indexer_qos(
     today: i64,
 ) -> Result<Read, ApiError> {
     let store = store_or_unavailable(store)?;
-    let parts = vec![
+    let figures = vec![
         Part::rows(
             "days",
             NestId::Qos,
             sql::qos_indexer_daily_sql(addr, today).ok_or_else(bad_address)?,
         ),
         Part::rows(
-            "behind",
-            NestId::Qos,
-            sql::qos_indexer_seconds_behind_sql(addr, today).ok_or_else(bad_address)?,
-        ),
-        Part::rows(
             "gateways",
             NestId::Qos,
             sql::qos_indexer_gateways_sql(addr, today).ok_or_else(bad_address)?,
         ),
-        Part::rows("freshness", NestId::Qos, sql::QOS_FRESHNESS_SQL.to_string()),
     ];
+    // Apart from the figures, so the heaviest of today's statements refused costs only its own.
+    let behind = vec![Part::rows(
+        "behind",
+        NestId::Qos,
+        sql::qos_indexer_seconds_behind_sql(addr, today).ok_or_else(bad_address)?,
+    )];
+    let freshness = vec![Part::rows(
+        "freshness",
+        NestId::Qos,
+        sql::QOS_FRESHNESS_SQL.to_string(),
+    )];
     let closed = if since_day < today {
         store.indexer_days(addr, since_day, today - 1).await?
     } else {
         Vec::new()
     };
-    let live = ctx
-        .cached(
+    let params = json!({"address": addr, "day": today});
+    let (figures, behind, freshness) = futures::join!(
+        live(
+            ctx,
             "indexer-qos-today",
             NestId::Qos,
-            json!({"address": addr, "day": today}),
-            CachePolicy::from_poll_interval(POLL),
-            folded(parts, Value::clone),
-        )
-        .await?;
-    let input = qos_input(&closed, &live.entry.value, today);
-    Ok(merged(qos_answer(&input), &live))
+            params.clone(),
+            figures
+        ),
+        live(ctx, "indexer-qos-behind", NestId::Qos, params, behind),
+        live(ctx, "qos-freshness", NestId::Qos, json!({}), freshness),
+    );
+    let lives = [figures.as_ref(), behind.as_ref(), freshness.as_ref()];
+    let mut today_live = serde_json::Map::new();
+    for r in lives.iter().flatten() {
+        if let Some(obj) = r.entry.value.as_object() {
+            today_live.extend(obj.clone());
+        }
+    }
+    let input = qos_input(&closed, &Value::Object(today_live), today);
+    Ok(merged(qos_answer(&input), &lives))
 }
 
 /// A stored day in the shape the nest answers a day in.
@@ -503,36 +553,39 @@ impl Cohort {
 
 /// Stored rows before `today` on the deployments `addr` served, today's rows from the nest on those
 /// same deployments, and the open allocations on them. Today's network-wide rows are one statement
-/// shared by every indexer's request.
+/// shared by every indexer's request. Without today's rows the score is the stored window's; without
+/// the allocations the served gap is unknown.
 async fn cohort(
     ctx: &ReadCtx,
     store: &dyn QosStore,
     addr: &str,
     from: i64,
     today: i64,
-) -> Result<(Cohort, Read), ApiError> {
+) -> Result<(Cohort, [Option<Read>; 2]), ApiError> {
     let allocations_sql = sql::indexer_allocation_shares_sql(addr).ok_or_else(bad_address)?;
-    let live = ctx
-        .cached(
+    let (live_rows, shares) = futures::join!(
+        live(
+            ctx,
             "qos-network-today",
             NestId::Qos,
             json!({"day": today}),
-            CachePolicy::from_poll_interval(POLL),
-            folded(
-                vec![Part::rows(
-                    "rows",
-                    NestId::Qos,
-                    sql::qos_network_rows_sql(today),
-                )],
-                Value::clone,
-            ),
-        )
-        .await?;
-    let today_rows: Vec<QosDailyRow> = live
-        .entry
-        .value
-        .get("rows")
-        .and_then(Value::as_array)
+            vec![Part::rows(
+                "rows",
+                NestId::Qos,
+                sql::qos_network_rows_sql(today),
+            )],
+        ),
+        live(
+            ctx,
+            "qos-allocation-shares",
+            NestId::Alloc,
+            json!({"address": addr}),
+            vec![Part::rows("allocations", NestId::Alloc, allocations_sql)],
+        ),
+    );
+    let today_rows: Vec<QosDailyRow> = live_rows
+        .as_ref()
+        .and_then(|r| r.entry.value.get("rows")?.as_array().cloned())
         .map(|rows| {
             rows.iter()
                 .filter_map(allocation_daily_from)
@@ -570,26 +623,12 @@ async fn cohort(
             .filter(|r| deployments.contains(r.deployment_id.as_str()))
             .cloned(),
     );
-    let allocations = ctx
-        .cached(
-            "qos-allocation-shares",
-            NestId::Alloc,
-            json!({"address": addr}),
-            CachePolicy::from_poll_interval(POLL),
-            folded(
-                vec![Part::rows("allocations", NestId::Alloc, allocations_sql)],
-                Value::clone,
-            ),
-        )
-        .await?;
-    let allocations = allocations
-        .entry
-        .value
-        .get("allocations")
-        .and_then(Value::as_array)
+    let allocations = shares
+        .as_ref()
+        .and_then(|r| r.entry.value.get("allocations")?.as_array().cloned())
         .map(|a| a.iter().filter_map(allocation_row_from).collect())
         .unwrap_or_default();
-    Ok((Cohort { rows, allocations }, live))
+    Ok((Cohort { rows, allocations }, [live_rows, shares]))
 }
 
 /// `/api/indexer/[address]/qos-score`: the latest score with its breakdown, and one score per day.
@@ -601,10 +640,10 @@ pub async fn indexer_qos_score(
 ) -> Result<Read, ApiError> {
     let store = store_or_unavailable(store)?;
     let from = today_unix_day - SCORE_WINDOW_DAYS - (SCORE_HISTORY_DAYS - 1);
-    let (c, live) = cohort(ctx, store, addr, from, today_unix_day).await?;
+    let (c, [rows, shares]) = cohort(ctx, store, addr, from, today_unix_day).await?;
     Ok(merged(
         score_answer(&c, addr, today_unix_day - GRAPH_EPOCH_DAYS),
-        &live,
+        &[rows.as_ref(), shares.as_ref()],
     ))
 }
 
@@ -644,7 +683,7 @@ pub async fn indexer_qos_deployments(
     today_unix_day: i64,
 ) -> Result<Read, ApiError> {
     let store = store_or_unavailable(store)?;
-    let (c, live) = cohort(
+    let (c, [rows, shares]) = cohort(
         ctx,
         store,
         addr,
@@ -654,7 +693,7 @@ pub async fn indexer_qos_deployments(
     .await?;
     Ok(merged(
         deployments_answer(&c, addr, today_unix_day - GRAPH_EPOCH_DAYS),
-        &live,
+        &[rows.as_ref(), shares.as_ref()],
     ))
 }
 
@@ -908,10 +947,15 @@ mod tests {
     }
 
     async fn ctx() -> (ReadCtx, Arc<Mutex<Vec<String>>>, MockServer) {
-        let server = MockServer::start().await;
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let (ctx, server) = ctx_with(Nest(seen.clone())).await;
+        (ctx, seen, server)
+    }
+
+    async fn ctx_with(nest: impl Respond + 'static) -> (ReadCtx, MockServer) {
+        let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(Nest(seen.clone()))
+            .respond_with(nest)
             .mount(&server)
             .await;
         let mut cfg = kittiwake_nest::NestConfig::new(server.uri());
@@ -923,7 +967,163 @@ mod tests {
             kittiwake_cache::Store::new(64),
             1,
         );
-        (ctx, seen, server)
+        (ctx, server)
+    }
+
+    /// The stand-in nest, except that it refuses every statement containing `refuse` the way DuckDB
+    /// refuses one over its memory limit, or says it is not ready at all.
+    struct Refusing {
+        refuse: &'static str,
+        unready: bool,
+    }
+
+    impl Respond for Refusing {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            if req.url.path().ends_with("/ready") && self.unready {
+                return ResponseTemplate::new(503).set_body_json(json!({
+                    "ready": false, "lag_blocks": 90_000, "tip": 1, "last_block": 1,
+                    "sealed_through": 1, "stalled": false
+                }));
+            }
+            let q = req
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "q")
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default();
+            if !self.refuse.is_empty() && q.contains(self.refuse) {
+                return ResponseTemplate::new(400).set_body_json(json!({
+                    "error": "query failed: Out of Memory Error: could not allocate block of size 256.0 KiB (243.9 MiB/244.1 MiB used)"
+                }));
+            }
+            Nest(Arc::new(Mutex::new(Vec::new()))).respond(req)
+        }
+    }
+
+    fn dates(read: &Read) -> Vec<String> {
+        read.entry.value["qos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["date"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Closed days are in Postgres, so a nest that cannot answer today costs the card today and
+    /// nothing more: today is a gap, and the answer says it was degraded.
+    #[tokio::test]
+    async fn a_nest_that_cannot_answer_today_leaves_a_gap_not_a_failed_card() {
+        for nest in [
+            Refusing {
+                refuse: "FROM qos_",
+                unready: false,
+            },
+            Refusing {
+                refuse: "",
+                unready: true,
+            },
+        ] {
+            let (ctx, _server) = ctx_with(nest).await;
+            let store = MemStore {
+                indexer: vec![
+                    stored(A, TODAY_UNIX - 3, 1_000.0),
+                    stored(A, TODAY_UNIX - 1, 2_000.0),
+                ],
+                ..MemStore::default()
+            };
+            let read = indexer_qos(&ctx, Some(&store), A, TODAY_UNIX - 89, TODAY_UNIX)
+                .await
+                .expect("the closed days are served");
+            assert_eq!(dates(&read), vec!["2026-09-09", "2026-09-11"]);
+            assert_eq!(read.entry.value["summary"]["queryCount"], json!(3_000.0));
+            assert_eq!(
+                read.entry.value["freshness"]["publisherLastPostAt"],
+                Value::Null
+            );
+            assert!(read.entry.provenance.degraded);
+        }
+    }
+
+    /// Seconds behind is the heaviest of today's statements. Refused alone, today keeps its other
+    /// figures and seconds behind reads as not measured.
+    #[tokio::test]
+    async fn a_refused_seconds_behind_leaves_today_without_that_figure_only() {
+        let (ctx, _server) = ctx_with(Refusing {
+            refuse: "qos_indexer_seconds_behind",
+            unready: false,
+        })
+        .await;
+        let store = MemStore {
+            indexer: vec![stored(A, TODAY_UNIX - 1, 2_000.0)],
+            ..MemStore::default()
+        };
+        let read = indexer_qos(&ctx, Some(&store), A, TODAY_UNIX - 1, TODAY_UNIX)
+            .await
+            .unwrap();
+        let out = &*read.entry.value;
+        assert_eq!(dates(&read), vec!["2026-09-11", "2026-09-12"]);
+        assert_eq!(out["qos"][1]["queryCount"], json!(500.0));
+        assert_eq!(out["qos"][1]["secondsBehind"], Value::Null);
+        assert_eq!(out["qos"][1]["gatewayIds"], json!(["0xgw"]));
+        assert_eq!(
+            out["freshness"]["publisherLastPostAt"],
+            json!(1_789_172_000_i64)
+        );
+        assert!(read.entry.provenance.degraded);
+    }
+
+    /// Without today's rows the score is the one the stored window gives; without the open
+    /// allocations the served gap is unknown rather than computed against nothing.
+    #[tokio::test]
+    async fn the_score_stands_on_stored_days_when_today_or_the_allocations_are_refused() {
+        let store = MemStore {
+            allocation: vec![
+                alloc_day(A, TODAY_UNIX - 1, 800.0),
+                alloc_day(B, TODAY_UNIX - 1, 300.0),
+            ],
+            ..MemStore::default()
+        };
+        let stored_only: Vec<QosDailyRow> = store.allocation.iter().map(daily_row).collect();
+        let expected =
+            kittiwake_qos::aggregate::score_indexers(&stored_only, &AggregateOpts::today(TODAY))
+                .into_iter()
+                .find(|q| q.indexer == A)
+                .unwrap()
+                .quality
+                .q_score;
+
+        let (ctx, _server) = ctx_with(Refusing {
+            refuse: "qos_allocation_daily",
+            unready: false,
+        })
+        .await;
+        let score = indexer_qos_score(&ctx, Some(&store), A, TODAY_UNIX)
+            .await
+            .expect("the stored window scores");
+        assert_eq!(score.entry.value["latest"]["q_score"], json!(expected));
+        assert!(score.entry.provenance.degraded);
+        let deployments = indexer_qos_deployments(&ctx, Some(&store), A, TODAY_UNIX)
+            .await
+            .expect("the stored window's deployments");
+        assert_eq!(
+            deployments.entry.value["deployments"][0]["served_share"]
+                .as_f64()
+                .unwrap(),
+            800.0 / 1_100.0
+        );
+        assert!(deployments.entry.provenance.degraded);
+
+        let (ctx, _server) = ctx_with(Refusing {
+            refuse: "lodestar_allocations",
+            unready: false,
+        })
+        .await;
+        let score = indexer_qos_score(&ctx, Some(&store), A, TODAY_UNIX)
+            .await
+            .expect("no allocations is not no score");
+        assert_eq!(score.entry.value["latest"]["served_gap"], Value::Null);
+        assert!(score.entry.value["latest"]["q_score"].is_number());
+        assert!(score.entry.provenance.degraded);
     }
 
     fn every_statement_names_one_day_at_most(seen: &[String]) {
@@ -1081,31 +1281,22 @@ mod tests {
                 }));
             }
             ResponseTemplate::new(200).set_body_json(json!({
-                "count": 1, "rows": [{"date": "2026-09-07", "query_count": 1.0}], "truncated": true
+                "count": 1, "rows": [{"date": unix_day_date(TODAY_UNIX), "query_count": 1.0}], "truncated": true
             }))
         }
     }
 
     #[tokio::test]
-    async fn a_truncated_answer_is_refused_rather_than_charted() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(Truncating)
-            .mount(&server)
-            .await;
-        let mut cfg = kittiwake_nest::NestConfig::new(server.uri());
-        for n in NestId::ALL {
-            cfg.base_paths.insert(n, format!("/{}", n.as_str()));
-        }
-        let ctx = ReadCtx::new(
-            kittiwake_nest::NestGate::new(cfg).unwrap(),
-            kittiwake_cache::Store::new(64),
-            1,
-        );
-        let store = MemStore::default();
-        let Err(e) = indexer_qos(&ctx, Some(&store), A, TODAY_UNIX, TODAY_UNIX).await else {
-            panic!("a truncated answer was charted");
+    async fn a_truncated_today_is_left_out_rather_than_charted() {
+        let (ctx, _server) = ctx_with(Truncating).await;
+        let store = MemStore {
+            indexer: vec![stored(A, TODAY_UNIX - 1, 2_000.0)],
+            ..MemStore::default()
         };
-        assert!(format!("{e:?}").contains("truncated"), "{e:?}");
+        let read = indexer_qos(&ctx, Some(&store), A, TODAY_UNIX - 1, TODAY_UNIX)
+            .await
+            .unwrap();
+        assert_eq!(dates(&read), vec!["2026-09-11"]);
+        assert!(read.entry.provenance.degraded);
     }
 }

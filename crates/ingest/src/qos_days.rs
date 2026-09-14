@@ -189,29 +189,59 @@ pub async fn fill_qos_days<S: QosDayStore>(
         .collect();
 
     let mut rows = 0;
+    let mut failed: Vec<(i64, IngestError)> = Vec::new();
     for day in from..=today {
-        let reason = match decide(day, today, stored.get(&day), &current) {
-            Decision::Skip => continue,
-            Decision::Compute(r) => r,
-            Decision::Probe => {
-                let Some(state) = stored.get(&day) else {
-                    continue;
-                };
-                let (probe, probe_prov) = probe_day(gate, lane, day).await?;
-                match after_probe(state, &probe, &probe_prov) {
-                    AfterProbe::Compute(r) => r,
-                    AfterProbe::Settle => {
-                        store.settle(day).await?;
-                        continue;
-                    }
-                    AfterProbe::Wait => continue,
-                }
+        match fill_day(store, gate, lane, day, today, stored.get(&day), &current).await {
+            Ok(n) => rows += n,
+            Err(e) => {
+                tracing::warn!(day, error = %e, "a QoS day could not be computed; the next run tries again");
+                failed.push((day, e));
             }
-        };
-        tracing::info!(day, ?reason, "computing a QoS day");
-        rows += compute_day(store, gate, lane, day).await?;
+        }
     }
-    Ok(Ingested { rows })
+    match failed.first() {
+        None => Ok(Ingested { rows }),
+        Some((day, e)) => Err(IngestError::Refused(format!(
+            "{} of {WINDOW_DAYS} QoS days could not be computed, the first {}: {e}",
+            failed.len(),
+            chrono::DateTime::from_timestamp(day * 86_400, 0)
+                .map(|d| d.date_naive().to_string())
+                .unwrap_or_else(|| day.to_string()),
+        ))),
+    }
+}
+
+/// One day of the window: nothing, a settle, or a compute. A day that fails is left as it was stored,
+/// or missing, so the next run decides it again.
+async fn fill_day<S: QosDayStore>(
+    store: &S,
+    gate: &NestGate,
+    lane: Lane,
+    day: i64,
+    today: i64,
+    stored: Option<&QosDayState>,
+    current: &Provenance,
+) -> Result<u64, IngestError> {
+    let reason = match decide(day, today, stored, current) {
+        Decision::Skip => return Ok(0),
+        Decision::Compute(r) => r,
+        Decision::Probe => {
+            let Some(state) = stored else {
+                return Ok(0);
+            };
+            let (probe, probe_prov) = probe_day(gate, lane, day).await?;
+            match after_probe(state, &probe, &probe_prov) {
+                AfterProbe::Compute(r) => r,
+                AfterProbe::Settle => {
+                    store.settle(day).await?;
+                    return Ok(0);
+                }
+                AfterProbe::Wait => return Ok(0),
+            }
+        }
+    };
+    tracing::info!(day, ?reason, "computing a QoS day");
+    compute_day(store, gate, lane, day).await
 }
 
 fn f(v: &Value, k: &str) -> Option<f64> {
@@ -639,6 +669,8 @@ mod tests {
     struct Nest {
         seen: Arc<Mutex<Vec<String>>>,
         changed_day: i64,
+        /// A day whose seconds-behind statement is refused, as DuckDB refuses one over its limit.
+        refused_day: i64,
     }
 
     impl Respond for Nest {
@@ -656,6 +688,12 @@ mod tests {
                 .map(|(_, v)| v.to_string())
                 .unwrap_or_default();
             self.seen.lock().unwrap().push(q.clone());
+            if q.contains("qos_indexer_seconds_behind") && sql::days_named(&q) == [self.refused_day]
+            {
+                return ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error": "query failed: Out of Memory Error: could not allocate block of size 256.0 KiB (243.9 MiB/244.1 MiB used)"
+                }));
+            }
             let rows = if q.contains("indexer_buckets") {
                 let extra = sql::days_named(&q) == vec![self.changed_day];
                 serde_json::json!([{
@@ -680,13 +718,18 @@ mod tests {
         }
     }
 
-    async fn run(store: &MemStore, changed_day: i64) -> Vec<String> {
+    async fn fill(
+        store: &MemStore,
+        changed_day: i64,
+        refused_day: i64,
+    ) -> (Vec<String>, Result<Ingested, IngestError>) {
         let server = MockServer::start().await;
         let seen = Arc::new(Mutex::new(Vec::new()));
         Mock::given(method("GET"))
             .respond_with(Nest {
                 seen: seen.clone(),
                 changed_day,
+                refused_day,
             })
             .mount(&server)
             .await;
@@ -695,10 +738,35 @@ mod tests {
             cfg.base_paths.insert(n, format!("/{}", n.as_str()));
         }
         let gate = NestGate::new(cfg).unwrap();
-        fill_qos_days(store, &gate, Lane::Cron, NOW)
-            .await
-            .expect("the fill runs");
-        seen.lock().unwrap().clone()
+        let result = fill_qos_days(store, &gate, Lane::Cron, NOW).await;
+        let seen = seen.lock().unwrap().clone();
+        (seen, result)
+    }
+
+    async fn run(store: &MemStore, changed_day: i64) -> Vec<String> {
+        let (seen, result) = fill(store, changed_day, i64::MIN).await;
+        if let Err(e) = result {
+            panic!("the fill failed: {e}");
+        }
+        seen
+    }
+
+    /// A day the nest refuses is left missing, so the next run computes it again; it costs no other
+    /// day, and the run still reports that it failed.
+    #[tokio::test]
+    async fn a_refused_day_is_left_missing_and_the_rest_of_the_window_is_filled() {
+        let store = MemStore::default();
+        let refused = TODAY - 40;
+        let (_, result) = fill(&store, -1, refused).await;
+        let Err(e) = result else {
+            panic!("a refused day was reported as a clean run");
+        };
+        assert!(e.to_string().contains("1 of 90"), "{e}");
+        assert!(e.to_string().contains("2026-08-04"), "{e}");
+        let days = store.days.lock().unwrap();
+        assert_eq!(days.len(), WINDOW_DAYS as usize - 1);
+        assert!(!days.contains_key(&refused));
+        assert!(days.contains_key(&(refused + 1)) && days.contains_key(&TODAY));
     }
 
     fn settled_window(store: &MemStore) {
