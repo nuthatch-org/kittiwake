@@ -15,6 +15,7 @@ pub mod bounties;
 pub mod graph_support;
 pub mod live;
 pub mod liveness;
+pub mod names;
 pub mod rav;
 pub mod refresh;
 pub mod state;

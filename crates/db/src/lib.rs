@@ -132,6 +132,9 @@ pub const INDEXERS_EXCLUDED: &str = "0xb43b2cccceada5292732a8c58ae134adefce09bb"
 #[serde(rename_all = "camelCase")]
 pub struct EnrichedIndexer {
     pub address: String,
+    /// Verified only: a Graph default name the account owns on ENS, else its primary ENS name.
+    pub name: Option<String>,
+    pub ens_name: Option<String>,
     pub url: Option<String>,
     pub geo_hash: Option<String>,
     pub self_stake_grt: Option<String>,
@@ -163,7 +166,7 @@ pub struct EnrichedIndexer {
 /// transition guard: the column genuinely holds both units, seven rows the platform wrote
 /// and this service no longer updates being the PPM ones, and without it they reach the
 /// dashboard as a cut of 549000%. It can go when #47 settles who owns the column.
-pub const ENRICHED_INDEXERS_SQL: &str = "SELECT address, url, geo_hash, self_stake_grt::text, delegated_grt::text, \
+pub const ENRICHED_INDEXERS_SQL: &str = "SELECT address, name, ens_name, url, geo_hash, self_stake_grt::text, delegated_grt::text, \
          allocated_grt::text, \
          (CASE WHEN reward_cut > 100 THEN reward_cut / 10000.0 ELSE reward_cut END)::text \
            AS reward_cut, \
@@ -184,6 +187,23 @@ pub async fn enriched_indexers(pool: &Pool, limit: i64) -> Result<Vec<EnrichedIn
         .fetch_all(pool)
         .await?;
     Ok(rows)
+}
+
+/// The names the `names` job verified, keyed by lowercase address. Addresses without one are absent.
+pub async fn indexer_names(
+    pool: &Pool,
+    addresses: &[String],
+) -> Result<std::collections::HashMap<String, String>, DbError> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT address, name FROM indexers WHERE LOWER(address) = ANY($1) AND name IS NOT NULL",
+    )
+    .bind(addresses)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(a, n)| (a.to_lowercase(), n))
+        .collect())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -692,6 +712,8 @@ mod directory_tests {
         let v = serde_json::to_value(EnrichedIndexer::default()).unwrap();
         for key in [
             "address",
+            "name",
+            "ensName",
             "selfStakeGrt",
             "netFlowGrt7d",
             "queryFeesCollectedGrt",
@@ -708,6 +730,7 @@ mod directory_tests {
     #[test]
     fn the_columns_the_refresh_job_writes_are_actually_read_back() {
         for column in [
+            "ens_name",
             "query_fees_collected_grt",
             "rewards_earned_grt",
             "net_flow_grt_7d",
