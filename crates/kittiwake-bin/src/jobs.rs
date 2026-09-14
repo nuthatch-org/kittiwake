@@ -239,7 +239,7 @@ pub fn ingest_jobs(
                     })
                 }),
             )
-            .staggered(mins(11)),
+            .staggered(mins(21)),
         );
     }
 
@@ -503,7 +503,7 @@ mod tests {
             ("ingest-rav", 60, 28),
             ("ingest-disputes", 60, 48),
             ("score-qos", 60, 38),
-            ("ingest-qos-days", 30, 11),
+            ("ingest-qos-days", 30, 21),
             ("refresh", 5, 0),
             ("snapshot-network", 5, 2),
             ("warm-ipfs", 10, 4),
@@ -543,7 +543,7 @@ mod tests {
             ("ingest-rav", mins(60), mins(28)),
             ("ingest-disputes", mins(360), mins(48)),
             ("score-qos", mins(60), mins(38)),
-            ("ingest-qos-days", mins(30), mins(11)),
+            ("ingest-qos-days", mins(30), mins(21)),
             ("refresh", mins(5), Duration::ZERO),
             ("snapshot-network", mins(5), mins(2)),
             ("warm", mins(1), Duration::ZERO),
