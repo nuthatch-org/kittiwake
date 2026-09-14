@@ -118,6 +118,490 @@ pub async fn write_rolling_apy(
     Ok(done)
 }
 
+/// Where the directory's QoS Quality score lives.
+///
+/// Not `indexer_qos_score`: that was the incumbent's history table, keyed by day, and lodestar's
+/// migration 020 that drops it is run by hand, so it may still be there with a different key.
+pub async fn ensure_qos_quality_table(pool: &Pool) -> Result<(), DbError> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS indexer_qos_quality ( \
+           indexer_address TEXT PRIMARY KEY, \
+           day DATE NOT NULL, \
+           q_score DOUBLE PRECISION NOT NULL, \
+           reliability DOUBLE PRECISION NOT NULL, \
+           lat_util DOUBLE PRECISION NOT NULL, \
+           fresh_util DOUBLE PRECISION, \
+           coverage DOUBLE PRECISION NOT NULL, \
+           served_gap DOUBLE PRECISION, \
+           efficiency DOUBLE PRECISION, \
+           computed_at TIMESTAMPTZ NOT NULL )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// One indexer's score as the QoS job computed it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QosQualityRow {
+    pub indexer_address: String,
+    pub day: chrono::NaiveDate,
+    pub q_score: f64,
+    pub reliability: f64,
+    pub lat_util: f64,
+    pub fresh_util: Option<f64>,
+    pub coverage: f64,
+    pub served_gap: Option<f64>,
+    pub efficiency: Option<f64>,
+}
+
+/// Replace the whole table with this run's scores.
+///
+/// Every row, not an upsert of the scored ones: an indexer that no longer appears in the window has
+/// no score, and keeping yesterday's would show a grade for service nobody measured.
+pub async fn write_qos_quality(pool: &Pool, rows: &[QosQualityRow]) -> Result<u64, DbError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM indexer_qos_quality")
+        .execute(&mut *tx)
+        .await?;
+    let done = sqlx::query(
+        "INSERT INTO indexer_qos_quality (indexer_address, day, q_score, reliability, lat_util, \
+         fresh_util, coverage, served_gap, efficiency, computed_at) \
+         SELECT *, NOW() FROM UNNEST($1::text[], $2::date[], $3::float8[], $4::float8[], \
+         $5::float8[], $6::float8[], $7::float8[], $8::float8[], $9::float8[])",
+    )
+    .bind(
+        rows.iter()
+            .map(|r| r.indexer_address.clone())
+            .collect::<Vec<_>>(),
+    )
+    .bind(rows.iter().map(|r| r.day).collect::<Vec<_>>())
+    .bind(rows.iter().map(|r| r.q_score).collect::<Vec<_>>())
+    .bind(rows.iter().map(|r| r.reliability).collect::<Vec<_>>())
+    .bind(rows.iter().map(|r| r.lat_util).collect::<Vec<_>>())
+    .bind(rows.iter().map(|r| r.fresh_util).collect::<Vec<_>>())
+    .bind(rows.iter().map(|r| r.coverage).collect::<Vec<_>>())
+    .bind(rows.iter().map(|r| r.served_gap).collect::<Vec<_>>())
+    .bind(rows.iter().map(|r| r.efficiency).collect::<Vec<_>>())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    Ok(done)
+}
+
+// ---------------------------------------------------------------------------------------------
+// QoS days: qos-reo-nest's results, one UTC day at a time
+// ---------------------------------------------------------------------------------------------
+
+/// A unix day number (days since 1970-01-01) as a date, and back.
+fn qos_date(day: i64) -> chrono::NaiveDate {
+    chrono::DateTime::from_timestamp(day * 86_400, 0)
+        .map(|d| d.date_naive())
+        .unwrap_or_default()
+}
+
+fn qos_day_number(date: chrono::NaiveDate) -> i64 {
+    date.and_time(chrono::NaiveTime::MIN).and_utc().timestamp() / 86_400
+}
+
+/// The three QoS day tables. Ours alone, like the rolling APYs; `db/schema.sql` declares them.
+pub async fn ensure_qos_day_tables(pool: &Pool) -> Result<(), DbError> {
+    for ddl in [
+        "CREATE TABLE IF NOT EXISTS qos_day ( \
+           day DATE PRIMARY KEY, registry_hash TEXT, nid TEXT, as_of BIGINT, sealed_through BIGINT, \
+           closing_block BIGINT, indexer_buckets INTEGER NOT NULL, query_buckets INTEGER NOT NULL, \
+           settled BOOLEAN NOT NULL, computed_at TIMESTAMPTZ NOT NULL )",
+        "CREATE TABLE IF NOT EXISTS qos_indexer_day ( \
+           indexer TEXT NOT NULL, day DATE NOT NULL, query_count DOUBLE PRECISION NOT NULL, \
+           num_200 DOUBLE PRECISION, success_rate DOUBLE PRECISION, latency_ms DOUBLE PRECISION, \
+           blocks_behind DOUBLE PRECISION, total_query_fees DOUBLE PRECISION NOT NULL, \
+           avg_query_fee DOUBLE PRECISION, allocations INTEGER, buckets INTEGER NOT NULL, \
+           bad_buckets INTEGER NOT NULL, worst_bucket_start BIGINT, \
+           worst_bucket_success_rate DOUBLE PRECISION, worst_bucket_queries DOUBLE PRECISION, \
+           seconds_behind_peers DOUBLE PRECISION, share_queries_over_5min_behind DOUBLE PRECISION, \
+           share_with_block_time DOUBLE PRECISION, gateways TEXT NOT NULL, \
+           PRIMARY KEY (indexer, day) )",
+        "CREATE TABLE IF NOT EXISTS qos_allocation_day ( \
+           indexer TEXT NOT NULL, deployment TEXT NOT NULL, chain TEXT NOT NULL, gateway TEXT NOT NULL, \
+           day DATE NOT NULL, query_count DOUBLE PRECISION NOT NULL, num_200 DOUBLE PRECISION, \
+           latency_ms DOUBLE PRECISION, blocks_behind DOUBLE PRECISION, \
+           total_query_fees DOUBLE PRECISION NOT NULL, buckets INTEGER NOT NULL, \
+           PRIMARY KEY (indexer, deployment, chain, gateway, day) )",
+        "CREATE INDEX IF NOT EXISTS qos_allocation_day_deployment ON qos_allocation_day (deployment, day)",
+    ] {
+        sqlx::query(ddl).execute(pool).await?;
+    }
+    Ok(())
+}
+
+/// What a stored QoS day was computed from, and what the job compares before computing it again.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct QosDayState {
+    /// Unix day number.
+    pub day: i64,
+    pub registry_hash: Option<String>,
+    pub nid: Option<String>,
+    pub as_of: Option<i64>,
+    pub sealed_through: Option<i64>,
+    /// The highest block holding a document for this day, when it had any.
+    pub closing_block: Option<i64>,
+    pub indexer_buckets: i64,
+    pub query_buckets: i64,
+    /// Sealed and past the resolver's retries: only a registry change reopens it.
+    pub settled: bool,
+}
+
+/// One indexer's day, as the chart reads it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct QosIndexerDay {
+    pub indexer: String,
+    pub day: i64,
+    pub query_count: f64,
+    pub num_200: Option<f64>,
+    pub success_rate: Option<f64>,
+    pub latency_ms: Option<f64>,
+    pub blocks_behind: Option<f64>,
+    pub total_query_fees: f64,
+    pub avg_query_fee: Option<f64>,
+    pub allocations: Option<i64>,
+    pub buckets: i64,
+    pub bad_buckets: i64,
+    pub worst_bucket_start: Option<i64>,
+    pub worst_bucket_success_rate: Option<f64>,
+    pub worst_bucket_queries: Option<f64>,
+    pub seconds_behind_peers: Option<f64>,
+    pub share_queries_over_5min_behind: Option<f64>,
+    pub share_with_block_time: Option<f64>,
+    /// Sorted.
+    pub gateways: Vec<String>,
+}
+
+/// One indexer on one deployment, chain and gateway for a day, as the score reads it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct QosAllocationDay {
+    pub indexer: String,
+    pub deployment: String,
+    pub chain: Option<String>,
+    pub gateway: String,
+    pub day: i64,
+    pub query_count: f64,
+    pub num_200: Option<f64>,
+    pub latency_ms: Option<f64>,
+    pub blocks_behind: Option<f64>,
+    pub total_query_fees: f64,
+    pub buckets: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct QosDayStateRow {
+    day: chrono::NaiveDate,
+    registry_hash: Option<String>,
+    nid: Option<String>,
+    as_of: Option<i64>,
+    sealed_through: Option<i64>,
+    closing_block: Option<i64>,
+    indexer_buckets: i64,
+    query_buckets: i64,
+    settled: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct QosIndexerDayRow {
+    indexer: String,
+    day: chrono::NaiveDate,
+    query_count: f64,
+    num_200: Option<f64>,
+    success_rate: Option<f64>,
+    latency_ms: Option<f64>,
+    blocks_behind: Option<f64>,
+    total_query_fees: f64,
+    avg_query_fee: Option<f64>,
+    allocations: Option<i64>,
+    buckets: i64,
+    bad_buckets: i64,
+    worst_bucket_start: Option<i64>,
+    worst_bucket_success_rate: Option<f64>,
+    worst_bucket_queries: Option<f64>,
+    seconds_behind_peers: Option<f64>,
+    share_queries_over_5min_behind: Option<f64>,
+    share_with_block_time: Option<f64>,
+    gateways: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct QosAllocationDayRow {
+    indexer: String,
+    deployment: String,
+    chain: String,
+    gateway: String,
+    day: chrono::NaiveDate,
+    query_count: f64,
+    num_200: Option<f64>,
+    latency_ms: Option<f64>,
+    blocks_behind: Option<f64>,
+    total_query_fees: f64,
+    buckets: i64,
+}
+
+impl From<QosAllocationDayRow> for QosAllocationDay {
+    fn from(r: QosAllocationDayRow) -> Self {
+        Self {
+            indexer: r.indexer,
+            deployment: r.deployment,
+            chain: (!r.chain.is_empty()).then_some(r.chain),
+            gateway: r.gateway,
+            day: qos_day_number(r.day),
+            query_count: r.query_count,
+            num_200: r.num_200,
+            latency_ms: r.latency_ms,
+            blocks_behind: r.blocks_behind,
+            total_query_fees: r.total_query_fees,
+            buckets: r.buckets,
+        }
+    }
+}
+
+/// The stored state of every QoS day from `from` to `to` inclusive (unix day numbers).
+pub async fn qos_day_states(pool: &Pool, from: i64, to: i64) -> Result<Vec<QosDayState>, DbError> {
+    let rows = sqlx::query_as::<_, QosDayStateRow>(
+        "SELECT day, registry_hash, nid, as_of, sealed_through, closing_block, \
+         indexer_buckets::bigint AS indexer_buckets, query_buckets::bigint AS query_buckets, settled \
+         FROM qos_day WHERE day BETWEEN $1 AND $2 ORDER BY day",
+    )
+    .bind(qos_date(from))
+    .bind(qos_date(to))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| QosDayState {
+            day: qos_day_number(r.day),
+            registry_hash: r.registry_hash,
+            nid: r.nid,
+            as_of: r.as_of,
+            sealed_through: r.sealed_through,
+            closing_block: r.closing_block,
+            indexer_buckets: r.indexer_buckets,
+            query_buckets: r.query_buckets,
+            settled: r.settled,
+        })
+        .collect())
+}
+
+/// Replace one day: its rows and its state together, so a reader never sees a day's rows from one
+/// computation beside the provenance of another.
+pub async fn write_qos_day(
+    pool: &Pool,
+    state: &QosDayState,
+    indexers: &[QosIndexerDay],
+    allocations: &[QosAllocationDay],
+) -> Result<u64, DbError> {
+    let date = qos_date(state.day);
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM qos_indexer_day WHERE day = $1")
+        .bind(date)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM qos_allocation_day WHERE day = $1")
+        .bind(date)
+        .execute(&mut *tx)
+        .await?;
+    let mut written = sqlx::query(
+        "INSERT INTO qos_indexer_day (indexer, day, query_count, num_200, success_rate, latency_ms, \
+         blocks_behind, total_query_fees, avg_query_fee, allocations, buckets, bad_buckets, \
+         worst_bucket_start, worst_bucket_success_rate, worst_bucket_queries, seconds_behind_peers, \
+         share_queries_over_5min_behind, share_with_block_time, gateways) \
+         SELECT i, $2::date, q, n, s, l, b, fees, af, a, bk, bad, ws, wr, wq, sb, s5, sk, g \
+         FROM UNNEST($1::text[], $3::float8[], $4::float8[], $5::float8[], $6::float8[], $7::float8[], \
+         $8::float8[], $9::float8[], $10::int[], $11::int[], $12::int[], $13::bigint[], $14::float8[], \
+         $15::float8[], $16::float8[], $17::float8[], $18::float8[], $19::text[]) \
+         AS t(i, q, n, s, l, b, fees, af, a, bk, bad, ws, wr, wq, sb, s5, sk, g)",
+    )
+    .bind(indexers.iter().map(|r| r.indexer.clone()).collect::<Vec<_>>())
+    .bind(date)
+    .bind(indexers.iter().map(|r| r.query_count).collect::<Vec<_>>())
+    .bind(indexers.iter().map(|r| r.num_200).collect::<Vec<_>>())
+    .bind(indexers.iter().map(|r| r.success_rate).collect::<Vec<_>>())
+    .bind(indexers.iter().map(|r| r.latency_ms).collect::<Vec<_>>())
+    .bind(indexers.iter().map(|r| r.blocks_behind).collect::<Vec<_>>())
+    .bind(indexers.iter().map(|r| r.total_query_fees).collect::<Vec<_>>())
+    .bind(indexers.iter().map(|r| r.avg_query_fee).collect::<Vec<_>>())
+    .bind(
+        indexers
+            .iter()
+            .map(|r| r.allocations.map(|a| a as i32))
+            .collect::<Vec<_>>(),
+    )
+    .bind(indexers.iter().map(|r| r.buckets as i32).collect::<Vec<_>>())
+    .bind(indexers.iter().map(|r| r.bad_buckets as i32).collect::<Vec<_>>())
+    .bind(indexers.iter().map(|r| r.worst_bucket_start).collect::<Vec<_>>())
+    .bind(indexers.iter().map(|r| r.worst_bucket_success_rate).collect::<Vec<_>>())
+    .bind(indexers.iter().map(|r| r.worst_bucket_queries).collect::<Vec<_>>())
+    .bind(indexers.iter().map(|r| r.seconds_behind_peers).collect::<Vec<_>>())
+    .bind(
+        indexers
+            .iter()
+            .map(|r| r.share_queries_over_5min_behind)
+            .collect::<Vec<_>>(),
+    )
+    .bind(indexers.iter().map(|r| r.share_with_block_time).collect::<Vec<_>>())
+    .bind(indexers.iter().map(|r| r.gateways.join(",")).collect::<Vec<_>>())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    written += sqlx::query(
+        "INSERT INTO qos_allocation_day (indexer, deployment, chain, gateway, day, query_count, \
+         num_200, latency_ms, blocks_behind, total_query_fees, buckets) \
+         SELECT i, d, c, g, $5::date, q, n, l, b, fees, bk \
+         FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $6::float8[], $7::float8[], \
+         $8::float8[], $9::float8[], $10::float8[], $11::int[]) AS t(i, d, c, g, q, n, l, b, fees, bk)",
+    )
+    .bind(allocations.iter().map(|r| r.indexer.clone()).collect::<Vec<_>>())
+    .bind(allocations.iter().map(|r| r.deployment.clone()).collect::<Vec<_>>())
+    .bind(
+        allocations
+            .iter()
+            .map(|r| r.chain.clone().unwrap_or_default())
+            .collect::<Vec<_>>(),
+    )
+    .bind(allocations.iter().map(|r| r.gateway.clone()).collect::<Vec<_>>())
+    .bind(date)
+    .bind(allocations.iter().map(|r| r.query_count).collect::<Vec<_>>())
+    .bind(allocations.iter().map(|r| r.num_200).collect::<Vec<_>>())
+    .bind(allocations.iter().map(|r| r.latency_ms).collect::<Vec<_>>())
+    .bind(allocations.iter().map(|r| r.blocks_behind).collect::<Vec<_>>())
+    .bind(allocations.iter().map(|r| r.total_query_fees).collect::<Vec<_>>())
+    .bind(allocations.iter().map(|r| r.buckets as i32).collect::<Vec<_>>())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    sqlx::query(
+        "INSERT INTO qos_day (day, registry_hash, nid, as_of, sealed_through, closing_block, \
+         indexer_buckets, query_buckets, settled, computed_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) \
+         ON CONFLICT (day) DO UPDATE SET registry_hash = EXCLUDED.registry_hash, nid = EXCLUDED.nid, \
+         as_of = EXCLUDED.as_of, sealed_through = EXCLUDED.sealed_through, \
+         closing_block = EXCLUDED.closing_block, indexer_buckets = EXCLUDED.indexer_buckets, \
+         query_buckets = EXCLUDED.query_buckets, settled = EXCLUDED.settled, computed_at = NOW()",
+    )
+    .bind(date)
+    .bind(state.registry_hash.clone())
+    .bind(state.nid.clone())
+    .bind(state.as_of)
+    .bind(state.sealed_through)
+    .bind(state.closing_block)
+    .bind(state.indexer_buckets as i32)
+    .bind(state.query_buckets as i32)
+    .bind(state.settled)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(written)
+}
+
+pub async fn settle_qos_day(pool: &Pool, day: i64) -> Result<(), DbError> {
+    sqlx::query("UPDATE qos_day SET settled = TRUE WHERE day = $1")
+        .bind(qos_date(day))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// One indexer's stored days from `from` to `to` inclusive, oldest first.
+pub async fn qos_indexer_days(
+    pool: &Pool,
+    indexer: &str,
+    from: i64,
+    to: i64,
+) -> Result<Vec<QosIndexerDay>, DbError> {
+    let rows = sqlx::query_as::<_, QosIndexerDayRow>(
+        "SELECT indexer, day, query_count, num_200, success_rate, latency_ms, blocks_behind, \
+         total_query_fees, avg_query_fee, allocations::bigint AS allocations, \
+         buckets::bigint AS buckets, bad_buckets::bigint AS bad_buckets, worst_bucket_start, \
+         worst_bucket_success_rate, worst_bucket_queries, seconds_behind_peers, \
+         share_queries_over_5min_behind, share_with_block_time, gateways \
+         FROM qos_indexer_day WHERE indexer = $1 AND day BETWEEN $2 AND $3 ORDER BY day",
+    )
+    .bind(indexer)
+    .bind(qos_date(from))
+    .bind(qos_date(to))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| QosIndexerDay {
+            indexer: r.indexer,
+            day: qos_day_number(r.day),
+            query_count: r.query_count,
+            num_200: r.num_200,
+            success_rate: r.success_rate,
+            latency_ms: r.latency_ms,
+            blocks_behind: r.blocks_behind,
+            total_query_fees: r.total_query_fees,
+            avg_query_fee: r.avg_query_fee,
+            allocations: r.allocations,
+            buckets: r.buckets,
+            bad_buckets: r.bad_buckets,
+            worst_bucket_start: r.worst_bucket_start,
+            worst_bucket_success_rate: r.worst_bucket_success_rate,
+            worst_bucket_queries: r.worst_bucket_queries,
+            seconds_behind_peers: r.seconds_behind_peers,
+            share_queries_over_5min_behind: r.share_queries_over_5min_behind,
+            share_with_block_time: r.share_with_block_time,
+            gateways: r
+                .gateways
+                .split(',')
+                .filter(|g| !g.is_empty())
+                .map(str::to_string)
+                .collect(),
+        })
+        .collect())
+}
+
+/// Every indexer's stored rows from `from` to `to` inclusive on the deployments `indexer` served in
+/// that span or names in `also`: the peers the score needs. `also` carries the deployments it served
+/// today, which are not stored yet.
+pub async fn qos_cohort_days(
+    pool: &Pool,
+    indexer: &str,
+    from: i64,
+    to: i64,
+    also: &[String],
+) -> Result<Vec<QosAllocationDay>, DbError> {
+    let rows = sqlx::query_as::<_, QosAllocationDayRow>(
+        "SELECT indexer, deployment, chain, gateway, day, query_count, num_200, latency_ms, \
+         blocks_behind, total_query_fees, buckets::bigint AS buckets FROM qos_allocation_day \
+         WHERE day BETWEEN $2 AND $3 AND (deployment = ANY($4) OR deployment IN \
+         (SELECT DISTINCT deployment FROM qos_allocation_day WHERE indexer = $1 AND day BETWEEN $2 AND $3))",
+    )
+    .bind(indexer)
+    .bind(qos_date(from))
+    .bind(qos_date(to))
+    .bind(also)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(QosAllocationDay::from).collect())
+}
+
+/// Every stored allocation row from `from` to `to` inclusive, for scoring the directory.
+pub async fn qos_network_days(
+    pool: &Pool,
+    from: i64,
+    to: i64,
+) -> Result<Vec<QosAllocationDay>, DbError> {
+    let rows = sqlx::query_as::<_, QosAllocationDayRow>(
+        "SELECT indexer, deployment, chain, gateway, day, query_count, num_200, latency_ms, \
+         blocks_behind, total_query_fees, buckets::bigint AS buckets FROM qos_allocation_day \
+         WHERE day BETWEEN $1 AND $2",
+    )
+    .bind(qos_date(from))
+    .bind(qos_date(to))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(QosAllocationDay::from).collect())
+}
+
 /// The indexer every directory read leaves out.
 ///
 /// Defined here rather than beside the nest SQL because both readers need it and only one of them
@@ -157,6 +641,8 @@ pub struct EnrichedIndexer {
     pub distinct_data_services: Option<i32>,
     pub reo_status: Option<String>,
     pub last_updated: Option<chrono::DateTime<chrono::Utc>>,
+    /// The QoS Quality score, 0 to 100. Null for an indexer the oracle measured nothing for.
+    pub q_score: Option<f64>,
 }
 
 /// The directory read. Held as a constant so the exclusion below can be asserted without a
@@ -177,8 +663,9 @@ pub const ENRICHED_INDEXERS_SQL: &str = "SELECT address, \
          delegation_capacity_pct::text, score::text, score_grade, allocation_count, \
          delegations_in_7d, undelegations_in_7d, net_flow_grt_7d::text, distinct_data_services, \
          reo_status, last_updated, query_fees_collected_grt::text, rewards_earned_grt::text, \
-         a.rolling_apy_30d::text, a.rolling_apy_90d::text \
+         a.rolling_apy_30d::text, a.rolling_apy_90d::text, q.q_score \
          FROM indexers i LEFT JOIN indexer_rolling_apy a ON a.indexer_address = i.address \
+         LEFT JOIN indexer_qos_quality q ON q.indexer_address = i.address \
          WHERE i.address <> $2 \
          ORDER BY i.score DESC NULLS LAST, i.self_stake_grt DESC LIMIT $1";
 

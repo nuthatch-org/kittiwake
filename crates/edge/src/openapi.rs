@@ -262,6 +262,18 @@ const SUMMARIES: &[Operation] = &[
         "When an indexer changed its cut, and what it changed from.",
     ),
     op(
+        "/api/indexer/{address}/qos",
+        "Edge & Node's gateway QoS for one indexer per UTC day, read from the oracle's own postings: queries, success rate and latency weighted by queries, fees, five-minute buckets seen and how many were bad, and seconds behind the freshest peer.",
+    ),
+    op(
+        "/api/indexer/{address}/qos-score",
+        "The QoS Quality score over thirty days of that feed, its four sub-scores and served gap, and the score for each of the last thirty days.",
+    ),
+    op(
+        "/api/indexer/{address}/qos-deployments",
+        "The deployments behind the QoS Quality score, heaviest drag first.",
+    ),
+    op(
         "/api/indexer/{address}/revenue",
         "What an indexer received over a window ending today, by UTC day and by deployment: query fees after the protocol, curators and delegators, and rewards after the delegators, each dated by the collection that paid it, with the collected figures beside them.",
     ),

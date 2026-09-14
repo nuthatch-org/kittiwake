@@ -3296,6 +3296,7 @@ dependencies = [
  "kittiwake-db",
  "kittiwake-ext",
  "kittiwake-nest",
+ "kittiwake-qos",
  "kittiwake-read",
  "kittiwake-rewards",
  "kittiwake-score",
@@ -3308,6 +3309,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -3386,6 +3388,7 @@ dependencies = [
  "kittiwake-disasm",
  "kittiwake-ext",
  "kittiwake-nest",
+ "kittiwake-qos",
  "kittiwake-rewards",
  "kittiwake-score",
  "kittiwake-types",

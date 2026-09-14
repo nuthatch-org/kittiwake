@@ -509,3 +509,78 @@ CREATE TABLE IF NOT EXISTS indexer_rolling_apy (
   rolling_apy_90d  NUMERIC,
   computed_at      TIMESTAMPTZ NOT NULL
 );
+
+-- The directory's QoS Quality score, recomputed by `score-qos` over thirty days of qos-reo-nest.
+-- A side table for the same reason as the APYs, and not named `indexer_qos_score`: that was the
+-- incumbent's per-day history, and lodestar's migration 020 that drops it is run by hand.
+CREATE TABLE IF NOT EXISTS indexer_qos_quality (
+  indexer_address  TEXT PRIMARY KEY,
+  day              DATE NOT NULL,
+  q_score          DOUBLE PRECISION NOT NULL,
+  reliability      DOUBLE PRECISION NOT NULL,
+  lat_util         DOUBLE PRECISION NOT NULL,
+  fresh_util       DOUBLE PRECISION,
+  coverage         DOUBLE PRECISION NOT NULL,
+  served_gap       DOUBLE PRECISION,
+  efficiency       DOUBLE PRECISION,
+  computed_at      TIMESTAMPTZ NOT NULL
+);
+
+-- qos-reo-nest's daily results, kept here because the nest cannot answer more than one day per
+-- statement inside its memory budget. One `qos_day` row per UTC day, carrying the provenance the
+-- day's rows were computed from and what the job compares to decide whether to compute it again.
+CREATE TABLE IF NOT EXISTS qos_day (
+  day              DATE PRIMARY KEY,
+  registry_hash    TEXT,
+  nid              TEXT,
+  as_of            BIGINT,
+  sealed_through   BIGINT,
+  closing_block    BIGINT,
+  indexer_buckets  INTEGER NOT NULL,
+  query_buckets    INTEGER NOT NULL,
+  settled          BOOLEAN NOT NULL,
+  computed_at      TIMESTAMPTZ NOT NULL
+);
+
+-- `qos_indexer_daily` joined to `qos_indexer_seconds_behind`, per indexer per day: the chart.
+CREATE TABLE IF NOT EXISTS qos_indexer_day (
+  indexer                         TEXT NOT NULL,
+  day                             DATE NOT NULL,
+  query_count                     DOUBLE PRECISION NOT NULL,
+  num_200                         DOUBLE PRECISION,
+  success_rate                    DOUBLE PRECISION,
+  latency_ms                      DOUBLE PRECISION,
+  blocks_behind                   DOUBLE PRECISION,
+  total_query_fees                DOUBLE PRECISION NOT NULL,
+  avg_query_fee                   DOUBLE PRECISION,
+  allocations                     INTEGER,
+  buckets                         INTEGER NOT NULL,
+  bad_buckets                     INTEGER NOT NULL,
+  worst_bucket_start              BIGINT,
+  worst_bucket_success_rate       DOUBLE PRECISION,
+  worst_bucket_queries            DOUBLE PRECISION,
+  seconds_behind_peers            DOUBLE PRECISION,
+  share_queries_over_5min_behind  DOUBLE PRECISION,
+  share_with_block_time           DOUBLE PRECISION,
+  gateways                        TEXT NOT NULL,
+  PRIMARY KEY (indexer, day)
+);
+
+-- `qos_allocation_daily` for every indexer, per day: the score's input. A deployment's attempts on a
+-- day are the sum of its rows, which is the served-share denominator. `chain` is '' when the oracle
+-- named none, because a key column cannot be null.
+CREATE TABLE IF NOT EXISTS qos_allocation_day (
+  indexer           TEXT NOT NULL,
+  deployment        TEXT NOT NULL,
+  chain             TEXT NOT NULL,
+  gateway           TEXT NOT NULL,
+  day               DATE NOT NULL,
+  query_count       DOUBLE PRECISION NOT NULL,
+  num_200           DOUBLE PRECISION,
+  latency_ms        DOUBLE PRECISION,
+  blocks_behind     DOUBLE PRECISION,
+  total_query_fees  DOUBLE PRECISION NOT NULL,
+  buckets           INTEGER NOT NULL,
+  PRIMARY KEY (indexer, deployment, chain, gateway, day)
+);
+CREATE INDEX IF NOT EXISTS qos_allocation_day_deployment ON qos_allocation_day (deployment, day);

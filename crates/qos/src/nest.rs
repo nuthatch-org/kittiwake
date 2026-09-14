@@ -34,7 +34,8 @@ pub struct AllocationDaily {
     pub num_200: Option<f64>,
     /// Mean latency weighted by query count.
     pub latency_ms: Option<f64>,
-    /// Unweighted mean of bucket means.
+    /// Mean blocks behind weighted by query count. An unweighted mean of bucket means lets a
+    /// deployment with five queries and 206.8M blocks behind outweigh a busy one.
     pub blocks_behind: Option<f64>,
     pub total_query_fees: f64,
     /// Buckets seen that day, out of 288.
