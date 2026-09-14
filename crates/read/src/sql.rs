@@ -298,10 +298,23 @@ pub fn indexer_delegators_sql(addr: &str, first: i64) -> Option<String> {
         return None;
     }
     let first = clamp(first, 1, 1000);
+    // Not `lodestar_delegator_stakes`: its per-position history fold is computed even though nothing
+    // here reads it, and for an indexer with 334,612 delegation events it exceeds the nest's memory limit.
     Some(format!(
-        "SELECT id, delegator, CAST(s.total_delegated_tokens AS VARCHAR) AS staked_tokens, \
-         CAST(share_amount AS VARCHAR) AS share_amount FROM lodestar_delegator_stakes s \
-         WHERE s.indexer = '{addr}' AND s.active ORDER BY s.total_delegated_tokens DESC, s.delegator ASC LIMIT {first}"
+        "WITH events AS ( \
+         SELECT LOWER(delegator) AS delegator, 'in' AS kind, CAST(tokens AS HUGEINT) AS tok, CAST(shares AS HUGEINT) AS sh \
+         FROM staking_legacy__stake_delegated WHERE LOWER(indexer) = '{addr}' \
+         UNION ALL SELECT LOWER(delegator), 'out', CAST(tokens AS HUGEINT), CAST(shares AS HUGEINT) \
+         FROM staking_legacy__stake_delegated_locked WHERE LOWER(indexer) = '{addr}' \
+         UNION ALL SELECT LOWER(delegator), 'in', CAST(tokens AS HUGEINT), CAST(shares AS HUGEINT) \
+         FROM staking__tokens_delegated WHERE LOWER(\"serviceProvider\") = '{addr}' \
+         UNION ALL SELECT LOWER(delegator), 'out', CAST(tokens AS HUGEINT), CAST(shares AS HUGEINT) \
+         FROM staking__tokens_undelegated WHERE LOWER(\"serviceProvider\") = '{addr}'), \
+         positions AS (SELECT delegator, SUM(CASE WHEN kind = 'in' THEN sh ELSE -sh END) AS share_amount, \
+         SUM(CASE WHEN kind = 'in' THEN tok ELSE 0 END) AS total_delegated_tokens FROM events GROUP BY 1) \
+         SELECT delegator || '-' || '{addr}' AS id, delegator, CAST(total_delegated_tokens AS VARCHAR) AS staked_tokens, \
+         CAST(share_amount AS VARCHAR) AS share_amount FROM positions WHERE share_amount > 0 \
+         ORDER BY total_delegated_tokens DESC, delegator ASC LIMIT {first}"
     ))
 }
 
@@ -1016,6 +1029,26 @@ mod tests {
             "0xABCDEF1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
         ));
         assert!(!is_deployment_id("0xdeadbeef"));
+    }
+
+    #[test]
+    fn an_indexers_delegators_are_summed_at_the_source_and_never_folded() {
+        let addr = "0xf92f430dd8567b0d466358c79594ab58d919a6d4";
+        let sql = indexer_delegators_sql(addr, 100).unwrap();
+        assert!(!sql.contains("lodestar_delegator_stakes"), "{sql}");
+        for source in [
+            "FROM staking_legacy__stake_delegated WHERE LOWER(indexer) = ",
+            "FROM staking_legacy__stake_delegated_locked WHERE LOWER(indexer) = ",
+            "FROM staking__tokens_delegated WHERE LOWER(\"serviceProvider\") = ",
+            "FROM staking__tokens_undelegated WHERE LOWER(\"serviceProvider\") = ",
+        ] {
+            assert!(
+                sql.contains(&format!("{source}'{addr}'")),
+                "missing {source}"
+            );
+        }
+        assert!(sql.contains("WHERE share_amount > 0"));
+        assert!(sql.ends_with("LIMIT 100"));
     }
 
     /// Every builder that takes an identifier must refuse rather than interpolate. This walks the

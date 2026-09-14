@@ -616,6 +616,9 @@ pub const INDEXERS_EXCLUDED: &str = "0xb43b2cccceada5292732a8c58ae134adefce09bb"
 #[serde(rename_all = "camelCase")]
 pub struct EnrichedIndexer {
     pub address: String,
+    /// Verified only: a Graph default name the account owns on ENS, else its primary ENS name.
+    pub name: Option<String>,
+    pub ens_name: Option<String>,
     pub url: Option<String>,
     pub geo_hash: Option<String>,
     pub self_stake_grt: Option<String>,
@@ -649,7 +652,10 @@ pub struct EnrichedIndexer {
 /// transition guard: the column genuinely holds both units, seven rows the platform wrote
 /// and this service no longer updates being the PPM ones, and without it they reach the
 /// dashboard as a cut of 549000%. It can go when #47 settles who owns the column.
-pub const ENRICHED_INDEXERS_SQL: &str = "SELECT address, url, geo_hash, self_stake_grt::text, delegated_grt::text, \
+pub const ENRICHED_INDEXERS_SQL: &str = "SELECT address, \
+         CASE WHEN EXISTS (SELECT 1 FROM ingestion_state WHERE key = 'kittiwake:names') THEN name END AS name, \
+         CASE WHEN EXISTS (SELECT 1 FROM ingestion_state WHERE key = 'kittiwake:names') THEN ens_name END AS ens_name, \
+         url, geo_hash, self_stake_grt::text, delegated_grt::text, \
          allocated_grt::text, \
          (CASE WHEN reward_cut > 100 THEN reward_cut / 10000.0 ELSE reward_cut END)::text \
            AS reward_cut, \
@@ -671,6 +677,31 @@ pub async fn enriched_indexers(pool: &Pool, limit: i64) -> Result<Vec<EnrichedIn
         .fetch_all(pool)
         .await?;
     Ok(rows)
+}
+
+/// Written by `ingest-names` in the same transaction as its first verified names.
+///
+/// `indexers.name` and `ens_name` predate this service and may hold unverified or placeholder
+/// strings, so every reader of them requires this cursor to exist.
+pub const NAMES_CURSOR_KEY: &str = "kittiwake:names";
+
+const INDEXER_NAMES_SQL: &str = "SELECT address, name FROM indexers \
+     WHERE LOWER(address) = ANY($1) AND name IS NOT NULL \
+     AND EXISTS (SELECT 1 FROM ingestion_state WHERE key = 'kittiwake:names')";
+
+/// The names `ingest-names` verified, keyed by lowercase address. Addresses without one are absent.
+pub async fn indexer_names(
+    pool: &Pool,
+    addresses: &[String],
+) -> Result<std::collections::HashMap<String, String>, DbError> {
+    let rows: Vec<(String, String)> = sqlx::query_as(INDEXER_NAMES_SQL)
+        .bind(addresses)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(a, n)| (a.to_lowercase(), n))
+        .collect())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1148,6 +1179,20 @@ mod directory_tests {
     /// directory served an indexer the dashboard deliberately hides. Both readers take the
     /// constant from here now; this pins the clause that was missing.
     #[test]
+    fn no_name_is_served_before_ingest_names_has_run() {
+        let gate =
+            format!("EXISTS (SELECT 1 FROM ingestion_state WHERE key = '{NAMES_CURSOR_KEY}')");
+        assert_eq!(
+            ENRICHED_INDEXERS_SQL.matches(&gate).count(),
+            2,
+            "{ENRICHED_INDEXERS_SQL}"
+        );
+        assert!(ENRICHED_INDEXERS_SQL.contains("THEN name END AS name"));
+        assert!(ENRICHED_INDEXERS_SQL.contains("THEN ens_name END AS ens_name"));
+        assert!(INDEXER_NAMES_SQL.contains(&gate), "{INDEXER_NAMES_SQL}");
+    }
+
+    #[test]
     fn the_directory_read_excludes_the_blocked_indexer() {
         assert!(
             ENRICHED_INDEXERS_SQL.contains("WHERE i.address <> $2"),
@@ -1179,6 +1224,8 @@ mod directory_tests {
         let v = serde_json::to_value(EnrichedIndexer::default()).unwrap();
         for key in [
             "address",
+            "name",
+            "ensName",
             "selfStakeGrt",
             "netFlowGrt7d",
             "queryFeesCollectedGrt",
@@ -1195,6 +1242,7 @@ mod directory_tests {
     #[test]
     fn the_columns_the_refresh_job_writes_are_actually_read_back() {
         for column in [
+            "ens_name",
             "query_fees_collected_grt",
             "rewards_earned_grt",
             "net_flow_grt_7d",

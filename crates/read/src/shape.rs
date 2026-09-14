@@ -119,6 +119,45 @@ pub fn indexer(r: &Value) -> Value {
     })
 }
 
+/// The indexer addresses in a directory page (`indexers`) or a profile (`indexer`), lowercase.
+pub fn indexer_account_ids(data: &Value) -> Vec<String> {
+    accounts(data)
+        .filter_map(|a| a.get("id")?.as_str().map(str::to_lowercase))
+        .collect()
+}
+
+/// Put verified names into `account.defaultDisplayName`. An address with no name stays null.
+pub fn put_indexer_names(data: &mut Value, names: &std::collections::HashMap<String, String>) {
+    if let Some(rows) = data.get_mut("indexers").and_then(Value::as_array_mut) {
+        rows.iter_mut().for_each(|row| put_name(row, names));
+    } else if let Some(row) = data.get_mut("indexer") {
+        put_name(row, names);
+    }
+}
+
+fn put_name(row: &mut Value, names: &std::collections::HashMap<String, String>) {
+    let Some(account) = row.get_mut("account") else {
+        return;
+    };
+    let name = account
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(|id| names.get(&id.to_lowercase()))
+        .cloned();
+    if let Some(name) = name {
+        account["defaultDisplayName"] = Value::String(name);
+    }
+}
+
+fn accounts(data: &Value) -> impl Iterator<Item = &Value> {
+    let rows = data.get("indexers").and_then(Value::as_array);
+    let one = data.get("indexer");
+    rows.into_iter()
+        .flatten()
+        .chain(one)
+        .filter_map(|r| r.get("account"))
+}
+
 pub fn curator(r: &Value) -> Value {
     json!({
         "id": t(r, "id"),
@@ -1336,6 +1375,38 @@ mod tests {
         assert_eq!(
             indexer(&empty)["account"]["defaultDisplayName"],
             Value::Null
+        );
+    }
+
+    #[test]
+    fn a_verified_name_lands_on_the_account_and_no_name_stays_null() {
+        let named = "0xF00F7157FA8FD0420B87956D46058A16B2F23ADC";
+        let unnamed = "0x090f7382f9ea85c733cd501f4d87f16cb5b83ed3";
+        let names: std::collections::HashMap<String, String> =
+            [(named.to_lowercase(), "p2p-org-booster.eth".to_string())].into();
+
+        let mut page = json!({ "indexers": [indexer(&json!({"id": named})), indexer(&json!({"id": unnamed}))] });
+        assert_eq!(
+            indexer_account_ids(&page),
+            vec![named.to_lowercase(), unnamed.to_string()]
+        );
+        put_indexer_names(&mut page, &names);
+        assert_eq!(
+            page["indexers"][0]["account"]["defaultDisplayName"],
+            json!("p2p-org-booster.eth")
+        );
+        assert_eq!(
+            page["indexers"][1]["account"]["defaultDisplayName"],
+            Value::Null
+        );
+
+        let mut profile =
+            json!({ "indexer": indexer_detail(&json!({"id": named}), &[], &[], &[], 16.0) });
+        assert_eq!(indexer_account_ids(&profile), vec![named.to_lowercase()]);
+        put_indexer_names(&mut profile, &names);
+        assert_eq!(
+            profile["indexer"]["account"]["defaultDisplayName"],
+            json!("p2p-org-booster.eth")
         );
     }
 

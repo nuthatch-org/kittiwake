@@ -204,9 +204,10 @@ fn reason_for(row: &EnrichedIndexer, dim: &str) -> Option<String> {
             }
         }
         "allocationEfficiency" => "High allocation efficiency".into(),
-        // Same as `cutStability`: the incumbent branches on `ensName`, which our feed does not
-        // carry, so it always renders the second arm.
-        "transparency" => "Verified identity".into(),
+        "transparency" => match &row.ens_name {
+            Some(ens) => format!("ENS: {ens}"),
+            None => "Verified identity".into(),
+        },
         "delegationTrend" => {
             if num(row.net_flow_grt_7d.as_deref()) > 0.0 {
                 "Net delegation inflow (7d)".into()
@@ -235,8 +236,8 @@ pub fn legacy_indexer(row: &EnrichedIndexer) -> Value {
         .unwrap_or("unknown");
     json!({
         "id": row.address.to_lowercase(),
-        "name": Value::Null,
-        "ensName": Value::Null,
+        "name": row.name,
+        "ensName": row.ens_name,
         "url": row.url,
         "geoHash": row.geo_hash,
 
@@ -363,6 +364,8 @@ mod tests {
     fn row(address: &str) -> EnrichedIndexer {
         EnrichedIndexer {
             address: address.into(),
+            name: None,
+            ens_name: None,
             url: Some("https://indexer.example".into()),
             geo_hash: None,
             self_stake_grt: Some("1500000.5".into()),
@@ -387,6 +390,26 @@ mod tests {
             last_updated: None,
             q_score: None,
         }
+    }
+
+    #[test]
+    fn a_named_indexer_is_recommended_under_its_name() {
+        let named = EnrichedIndexer {
+            name: Some("pinax.eth".into()),
+            ens_name: Some("pinax.eth".into()),
+            ..row("0xaabb")
+        };
+        let value = legacy_indexer(&named);
+        assert_eq!(value["name"], "pinax.eth");
+        assert_eq!(value["ensName"], "pinax.eth");
+        assert_eq!(
+            reason_for(&named, "transparency").as_deref(),
+            Some("ENS: pinax.eth")
+        );
+        assert_eq!(
+            reason_for(&row("0xaabb"), "transparency").as_deref(),
+            Some("Verified identity")
+        );
     }
 
     /// Every slider names dimensions that exist. One that did not would be created at zero and
