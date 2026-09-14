@@ -1961,6 +1961,100 @@ mod stake_history_tests {
     }
 }
 
+/// An indexer's daily rewards and query fees, in the shape the retired Horizon Performance route
+/// answered: two lists, newest first, each holding only the days that had one of its events.
+///
+/// `timestamp` is microseconds because that is what the subgraph's `Timestamp` scalar carried.
+/// `totalCollected` stays gross. `totalCollectedNet` is what the indexer received, after the
+/// protocol, the curators and the delegators, and the protocol's cut is null for the era whose
+/// events never stated it.
+pub fn indexer_trends(v: &Value) -> Value {
+    let rows = v
+        .get("rows")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let micros = |r: &Value| (i0(r, "day_start").as_i64().unwrap_or(0) * 1_000_000).to_string();
+    let count = |r: &Value, k: &str| i0(r, k).as_i64().unwrap_or(0);
+    let rewards: Vec<Value> = rows
+        .iter()
+        .filter(|r| count(r, "reward_count") > 0)
+        .map(|r| {
+            json!({
+                "timestamp": micros(r),
+                "indexer": t(r, "indexer"),
+                "totalRewards": s0(r, "total_rewards"),
+                "totalIndexerRewards": s0(r, "indexer_rewards"),
+                "totalDelegationRewards": s0(r, "delegator_rewards"),
+                "rewardCount": count(r, "reward_count").to_string(),
+            })
+        })
+        .collect();
+    let query_fees: Vec<Value> = rows
+        .iter()
+        .filter(|r| count(r, "fee_count") > 0)
+        .map(|r| {
+            json!({
+                "timestamp": micros(r),
+                "indexer": t(r, "indexer"),
+                "totalCollected": s0(r, "fees_gross"),
+                "totalCurators": s0(r, "fees_curators"),
+                "totalProtocolTax": s(r, "fees_protocol"),
+                "totalCollectedNet": s0(r, "fees_net"),
+                "feeCount": count(r, "fee_count").to_string(),
+            })
+        })
+        .collect();
+    json!({ "rewards": rewards, "queryFees": query_fees })
+}
+
+#[cfg(test)]
+mod indexer_trends_tests {
+    use super::*;
+
+    #[test]
+    fn a_day_lands_in_each_list_it_had_events_for() {
+        let v = json!({"rows": [
+            {"indexer": "0xi", "day_start": 1_787_356_800, "total_rewards": "30", "indexer_rewards": "10",
+             "delegator_rewards": "20", "reward_count": 2, "fees_gross": "0", "fees_curators": "0",
+             "fees_protocol": null, "fees_net": "0", "fee_count": 0},
+            {"indexer": "0xi", "day_start": 1_787_270_400, "total_rewards": "0", "indexer_rewards": "0",
+             "delegator_rewards": "0", "reward_count": 0, "fees_gross": "1000", "fees_curators": "100",
+             "fees_protocol": "10", "fees_net": "890", "fee_count": "3"},
+        ]});
+        let out = indexer_trends(&v);
+        let rewards = out["rewards"].as_array().unwrap();
+        let fees = out["queryFees"].as_array().unwrap();
+        assert_eq!(rewards.len(), 1);
+        assert_eq!(fees.len(), 1);
+        assert_eq!(rewards[0]["timestamp"], json!("1787356800000000"));
+        assert_eq!(rewards[0]["totalDelegationRewards"], json!("20"));
+        assert_eq!(rewards[0]["rewardCount"], json!("2"));
+        assert_eq!(
+            fees[0]["totalCollected"],
+            json!("1000"),
+            "gross, as the subgraph's field was"
+        );
+        assert_eq!(fees[0]["totalCollectedNet"], json!("890"));
+        assert_eq!(fees[0]["totalProtocolTax"], json!("10"));
+        assert_eq!(fees[0]["feeCount"], json!("3"));
+    }
+
+    #[test]
+    fn a_protocol_cut_nobody_stated_is_null_and_an_empty_answer_is_two_empty_lists() {
+        let v = json!({"rows": [{"indexer": "0xi", "day_start": 0, "fees_gross": "5", "fees_curators": "1",
+                                 "fees_protocol": null, "fees_net": "4", "fee_count": 1}]});
+        assert_eq!(
+            indexer_trends(&v)["queryFees"][0]["totalProtocolTax"],
+            Value::Null
+        );
+        assert_eq!(
+            indexer_trends(&json!({"rows": []})),
+            json!({"rewards": [], "queryFees": []})
+        );
+    }
+}
+
 /// A deployment's weekly signal and stake series, folded from the two event lists.
 ///
 /// The nest answers what happened; the chart plots what was true. Signal is the running sum of

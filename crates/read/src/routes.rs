@@ -661,6 +661,23 @@ pub async fn indexer_stake_history(
     .await
 }
 
+/// `/api/indexer/[address]/trends`: the daily rewards and fees the indexer page charts.
+pub async fn indexer_trends(ctx: &ReadCtx, addr: &str, since: i64) -> Result<Read, ApiError> {
+    let sql = addr_or_400!(sql::indexer_daily_sql(addr, since), "address");
+    ctx.cached(
+        "indexer-trends",
+        NestId::Alloc,
+        serde_json::json!({"address": addr, "since": since}),
+        CachePolicy::from_poll_interval(cadence::ARCHIVAL),
+        many_folded(
+            vec![Part::rows("rows", NestId::Alloc, sql)],
+            T_FOLD,
+            shape::indexer_trends,
+        ),
+    )
+    .await
+}
+
 // ---------------------------------------------------------------------------------------------
 // Portfolios
 // ---------------------------------------------------------------------------------------------
