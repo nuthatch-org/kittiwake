@@ -3258,12 +3258,14 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sqlx",
  "subtle",
  "tattler",
  "tokio",
  "tower",
  "tower-http 0.7.1",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -3393,6 +3395,7 @@ dependencies = [
  "kittiwake-score",
  "kittiwake-types",
  "metrics",
+ "moka",
  "regex",
  "serde",
  "serde_json",

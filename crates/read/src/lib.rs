@@ -10,10 +10,12 @@ pub mod concentration;
 pub mod dips_agreements;
 pub mod indexing_status;
 pub mod manifest;
+pub mod naming;
 pub mod preflight;
 pub mod qos;
 pub mod recommend;
 pub mod sql;
+pub mod status_probe;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +38,8 @@ pub struct ReadCtx {
     pub gate: NestGate,
     pub store: Store,
     pub schema_version: u32,
+    /// Absent when no database is configured, and the indexer page is then served without names.
+    pub naming: Option<naming::Naming>,
     /// Absent when no Arbitrum RPC is configured. The routes that need a contract read say so
     /// rather than quietly omitting the part they could not compute.
     pub chain: Option<kittiwake_chain::Chain>,
@@ -58,8 +62,14 @@ impl ReadCtx {
             gate,
             store,
             schema_version,
+            naming: None,
             chain: None,
         }
+    }
+
+    pub fn with_naming(mut self, naming: Option<naming::Naming>) -> Self {
+        self.naming = naming;
+        self
     }
 
     pub fn with_chain(mut self, chain: Option<kittiwake_chain::Chain>) -> Self {

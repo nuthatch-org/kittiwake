@@ -20,6 +20,7 @@ kittiwake-score = { version = "0.1.0", path = "../score" }
 kittiwake-nest = { version = "0.1.0", path = "../nest" }
 kittiwake-types = { version = "0.1.0", path = "../types" }
 metrics = "0.24.6"
+moka = { version = "0.12.16", features = ["future"] }
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -30,5 +31,5 @@ serde_yaml_ng = "0.10.0"
 thiserror = "2.0.20"
 
 [dev-dependencies]
-tokio = { version = "1.53.1", features = ["full"] }
+tokio = { version = "1.53.1", features = ["full", "test-util"] }
 wiremock = "0.6.5"

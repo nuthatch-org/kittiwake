@@ -191,9 +191,7 @@ pub async fn indexer(
     Path(address): Path<String>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
-    let read = routes::indexer(&st.read, &addr(&address)).await?;
-    let read = named_indexers(&st, read).await;
-    Ok(envelope(named_allocations(&st, read).await))
+    Ok(envelope(routes::indexer(&st.read, &addr(&address)).await?))
 }
 
 /// Put the verified indexer names from Postgres on the accounts. A failed read leaves them null:
@@ -223,40 +221,11 @@ async fn named_indexers(st: &AppState, mut read: kittiwake_read::Read) -> kittiw
     read
 }
 
-/// Put the names on an indexer's allocations, when there is a database to read them from.
-///
-/// Same split and the same fresh-entry reasoning as `named` below: the allocation rows come from
-/// the allocation nest, the names from IPFS documents keyed off the GNS nest, and enriching the
-/// cached entry in place would make its contents depend on whether a database happened to be
-/// configured on the run that filled it.
-async fn named_allocations(st: &AppState, mut read: kittiwake_read::Read) -> kittiwake_read::Read {
-    let Some(pool) = st.pool.as_ref() else {
-        return read;
-    };
-    let mut data = (*read.entry.value).clone();
-    let Some(indexer) = data.get_mut("indexer") else {
-        return read;
-    };
-    kittiwake_read::search::enrich_allocation_deployments(
-        pool,
-        &st.ipfs,
-        &st.read.gate,
-        kittiwake_nest::Lane::Read,
-        indexer,
-    )
-    .await;
-    read.entry = std::sync::Arc::new(kittiwake_cache::Entry {
-        value: std::sync::Arc::new(data),
-        provenance: read.entry.provenance.clone(),
-        fetched_at: read.entry.fetched_at,
-    });
-    read
-}
-
 /// `/api/indexer-status/[address]`: what this indexer is actually serving, right now.
 ///
 /// The nest says what it has allocated to; only the indexer's own status endpoint says whether it
-/// is synced, and that is a live probe rather than a cached fold. The two are joined here: an
+/// is synced, and that is a probe of the node, served with its age rather than waited for. See
+/// [`kittiwake_read::status_probe`]. The two are joined here: an
 /// allocation with no matching status is one the indexer is paid for and is not serving, which is
 /// the case this panel exists to surface.
 pub async fn indexer_status(
@@ -282,14 +251,17 @@ pub async fn indexer_status(
         .unwrap_or_default();
 
     // One probe for the whole indexer: its status endpoint answers for every deployment at once.
-    let probe = if url.is_empty() {
+    let node = if url.is_empty() {
         None
     } else {
-        Some(st.ext.probe_indexer(&url).await)
+        Some(st.probes.observe(&url).await)
     };
-    let unreachable = probe.as_ref().map(|p| !p.reachable).unwrap_or(true);
-    let statuses: std::collections::HashMap<String, &kittiwake_ext::IndexingStatus> = probe
+    let probe = node
         .as_ref()
+        .and_then(|n| n.checked.as_deref())
+        .map(|c| &c.result);
+    let unreachable = probe.map(|p| !p.reachable).unwrap_or(true);
+    let statuses: std::collections::HashMap<String, &kittiwake_ext::IndexingStatus> = probe
         .map(|p| {
             p.statuses
                 .iter()
@@ -361,6 +333,7 @@ pub async fn indexer_status(
             "syncingCount": syncing,
             "failedCount": failed,
             "unreachableCount": if unreachable { deployments.len() as i64 } else { missing },
+            "node": node.as_ref().map(|n| n.json()),
             "deployments": deployments,
         },
         "source": "nuthatch",
@@ -4062,5 +4035,300 @@ mod deployment_id_tests {
         let hex = "0x43a24eec54b93a1f0e5f1c6a4b9a0a6d1e2f3c4b5a69788796a5b4c3d2e1f009";
         assert_eq!(deployment_id(hex), hex);
         assert_eq!(deployment_id(&hex.to_uppercase()), hex);
+    }
+}
+
+#[cfg(test)]
+mod indexer_page_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use kittiwake_ext::{IndexingStatus, ProbeResult};
+    use kittiwake_read::status_probe::{Probe, StatusProbes};
+    use serde_json::Value;
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    const INDEXER: &str = "0x00000000000000000000000000000000000000aa";
+    const DEPLOYMENT: &str = "QmStfa6zwPUzKHyGrgdNMh8rgbc91sgvmskidBSujG92FR";
+    const METADATA: &str = "0xdb0c77a3184bf017abafb7606794d77ff53d9a59a0bc1dc23f1a762bd1e631ff";
+
+    /// The allocation nest, the GNS nest and IPFS behind one stand-in, recording every call. The
+    /// indexer has one allocation, on a deployment whose metadata document names it.
+    struct Upstream(Arc<Mutex<Vec<String>>>);
+
+    impl Respond for Upstream {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let path = req.url.path().to_string();
+            if path.ends_with("/ready") {
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ready": true, "lag_blocks": 0, "tip": 1, "last_block": 1,
+                    "sealed_through": 1, "stalled": false
+                }));
+            }
+            self.0.lock().unwrap().push(path.clone());
+            if path == "/api/v0/cat" {
+                return ResponseTemplate::new(200)
+                    .set_body_string(r#"{"displayName":"Uniswap V3"}"#);
+            }
+            let q = req
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "q")
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default();
+            let rows: Vec<Value> = if path.starts_with("/gns/") {
+                q.split('\'')
+                    .skip(1)
+                    .step_by(2)
+                    .filter(|s| s.len() == 66 && s.starts_with("0x"))
+                    .map(|id| {
+                        serde_json::json!({
+                            "deployment_id": id, "subgraph_id": "1",
+                            "subgraph_metadata": METADATA, "version_metadata": null
+                        })
+                    })
+                    .collect()
+            } else {
+                vec![serde_json::json!({
+                    "id": INDEXER,
+                    "url": "https://indexer.example",
+                    "allocated_tokens": "1",
+                    "subgraph_deployment": kittiwake_read::shape::ipfs_hash_to_bytes32(DEPLOYMENT),
+                })]
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count": rows.len(), "rows": rows,
+                "provenance": {"as_of": 1, "sealed_through": 1, "source": "mock"}
+            }))
+        }
+    }
+
+    async fn state(
+        probe: Probe,
+        wait: Duration,
+    ) -> (AppState, Arc<Mutex<Vec<String>>>, MockServer) {
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(any())
+            .respond_with(Upstream(seen.clone()))
+            .mount(&server)
+            .await;
+        let mut cfg = kittiwake_nest::NestConfig::new(server.uri());
+        for n in kittiwake_types::NestId::ALL {
+            cfg.base_paths.insert(n, format!("/{}", n.as_str()));
+        }
+        // Postgres is a listener that records each connection and hangs up. Nothing is ever read
+        // from it, so a request that names anything also has to ask the GNS nest and IPFS.
+        let postgres = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = postgres.local_addr().unwrap().port();
+        let connections = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = postgres.accept().await {
+                connections.lock().unwrap().push("postgres".to_string());
+                drop(socket);
+            }
+        });
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_lazy(&format!("postgres://unused:unused@127.0.0.1:{port}/unused"))
+            .expect("a lazy pool needs no server");
+        let ipfs = kittiwake_ext::Ipfs::new(&server.uri());
+        let read = kittiwake_read::ReadCtx::new(
+            kittiwake_nest::NestGate::new(cfg).unwrap(),
+            kittiwake_cache::Store::new(64),
+            1,
+        )
+        .with_naming(Some(kittiwake_read::naming::Naming::new(
+            pool.clone(),
+            ipfs.clone(),
+        )));
+        let mut st = crate::state(
+            crate::Limits::new(1000, 1000, 1000, Vec::new()),
+            None,
+            Some(pool),
+            read,
+            None,
+            None,
+            ipfs,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        st.probes = StatusProbes::with_probe(probe, wait);
+        (st, seen, server)
+    }
+
+    fn peer() -> ConnectInfo<SocketAddr> {
+        ConnectInfo(([127, 0, 0, 1], 1).into())
+    }
+
+    async fn body(resp: Result<Response, ErrorResponse>) -> Value {
+        let Ok(resp) = resp else {
+            panic!("the route refused")
+        };
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn node_answering(reachable: bool) -> Probe {
+        Arc::new(move |url| {
+            Box::pin(async move {
+                ProbeResult {
+                    url,
+                    reachable,
+                    elapsed_ms: 3,
+                    statuses: vec![IndexingStatus {
+                        deployment: DEPLOYMENT.to_string(),
+                        network: Some("mainnet".to_string()),
+                        health: "healthy".to_string(),
+                        synced: true,
+                        latest_block: Some(10),
+                        chain_head_block: Some(10),
+                        blocks_behind: Some(0),
+                    }]
+                    .into_iter()
+                    .filter(|_| reachable)
+                    .collect(),
+                    error: (!reachable).then(|| "connection refused".to_string()),
+                }
+            })
+        })
+    }
+
+    async fn status(st: &AppState) -> Value {
+        body(
+            indexer_status(
+                State(st.clone()),
+                peer(),
+                HeaderMap::new(),
+                Path(INDEXER.to_string()),
+            )
+            .await,
+        )
+        .await
+    }
+
+    /// The largest indexer's page took 10.5 s from the cache on 2026-09-15: its allocations were
+    /// named again on every request, after the cache rather than inside it.
+    #[tokio::test]
+    async fn a_second_request_for_an_indexer_page_does_no_naming_work() {
+        let (st, seen, _server) = state(node_answering(true), Duration::ZERO).await;
+        let page = || async {
+            body(
+                indexer(
+                    State(st.clone()),
+                    peer(),
+                    HeaderMap::new(),
+                    Path(INDEXER.to_string()),
+                )
+                .await,
+            )
+            .await
+        };
+        let name = |v: &Value| {
+            v["data"]["indexer"]["allocations"][0]["subgraphDeployment"]["displayName"].clone()
+        };
+        let asked = |prefix: &str| {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.starts_with(prefix))
+                .count()
+        };
+
+        let first = page().await;
+        assert_eq!(name(&first), "Uniswap V3");
+        assert!(
+            asked("/gns/") > 0,
+            "the first request asked the GNS nest nothing"
+        );
+        assert!(
+            asked("/api/v0/cat") > 0,
+            "the first request asked IPFS nothing"
+        );
+        assert!(
+            asked("postgres") > 0,
+            "the first request read no indexer name"
+        );
+        let before = seen.lock().unwrap().len();
+
+        let second = page().await;
+        assert_eq!(
+            name(&second),
+            "Uniswap V3",
+            "the cached answer carries the names"
+        );
+        let after = seen.lock().unwrap()[before..].to_vec();
+        assert!(after.is_empty(), "a cached page asked {after:?}");
+    }
+
+    /// Probed inside the request, a node that did not answer cost every load of the page the probe's
+    /// eight seconds (2026-09-15).
+    #[tokio::test]
+    async fn a_node_that_does_not_answer_costs_the_status_route_the_wait_and_no_more() {
+        let silent: Probe = Arc::new(|url| {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(8)).await;
+                node_answering(false)(url).await
+            })
+        });
+        let wait = Duration::from_millis(300);
+        let (st, _, _server) = state(silent, wait).await;
+        assert!(
+            kittiwake_read::routes::indexer_status(&st.read, INDEXER)
+                .await
+                .is_ok(),
+            "the nest fold, cached first so only the probe is timed"
+        );
+
+        let began = Instant::now();
+        let body = status(&st).await;
+        let took = began.elapsed();
+        assert!(took < wait + Duration::from_millis(500), "waited {took:?}");
+        let node = &body["data"]["node"];
+        assert_eq!(
+            node["reachable"],
+            Value::Null,
+            "not yet known is not unreachable"
+        );
+        assert_eq!(node["pending"], true);
+        assert_eq!(node["checkedAt"], Value::Null);
+        assert_eq!(node["lastReachedAt"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_node_that_cannot_be_reached_is_said_to_be_and_never_to_have_been_reached() {
+        let (st, _, _server) = state(node_answering(false), Duration::from_secs(2)).await;
+        let body = status(&st).await;
+        let data = &body["data"];
+        let node = &data["node"];
+        assert_eq!(node["reachable"], false);
+        assert_eq!(node["error"], "connection refused");
+        assert_eq!(node["pending"], false);
+        assert_eq!(node["ageSeconds"], 0);
+        assert!(node["checkedAt"].is_i64());
+        assert_eq!(node["lastReachedAt"], Value::Null);
+        assert_eq!(data["unreachableCount"], 1);
+        assert_eq!(data["deployments"][0]["status"], "unreachable");
+    }
+
+    #[tokio::test]
+    async fn a_node_that_answers_is_said_to_have_been_reached_when_it_was_checked() {
+        let (st, _, _server) = state(node_answering(true), Duration::from_secs(2)).await;
+        let body = status(&st).await;
+        let data = &body["data"];
+        let node = &data["node"];
+        assert_eq!(node["reachable"], true);
+        assert_eq!(node["stale"], false);
+        assert!(node["checkedAt"].is_i64());
+        assert_eq!(node["lastReachedAt"], node["checkedAt"]);
+        assert_eq!(data["syncedCount"], 1);
+        assert_eq!(data["deployments"][0]["status"], "synced");
     }
 }

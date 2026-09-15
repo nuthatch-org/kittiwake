@@ -514,21 +514,12 @@ pub async fn display_names_for_deployments(
     Ok(out)
 }
 
-/// Put names on the deployments an indexer's allocations point at.
-///
-/// The allocation rows come from the allocation nest and carry a deployment id and nothing else;
-/// the names live in IPFS documents keyed off the GNS nest. Same split as `enrich_deployments`,
-/// different shape: here the deployments are nested one level down, inside `allocations` and
-/// `closedAllocations`, rather than being the list itself.
-///
-/// Silent when the metadata cannot be read, for the same reason as the list: an allocation table
-/// with hashes in it is a table, and one that failed because a name was missing is not.
 /// The two places an indexer profile keeps allocations. One list, so the collect and the write-back
 /// cannot drift apart and quietly name only half of them.
 const ALLOCATION_FIELDS: [&str; 2] = ["allocations", "closedAllocations"];
 
 /// Every deployment hash an indexer's allocations point at, deduplicated.
-fn allocation_deployment_hashes(indexer: &serde_json::Value) -> Vec<String> {
+pub(crate) fn allocation_deployment_hashes(indexer: &serde_json::Value) -> Vec<String> {
     let mut hashes: Vec<String> = ALLOCATION_FIELDS
         .iter()
         .filter_map(|f| indexer.get(f).and_then(|v| v.as_array()))
@@ -549,7 +540,7 @@ fn allocation_deployment_hashes(indexer: &serde_json::Value) -> Vec<String> {
 ///
 /// A hash with no name keeps its null rather than gaining an empty string: the table renders the
 /// hash either way, and "" would claim the subgraph is called nothing.
-fn apply_allocation_names(
+pub(crate) fn apply_allocation_names(
     indexer: &mut serde_json::Value,
     names: &BTreeMap<String, Option<String>>,
 ) {
@@ -567,25 +558,6 @@ fn apply_allocation_names(
             if let Some(Some(name)) = names.get(hash) {
                 dep["displayName"] = serde_json::Value::String(name.clone());
             }
-        }
-    }
-}
-
-pub async fn enrich_allocation_deployments(
-    pool: &Pool,
-    ipfs: &Ipfs,
-    gate: &NestGate,
-    lane: Lane,
-    indexer: &mut serde_json::Value,
-) {
-    let hashes = allocation_deployment_hashes(indexer);
-    if hashes.is_empty() {
-        return;
-    }
-    match display_names_for_deployments(pool, ipfs, gate, lane, &hashes).await {
-        Ok(names) => apply_allocation_names(indexer, &names),
-        Err(e) => {
-            tracing::debug!(err = %e, "allocation deployment names unavailable; the table keeps its hashes");
         }
     }
 }

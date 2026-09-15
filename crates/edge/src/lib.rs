@@ -86,6 +86,8 @@ impl Limits {
 pub struct AppState {
     pub read: ReadCtx,
     pub ext: kittiwake_ext::Ext,
+    /// The last probe of each indexer's own status endpoint, for `/api/indexer-status`.
+    pub probes: kittiwake_read::status_probe::StatusProbes,
     pub ipfs: kittiwake_ext::Ipfs,
     /// Present only when the Dock has its independently managed session secret.
     pub studio: Option<Studio>,
@@ -1258,6 +1260,7 @@ pub fn state(
     tap_payer: Option<Arc<kittiwake_chain::tap::Payer>>,
     support_token: Option<String>,
 ) -> AppState {
+    let ext = kittiwake_ext::Ext::default();
     AppState {
         chain: read.chain.clone(),
         // Set afterwards with `with_cors`, rather than as a fourteenth positional argument to a
@@ -1265,7 +1268,8 @@ pub fn state(
         cors_origins: None,
         cors_patterns: None,
         read,
-        ext: kittiwake_ext::Ext::default(),
+        probes: kittiwake_read::status_probe::StatusProbes::new(ext.clone()),
+        ext,
         ipfs,
         studio,
         foghorn_api_url: foghorn_api_url.map(|u| Arc::from(u.as_str())),
