@@ -546,6 +546,7 @@ impl NestGate {
                 source: raw.source.or_else(|| Some(spec.nest.as_str().to_string())),
                 truncated: env.truncated,
                 degraded: env.degraded,
+                partial: false,
             },
         })
     }

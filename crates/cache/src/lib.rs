@@ -143,14 +143,26 @@ pub struct Store {
     inner: moka::future::Cache<String, Arc<Entry>>,
 }
 
+/// How long an answer that left out a part is kept, whatever its route's policy. No longer than the
+/// shortest freshness, so it is never served stale, and the part is asked for again within the minute.
+pub const PARTIAL_FOR: Duration = FRESH_FLOOR;
+
 impl Store {
     pub fn new(max_capacity: u64) -> Self {
+        Self::keeping_partial_for(max_capacity, PARTIAL_FOR)
+    }
+
+    /// As [`Store::new`], keeping an answer that left out a part for `window`.
+    pub fn keeping_partial_for(max_capacity: u64, window: Duration) -> Self {
         Self {
             inner: moka::future::Cache::builder()
                 .max_capacity(max_capacity)
                 // The longest any entry may live regardless of policy, so a dataset that stops
                 // being requested cannot pin memory for ever.
                 .time_to_live(Duration::from_secs(3600))
+                // In the store rather than in each policy, so no reader, revalidation or warmer can
+                // serve or keep a partial answer past it.
+                .expire_after(PartialExpiry(window))
                 .build(),
         }
     }
@@ -171,6 +183,26 @@ impl Store {
 
     pub fn entry_count(&self) -> u64 {
         self.inner.entry_count()
+    }
+}
+
+struct PartialExpiry(Duration);
+
+impl moka::Expiry<String, Arc<Entry>> for PartialExpiry {
+    fn expire_after_create(&self, _: &String, entry: &Arc<Entry>, _: Instant) -> Option<Duration> {
+        entry.provenance.partial.then_some(self.0)
+    }
+
+    // An overwrite decides afresh. moka's default keeps the old entry's expiry, which would keep a
+    // partial answer that replaced a whole one for an hour.
+    fn expire_after_update(
+        &self,
+        _: &String,
+        entry: &Arc<Entry>,
+        _: Instant,
+        _: Option<Duration>,
+    ) -> Option<Duration> {
+        entry.provenance.partial.then_some(self.0)
     }
 }
 
@@ -255,6 +287,39 @@ mod tests {
         assert_eq!(
             got.meta(ServedFrom::Cache, false).served_from,
             ServedFrom::Cache
+        );
+    }
+
+    /// Kept like any other answer, one missing a part would be served for its route's whole window
+    /// as though it were whole, and the part not asked for again until then.
+    #[tokio::test]
+    async fn an_answer_missing_a_part_is_kept_for_its_window_and_no_longer() {
+        let window = Duration::from_millis(200);
+        let store = Store::keeping_partial_for(64, window);
+        let entry = |partial| {
+            Entry::new(
+                serde_json::json!({}),
+                Provenance {
+                    partial,
+                    ..Default::default()
+                },
+            )
+        };
+        store.insert("partial".into(), entry(true)).await;
+        store.insert("whole".into(), entry(false)).await;
+        store.insert("made whole".into(), entry(true)).await;
+        store.insert("made whole".into(), entry(false)).await;
+        store.insert("made partial".into(), entry(false)).await;
+        store.insert("made partial".into(), entry(true)).await;
+        assert!(store.get("partial").await.is_some(), "kept for its window");
+
+        tokio::time::sleep(window + Duration::from_millis(100)).await;
+        assert!(store.get("partial").await.is_none());
+        assert!(store.get("made partial").await.is_none());
+        assert!(store.get("whole").await.is_some());
+        assert!(
+            store.get("made whole").await.is_some(),
+            "a whole answer replacing a partial one does not inherit its window"
         );
     }
 }

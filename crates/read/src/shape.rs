@@ -631,13 +631,14 @@ pub fn closed_allocation(r: &Value) -> Value {
     })
 }
 
-/// The whole indexer profile.
+/// The whole indexer profile. A section given as `None` could not be read, and is left out rather
+/// than shown empty.
 #[allow(clippy::too_many_arguments)]
 pub fn indexer_detail(
     row: &Value,
-    operators: &[Value],
-    active: &[Value],
-    closed: &[Value],
+    operators: Option<&[Value]>,
+    active: Option<&[Value]>,
+    closed: Option<&[Value]>,
     delegation_ratio: f64,
 ) -> Value {
     let mut out = json!({
@@ -646,10 +647,6 @@ pub fn indexer_detail(
             "id": t(row, "id"),
             "defaultDisplayName": Value::Null,
             "metadata": Value::Null,
-            "operators": operators
-                .iter()
-                .map(|o| json!({ "id": t(o, "operator") }))
-                .collect::<Vec<_>>(),
         }),
         "stakedTokens": s0(row, "staked_tokens"),
         "lockedTokens": s0(row, "locked_tokens"),
@@ -668,9 +665,19 @@ pub fn indexer_detail(
         "url": t(row, "url"),
         "geoHash": t(row, "geohash"),
         "createdAt": i0(row, "created_at"),
-        "allocations": active.iter().map(active_allocation).collect::<Vec<_>>(),
-        "closedAllocations": closed.iter().map(closed_allocation).collect::<Vec<_>>(),
     });
+    if let Some(operators) = operators {
+        out["account"]["operators"] = operators
+            .iter()
+            .map(|o| json!({ "id": t(o, "operator") }))
+            .collect();
+    }
+    if let Some(active) = active {
+        out["allocations"] = active.iter().map(active_allocation).collect();
+    }
+    if let Some(closed) = closed {
+        out["closedAllocations"] = closed.iter().map(closed_allocation).collect();
+    }
 
     if let Value::Object(derived) = derived_indexer_metrics(row, delegation_ratio) {
         for (k, v) in derived {
@@ -1435,8 +1442,8 @@ mod tests {
             Value::Null
         );
 
-        let mut profile =
-            json!({ "indexer": indexer_detail(&json!({"id": named}), &[], &[], &[], 16.0) });
+        let detail = indexer_detail(&json!({"id": named}), Some(&[]), Some(&[]), Some(&[]), 16.0);
+        let mut profile = json!({ "indexer": detail });
         assert_eq!(indexer_account_ids(&profile), vec![named.to_lowercase()]);
         put_indexer_names(&mut profile, &names);
         assert_eq!(
@@ -1581,7 +1588,7 @@ mod tests {
         let ops = vec![json!({"operator": "0xop"})];
         let active = vec![json!({"id": "0xa1", "subgraph_deployment": "0xdep"})];
         let closed = vec![json!({"id": "0xc1", "subgraph_deployment": "0xdep", "poi": "0xpoi"})];
-        let d = indexer_detail(&row, &ops, &active, &closed, 16.0);
+        let d = indexer_detail(&row, Some(&ops), Some(&active), Some(&closed), 16.0);
         assert_eq!(d["account"]["operators"][0]["id"], json!("0xop"));
         assert_eq!(
             d["allocations"][0]["subgraphDeployment"]["id"],

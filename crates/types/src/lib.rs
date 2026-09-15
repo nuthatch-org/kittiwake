@@ -108,9 +108,14 @@ pub struct Provenance {
     /// The nest cut the answer off at its row cap.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
-    /// The nest served from a degraded set of tables.
+    /// The answer is missing something: the nest served from a degraded set of tables, or a
+    /// composed answer left out a part it could not read.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub degraded: bool,
+    /// A composed answer left out a part it could not read. Unlike a degraded table, a refused part
+    /// may answer when asked again, so the cache keeps such an answer only briefly. Never sent.
+    #[serde(skip)]
+    pub partial: bool,
 }
 
 /// Provenance plus what this particular delivery did: served from where, how old, stale or not.

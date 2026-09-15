@@ -281,6 +281,9 @@ pub(crate) fn provenance_headers(headers: &mut HeaderMap, meta: &Meta) {
     if let Some(sealed) = meta.provenance.sealed_through {
         set(headers, "x-kittiwake-sealed-through", sealed.to_string());
     }
+    if meta.provenance.degraded {
+        set(headers, "x-kittiwake-degraded", "true".to_string());
+    }
 }
 
 /// Wrap a cached read as the response every data route returns.
@@ -1521,6 +1524,7 @@ mod tests {
             source: None,
             truncated: false,
             degraded: false,
+            partial: false,
         }
     }
 

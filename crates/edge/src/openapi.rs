@@ -139,7 +139,10 @@ const SUMMARIES: &[Operation] = &[
         "/api/indexers-enriched",
         "The directory with the computed columns the dashboard ranks by.",
     ),
-    op("/api/indexer/{address}", "One indexer in full."),
+    op(
+        "/api/indexer/{address}",
+        "One indexer in full. A section that could not be read is left out and named under `degraded`.",
+    ),
     op(
         "/api/indexer-status/{address}",
         "What one indexer's own endpoint says it is serving.",
