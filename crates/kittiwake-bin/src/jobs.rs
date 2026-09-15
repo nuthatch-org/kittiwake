@@ -219,28 +219,30 @@ pub fn ingest_jobs(
     // or changed.
     {
         let pool = pool.clone();
-        jobs.push(
-            JobDef::every(
-                "ingest-qos-days",
-                mins(30),
-                Arc::new(move |ctx| {
-                    let pool = pool.clone();
-                    Box::pin(async move {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
-                        kittiwake_ingest::qos_days::fill_qos_days(&pool, &ctx.gate, ctx.lane, now)
-                            .await
-                            .map(|i| JobOutcome {
-                                rows_written: i.rows,
-                            })
-                            .map_err(|e| e.to_string())
-                    })
-                }),
-            )
-            .staggered(mins(21)),
-        );
+        let mut job = JobDef::every(
+            "ingest-qos-days",
+            mins(30),
+            Arc::new(move |ctx| {
+                let pool = pool.clone();
+                Box::pin(async move {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    kittiwake_ingest::qos_days::fill_qos_days(&pool, &ctx.gate, ctx.lane, now)
+                        .await
+                        .map(|i| JobOutcome {
+                            rows_written: i.rows,
+                        })
+                        .map_err(|e| e.to_string())
+                })
+            }),
+        )
+        .staggered(mins(21));
+        // A day is a handful of nest statements and takes 10 to 20 s on a busy nest, so the 90-day
+        // window cannot finish inside the default five minutes. Under the 30-minute period.
+        job.timeout = mins(25);
+        jobs.push(job);
     }
 
     // Hourly: the oracle's documents resolve half an hour behind the chain, and a thirty-day score
