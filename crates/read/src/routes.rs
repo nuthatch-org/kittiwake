@@ -907,11 +907,13 @@ pub async fn payments(ctx: &ReadCtx, receiver: Option<&str>) -> Result<Read, Api
         "address"
     );
     let tally_sql = addr_or_400!(sql::tally_collected_sql(receiver, 50), "address");
+    let by_payer_sql = addr_or_400!(sql::tally_by_payer_sql(receiver), "address");
 
     let parts = vec![
         Part::rows("accounts", NestId::Alloc, accounts_sql),
         Part::rows("transactions", NestId::Alloc, tx_sql),
         Part::rows("tally", NestId::Alloc, tally_sql),
+        Part::rows("byPayer", NestId::Alloc, by_payer_sql),
     ];
     let inner = many(parts, T_FOLD);
     let fetch: Fetcher = Arc::new(move |gate, lane| {
@@ -925,7 +927,12 @@ pub async fn payments(ctx: &ReadCtx, receiver: Option<&str>) -> Result<Read, Api
                     .unwrap_or_default()
             };
             Ok((
-                crate::shape::payments(&arr("accounts"), &arr("transactions"), &arr("tally")),
+                crate::shape::payments(
+                    &arr("accounts"),
+                    &arr("transactions"),
+                    &arr("tally"),
+                    &arr("byPayer"),
+                ),
                 p,
             ))
         })
