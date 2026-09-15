@@ -716,6 +716,17 @@ pub fn tally_collected_sql(receiver: Option<&str>, first: i64) -> Option<String>
     ))
 }
 
+/// Every payer's collections, summed with no cap. A total taken from `tally_collected_sql` sums only
+/// the largest collections, which understated one indexer by half and the network by two thirds.
+pub fn tally_by_payer_sql(receiver: Option<&str>) -> Option<String> {
+    let rc = receiver_clause("receiver", receiver)?;
+    Some(format!(
+        "SELECT LOWER(payer) AS payer, COUNT(DISTINCT \"collectionId\") AS collections, \
+         CAST(SUM(CAST(tokens AS HUGEINT)) AS VARCHAR) AS tokens FROM tally__payment_collected WHERE 1=1{rc} \
+         GROUP BY 1 ORDER BY SUM(CAST(tokens AS HUGEINT)) DESC"
+    ))
+}
+
 // ---------------------------------------------------------------------------------------------
 // Deployments and curation
 // ---------------------------------------------------------------------------------------------
@@ -1081,6 +1092,7 @@ mod tests {
         assert!(escrow_accounts_sql(Some(bad), 10).is_none());
         assert!(escrow_transactions_sql(Some(bad), 10).is_none());
         assert!(tally_collected_sql(Some(bad), 10).is_none());
+        assert!(tally_by_payer_sql(Some(bad)).is_none());
         assert!(deployments_by_id_sql(&[bad.to_string()]).is_none());
         assert!(deployment_sql(bad).is_none());
         assert!(allocations_by_deployment_sql(bad, 10).is_none());
@@ -1148,7 +1160,17 @@ mod tests {
     fn an_absent_filter_is_not_a_failure() {
         assert!(escrow_accounts_sql(None, 10).is_some());
         assert!(tally_collected_sql(None, 10).is_some());
+        assert!(tally_by_payer_sql(None).is_some());
         assert!(poi_allocations_sql(None, 10).is_some());
+    }
+
+    #[test]
+    fn the_collected_total_is_not_capped() {
+        let q = tally_by_payer_sql(Some("0xf92f430dd8567b0d466358c79594ab58d919a6d4")).unwrap();
+        assert!(
+            !q.contains("LIMIT"),
+            "a total summed from a capped list is short: {q}"
+        );
     }
 
     /// Without a receiver the balances fold keeps only positive ones; with one, a zero or negative

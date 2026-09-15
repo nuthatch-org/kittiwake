@@ -412,7 +412,12 @@ fn distinct(rows: &[Value], key: &str) -> usize {
 }
 
 /// The payments panel: three lists and the totals over them.
-pub fn payments(accounts: &[Value], transactions: &[Value], tally: &[Value]) -> Value {
+pub fn payments(
+    accounts: &[Value],
+    transactions: &[Value],
+    tally: &[Value],
+    by_payer: &[Value],
+) -> Value {
     let escrow: Vec<Value> = accounts
         .iter()
         .map(|r| {
@@ -468,13 +473,29 @@ pub fn payments(accounts: &[Value], transactions: &[Value], tally: &[Value]) -> 
         })
         .collect();
 
+    let collected_by_payer: Vec<Value> = by_payer
+        .iter()
+        .map(|r| {
+            json!({
+                "payer": { "id": t(r, "payer") },
+                "collections": r
+                    .get("collections")
+                    .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
+                    .unwrap_or(0),
+                "tokens": s0(r, "tokens"),
+            })
+        })
+        .collect();
+
     json!({
         "escrowAccounts": escrow,
         "recentTransactions": recent,
         "topCollectors": collectors,
+        "collectedByPayer": collected_by_payer,
         "totalEscrowBalance": sum_wei(accounts, "balance"),
         "totalThawing": sum_wei(accounts, "thawing"),
-        "totalCollected": sum_wei(tally, "tokens"),
+        // `tally` is only the largest collections; the per-payer rows are all of them.
+        "totalCollected": sum_wei(by_payer, "tokens"),
         "activePayers": distinct(accounts, "payer"),
         "activeReceivers": distinct(accounts, "receiver"),
     })
@@ -1333,7 +1354,7 @@ mod tests {
             json!({"payer": "0xa", "collector": "0xc", "receiver": "0xr", "balance": "1000000000000000000000000", "thawing": "5"}),
             json!({"payer": "0xa", "collector": "0xc", "receiver": "0xs", "balance": "2000000000000000000000000", "thawing": "0"}),
         ];
-        let out = payments(&accounts, &[], &[]);
+        let out = payments(&accounts, &[], &[], &[]);
         assert_eq!(
             out["totalEscrowBalance"],
             json!("3000000000000000000000000")
@@ -1341,6 +1362,20 @@ mod tests {
         assert_eq!(out["totalThawing"], json!("5"));
         assert_eq!(out["activePayers"], json!(1), "one payer, twice");
         assert_eq!(out["activeReceivers"], json!(2));
+    }
+
+    #[test]
+    fn total_collected_counts_every_payer_not_just_the_largest_collections() {
+        let top =
+            vec![json!({"payer": "0xa", "receiver": "0xr", "collection_id": "0x1", "tokens": "7"})];
+        let by_payer = vec![
+            json!({"payer": "0xa", "collections": 3, "tokens": "9"}),
+            json!({"payer": "0xb", "collections": "1", "tokens": "1"}),
+        ];
+        let out = payments(&[], &[], &top, &by_payer);
+        assert_eq!(out["totalCollected"], json!("10"));
+        assert_eq!(out["topCollectors"].as_array().unwrap().len(), 1);
+        assert_eq!(out["collectedByPayer"][1]["collections"], json!(1));
     }
 
     #[test]
