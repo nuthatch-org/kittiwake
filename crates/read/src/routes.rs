@@ -536,10 +536,12 @@ pub async fn indexer(ctx: &ReadCtx, addr: &str) -> Result<Read, ApiError> {
         ),
     ];
     let inner = many(parts, T_FOLD);
+    let naming = ctx.naming.clone();
     let fetch: Fetcher = Arc::new(move |gate, lane| {
         let inner = inner.clone();
+        let naming = naming.clone();
         Box::pin(async move {
-            let (v, p) = inner(gate, lane).await?;
+            let (v, p) = inner(gate.clone(), lane).await?;
             let arr = |k: &str| {
                 v.get(k)
                     .and_then(|x| x.as_array())
@@ -567,7 +569,12 @@ pub async fn indexer(ctx: &ReadCtx, addr: &str) -> Result<Read, ApiError> {
                     .map(crate::shape::delegator)
                     .collect(),
             );
-            Ok((serde_json::json!({ "indexer": shaped }), p))
+            let mut value = serde_json::json!({ "indexer": shaped });
+            // Named inside the fetch, so the cached answer carries the names.
+            if let Some(naming) = &naming {
+                naming.indexer_page(&gate, lane, &mut value).await;
+            }
+            Ok((value, p))
         })
     });
 

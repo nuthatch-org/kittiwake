@@ -3029,7 +3029,7 @@ mod provenance_tests {
                 dep.get("displayName").is_some(),
                 "nothing can fill in a name that has nowhere to go: {dep}"
             );
-            // Null until `named_allocations` has been past it. Null means unlooked-at or unnamed;
+            // Null until `naming::Naming` has been past it. Null means unlooked-at or unnamed;
             // it must not be invented here, where there is no metadata to invent it from.
             assert_eq!(dep["displayName"], Value::Null);
             assert!(dep["ipfsHash"].as_str().unwrap().starts_with("Qm"));

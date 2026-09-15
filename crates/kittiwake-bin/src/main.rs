@@ -165,11 +165,22 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let ipfs = kittiwake_ext::Ipfs::new(
+        cfg.studio
+            .as_ref()
+            .map(|s| s.ipfs_url.as_str())
+            .unwrap_or(kittiwake_ext::THEGRAPH_IPFS),
+    );
+
     // One read context for the whole process. Building a second one for the warmer meant it cached
     // answers computed without the chain client, and because it kept them warm the edge never took
     // a cold path that would have filled them in - a supply block that was null for ever, silently.
     let read = ReadCtx::new(gate.clone(), store.clone(), cache_cfg.schema_version)
-        .with_chain(chain.clone());
+        .with_chain(chain.clone())
+        .with_naming(
+            pool.clone()
+                .map(|p| kittiwake_read::naming::Naming::new(p, ipfs.clone())),
+        );
 
     // Said once, loudly, rather than discovered when the rate limiter starts refusing everyone:
     // without this the service cannot tell one visitor behind a proxy from another.
@@ -192,12 +203,6 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("invalid studio session secret: {e}"))
         })
         .transpose()?;
-    let ipfs = kittiwake_ext::Ipfs::new(
-        cfg.studio
-            .as_ref()
-            .map(|s| s.ipfs_url.as_str())
-            .unwrap_or(kittiwake_ext::THEGRAPH_IPFS),
-    );
     let state = kittiwake_edge::state(
         limits,
         metrics,
