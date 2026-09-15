@@ -150,27 +150,131 @@ fn bad_address() -> ApiError {
     ApiError::BadRequest("not a valid address".into())
 }
 
-/// A live read, or `None` when the nest could not give it. Closed days are in Postgres, so a refused
-/// statement costs the answer the figures it carried, never the route.
-async fn live(
-    ctx: &ReadCtx,
+/// How long a live read may be served stale. `kittiwake-warmer` refreshes each one before this runs
+/// out, and the oracle's documents resolve half an hour behind the chain in any case.
+pub const LIVE_STALE_FOR: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// One live read: its cache key and the statements behind it. The routes and the warmer build them
+/// in the same place, so the warmer fills exactly the entries the routes read.
+struct LiveRead {
     route: &'static str,
     nest: NestId,
     params: Value,
     parts: Vec<Part>,
-) -> Option<Read> {
-    ctx.cached(
-        route,
-        nest,
-        params,
-        CachePolicy::from_poll_interval(POLL),
-        folded(parts, Value::clone),
-    )
-    .await
-    .inspect_err(
-        |e| tracing::warn!(route, error = %e, "live QoS read failed; its figures are left out"),
-    )
-    .ok()
+}
+
+impl LiveRead {
+    async fn read(self, ctx: &ReadCtx) -> Result<Read, ApiError> {
+        ctx.cached(
+            self.route,
+            self.nest,
+            self.params,
+            CachePolicy::from_poll_interval(POLL).kept_warm(LIVE_STALE_FOR),
+            folded(self.parts, Value::clone),
+        )
+        .await
+    }
+}
+
+/// A live read, or `None` when the nest could not give it. Closed days are in Postgres, so a refused
+/// statement costs the answer the figures it carried, never the route.
+async fn live(ctx: &ReadCtx, read: LiveRead) -> Option<Read> {
+    let route = read.route;
+    read.read(ctx)
+        .await
+        .inspect_err(
+            |e| tracing::warn!(route, error = %e, "live QoS read failed; its figures are left out"),
+        )
+        .ok()
+}
+
+/// Today's reads behind the Query Performance card: its figures, seconds behind, and freshness.
+fn today_reads(addr: &str, today: i64) -> Result<[LiveRead; 3], ApiError> {
+    let params = json!({"address": addr, "day": today});
+    Ok([
+        LiveRead {
+            route: "indexer-qos-today",
+            nest: NestId::Qos,
+            params: params.clone(),
+            parts: vec![
+                Part::rows(
+                    "days",
+                    NestId::Qos,
+                    sql::qos_indexer_daily_sql(addr, today).ok_or_else(bad_address)?,
+                ),
+                Part::rows(
+                    "gateways",
+                    NestId::Qos,
+                    sql::qos_indexer_gateways_sql(addr, today).ok_or_else(bad_address)?,
+                ),
+            ],
+        },
+        // Apart from the figures, so the heaviest of today's statements refused costs only its own.
+        LiveRead {
+            route: "indexer-qos-behind",
+            nest: NestId::Qos,
+            params,
+            parts: vec![Part::rows(
+                "behind",
+                NestId::Qos,
+                sql::qos_indexer_seconds_behind_sql(addr, today).ok_or_else(bad_address)?,
+            )],
+        },
+        LiveRead {
+            route: "qos-freshness",
+            nest: NestId::Qos,
+            params: json!({}),
+            parts: vec![Part::rows(
+                "freshness",
+                NestId::Qos,
+                sql::QOS_FRESHNESS_SQL.to_string(),
+            )],
+        },
+    ])
+}
+
+/// Today's network-wide rows: one statement shared by every indexer's request.
+fn network_today(today: i64) -> LiveRead {
+    LiveRead {
+        route: "qos-network-today",
+        nest: NestId::Qos,
+        params: json!({"day": today}),
+        parts: vec![Part::rows(
+            "rows",
+            NestId::Qos,
+            sql::qos_network_rows_sql(today),
+        )],
+    }
+}
+
+/// The open allocations on `addr`'s deployments.
+fn allocation_shares(addr: &str) -> Result<LiveRead, ApiError> {
+    Ok(LiveRead {
+        route: "qos-allocation-shares",
+        nest: NestId::Alloc,
+        params: json!({"address": addr}),
+        parts: vec![Part::rows(
+            "allocations",
+            NestId::Alloc,
+            sql::indexer_allocation_shares_sql(addr).ok_or_else(bad_address)?,
+        )],
+    })
+}
+
+/// Warm the QoS nest's reads behind `addr`'s QoS card and score, one at a time, stopping at the
+/// first the nest refuses. Meant for a [`ReadCtx::warming`] copy.
+pub async fn warm_qos_nest(ctx: &ReadCtx, addr: &str, today: i64) -> Result<Vec<Read>, ApiError> {
+    let [figures, behind, freshness] = today_reads(addr, today)?;
+    let mut out = Vec::new();
+    for read in [figures, behind, freshness, network_today(today)] {
+        out.push(read.read(ctx).await?);
+    }
+    Ok(out)
+}
+
+/// Warm the allocation nest's read behind `addr`'s QoS score.
+pub async fn warm_allocation_shares(ctx: &ReadCtx, addr: &str) -> Result<Read, ApiError> {
+    allocation_shares(addr)?.read(ctx).await
 }
 
 /// A merged answer, dated by the first live read (the stored days are older than it by construction)
@@ -207,46 +311,14 @@ pub async fn indexer_qos(
     today: i64,
 ) -> Result<Read, ApiError> {
     let store = store_or_unavailable(store)?;
-    let figures = vec![
-        Part::rows(
-            "days",
-            NestId::Qos,
-            sql::qos_indexer_daily_sql(addr, today).ok_or_else(bad_address)?,
-        ),
-        Part::rows(
-            "gateways",
-            NestId::Qos,
-            sql::qos_indexer_gateways_sql(addr, today).ok_or_else(bad_address)?,
-        ),
-    ];
-    // Apart from the figures, so the heaviest of today's statements refused costs only its own.
-    let behind = vec![Part::rows(
-        "behind",
-        NestId::Qos,
-        sql::qos_indexer_seconds_behind_sql(addr, today).ok_or_else(bad_address)?,
-    )];
-    let freshness = vec![Part::rows(
-        "freshness",
-        NestId::Qos,
-        sql::QOS_FRESHNESS_SQL.to_string(),
-    )];
+    let [figures, behind, freshness] = today_reads(addr, today)?;
     let closed = if since_day < today {
         store.indexer_days(addr, since_day, today - 1).await?
     } else {
         Vec::new()
     };
-    let params = json!({"address": addr, "day": today});
-    let (figures, behind, freshness) = futures::join!(
-        live(
-            ctx,
-            "indexer-qos-today",
-            NestId::Qos,
-            params.clone(),
-            figures
-        ),
-        live(ctx, "indexer-qos-behind", NestId::Qos, params, behind),
-        live(ctx, "qos-freshness", NestId::Qos, json!({}), freshness),
-    );
+    let (figures, behind, freshness) =
+        futures::join!(live(ctx, figures), live(ctx, behind), live(ctx, freshness),);
     let lives = [figures.as_ref(), behind.as_ref(), freshness.as_ref()];
     let mut today_live = serde_json::Map::new();
     for r in lives.iter().flatten() {
@@ -562,27 +634,8 @@ async fn cohort(
     from: i64,
     today: i64,
 ) -> Result<(Cohort, [Option<Read>; 2]), ApiError> {
-    let allocations_sql = sql::indexer_allocation_shares_sql(addr).ok_or_else(bad_address)?;
-    let (live_rows, shares) = futures::join!(
-        live(
-            ctx,
-            "qos-network-today",
-            NestId::Qos,
-            json!({"day": today}),
-            vec![Part::rows(
-                "rows",
-                NestId::Qos,
-                sql::qos_network_rows_sql(today),
-            )],
-        ),
-        live(
-            ctx,
-            "qos-allocation-shares",
-            NestId::Alloc,
-            json!({"address": addr}),
-            vec![Part::rows("allocations", NestId::Alloc, allocations_sql)],
-        ),
-    );
+    let shares = allocation_shares(addr)?;
+    let (live_rows, shares) = futures::join!(live(ctx, network_today(today)), live(ctx, shares));
     let today_rows: Vec<QosDailyRow> = live_rows
         .as_ref()
         .and_then(|r| r.entry.value.get("rows")?.as_array().cloned())

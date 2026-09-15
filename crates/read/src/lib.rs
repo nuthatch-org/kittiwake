@@ -44,6 +44,8 @@ pub struct ReadCtx {
     /// Absent when no Arbitrum RPC is configured. The routes that need a contract read say so
     /// rather than quietly omitting the part they could not compute.
     pub chain: Option<kittiwake_chain::Chain>,
+    /// Set on the warmer's copy. See [`ReadCtx::warming`].
+    warm_ahead: Option<Duration>,
 }
 
 /// A source that is not a nest: it has no provenance of its own, so the age of the cache entry is
@@ -65,6 +67,7 @@ impl ReadCtx {
             schema_version,
             naming: None,
             chain: None,
+            warm_ahead: None,
         }
     }
 
@@ -76,6 +79,15 @@ impl ReadCtx {
     pub fn with_chain(mut self, chain: Option<kittiwake_chain::Chain>) -> Self {
         self.chain = chain;
         self
+    }
+
+    /// The warmer's copy. An entry that would expire within `ahead` is refreshed on the cron lane
+    /// and waited for, so the warmer's pace is the load it adds; a younger entry is left alone.
+    pub fn warming(&self, ahead: Duration) -> Self {
+        Self {
+            warm_ahead: Some(ahead),
+            ..self.clone()
+        }
     }
 
     /// Read one route's answer, honouring its freshness policy.
@@ -97,6 +109,10 @@ impl ReadCtx {
         fetch: Fetcher,
     ) -> Result<Read, ApiError> {
         let key = kittiwake_cache::key(self.schema_version, nest.as_str(), route, &params);
+
+        if let Some(ahead) = self.warm_ahead {
+            return self.warm(key, route, nest, policy, fetch, ahead).await;
+        }
 
         if let Some(entry) = self.store.get(&key).await {
             match classify(entry.age(), &policy) {
@@ -200,6 +216,29 @@ impl ReadCtx {
         Ok(Read { entry, meta })
     }
 
+    /// The warmer's path. See [`ReadCtx::warming`].
+    async fn warm(
+        &self,
+        key: String,
+        route: &'static str,
+        nest: NestId,
+        policy: CachePolicy,
+        fetch: Fetcher,
+        ahead: Duration,
+    ) -> Result<Read, ApiError> {
+        if let Some(entry) = self.store.get(&key).await
+            && entry.age() + ahead < policy.hard_ttl
+        {
+            let stale = classify(entry.age(), &policy) != Freshness::Fresh;
+            let meta = entry.meta(ServedFrom::Cache, stale);
+            return Ok(Read { entry, meta });
+        }
+        metrics::counter!("read_cache_total", "route" => route, "outcome" => "warmed").increment(1);
+        let entry = self.fetch_and_store(&key, nest, fetch, Lane::Cron).await?;
+        let meta = entry.meta(ServedFrom::Nest, false);
+        Ok(Read { entry, meta })
+    }
+
     fn spawn_refresh(&self, key: String, route: &'static str, nest: NestId, fetch: Fetcher) {
         let ctx = self.clone();
         tokio::spawn(async move {
@@ -264,3 +303,95 @@ pub mod disassembly;
 pub mod routes;
 pub mod search;
 pub mod shape;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Instant;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const AHEAD: Duration = Duration::from_secs(60);
+
+    async fn ctx() -> (ReadCtx, MockServer) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ready": true, "lag_blocks": 0, "tip": 1, "last_block": 1,
+                "sealed_through": 1, "stalled": false
+            })))
+            .mount(&server)
+            .await;
+        let gate = NestGate::new(kittiwake_nest::NestConfig::new(server.uri())).unwrap();
+        (ReadCtx::new(gate, Store::new(64), 1), server)
+    }
+
+    /// Thirty seconds fresh and five minutes stale: five and a half minutes from fetch to expiry.
+    fn policy() -> CachePolicy {
+        CachePolicy::from_poll_interval(Duration::from_secs(30))
+    }
+
+    fn key() -> String {
+        kittiwake_cache::key(1, NestId::Alloc.as_str(), "r", &serde_json::json!({}))
+    }
+
+    /// A read whose fetch asks nothing and records the lane it was handed.
+    async fn read(ctx: &ReadCtx, lanes: &Arc<Mutex<Vec<Lane>>>) -> Read {
+        let lanes = lanes.clone();
+        let fetch: Fetcher = Arc::new(move |_gate, lane| {
+            lanes.lock().unwrap().push(lane);
+            Box::pin(async { Ok((serde_json::json!({}), Provenance::default())) })
+        });
+        ctx.cached("r", NestId::Alloc, serde_json::json!({}), policy(), fetch)
+            .await
+            .unwrap()
+    }
+
+    async fn aged(ctx: &ReadCtx, age: Duration) {
+        let entry = Entry {
+            fetched_at: Instant::now() - age,
+            ..Entry::new(serde_json::json!({}), Provenance::default())
+        };
+        ctx.store.insert(key(), entry).await;
+    }
+
+    #[tokio::test]
+    async fn the_warmer_fills_a_miss_on_the_cron_lane() {
+        let (ctx, _server) = ctx().await;
+        let lanes = Arc::new(Mutex::new(Vec::new()));
+        let warmed = read(&ctx.warming(AHEAD), &lanes).await;
+        assert_eq!(warmed.meta.served_from, ServedFrom::Nest);
+        assert_eq!(
+            *lanes.lock().unwrap(),
+            vec![Lane::Cron],
+            "never the lane a reader waits in"
+        );
+        assert_eq!(read(&ctx, &lanes).await.meta.served_from, ServedFrom::Cache);
+    }
+
+    #[tokio::test]
+    async fn the_warmer_leaves_an_entry_that_outlives_its_next_visit() {
+        let (ctx, _server) = ctx().await;
+        aged(&ctx, Duration::from_secs(40)).await;
+        let lanes = Arc::new(Mutex::new(Vec::new()));
+        let kept = read(&ctx.warming(AHEAD), &lanes).await;
+        assert!(lanes.lock().unwrap().is_empty());
+        assert!(kept.meta.stale, "and labels it stale");
+    }
+
+    #[tokio::test]
+    async fn the_warmer_refreshes_an_entry_that_would_expire_first_and_waits_for_it() {
+        let (ctx, _server) = ctx().await;
+        aged(&ctx, Duration::from_secs(40)).await;
+        let lanes = Arc::new(Mutex::new(Vec::new()));
+        let refreshed = read(&ctx.warming(Duration::from_secs(300)), &lanes).await;
+        assert_eq!(*lanes.lock().unwrap(), vec![Lane::Cron]);
+        assert_eq!(refreshed.meta.served_from, ServedFrom::Nest);
+        let stored = ctx.store.get(&key()).await.unwrap();
+        assert!(
+            stored.age() < Duration::from_secs(5),
+            "refreshed before it returned"
+        );
+    }
+}

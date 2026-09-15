@@ -3485,13 +3485,18 @@ dependencies = [
 name = "kittiwake-warmer"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "kittiwake-cache",
+ "kittiwake-db",
  "kittiwake-nest",
  "kittiwake-read",
+ "kittiwake-rewards",
  "kittiwake-types",
  "metrics",
+ "serde_json",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

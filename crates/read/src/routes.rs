@@ -260,6 +260,21 @@ mod cadence {
     pub const ARCHIVAL: Duration = Duration::from_secs(600);
 }
 
+/// How long the slow answers behind an indexer's page may be served stale. `kittiwake-warmer`
+/// refreshes them before this runs out, for every indexer in the directory.
+pub const INDEXER_PAGE_STALE_FOR: Duration = Duration::from_secs(60 * 60);
+
+fn indexer_page(poll: Duration) -> CachePolicy {
+    CachePolicy::from_poll_interval(poll).kept_warm(INDEXER_PAGE_STALE_FOR)
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 const T_FOLD: Duration = Duration::from_secs(45);
 const T_QUICK: Duration = Duration::from_secs(20);
 
@@ -612,7 +627,7 @@ pub async fn indexer(ctx: &ReadCtx, addr: &str) -> Result<Read, ApiError> {
         "indexer",
         NestId::Alloc,
         serde_json::json!({ "address": addr }),
-        CachePolicy::from_poll_interval(cadence::LIVE),
+        indexer_page(cadence::LIVE),
         fetch,
     )
     .await
@@ -636,7 +651,7 @@ pub async fn indexer_status(ctx: &ReadCtx, addr: &str) -> Result<Read, ApiError>
         "indexer-status",
         NestId::Alloc,
         serde_json::json!({"address": addr}),
-        CachePolicy::from_poll_interval(cadence::LIVE),
+        indexer_page(cadence::LIVE),
         many(parts, T_FOLD),
     )
     .await
@@ -672,30 +687,44 @@ pub async fn apr_provenance(ctx: &ReadCtx, addr: &str) -> Result<Read, ApiError>
     .await
 }
 
-/// `/api/indexer-stake-history/[address]`: one statement for the whole series.
-pub async fn indexer_stake_history(
-    ctx: &ReadCtx,
-    addr: &str,
-    cutoffs: &[i64],
-) -> Result<Read, ApiError> {
-    let sql = addr_or_400!(
-        sql::indexer_stake_history_sql(addr, cutoffs),
+/// `/api/indexer-stake-history/[address]`: one statement for the whole series, weekly over `days`.
+///
+/// Keyed on the window, with the cutoffs taken when it is fetched. Keyed on the cutoffs, the key
+/// moved every second and no request was ever answered from the cache.
+pub async fn indexer_stake_history(ctx: &ReadCtx, addr: &str, days: i64) -> Result<Read, ApiError> {
+    addr_or_400!(
+        sql::indexer_stake_history_sql(addr, &stake_history_cutoffs(unix_now(), days)),
         "address or window"
     );
-    ctx.cached(
-        "indexer-stake-history",
-        NestId::Alloc,
-        serde_json::json!({"address": addr, "points": cutoffs.len(), "from": cutoffs.first(), "to": cutoffs.last()}),
-        CachePolicy::from_poll_interval(cadence::ARCHIVAL),
+    let addr_owned = addr.to_string();
+    let fetch: Fetcher = Arc::new(move |gate, lane| {
+        let cutoffs = stake_history_cutoffs(unix_now(), days);
+        let sql = sql::indexer_stake_history_sql(&addr_owned, &cutoffs).unwrap_or_default();
         rows_shaped(
             NestId::Alloc,
             sql,
             T_FOLD,
             shape::stake_history_point,
             Some("history"),
-        ),
+        )(gate, lane)
+    });
+    ctx.cached(
+        "indexer-stake-history",
+        NestId::Alloc,
+        serde_json::json!({"address": addr, "days": days}),
+        indexer_page(cadence::ARCHIVAL),
+        fetch,
     )
     .await
+}
+
+/// Weekly cutoffs from `days` before `end` up to it.
+pub fn stake_history_cutoffs(end: i64, days: i64) -> Vec<i64> {
+    let start = end - days * 86_400;
+    (0..)
+        .map(|i| start + i * 86_400 * 7)
+        .take_while(|t| *t <= end)
+        .collect()
 }
 
 /// `/api/indexer/[address]/trends`: the daily rewards and fees the indexer page charts.
@@ -705,7 +734,7 @@ pub async fn indexer_trends(ctx: &ReadCtx, addr: &str, since: i64) -> Result<Rea
         "indexer-trends",
         NestId::Alloc,
         serde_json::json!({"address": addr, "since": since}),
-        CachePolicy::from_poll_interval(cadence::ARCHIVAL),
+        indexer_page(cadence::ARCHIVAL),
         many_folded(
             vec![Part::rows("rows", NestId::Alloc, sql)],
             T_FOLD,
@@ -742,7 +771,7 @@ pub async fn indexer_revenue(
         "indexer-revenue",
         NestId::Alloc,
         serde_json::json!({"address": addr, "since": since, "byDeployment": by_deployment}),
-        CachePolicy::from_poll_interval(cadence::SLOW),
+        indexer_page(cadence::SLOW),
         many(parts, T_FOLD),
     )
     .await
@@ -906,7 +935,7 @@ pub async fn provisions_by_indexer(ctx: &ReadCtx, addr: &str) -> Result<Read, Ap
         "provisions-indexer",
         NestId::Alloc,
         serde_json::json!({ "indexer": addr }),
-        CachePolicy::from_poll_interval(cadence::LIVE),
+        indexer_page(cadence::LIVE),
         fetch,
     )
     .await
@@ -1028,37 +1057,41 @@ pub async fn poi(ctx: &ReadCtx, deployment: Option<&str>, first: i64) -> Result<
 // Delegation activity
 // ---------------------------------------------------------------------------------------------
 
+/// `/api/delegation-events`: the newest `first` events over the last `days`, keyed on the window
+/// for the reason [`indexer_stake_history`] is.
 pub async fn delegation_events(
     ctx: &ReadCtx,
     indexer: Option<&str>,
     first: i64,
-    since: i64,
+    days: i64,
 ) -> Result<Read, ApiError> {
-    let sql = addr_or_400!(sql::delegation_events_sql(indexer, first, since), "address");
+    addr_or_400!(sql::delegation_events_sql(indexer, first, 0), "address");
+    let indexer_owned = indexer.map(str::to_string);
+    let fetch: Fetcher = Arc::new(move |gate, lane| {
+        let since = unix_now() - days * 86_400;
+        let sql =
+            sql::delegation_events_sql(indexer_owned.as_deref(), first, since).unwrap_or_default();
+        // The incumbent puts `source` inside `data` on this route and at the top level on
+        // others. Not a pattern worth rationalising - just one the callers already parse.
+        let inner = rows_shaped(
+            NestId::Alloc,
+            sql,
+            T_FOLD,
+            crate::shape::delegation_event,
+            Some("delegationEvents"),
+        );
+        Box::pin(async move {
+            let (mut v, p) = inner(gate, lane).await?;
+            v["source"] = serde_json::json!("nuthatch");
+            Ok((v, p))
+        })
+    });
     ctx.cached(
         "delegation-events",
         NestId::Alloc,
-        serde_json::json!({"indexer": indexer, "first": first, "since": since}),
+        serde_json::json!({"indexer": indexer, "first": first, "days": days}),
         CachePolicy::from_poll_interval(cadence::SLOW),
-        {
-            // The incumbent puts `source` inside `data` on this route and at the top level on
-            // others. Not a pattern worth rationalising - just one the callers already parse.
-            let inner = rows_shaped(
-                NestId::Alloc,
-                sql,
-                T_FOLD,
-                crate::shape::delegation_event,
-                Some("delegationEvents"),
-            );
-            Arc::new(move |gate, lane| {
-                let inner = inner.clone();
-                Box::pin(async move {
-                    let (mut v, p) = inner(gate, lane).await?;
-                    v["source"] = serde_json::json!("nuthatch");
-                    Ok((v, p))
-                })
-            })
-        },
+        fetch,
     )
     .await
 }
@@ -1899,6 +1932,48 @@ mod wiring_tests {
         assert!(
             !seen.iter().any(|s| s.starts_with("/legacy-flows/sql")),
             "the archive should not have been asked"
+        );
+    }
+
+    /// Keyed on its cutoffs or its start, each of these was a new entry every second, so every
+    /// request was a statement and nothing could keep them warm.
+    #[tokio::test]
+    async fn a_moving_window_asked_a_second_later_is_answered_from_the_cache() {
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("GET"))
+            .respond_with(Recorder(seen.clone()))
+            .mount(&server)
+            .await;
+        let mut cfg = kittiwake_nest::NestConfig::new(server.uri());
+        for n in NestId::ALL {
+            cfg.base_paths.insert(n, format!("/{}", n.as_str()));
+        }
+        let ctx = ReadCtx::new(
+            NestGate::new(cfg).unwrap(),
+            kittiwake_cache::Store::new(64),
+            1,
+        );
+        let a = "0x00000000000000000000000000000000000000aa";
+
+        indexer_stake_history(&ctx, a, 182).await.unwrap();
+        delegation_events(&ctx, Some(a), 100, 30).await.unwrap();
+        let asked = seen.lock().unwrap().len();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        let history = indexer_stake_history(&ctx, a, 182).await.unwrap();
+        let events = delegation_events(&ctx, Some(a), 100, 30).await.unwrap();
+        assert_eq!(history.meta.served_from, kittiwake_types::ServedFrom::Cache);
+        assert_eq!(events.meta.served_from, kittiwake_types::ServedFrom::Cache);
+        assert_eq!(seen.lock().unwrap().len(), asked);
+    }
+
+    #[test]
+    fn stake_history_cutoffs_are_weekly_and_end_at_the_end() {
+        let end = 1_789_000_000;
+        assert_eq!(
+            stake_history_cutoffs(end, 14),
+            vec![end - 14 * 86_400, end - 7 * 86_400, end]
         );
     }
 }

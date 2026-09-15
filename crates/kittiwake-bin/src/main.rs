@@ -298,6 +298,44 @@ async fn main() -> anyhow::Result<()> {
                     })
                 }),
             ));
+
+            // Every directory indexer's page, a few indexers a minute. The directory is in
+            // Postgres, so without one only the list folds are warmed.
+            if let Some(p) = &pool {
+                let pool = p.clone();
+                let directory: kittiwake_warmer::Directory = Arc::new(move || {
+                    let pool = pool.clone();
+                    Box::pin(async move {
+                        kittiwake_db::enriched_indexers(&pool, kittiwake_warmer::DIRECTORY_SIZE)
+                            .await
+                            .map(|rows| {
+                                rows.into_iter().map(|r| r.address.to_lowercase()).collect()
+                            })
+                            .map_err(|e| e.to_string())
+                    })
+                });
+                let pages = Arc::new(kittiwake_warmer::IndexerPages::new());
+                let warm_ctx = read.clone();
+                let mut job = JobDef::every(
+                    "warm-indexers",
+                    Duration::from_secs(60),
+                    Arc::new(move |_ctx| {
+                        let ctx = warm_ctx.clone();
+                        let pages = pages.clone();
+                        let directory = directory.clone();
+                        Box::pin(async move {
+                            pages.run(&ctx, &directory).await.map(|report| JobOutcome {
+                                rows_written: report.warmed,
+                            })
+                        })
+                    }),
+                )
+                .staggered(Duration::from_secs(30));
+                // A run works up to thirty seconds past its last indexer and rests as long again;
+                // a slow indexer on a slow nest can take several minutes of that.
+                job.timeout = Duration::from_secs(600);
+                jobs.push(job);
+            }
         }
 
         if cfg.scheduler_enabled {
