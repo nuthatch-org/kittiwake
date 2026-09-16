@@ -4054,9 +4054,12 @@ mod indexer_page_tests {
     const DEPLOYMENT: &str = "QmStfa6zwPUzKHyGrgdNMh8rgbc91sgvmskidBSujG92FR";
     const METADATA: &str = "0xdb0c77a3184bf017abafb7606794d77ff53d9a59a0bc1dc23f1a762bd1e631ff";
 
+    /// Fragments of SQL: a statement containing any of them is refused.
+    type Refused = Arc<Mutex<Vec<&'static str>>>;
+
     /// The allocation nest, the GNS nest and IPFS behind one stand-in, recording every call. The
     /// indexer has one allocation, on a deployment whose metadata document names it.
-    struct Upstream(Arc<Mutex<Vec<String>>>);
+    struct Upstream(Arc<Mutex<Vec<String>>>, Refused);
 
     impl Respond for Upstream {
         fn respond(&self, req: &Request) -> ResponseTemplate {
@@ -4078,6 +4081,10 @@ mod indexer_page_tests {
                 .find(|(k, _)| k == "q")
                 .map(|(_, v)| v.to_string())
                 .unwrap_or_default();
+            if self.1.lock().unwrap().iter().any(|f| q.contains(f)) {
+                return ResponseTemplate::new(500)
+                    .set_body_string("Resources exhausted: failed to allocate additional memory");
+            }
             let rows: Vec<Value> = if path.starts_with("/gns/") {
                 q.split('\'')
                     .skip(1)
@@ -4109,10 +4116,25 @@ mod indexer_page_tests {
         probe: Probe,
         wait: Duration,
     ) -> (AppState, Arc<Mutex<Vec<String>>>, MockServer) {
+        stand_in(
+            probe,
+            wait,
+            Refused::default(),
+            kittiwake_cache::Store::new(64),
+        )
+        .await
+    }
+
+    async fn stand_in(
+        probe: Probe,
+        wait: Duration,
+        refused: Refused,
+        store: kittiwake_cache::Store,
+    ) -> (AppState, Arc<Mutex<Vec<String>>>, MockServer) {
         let server = MockServer::start().await;
         let seen = Arc::new(Mutex::new(Vec::new()));
         Mock::given(any())
-            .respond_with(Upstream(seen.clone()))
+            .respond_with(Upstream(seen.clone(), refused))
             .mount(&server)
             .await;
         let mut cfg = kittiwake_nest::NestConfig::new(server.uri());
@@ -4135,15 +4157,12 @@ mod indexer_page_tests {
             .connect_lazy(&format!("postgres://unused:unused@127.0.0.1:{port}/unused"))
             .expect("a lazy pool needs no server");
         let ipfs = kittiwake_ext::Ipfs::new(&server.uri());
-        let read = kittiwake_read::ReadCtx::new(
-            kittiwake_nest::NestGate::new(cfg).unwrap(),
-            kittiwake_cache::Store::new(64),
-            1,
-        )
-        .with_naming(Some(kittiwake_read::naming::Naming::new(
-            pool.clone(),
-            ipfs.clone(),
-        )));
+        let read =
+            kittiwake_read::ReadCtx::new(kittiwake_nest::NestGate::new(cfg).unwrap(), store, 1)
+                .with_naming(Some(kittiwake_read::naming::Naming::new(
+                    pool.clone(),
+                    ipfs.clone(),
+                )));
         let mut st = crate::state(
             crate::Limits::new(1000, 1000, 1000, Vec::new()),
             None,
@@ -4199,6 +4218,149 @@ mod indexer_page_tests {
                 }
             })
         })
+    }
+
+    // What the stand-in refuses, each matched on a fragment of its statement.
+    const DELEGATORS: &str = "staking_legacy__stake_delegated";
+    const INDEXER_ROW: &str = "FROM lodestar_indexers";
+    const RATIO: &str = "FROM lodestar_network_params";
+
+    /// The page, where it was served from, and whether its headers say it is degraded.
+    async fn profile(st: &AppState) -> (String, bool, Value) {
+        let Ok(resp) = indexer(
+            State(st.clone()),
+            peer(),
+            HeaderMap::new(),
+            Path(INDEXER.to_string()),
+        )
+        .await
+        else {
+            panic!("the route refused")
+        };
+        let header = |name| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let served = header("x-kittiwake-served-from");
+        let degraded = header("x-kittiwake-degraded") == "true";
+        (served, degraded, body(Ok(resp)).await)
+    }
+
+    /// On 2026-09-14 the delegators ran the allocation nest out of memory, and the page failed with
+    /// them for half an hour.
+    #[tokio::test]
+    async fn a_section_the_nest_refuses_is_left_out_and_named_and_the_page_still_answers() {
+        let refused = Refused::new(Mutex::new(vec![DELEGATORS]));
+        let (st, _, _server) = stand_in(
+            node_answering(true),
+            Duration::ZERO,
+            refused,
+            kittiwake_cache::Store::new(64),
+        )
+        .await;
+
+        let (_, degraded, body) = profile(&st).await;
+        assert!(degraded, "the header says so");
+        assert_eq!(body["provenance"]["degraded"], true);
+        assert_eq!(
+            body["data"]["degraded"],
+            serde_json::json!([{"part": "delegators", "reason": "nest_upstream"}])
+        );
+        let indexer = &body["data"]["indexer"];
+        assert!(
+            indexer.get("delegators").is_none(),
+            "left out, not shown empty"
+        );
+        assert!(indexer["stakedTokens"].is_string());
+        assert!(indexer["account"]["operators"].is_array());
+        assert!(indexer["closedAllocations"].is_array());
+        assert_eq!(
+            indexer["allocations"][0]["subgraphDeployment"]["displayName"], "Uniswap V3",
+            "the rest is still named"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_required_part_the_nest_refuses_still_fails_the_page() {
+        for required in [INDEXER_ROW, RATIO] {
+            let refused = Refused::new(Mutex::new(vec![required]));
+            let (st, _, _server) = stand_in(
+                node_answering(true),
+                Duration::ZERO,
+                refused,
+                kittiwake_cache::Store::new(64),
+            )
+            .await;
+            let answer = indexer(
+                State(st.clone()),
+                peer(),
+                HeaderMap::new(),
+                Path(INDEXER.to_string()),
+            )
+            .await;
+            match answer {
+                Ok(resp) => panic!("answered {} without {required}", resp.status()),
+                Err(e) => assert_eq!(e.0.status(), 502, "{required}"),
+            }
+        }
+    }
+
+    /// Kept for the route's own window, the page would be served without its delegators as though
+    /// it had none, and #148's warmer would keep it that way for an hour.
+    #[tokio::test]
+    async fn a_page_missing_a_section_is_not_kept_as_though_it_were_whole() {
+        let window = Duration::from_millis(300);
+        let refused = Refused::new(Mutex::new(vec![DELEGATORS]));
+        let (st, _, _server) = stand_in(
+            node_answering(true),
+            Duration::ZERO,
+            refused.clone(),
+            kittiwake_cache::Store::keeping_partial_for(64, window),
+        )
+        .await;
+
+        let (served, degraded, _) = profile(&st).await;
+        assert_eq!((served.as_str(), degraded), ("nest", true));
+        let (served, degraded, body) = profile(&st).await;
+        assert_eq!(served, "cache");
+        assert!(degraded, "from the cache, still said to be degraded");
+        assert!(body["data"]["degraded"].is_array());
+
+        refused.lock().unwrap().clear();
+        // Past the window, and past the five seconds the gate remembers a failed statement for.
+        tokio::time::sleep(Duration::from_millis(5500)).await;
+        let (served, degraded, body) = profile(&st).await;
+        assert_eq!(served, "nest", "asked again once its window was out");
+        assert!(!degraded);
+        assert!(body["data"].get("degraded").is_none());
+        assert!(body["data"]["indexer"]["delegators"].is_array());
+
+        tokio::time::sleep(window + Duration::from_millis(200)).await;
+        let (served, _, _) = profile(&st).await;
+        assert_eq!(served, "cache", "a whole page keeps its route's window");
+    }
+
+    #[tokio::test]
+    async fn a_page_whose_parts_all_answer_says_nothing_of_degradation() {
+        let (st, _, _server) = state(node_answering(true), Duration::ZERO).await;
+        let (_, degraded, body) = profile(&st).await;
+        assert!(!degraded);
+        assert!(body["provenance"].get("degraded").is_none());
+        let data = body["data"].as_object().unwrap();
+        assert_eq!(data.keys().collect::<Vec<_>>(), ["indexer"]);
+        let indexer = &data["indexer"];
+        // What Lodestar's `fetchIndexerDetail` holds the route to.
+        assert!(indexer["account"].is_object());
+        for section in ["allocations", "closedAllocations", "delegators"] {
+            assert!(indexer[section].is_array(), "{section}");
+        }
+        assert!(indexer["account"]["operators"].is_array());
+        for figure in ["stakedTokens", "delegatedTokens"] {
+            assert!(indexer[figure].is_string(), "{figure}");
+        }
     }
 
     async fn status(st: &AppState) -> Value {

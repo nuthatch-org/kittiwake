@@ -23,6 +23,8 @@ pub struct Part {
     pub sql: String,
     /// Fold to a single row rather than an array. For the one-row views.
     pub one: bool,
+    /// Left out of the answer when it cannot be read, rather than failing it. See [`many`].
+    pub optional: bool,
 }
 
 impl Part {
@@ -32,6 +34,7 @@ impl Part {
             nest,
             sql,
             one: false,
+            optional: false,
         }
     }
     pub fn one(name: &'static str, nest: NestId, sql: String) -> Self {
@@ -40,6 +43,13 @@ impl Part {
             nest,
             sql,
             one: true,
+            optional: false,
+        }
+    }
+    pub fn optional(self) -> Self {
+        Self {
+            optional: true,
+            ..self
         }
     }
 }
@@ -59,6 +69,7 @@ pub(crate) fn older_of(a: &Provenance, b: &Provenance) -> Provenance {
         source: a.source.clone().or_else(|| b.source.clone()),
         truncated: a.truncated || b.truncated,
         degraded: a.degraded || b.degraded,
+        partial: a.partial || b.partial,
     }
 }
 
@@ -105,6 +116,9 @@ pub fn many_folded(
 /// coalescer and the warmer rather than letting one fold own the nest. It is a width and not a
 /// reservation, so this does not stop contention with other requests - it stops a request
 /// contending with itself, which is the part that could never resolve.
+///
+/// A part marked [`Part::optional`] that cannot be read is left out, named with its error's code
+/// under `degraded`, and the answer marked degraded and partial. Any other part fails the answer.
 pub fn many(parts: Vec<Part>, timeout: Duration) -> Fetcher {
     let parts = Arc::new(parts);
     Arc::new(move |gate: NestGate, lane: Lane| {
@@ -153,9 +167,18 @@ pub fn many(parts: Vec<Part>, timeout: Duration) -> Fetcher {
             }
             let mut out = serde_json::Map::new();
             let mut provenance: Option<Provenance> = None;
+            let mut degraded = Vec::new();
 
             for (part, answer) in parts.iter().zip(answers) {
-                let answer = answer.map_err(ApiError::from)?;
+                let answer = match answer.map_err(ApiError::from) {
+                    Ok(answer) => answer,
+                    Err(e) if part.optional => {
+                        tracing::warn!(part = part.name, error = %e, "part left out of the answer");
+                        degraded.push(serde_json::json!({"part": part.name, "reason": e.code()}));
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
                 let value = if part.one {
                     answer
                         .rows
@@ -172,10 +195,13 @@ pub fn many(parts: Vec<Part>, timeout: Duration) -> Fetcher {
                 });
             }
 
-            Ok((
-                serde_json::Value::Object(out),
-                provenance.unwrap_or_default(),
-            ))
+            let mut provenance = provenance.unwrap_or_default();
+            if !degraded.is_empty() {
+                provenance.degraded = true;
+                provenance.partial = true;
+                out.insert("degraded".to_string(), serde_json::Value::Array(degraded));
+            }
+            Ok((serde_json::Value::Object(out), provenance))
         })
     })
 }
@@ -502,6 +528,11 @@ pub async fn token_metrics(ctx: &ReadCtx, first: i64) -> Result<Read, ApiError> 
 
 /// `/api/indexer/[address]`: the whole profile. Six folds, measured at 17.9 seconds cold, which is
 /// why the warmer keeps the hot ones filled.
+///
+/// The indexer's row and the delegation ratio its stake figures are derived from are required. The
+/// operators, delegators and both allocation lists are sections, left out and named under
+/// `degraded` when the nest refuses them: on 2026-09-14 the delegators ran the allocation nest out
+/// of memory and took the whole page with them for half an hour.
 pub async fn indexer(ctx: &ReadCtx, addr: &str) -> Result<Read, ApiError> {
     let parts = vec![
         Part::one(
@@ -513,22 +544,26 @@ pub async fn indexer(ctx: &ReadCtx, addr: &str) -> Result<Read, ApiError> {
             "operators",
             NestId::Alloc,
             addr_or_400!(sql::indexer_operators_sql(addr), "address"),
-        ),
+        )
+        .optional(),
         Part::rows(
             "delegators",
             NestId::Alloc,
             addr_or_400!(sql::indexer_delegators_sql(addr, 100), "address"),
-        ),
+        )
+        .optional(),
         Part::rows(
-            "active",
+            "allocations",
             NestId::Alloc,
             addr_or_400!(sql::indexer_active_allocations_sql(addr), "address"),
-        ),
+        )
+        .optional(),
         Part::rows(
-            "closed",
+            "closedAllocations",
             NestId::Alloc,
             addr_or_400!(sql::indexer_closed_allocations_sql(addr, 500), "address"),
-        ),
+        )
+        .optional(),
         Part::one(
             "params",
             NestId::Alloc,
@@ -542,12 +577,7 @@ pub async fn indexer(ctx: &ReadCtx, addr: &str) -> Result<Read, ApiError> {
         let naming = naming.clone();
         Box::pin(async move {
             let (v, p) = inner(gate.clone(), lane).await?;
-            let arr = |k: &str| {
-                v.get(k)
-                    .and_then(|x| x.as_array())
-                    .cloned()
-                    .unwrap_or_default()
-            };
+            let section = |k: &str| v.get(k).and_then(|x| x.as_array()).map(Vec::as_slice);
             let row = v.get("indexer").cloned().unwrap_or(serde_json::Value::Null);
             // The protocol's delegation ratio, defaulting to sixteen if the view is unreadable.
             let ratio = v
@@ -558,18 +588,18 @@ pub async fn indexer(ctx: &ReadCtx, addr: &str) -> Result<Read, ApiError> {
 
             let mut shaped = crate::shape::indexer_detail(
                 &row,
-                &arr("operators"),
-                &arr("active"),
-                &arr("closed"),
+                section("operators"),
+                section("allocations"),
+                section("closedAllocations"),
                 ratio,
             );
-            shaped["delegators"] = serde_json::Value::Array(
-                arr("delegators")
-                    .iter()
-                    .map(crate::shape::delegator)
-                    .collect(),
-            );
+            if let Some(delegators) = section("delegators") {
+                shaped["delegators"] = delegators.iter().map(crate::shape::delegator).collect();
+            }
             let mut value = serde_json::json!({ "indexer": shaped });
+            if let Some(degraded) = v.get("degraded") {
+                value["degraded"] = degraded.clone();
+            }
             // Named inside the fetch, so the cached answer carries the names.
             if let Some(naming) = &naming {
                 naming.indexer_page(&gate, lane, &mut value).await;
