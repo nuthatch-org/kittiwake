@@ -34,12 +34,15 @@ if [ "$REMOVE" = 0 ]; then
     case "$o" in
       '*')
         echo "\"*\" cannot carry the Dock's session cookie; it would sign users out." >&2; exit 1 ;;
-      https://*|http://localhost*) ;;
+      # A localhost origin was allowed here for local development, and production ended up serving
+      # `access-control-allow-origin: http://localhost:3000` with credentials, which any page on a
+      # visitor's own localhost could use. Local runs go through a same-origin proxy now (#151).
+      http://localhost*)
+        echo "$o would let any page on a visitor's localhost read credentialed answers. Run the dev server behind a same-origin proxy instead." >&2; exit 1 ;;
+      https://*) ;;
       *) echo "$o is not an https origin" >&2; exit 1 ;;
     esac
-    # Everything after the first `://`, whatever the scheme. `${o#https://}` left an
-    # `http://localhost:3000` untouched, so the slashes in its own scheme read as a path and a
-    # perfectly good origin was refused.
+    # Everything after the first `://`, whatever the scheme, so a port is not read as a path.
     host=${o#*://}
     case "$host" in
       */*) echo "$o has a path; an origin is scheme://host[:port]" >&2; exit 1 ;;
