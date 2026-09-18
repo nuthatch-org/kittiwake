@@ -1055,6 +1055,24 @@ fn dec_grt(v: &Value, key: &str) -> f64 {
     }
 }
 
+fn allocation_rate(r: &Value) -> f64 {
+    dec_grt(r, "allocator_minting_rate_dec") + dec_grt(r, "self_minting_rate_dec")
+}
+
+/// Per-block GRT the RewardsManager is allocated. Indexing APR is paid from this, not from
+/// protocol-total issuance: GIP-0089 moved a fifth off RewardsManager.
+pub fn indexing_rate_from_rows(allocations: &[Value]) -> f64 {
+    allocations
+        .iter()
+        .find(|r| {
+            r.get("target")
+                .and_then(|v| v.as_str())
+                .is_some_and(|t| t.eq_ignore_ascii_case(dips_addr::REWARDS_MANAGER))
+        })
+        .map(allocation_rate)
+        .unwrap_or(0.0)
+}
+
 /// The issuance split, and how it was arrived at.
 ///
 /// Two targets are always present whether or not the allocator has ever mentioned them: the
@@ -1091,9 +1109,8 @@ pub fn dips(
         .filter_map(|r| Some((r.get("target")?.as_str()?.to_lowercase(), r)))
         .collect();
 
-    let rate_of =
-        |r: &Value| dec_grt(r, "allocator_minting_rate_dec") + dec_grt(r, "self_minting_rate_dec");
-    let total_rate: f64 = allocations.iter().map(rate_of).sum();
+    let total_rate: f64 = allocations.iter().map(allocation_rate).sum();
+    let indexing_rate = indexing_rate_from_rows(allocations);
 
     let mut targets: Vec<String> = observed.keys().cloned().collect();
     for always in [dips_addr::DEFAULT_ALLOCATION, dips_addr::REWARDS_MANAGER] {
@@ -1106,7 +1123,7 @@ pub fn dips(
         .iter()
         .map(|target| {
             let row = observed.get(target);
-            let rate = row.map(|r| rate_of(r)).unwrap_or(0.0);
+            let rate = row.map(|r| allocation_rate(r)).unwrap_or(0.0);
             let last = delivered.get(target).copied();
             json!({
                 "target": target,
@@ -1129,7 +1146,7 @@ pub fn dips(
 
     let agreement_rate = observed
         .get(dips_addr::DEFAULT_ALLOCATION)
-        .map(|r| rate_of(r))
+        .map(|r| allocation_rate(r))
         .unwrap_or(0.0);
 
     let timeline: Vec<Value> = timeline_rows
@@ -1156,6 +1173,7 @@ pub fn dips(
     json!({
         "available": true,
         "totalRate": total_rate,
+        "indexingRate": indexing_rate,
         "agreementRate": agreement_rate,
         // Live means the indexing-agreement side is actually funded, not merely wired up.
         "live": agreement_rate > 0.0,
@@ -1872,6 +1890,35 @@ mod tests {
         assert!(targets.contains(&dips_addr::REWARDS_MANAGER));
         assert_eq!(out["live"], json!(false), "nothing configured is not live");
         assert_eq!(out["agreementRate"], json!(0.0));
+        assert_eq!(out["indexingRate"], json!(0.0));
+    }
+
+    /// GIP-0089 numbers from 18 September 2026. The protocol still issues 120.73; only 96.584
+    /// reaches the RewardsManager. APR that uses the total is 1.25× high.
+    #[test]
+    fn indexing_rate_is_the_rewards_manager_not_the_protocol_total() {
+        let allocations = vec![
+            json!({
+                "target": dips_addr::REWARDS_MANAGER,
+                "allocator_minting_rate_dec": "0",
+                "self_minting_rate_dec": "96584000000000000000"
+            }),
+            json!({
+                "target": dips_addr::INNOVATION_ALLOCATION,
+                "allocator_minting_rate_dec": "24146000000000000000",
+                "self_minting_rate_dec": "0"
+            }),
+        ];
+        let out = dips(&allocations, &[], &[], &[]);
+        let indexing = out["indexingRate"].as_f64().unwrap();
+        let total = out["totalRate"].as_f64().unwrap();
+        assert!((indexing - 96.584).abs() < 1e-9);
+        assert!((total - 120.73).abs() < 1e-9);
+        assert!((total / indexing - 1.25).abs() < 1e-9);
+        assert!(
+            (indexing_rate_from_rows(&allocations) - indexing).abs() < 1e-12,
+            "refresh reads the nest rows, not the shaped payload"
+        );
     }
 
     /// Configured and unpaid is a different state from unconfigured, and the one worth noticing.
