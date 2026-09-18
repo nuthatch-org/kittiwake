@@ -43,8 +43,9 @@ pub async fn refresh(
     let month_ago = now - 30 * 86_400;
     let quarter_ago = now - 90 * 86_400;
 
-    // Six reads. Each is coalesced on its own statement by the gate, and all of them draw from the
-    // background lane, so a page view never waits behind this job.
+    // Alloc-nest reads plus the dips issuance split. Each is coalesced on its own statement by
+    // the gate, and all of them draw from the background lane, so a page view never waits behind
+    // this job.
     let network = page(
         gate,
         NestId::Alloc,
@@ -120,6 +121,16 @@ pub async fn refresh(
         "exchange rates 90d",
     )
     .await?;
+    // Not `?`: a dips outage must not fail the directory. Instant APR then falls back to
+    // protocol-total issuance, which is 1.25× high since GIP-0089.
+    let dips_allocs = page(
+        gate,
+        NestId::Dips,
+        sql::DIPS_CURRENT_ALLOCATION_SQL.into(),
+        lane,
+        "dips allocation",
+    )
+    .await;
 
     let net = network
         .rows
@@ -133,8 +144,28 @@ pub async fn refresh(
         .unwrap_or(serde_json::Value::Null);
 
     let total_signal = grt(s(&net, "total_tokens_signalled"));
-    let issuance_per_block = grt(s(&net, "issuance_per_block"));
-    let annual_issuance = issuance_per_block * L1_BLOCKS_PER_YEAR;
+    let protocol_issuance_per_block = grt(s(&net, "issuance_per_block"));
+    let indexing_per_block = match dips_allocs {
+        Ok(answer) => {
+            let rate = kittiwake_read::shape::indexing_rate_from_rows(&answer.rows);
+            if rate > 0.0 {
+                rate
+            } else {
+                tracing::warn!(
+                    "dips has no RewardsManager rate; Instant APR is using total protocol issuance"
+                );
+                protocol_issuance_per_block
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "dips nest unavailable; Instant APR is using total protocol issuance"
+            );
+            protocol_issuance_per_block
+        }
+    };
+    let annual_issuance = indexing_per_block * L1_BLOCKS_PER_YEAR;
     let delegation_ratio = i(&par, "delegation_ratio").unwrap_or(16) as f64;
     // The protocol payment cut is a network parameter and not part of this fold: the APR is built
     // from each indexer's own reward cut, which is what a delegator to that indexer feels.
