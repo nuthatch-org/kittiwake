@@ -265,6 +265,7 @@ pub async fn refresh(
         };
 
         let self_stake = grt(s(r, "staked_tokens"));
+        let locked = grt(s(r, "locked_tokens"));
         let delegated = grt(s(r, "delegated_tokens"));
         let thawing = grt(s(r, "delegated_thawing_tokens"));
         let allocated = grt(s(r, "allocated_tokens"));
@@ -283,6 +284,15 @@ pub async fn refresh(
         } else {
             None
         };
+
+        // With nobody usably delegated there is no cut to feel, and the raw one stands.
+        let effective_cut = rw::effective_cut(
+            reward_cut_ppm,
+            self_stake - locked,
+            delegated,
+            delegation_ratio,
+        )
+        .unwrap_or(reward_cut_ppm / 1_000_000.0);
 
         let empty: Vec<rw::Allocation> = Vec::new();
         let allocs = allocs_by_indexer.get(&id).unwrap_or(&empty);
@@ -344,7 +354,7 @@ pub async fn refresh(
             has_display_name,
             reward_cut_ppm,
             query_fee_cut_ppm,
-            effective_cut_percent: Some(apr.effective_cut * 100.0),
+            effective_cut_percent: Some(effective_cut * 100.0),
             query_fees_collected_grt: grt(s(r, "query_fees_collected")),
             served_gap: None,
             net_flow_grt_7d: net_flow,
@@ -368,8 +378,10 @@ pub async fn refresh(
             // divides by ten thousand so the wire is unchanged. #47.
             reward_cut: reward_cut_ppm,
             query_fee_cut: query_fee_cut_ppm,
-            effective_cut: apr.effective_cut * 100.0,
-            delegator_apr: rolling.unwrap_or(apr.apr),
+            effective_cut: effective_cut * 100.0,
+            // Forward-looking, as every page that shows it says. The trailing APYs have their own
+            // columns; putting the 30-day one here gave ellipfra a 39% "APR" against 26.9%.
+            delegator_apr: apr.apr,
             capacity_pct: capacity.utilization_percent,
             last_param_update: i(r, "last_delegation_parameter_update").unwrap_or(0),
             score: score.composite,
