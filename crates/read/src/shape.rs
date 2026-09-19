@@ -538,12 +538,9 @@ pub fn derived_indexer_metrics(r: &Value, delegation_ratio: f64) -> Value {
         Some(Value::String(s)) => s.parse().unwrap_or(0.0),
         _ => 0.0,
     };
-    let delegator_cut = (1_000_000.0 - cut) / 1_000_000.0;
-    let effective_cut = if delegated_stake_ratio == 0.0 {
-        0.0
-    } else {
-        1.0 - delegator_cut / delegated_stake_ratio
-    };
+    let effective_cut =
+        kittiwake_rewards::effective_cut(cut, usable_own, delegated, delegation_ratio)
+            .unwrap_or(0.0);
 
     let max_delegated = staked * delegation_ratio;
     let dilution_denom = max_delegated.max(delegated);

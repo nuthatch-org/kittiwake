@@ -125,6 +125,27 @@ pub fn delegator_apr_breakdown(
     }
 }
 
+/// The share of rewards the indexer keeps, measured against the share of the stake that is its
+/// own: what a delegator actually gives up. The network subgraph's `indexingRewardEffectiveCut`,
+/// and the figure Graphscan shows as the effective reward cut.
+///
+/// `usable_own_grt` leaves locked stake out, and delegation past the ratio is not counted, because
+/// neither earns. `None` with nothing usably delegated, where there is no delegator to feel a cut.
+pub fn effective_cut(
+    cut_ppm: f64,
+    usable_own_grt: f64,
+    delegated_grt: f64,
+    delegation_ratio: f64,
+) -> Option<f64> {
+    let own = usable_own_grt.max(0.0);
+    let usable = own + delegated_grt.min(own * delegation_ratio);
+    if usable <= 0.0 {
+        return None;
+    }
+    let delegated_share = 1.0 - own / usable;
+    (delegated_share > 0.0).then(|| 1.0 - (1.0 - cut_ppm / 1_000_000.0) / delegated_share)
+}
+
 /// Realised return over a window, from what closed allocations actually paid delegators.
 ///
 /// Preferred over the estimate above when there is enough history: it is what happened rather than
@@ -197,6 +218,27 @@ pub fn delegation_capacity(self_stake_grt: f64, delegated_grt: f64, ratio: f64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ellipfra-indexer.eth on 2026-09-19: a 43% cut on 12.8M own and 168.9M delegated. Graphscan
+    /// shows 38.7%, and so does the indexer page.
+    #[test]
+    fn the_effective_cut_is_the_cut_against_the_delegated_share_of_the_stake() {
+        let e = effective_cut(430_000.0, 12_800_862.23, 168_895_515.71, 16.0).unwrap();
+        assert!((e - 0.386_798_785).abs() < 1e-6, "{e}");
+    }
+
+    #[test]
+    fn delegation_past_the_ratio_does_not_lower_the_effective_cut() {
+        let at_cap = effective_cut(200_000.0, 1_000.0, 16_000.0, 16.0);
+        let over = effective_cut(200_000.0, 1_000.0, 50_000.0, 16.0);
+        assert_eq!(at_cap, over);
+    }
+
+    #[test]
+    fn with_nothing_usably_delegated_there_is_no_effective_cut() {
+        assert_eq!(effective_cut(100_000.0, 5_000.0, 0.0, 16.0), None);
+        assert_eq!(effective_cut(100_000.0, 0.0, 9_000.0, 16.0), None);
+    }
 
     const NOW: i64 = 1_788_000_000;
 
