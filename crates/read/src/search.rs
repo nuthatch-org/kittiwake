@@ -245,6 +245,43 @@ pub async fn subgraph_metadata_for_deployments(
     Ok(out)
 }
 
+/// The metadata document of each deployment's newest publisher, as a CID, for every deployment the
+/// GNS nest knows.
+///
+/// One statement over the whole table, because the directory wants it for every row. A hundred ids
+/// at a time, as [`subgraph_metadata_for_deployments`] asks, is 56 statements for the directory's
+/// 5,594 rows; a thousand rows named that way took 4.3 to 11.8 s, and the whole table of 28,879
+/// answered in 1.2 s (2026-09-19).
+pub async fn metadata_cids_by_deployment(
+    gate: &NestGate,
+    lane: Lane,
+) -> Result<BTreeMap<String, String>, ApiError> {
+    let mut spec = QuerySpec::read(
+        NestId::Gns,
+        "SELECT LOWER(deployment_id) AS deployment_id, subgraph_metadata FROM (\
+         SELECT deployment_id, subgraph_metadata, ROW_NUMBER() OVER (PARTITION BY \
+         LOWER(deployment_id) ORDER BY created_at DESC) AS rn FROM deployment_subgraphs) \
+         WHERE rn = 1",
+    );
+    spec.lane = lane;
+    let answer = gate.query(&spec).await?;
+    if answer.provenance.truncated {
+        tracing::warn!(
+            rows = answer.rows.len(),
+            "the nest truncated the publisher table; the directory names only what came back"
+        );
+    }
+    Ok(answer
+        .rows
+        .iter()
+        .filter_map(|r| {
+            let id = r.get("deployment_id")?.as_str()?.to_string();
+            let cid = metadata_cid(r.get("subgraph_metadata").and_then(|v| v.as_str()))?;
+            Some((id, cid))
+        })
+        .collect())
+}
+
 /// Search hits for a set of deployment ids: each one's newest subgraph and name, most signal first.
 async fn hits_for_deployments(
     pool: &Pool,

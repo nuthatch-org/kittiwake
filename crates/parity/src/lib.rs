@@ -247,6 +247,11 @@ pub mod coverage {
             "the incumbent has no such route, so there is nothing to compare against. It was added here because the preview cards needed one deployment by hash and the list route cannot answer that: it is ordered by signal and filtered to a threshold. The rows it returns are the list route's own shaping, which parity does compare",
         ),
         (
+            "/api/subgraph-directory",
+            Excused::Entirely,
+            "the incumbent has no such route. It filters the whole deployment set here because the browser could only filter the page it had (lodestar#252); its rows and filters are tested in `kittiwake_read::directory`",
+        ),
+        (
             "/api/file-issue",
             Excused::Entirely,
             "opens a real issue in a public repository. A parity run would file one on each side, every run, in somebody else's tracker, and there is no way to un-file it",

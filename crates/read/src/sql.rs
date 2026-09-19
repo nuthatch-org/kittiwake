@@ -756,6 +756,13 @@ pub fn deployments_list_sql(first: i64, skip: i64, order_by: &str, descending: b
     )
 }
 
+/// Every deployment the directory lists, under the same floor as [`deployments_list_sql`].
+pub fn directory_sql() -> String {
+    format!(
+        "SELECT {DEPLOYMENT_COLS} FROM lodestar_deployments WHERE signalled_tokens > 1000000000000000000"
+    )
+}
+
 pub fn deployments_by_id_sql(ids: &[String]) -> Option<String> {
     if ids.is_empty() || ids.len() > 500 || !ids.iter().all(|i| is_deployment_id(i)) {
         return None;
@@ -844,6 +851,16 @@ pub fn deployment_fees_since_sql(since: i64, first: i64) -> String {
         "SELECT LOWER(subgraph_deployment) AS id, CAST(SUM(query_fees_collected) AS VARCHAR) AS query_fees \
          FROM lodestar_allocations WHERE status = 'Closed' AND closed_at >= {since} GROUP BY 1 \
          HAVING SUM(query_fees_collected) > 0 ORDER BY SUM(query_fees_collected) DESC LIMIT {first}"
+    )
+}
+
+/// As [`deployment_fees_since_sql`], for every deployment that earned: the directory filters and
+/// sorts on the figure, so the largest two hundred are not enough.
+pub fn deployment_fees_window_sql(since: i64) -> String {
+    format!(
+        "SELECT LOWER(subgraph_deployment) AS id, CAST(SUM(query_fees_collected) AS VARCHAR) AS query_fees \
+         FROM lodestar_allocations WHERE status = 'Closed' AND closed_at >= {since} GROUP BY 1 \
+         HAVING SUM(query_fees_collected) > 0"
     )
 }
 
