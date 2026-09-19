@@ -861,9 +861,42 @@ pub async fn subgraph_fees_30d(
     headers: HeaderMap,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
-    let since = now() - 30 * 86_400;
-    let read = routes::subgraph_fees_30d(&st.read, since).await?;
+    let read = routes::subgraph_fees_30d(&st.read, thirty_days_back(now())).await?;
     Ok(envelope(named(&st, read).await))
+}
+
+/// The start of a thirty-day window, moved on by the hour. `since` is part of the cache key, and
+/// to the second it was a new key on every request: `/api/subgraph-fees-30d` asked the nest every
+/// time (x-kittiwake-age 0 twice running, 2026-09-19).
+fn thirty_days_back(now: i64) -> i64 {
+    now - now.rem_euclid(3600) - 30 * 86_400
+}
+
+/// `/api/subgraph-directory`: the deployments list, filtered, sorted and paged over the whole set.
+pub async fn subgraph_directory(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let q = kittiwake_read::directory::Query::parse(&params).map_err(ApiError::BadRequest)?;
+    let now = now();
+    let read = routes::subgraph_directory(&st.read, thirty_days_back(now)).await?;
+    let set = &*read.entry.value;
+    let page = kittiwake_read::directory::select(set, &q, now);
+    let mut resp = axum::Json(serde_json::json!({
+        "data": page.rows,
+        "total": page.total,
+        "unanalysed": set.get("unanalysed"),
+        "facets": set.get("facets"),
+        "source": "nuthatch",
+        "provenance": &read.meta,
+    }))
+    .into_response();
+    crate::provenance_headers(resp.headers_mut(), &read.meta);
+    crate::no_store(resp.headers_mut());
+    Ok(resp)
 }
 
 pub async fn subgraph_curation(
@@ -4492,5 +4525,57 @@ mod indexer_page_tests {
         assert_eq!(node["lastReachedAt"], node["checkedAt"]);
         assert_eq!(data["syncedCount"], 1);
         assert_eq!(data["deployments"][0]["status"], "synced");
+    }
+
+    async fn directory_page(
+        st: &AppState,
+        pairs: &[(&str, &str)],
+    ) -> Result<Response, ErrorResponse> {
+        let params = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        subgraph_directory(State(st.clone()), peer(), HeaderMap::new(), Query(params)).await
+    }
+
+    #[tokio::test]
+    async fn the_directory_answers_a_page_with_its_total_and_what_it_could_not_label() {
+        let (st, _, _server) = state(node_answering(true), Duration::ZERO).await;
+        let all = body(directory_page(&st, &[("first", "10")]).await).await;
+        assert_eq!(all["total"], 1);
+        assert_eq!(all["data"].as_array().unwrap().len(), 1);
+        // No database answered, so no manifest was read and the row cannot match a network.
+        assert_eq!(all["unanalysed"], 1);
+        let mainnet = body(directory_page(&st, &[("network", "mainnet")]).await).await;
+        assert_eq!(mainnet["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_bound_the_directory_cannot_read_is_refused_before_the_nest_is_asked() {
+        let (st, seen, _server) = state(node_answering(true), Duration::ZERO).await;
+        assert!(directory_page(&st, &[("signalMin", "lots")]).await.is_err());
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_directory_asks_the_nest_once_and_filters_the_kept_set_after() {
+        let (st, seen, _server) = state(node_answering(true), Duration::ZERO).await;
+        body(directory_page(&st, &[]).await).await;
+        body(directory_page(&st, &[("sort", "ratio"), ("ratioMin", "5")]).await).await;
+        let asked = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.starts_with("/alloc"))
+            .count();
+        assert_eq!(asked, 2, "the set and its fees, once between them");
+    }
+
+    #[test]
+    fn the_fee_window_moves_by_the_hour_not_the_second() {
+        let t: i64 = 1_790_000_000;
+        let hour = t - t.rem_euclid(3600);
+        assert_eq!(thirty_days_back(hour), thirty_days_back(hour + 3599));
+        assert_eq!(thirty_days_back(hour + 3600) - thirty_days_back(hour), 3600);
     }
 }

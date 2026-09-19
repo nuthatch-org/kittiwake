@@ -211,6 +211,10 @@ const SUMMARIES: &[Operation] = &[
         "Thirty days of query fees per deployment.",
     ),
     op(
+        "/api/subgraph-directory",
+        "Every listed deployment, filtered by signal, stake, ratio, fees, network, complexity, category and age, sorted and paged.",
+    ),
+    op(
         "/api/subgraph-search",
         "Search deployments by name, hash prefix or contract address.",
     ),

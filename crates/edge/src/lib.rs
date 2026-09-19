@@ -1095,6 +1095,7 @@ pub fn router(state: AppState) -> Router {
             get(handlers::subgraph_deployments),
         )
         .route("/api/subgraph-fees-30d", get(handlers::subgraph_fees_30d))
+        .route("/api/subgraph-directory", get(handlers::subgraph_directory))
         .route(
             "/api/subgraph-curation/{hash}",
             get(handlers::subgraph_curation),

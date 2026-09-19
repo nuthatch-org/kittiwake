@@ -8,6 +8,7 @@
 pub mod census;
 pub mod concentration;
 pub mod dips_agreements;
+pub mod directory;
 pub mod indexing_status;
 pub mod manifest;
 pub mod naming;

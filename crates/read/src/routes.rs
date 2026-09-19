@@ -1312,6 +1312,64 @@ pub async fn subgraph_fees_30d(ctx: &ReadCtx, since: i64) -> Result<Read, ApiErr
     .await
 }
 
+/// `/api/subgraph-directory`'s whole set: every listed deployment with its fees since `since`,
+/// labelled. The route filters and pages it per request; see [`crate::directory`].
+pub async fn subgraph_directory(ctx: &ReadCtx, since: i64) -> Result<Read, ApiError> {
+    let naming = ctx.naming.clone();
+    let fetch: Fetcher = Arc::new(move |gate: NestGate, lane: Lane| {
+        let naming = naming.clone();
+        Box::pin(async move {
+            let mut deps =
+                QuerySpec::read(NestId::Alloc, sql::directory_sql()).with_timeout(T_FOLD);
+            deps.lane = lane;
+            let mut fees = QuerySpec::read(NestId::Alloc, sql::deployment_fees_window_sql(since))
+                .with_timeout(T_FOLD);
+            fees.lane = lane;
+            let dkey = format!("alloc:{}", blake3::hash(deps.sql.as_bytes()).to_hex());
+            let fkey = format!("alloc:{}", blake3::hash(fees.sql.as_bytes()).to_hex());
+            let (dep_rows, fee_rows) = tokio::join!(
+                gate.query_coalesced(&dkey, deps),
+                gate.query_coalesced(&fkey, fees),
+            );
+            let (dep_rows, fee_rows) = (
+                dep_rows.map_err(ApiError::from)?,
+                fee_rows.map_err(ApiError::from)?,
+            );
+
+            let by_id: std::collections::HashMap<&str, &serde_json::Value> = fee_rows
+                .rows
+                .iter()
+                .filter_map(|r| Some((r.get("id")?.as_str()?, r.get("query_fees")?)))
+                .collect();
+            let mut rows: Vec<serde_json::Value> = dep_rows
+                .rows
+                .iter()
+                .map(|r| {
+                    let id = r.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                    crate::directory::row(r, by_id.get(id.to_lowercase().as_str()).copied())
+                })
+                .collect();
+            let unanalysed = match &naming {
+                Some(n) => n.label_directory(&gate, lane, &mut rows).await,
+                None => rows.len(),
+            };
+            Ok((
+                crate::directory::set(rows, unanalysed),
+                older_of(&dep_rows.provenance, &fee_rows.provenance),
+            ))
+        })
+    });
+
+    ctx.cached(
+        "subgraph-directory",
+        NestId::Alloc,
+        serde_json::json!({ "since": since }),
+        CachePolicy::from_poll_interval(cadence::SLOW),
+        fetch,
+    )
+    .await
+}
+
 pub async fn subgraph_curation(ctx: &ReadCtx, dep: &str) -> Result<Read, ApiError> {
     let sql = addr_or_400!(sql::deployment_signals_sql(dep, 100), "deployment id");
     let inner = rows_only(NestId::Alloc, sql, T_FOLD);
