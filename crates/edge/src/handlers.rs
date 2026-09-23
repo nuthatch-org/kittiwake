@@ -74,15 +74,18 @@ macro_rules! budget {
 }
 
 /// The parameters every list route accepts.
+///
+/// Lodestar sends `orderBy` and `orderDirection`; with only the snake-case names accepted, every
+/// ordering it asked for was silently the default.
 #[derive(serde::Deserialize)]
 pub struct ListQuery {
     #[serde(default = "d_first")]
     pub first: i64,
     #[serde(default)]
     pub skip: i64,
-    #[serde(default)]
+    #[serde(default, alias = "orderBy")]
     pub order_by: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "orderDirection")]
     pub order_direction: Option<String>,
 }
 
@@ -4596,5 +4599,22 @@ mod indexer_page_tests {
         let hour = t - t.rem_euclid(3600);
         assert_eq!(thirty_days_back(hour), thirty_days_back(hour + 3599));
         assert_eq!(thirty_days_back(hour + 3600) - thirty_days_back(hour), 3600);
+    }
+}
+
+#[cfg(test)]
+mod list_query_tests {
+    /// Both spellings order the list; lodestar has always sent the camel-case one.
+    #[test]
+    fn list_ordering_is_read_in_either_case() {
+        use axum::extract::Query;
+        for uri in [
+            "/?orderBy=allocatedTokens&orderDirection=asc",
+            "/?order_by=allocatedTokens&order_direction=asc",
+        ] {
+            let Query(q) = Query::<super::ListQuery>::try_from_uri(&uri.parse().unwrap()).unwrap();
+            assert_eq!(q.order("stakedTokens"), "allocatedTokens", "{uri}");
+            assert!(!q.descending(), "{uri}");
+        }
     }
 }
