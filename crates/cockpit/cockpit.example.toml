@@ -1,0 +1,18 @@
+# lodestar-cockpit. Run it inside the indexer's network: COCKPIT_CONFIG=cockpit.toml lodestar-cockpit
+# Every key can also be set as COCKPIT_<KEY>, and nested ones as COCKPIT_AGENT__TOKEN.
+
+bind = "127.0.0.1:8088"
+indexer = "0x0000000000000000000000000000000000000000"
+# The origin the self-hosted Lodestar build is served from. Same site as this service, or the
+# SameSite=Strict session cookie will not be sent.
+allowed_origin = "http://localhost:3000"
+arbitrum_rpc = "https://arb1.arbitrum.io/rpc"
+# protocol_network = "eip155:42161"
+# session_ttl_secs = 3600
+# nonce_ttl_secs = 300
+# session_key = "<64 hex chars>"   # unset: a new key each start, which signs everyone out
+# secure_cookie = true             # false only for plain http on a host other than localhost
+
+[agent]
+url = "http://indexer-agent:18000/"
+# token = "..."                    # sent as a bearer token, never to the browser

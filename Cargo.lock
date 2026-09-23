@@ -3170,6 +3170,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "kittiwake-cockpit"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "figment",
+ "futures",
+ "getrandom 0.4.3",
+ "hex",
+ "hmac 0.12.1",
+ "http",
+ "kittiwake-chain",
+ "kittiwake-obs",
+ "kittiwake-ssrf",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tower",
+ "tower-http 0.7.1",
+ "tracing",
+ "url",
+ "wiremock",
+]
+
+[[package]]
 name = "kittiwake-config"
 version = "0.1.0"
 dependencies = [

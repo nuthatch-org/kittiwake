@@ -1,0 +1,38 @@
+[package]
+name = "kittiwake-cockpit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lodestar-cockpit"
+path = "src/main.rs"
+
+[dependencies]
+alloy = { version = "2.4.1", features = ["signers"] }
+anyhow = "1.0.104"
+axum = { version = "0.8.9", features = ["macros", "json"] }
+base64 = "0.23.1"
+chrono = "0.4.45"
+figment = { version = "0.10.19", features = ["toml", "env"] }
+futures = "0.3.34"
+getrandom = "0.4.3"
+hex = "0.4.3"
+hmac = "0.12.1"
+http = "1.5.0"
+kittiwake-chain = { version = "0.1.0", path = "../chain" }
+kittiwake-obs = { version = "0.1.0", path = "../obs" }
+kittiwake-ssrf = { version = "0.1.0", path = "../ssrf" }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.10.9"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tower-http = { version = "0.7.1", features = ["cors", "trace"] }
+tracing = "0.1.44"
+url = "2.5.8"
+
+[dev-dependencies]
+alloy = { version = "2.4.1", features = ["signers", "signer-local"] }
+tower = { version = "0.5.3", features = ["util"] }
+wiremock = "0.6.5"

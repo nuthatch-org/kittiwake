@@ -58,6 +58,8 @@ sol! {
         }
         function getDelegationPool(address serviceProvider, address verifier)
             external view returns (DelegationPool memory);
+        function isAuthorized(address serviceProvider, address verifier, address operator)
+            external view returns (bool);
     }
 
     /// The Dock's bounty board. Read-only here: this service reconciles the cache against the
@@ -501,6 +503,28 @@ impl Chain {
             v.to_string().parse::<f64>().unwrap_or(0.0) / 1e18
         };
         Some((wei(pool.tokens), wei(pool.tokensThawing)))
+    }
+
+    /// Whether `operator` may act for `indexer` on the SubgraphService. HorizonStaking answers
+    /// from the legacy operator table for this verifier, so operators set before Horizon count.
+    pub async fn is_subgraph_service_operator(
+        &self,
+        indexer: Address,
+        operator: Address,
+    ) -> Result<bool, ApiError> {
+        let staking = Address::from_str(HORIZON_STAKING).expect("staking address is a constant");
+        let verifier = Address::from_str(SUBGRAPH_SERVICE).expect("verifier is a constant");
+        let c = IHorizonStaking::new(staking, self.arb()?);
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            c.isAuthorized(indexer, verifier, operator).call(),
+        )
+        .await
+        {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(ApiError::Unavailable(format!("isAuthorized: {e}"))),
+            Err(_) => Err(ApiError::Unavailable("isAuthorized timed out".into())),
+        }
     }
 
     /// One bounty's on-chain state, from the board at `board`.
