@@ -273,7 +273,7 @@ pub fn indexer_detail_sql(addr: &str) -> Option<String> {
          last_delegation_parameter_update, CAST(rewards_earned AS VARCHAR) AS rewards_earned, \
          CAST(query_fees_collected AS VARCHAR) AS query_fees_collected, \
          CAST(delegator_shares AS VARCHAR) AS delegator_shares, \
-         CAST(provisioned_tokens AS VARCHAR) AS provisioned_tokens, url, geohash, created_at \
+         CAST(provisioned_tokens AS VARCHAR) AS provisioned_tokens, delegator_count, url, geohash, created_at \
          FROM lodestar_indexers WHERE id = '{addr}'"
     ))
 }
@@ -315,6 +315,75 @@ pub fn indexer_delegators_sql(addr: &str, first: i64) -> Option<String> {
          SELECT delegator || '-' || '{addr}' AS id, delegator, CAST(total_delegated_tokens AS VARCHAR) AS staked_tokens, \
          CAST(share_amount AS VARCHAR) AS share_amount FROM positions WHERE share_amount > 0 \
          ORDER BY total_delegated_tokens DESC, delegator ASC LIMIT {first}"
+    ))
+}
+
+/// The columns the delegator list may sort by. Stake and share of the pool are one order: every
+/// position in a pool is valued at the same rate, so both sort by shares.
+pub fn indexer_delegators_order_column(order_by: &str) -> &'static str {
+    match order_by {
+        "delegatedAt" => "delegated_at",
+        "lastChangeAt" => "last_change_at",
+        "thawingTokens" => "thawing_tokens",
+        _ => "share_amount",
+    }
+}
+
+/// Every delegator of one indexer, a page at a time, with the size of the whole list on each row.
+///
+/// A position is listed while it holds shares or has Horizon tokens still thawing. A legacy lock
+/// never withdrawn is carried as `locked_tokens` but does not keep a position listed: those sit
+/// there forever, 1.2M GRT on one indexer. The pool is `lodestar_indexer_pool`, so a position is
+/// valued as the delegator page values it.
+pub fn indexer_delegators_page_sql(
+    addr: &str,
+    first: i64,
+    skip: i64,
+    order_by: &str,
+    descending: bool,
+) -> Option<String> {
+    if !is_address(addr) {
+        return None;
+    }
+    let first = clamp(first, 1, 1000);
+    let skip = clamp(skip, 0, 1_000_000);
+    let col = indexer_delegators_order_column(order_by);
+    let dir = if descending { "DESC" } else { "ASC" };
+    Some(format!(
+        "WITH events AS ( \
+         SELECT LOWER(delegator) AS delegator, 'in' AS kind, CAST(tokens AS HUGEINT) AS tok, CAST(shares AS HUGEINT) AS sh, CAST(block_timestamp AS BIGINT) AS ts \
+         FROM staking_legacy__stake_delegated WHERE LOWER(indexer) = '{addr}' \
+         UNION ALL SELECT LOWER(delegator), 'lock', CAST(tokens AS HUGEINT), CAST(shares AS HUGEINT), CAST(block_timestamp AS BIGINT) \
+         FROM staking_legacy__stake_delegated_locked WHERE LOWER(indexer) = '{addr}' \
+         UNION ALL SELECT LOWER(delegator), 'in', CAST(tokens AS HUGEINT), CAST(shares AS HUGEINT), CAST(block_timestamp AS BIGINT) \
+         FROM staking__tokens_delegated WHERE LOWER(\"serviceProvider\") = '{addr}' \
+         UNION ALL SELECT LOWER(delegator), 'thaw', CAST(tokens AS HUGEINT), CAST(shares AS HUGEINT), CAST(block_timestamp AS BIGINT) \
+         FROM staking__tokens_undelegated WHERE LOWER(\"serviceProvider\") = '{addr}' \
+         UNION ALL SELECT LOWER(delegator), 'unlock', CAST(tokens AS HUGEINT), CAST(0 AS HUGEINT), CAST(block_timestamp AS BIGINT) \
+         FROM staking__stake_delegated_withdrawn WHERE LOWER(indexer) = '{addr}' \
+         UNION ALL SELECT LOWER(delegator), 'release', CAST(tokens AS HUGEINT), CAST(0 AS HUGEINT), CAST(block_timestamp AS BIGINT) \
+         FROM staking__delegated_tokens_withdrawn WHERE LOWER(\"serviceProvider\") = '{addr}'), \
+         positions AS (SELECT delegator, \
+         SUM(CASE WHEN kind = 'in' THEN sh WHEN kind IN ('lock', 'thaw') THEN -sh ELSE 0 END) AS share_amount, \
+         SUM(CASE WHEN kind = 'in' THEN tok ELSE 0 END) AS total_delegated_tokens, \
+         GREATEST(SUM(CASE WHEN kind = 'thaw' THEN tok WHEN kind = 'release' THEN -tok ELSE 0 END), 0) AS thawing_tokens, \
+         GREATEST(SUM(CASE WHEN kind = 'lock' THEN tok WHEN kind = 'unlock' THEN -tok ELSE 0 END), 0) AS locked_tokens, \
+         MIN(ts) FILTER (WHERE kind = 'in') AS delegated_at, MAX(ts) AS last_change_at FROM events GROUP BY 1), \
+         thaw AS (SELECT LOWER(owner) AS delegator, MAX(CAST(\"thawingUntil\" AS BIGINT)) AS thawing_until FROM staking__thaw_request_created \
+         WHERE LOWER(\"serviceProvider\") = '{addr}' AND CAST(\"requestType\" AS INTEGER) IN (1, 2) GROUP BY 1), \
+         pool AS (SELECT delegator_shares, delegated_tokens FROM lodestar_indexer_pool WHERE id = '{addr}') \
+         SELECT p.delegator || '-' || '{addr}' AS id, p.delegator, CAST(p.share_amount AS VARCHAR) AS share_amount, \
+         CAST(CASE WHEN pool.delegator_shares > 0 THEN (p.share_amount // pool.delegator_shares) * pool.delegated_tokens \
+         + CAST(CAST(p.share_amount % pool.delegator_shares AS DOUBLE) * CAST(pool.delegated_tokens AS DOUBLE) / CAST(pool.delegator_shares AS DOUBLE) AS HUGEINT) \
+         ELSE 0 END AS VARCHAR) AS current_tokens, \
+         CAST(p.total_delegated_tokens AS VARCHAR) AS total_delegated_tokens, CAST(p.thawing_tokens AS VARCHAR) AS thawing_tokens, \
+         CASE WHEN p.thawing_tokens > 0 THEN t.thawing_until END AS thawing_until, CAST(p.locked_tokens AS VARCHAR) AS locked_tokens, \
+         p.delegated_at, p.last_change_at, \
+         CAST(pool.delegator_shares AS VARCHAR) AS pool_shares, CAST(pool.delegated_tokens AS VARCHAR) AS pool_tokens, \
+         COUNT(*) OVER () AS total, COUNT(*) FILTER (WHERE p.share_amount > 0) OVER () AS active \
+         FROM positions p LEFT JOIN thaw t ON t.delegator = p.delegator CROSS JOIN pool \
+         WHERE p.share_amount > 0 OR p.thawing_tokens > 0 \
+         ORDER BY p.{col} {dir} NULLS LAST, p.delegator ASC LIMIT {first} OFFSET {skip}"
     ))
 }
 
@@ -1079,6 +1148,56 @@ mod tests {
         assert!(sql.ends_with("LIMIT 100"));
     }
 
+    /// 106,652 positions on the largest indexer (2026-09-23). The page is cut by the nest and the
+    /// fold behind `lodestar_delegator_stakes` is never asked for.
+    #[test]
+    fn every_delegator_is_paged_at_the_source() {
+        let addr = "0xf92f430dd8567b0d466358c79594ab58d919a6d4";
+        let sql = indexer_delegators_page_sql(addr, 25, 50, "lastChangeAt", false).unwrap();
+        assert!(!sql.contains("lodestar_delegator_stakes"), "{sql}");
+        for source in [
+            "FROM staking_legacy__stake_delegated WHERE LOWER(indexer) = ",
+            "FROM staking_legacy__stake_delegated_locked WHERE LOWER(indexer) = ",
+            "FROM staking__tokens_delegated WHERE LOWER(\"serviceProvider\") = ",
+            "FROM staking__tokens_undelegated WHERE LOWER(\"serviceProvider\") = ",
+            "FROM staking__stake_delegated_withdrawn WHERE LOWER(indexer) = ",
+            "FROM staking__delegated_tokens_withdrawn WHERE LOWER(\"serviceProvider\") = ",
+            "FROM lodestar_indexer_pool WHERE id = ",
+        ] {
+            assert!(
+                sql.contains(&format!("{source}'{addr}'")),
+                "missing {source}"
+            );
+        }
+        assert!(sql.contains("COUNT(*) OVER () AS total"));
+        assert!(sql.ends_with(
+            "ORDER BY p.last_change_at ASC NULLS LAST, p.delegator ASC LIMIT 25 OFFSET 50"
+        ));
+        // The nest takes the statement in the URL and refuses a request line over 16 KB.
+        assert!(sql.len() < 8_192, "{} bytes", sql.len());
+    }
+
+    #[test]
+    fn the_delegator_sort_is_an_allowlist() {
+        let addr = "0xf92f430dd8567b0d466358c79594ab58d919a6d4";
+        for (asked, column) in [
+            ("stake", "share_amount"),
+            ("share", "share_amount"),
+            ("delegatedAt", "delegated_at"),
+            ("lastChangeAt", "last_change_at"),
+            ("thawingTokens", "thawing_tokens"),
+            ("1; DROP TABLE x", "share_amount"),
+        ] {
+            let sql = indexer_delegators_page_sql(addr, 10, 0, asked, true).unwrap();
+            assert!(
+                sql.contains(&format!("ORDER BY p.{column} DESC NULLS LAST")),
+                "{asked} did not sort by {column}"
+            );
+        }
+        let sql = indexer_delegators_page_sql(addr, 1_000_000, -5, "stake", true).unwrap();
+        assert!(sql.ends_with("LIMIT 1000 OFFSET 0"), "{sql}");
+    }
+
     /// Every builder that takes an identifier must refuse rather than interpolate. This walks the
     /// whole surface with one hostile value, so a new builder added without validation is caught
     /// here rather than in production.
@@ -1092,6 +1211,7 @@ mod tests {
         assert!(indexer_detail_sql(bad).is_none());
         assert!(indexer_operators_sql(bad).is_none());
         assert!(indexer_delegators_sql(bad, 10).is_none());
+        assert!(indexer_delegators_page_sql(bad, 10, 0, "stake", true).is_none());
         assert!(indexer_active_allocations_sql(bad).is_none());
         assert!(indexer_closed_allocations_sql(bad, 10).is_none());
         assert!(indexer_stake_history_sql(bad, &[1, 2]).is_none());

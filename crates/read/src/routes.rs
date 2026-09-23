@@ -633,6 +633,49 @@ pub async fn indexer(ctx: &ReadCtx, addr: &str) -> Result<Read, ApiError> {
     .await
 }
 
+pub struct DelegatorsParams {
+    pub first: i64,
+    pub skip: i64,
+    pub order_by: String,
+    pub descending: bool,
+}
+
+/// `/api/indexer/[address]/delegators`: every delegator, paged and sorted by the nest.
+/// `/api/indexer/[address]` keeps its hundred for the callers that still read them there.
+pub async fn indexer_delegators(
+    ctx: &ReadCtx,
+    addr: &str,
+    p: DelegatorsParams,
+) -> Result<Read, ApiError> {
+    let first = sql::clamp(p.first, 1, 1000);
+    let skip = sql::clamp(p.skip, 0, 1_000_000);
+    let order = sql::indexer_delegators_order_column(&p.order_by);
+    let sql = addr_or_400!(
+        sql::indexer_delegators_page_sql(addr, first, skip, &p.order_by, p.descending),
+        "address"
+    );
+    let inner = rows_only(NestId::Alloc, sql, T_FOLD);
+    let fetch: Fetcher = Arc::new(move |gate, lane| {
+        let inner = inner.clone();
+        Box::pin(async move {
+            let (v, prov) = inner(gate, lane).await?;
+            let rows = v.as_array().map(Vec::as_slice).unwrap_or_default();
+            Ok((shape::indexer_delegators_page(rows, skip), prov))
+        })
+    });
+
+    ctx.cached(
+        "indexer-delegators",
+        NestId::Alloc,
+        serde_json::json!({
+            "address": addr, "first": first, "skip": skip, "order": order, "descending": p.descending,
+        }),
+        CachePolicy::from_poll_interval(cadence::LIVE),
+        fetch,
+    )
+    .await
+}
+
 /// `/api/indexer-status/[address]`: the subset the profile header needs, measured at 7.7 seconds.
 pub async fn indexer_status(ctx: &ReadCtx, addr: &str) -> Result<Read, ApiError> {
     let parts = vec![
@@ -1975,5 +2018,126 @@ mod wiring_tests {
             stake_history_cutoffs(end, 14),
             vec![end - 14 * 86_400, end - 7 * 86_400, end]
         );
+    }
+
+    /// Answers every statement with the same rows, and records what it was asked.
+    struct Rows(Arc<Mutex<Vec<String>>>, Vec<serde_json::Value>);
+
+    impl Respond for Rows {
+        fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+            if req.url.path().ends_with("/ready") {
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ready": true, "lag_blocks": 0, "tip": 1, "last_block": 1,
+                    "sealed_through": 1, "stalled": false
+                }));
+            }
+            if let Some((_, q)) = req.url.query_pairs().find(|(k, _)| k == "q") {
+                self.0.lock().unwrap().push(q.to_string());
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count": self.1.len(), "rows": self.1,
+                "provenance": {"as_of": 1, "sealed_through": 1, "source": "mock"}
+            }))
+        }
+    }
+
+    async fn ctx_answering(
+        rows: Vec<serde_json::Value>,
+    ) -> (ReadCtx, Arc<Mutex<Vec<String>>>, MockServer) {
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("GET"))
+            .respond_with(Rows(seen.clone(), rows))
+            .mount(&server)
+            .await;
+        let mut cfg = kittiwake_nest::NestConfig::new(server.uri());
+        for n in NestId::ALL {
+            cfg.base_paths.insert(n, format!("/{}", n.as_str()));
+        }
+        let ctx = ReadCtx::new(
+            NestGate::new(cfg).unwrap(),
+            kittiwake_cache::Store::new(64),
+            1,
+        );
+        (ctx, seen, server)
+    }
+
+    const INDEXER: &str = "0x2f09092aacd80196fc984908c5a9a7ab3ee4f1ce";
+
+    #[tokio::test]
+    async fn the_delegator_page_the_reader_asked_for_is_the_one_the_nest_is_asked() {
+        let row = serde_json::json!({
+            "id": format!("0x1f5fa305abcc49e014d1dbfc4ed68befad403688-{INDEXER}"),
+            "delegator": "0x1f5fa305abcc49e014d1dbfc4ed68befad403688",
+            "share_amount": "5017656192609777038808807",
+            "current_tokens": "11624834073223557856362496",
+            "total_delegated_tokens": "10300000000000000000000000",
+            "thawing_tokens": "0", "thawing_until": null, "locked_tokens": "0",
+            "delegated_at": 1788253100, "last_change_at": 1788253100,
+            "pool_shares": "71439299428911516114298997",
+            "pool_tokens": "165509546746463656406107704",
+            "total": 2498, "active": 2490,
+        });
+        let (ctx, seen, _server) = ctx_answering(vec![row]).await;
+
+        let read = indexer_delegators(
+            &ctx,
+            INDEXER,
+            DelegatorsParams {
+                first: 50,
+                skip: 100,
+                order_by: "delegatedAt".into(),
+                descending: false,
+            },
+        )
+        .await
+        .expect("the nest answers");
+
+        let asked = seen.lock().unwrap();
+        let page = asked
+            .iter()
+            .find(|q| q.contains("lodestar_indexer_pool"))
+            .expect("the page was asked for");
+        assert!(
+            page.ends_with(
+                "ORDER BY p.delegated_at ASC NULLS LAST, p.delegator ASC LIMIT 50 OFFSET 100"
+            ),
+            "{page}"
+        );
+
+        let v = &*read.entry.value;
+        assert_eq!(v["total"], 2498);
+        assert_eq!(v["active"], 2490);
+        assert_eq!(v["pool"]["delegatorShares"], "71439299428911516114298997");
+        let d = &v["delegators"][0];
+        assert_eq!(
+            d["delegator"]["id"],
+            "0x1f5fa305abcc49e014d1dbfc4ed68befad403688"
+        );
+        assert_eq!(d["currentTokens"], "11624834073223557856362496");
+        assert_eq!(d["totalDelegatedTokens"], "10300000000000000000000000");
+        assert_eq!(d["thawingUntil"], serde_json::Value::Null);
+        assert_eq!(d["delegatedAt"], 1788253100);
+    }
+
+    /// Past the end there is no row to carry the totals. Zero there would tell the reader the
+    /// indexer has no delegators; only an empty first page may say that.
+    #[tokio::test]
+    async fn a_page_past_the_end_does_not_claim_there_are_no_delegators() {
+        let (ctx, _seen, _server) = ctx_answering(Vec::new()).await;
+        let page = |skip| DelegatorsParams {
+            first: 25,
+            skip,
+            order_by: "stake".into(),
+            descending: true,
+        };
+
+        let past = indexer_delegators(&ctx, INDEXER, page(5000)).await.unwrap();
+        assert_eq!(past.entry.value["total"], serde_json::Value::Null);
+        assert_eq!(past.entry.value["delegators"], serde_json::json!([]));
+
+        let none = indexer_delegators(&ctx, INDEXER, page(0)).await.unwrap();
+        assert_eq!(none.entry.value["total"], 0);
+        assert_eq!(none.entry.value["pool"], serde_json::Value::Null);
     }
 }

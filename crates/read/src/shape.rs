@@ -690,6 +690,7 @@ pub fn indexer_detail(
         "rewardsEarned": s0(row, "rewards_earned"),
         "queryFeesCollected": s0(row, "query_fees_collected"),
         "delegatorShares": s0(row, "delegator_shares"),
+        "delegatorCount": i(row, "delegator_count"),
         "url": t(row, "url"),
         "geoHash": t(row, "geohash"),
         "createdAt": i0(row, "created_at"),
@@ -1025,6 +1026,50 @@ pub fn delegator(r: &Value) -> Value {
         "delegator": json!({ "id": t(r, "delegator") }),
         "stakedTokens": s0(r, "staked_tokens"),
         "shareAmount": s0(r, "share_amount"),
+    })
+}
+
+/// One page of an indexer's delegators. `currentTokens` is what the position is worth now;
+/// `totalDelegatedTokens` is everything ever delegated into it, which `delegator` calls
+/// `stakedTokens`.
+///
+/// The totals ride on every row, so a page past the end has none to carry them. Past the end is
+/// `total: null`, not zero; only an empty first page says the indexer has no delegators.
+pub fn indexer_delegators_page(rows: &[Value], skip: i64) -> Value {
+    let first = rows.first();
+    let count = |key: &str| match first {
+        Some(r) => i0(r, key),
+        None if skip == 0 => json!(0),
+        None => Value::Null,
+    };
+    let pool = first.map_or(Value::Null, |r| {
+        json!({
+            "delegatorShares": s0(r, "pool_shares"),
+            "delegatedTokens": s0(r, "pool_tokens"),
+        })
+    });
+    let delegators: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": t(r, "id"),
+                "delegator": json!({ "id": t(r, "delegator") }),
+                "shareAmount": s0(r, "share_amount"),
+                "currentTokens": s0(r, "current_tokens"),
+                "totalDelegatedTokens": s0(r, "total_delegated_tokens"),
+                "thawingTokens": s0(r, "thawing_tokens"),
+                "thawingUntil": i(r, "thawing_until"),
+                "lockedTokens": s0(r, "locked_tokens"),
+                "delegatedAt": i(r, "delegated_at"),
+                "lastChangeAt": i(r, "last_change_at"),
+            })
+        })
+        .collect();
+    json!({
+        "delegators": delegators,
+        "total": count("total"),
+        "active": count("active"),
+        "pool": pool,
     })
 }
 

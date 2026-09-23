@@ -624,6 +624,44 @@ pub async fn indexer_trends(
     ))
 }
 
+/// The paging parameters as the dashboard spells them. `ListQuery` takes snake_case, which the
+/// directory's `orderBy` has never matched.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegatorsQuery {
+    #[serde(default = "d_delegators_first")]
+    pub first: i64,
+    #[serde(default)]
+    pub skip: i64,
+    #[serde(default)]
+    pub order_by: Option<String>,
+    #[serde(default)]
+    pub order_direction: Option<String>,
+}
+
+fn d_delegators_first() -> i64 {
+    25
+}
+
+pub async fn indexer_delegators(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(address): Path<String>,
+    Query(q): Query<DelegatorsQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let params = routes::DelegatorsParams {
+        first: q.first,
+        skip: q.skip,
+        order_by: q.order_by.unwrap_or_default(),
+        descending: q.order_direction.as_deref() != Some("asc"),
+    };
+    Ok(envelope(
+        routes::indexer_delegators(&st.read, &addr(&address), params).await?,
+    ))
+}
+
 pub async fn curators(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,

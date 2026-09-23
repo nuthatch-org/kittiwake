@@ -1202,6 +1202,10 @@ pub fn router(state: AppState) -> Router {
             get(handlers::indexer_trends),
         )
         .route(
+            "/api/indexer/{address}/delegators",
+            get(handlers::indexer_delegators),
+        )
+        .route(
             "/api/subgraph-schema/{hash}",
             get(handlers::subgraph_schema),
         )
