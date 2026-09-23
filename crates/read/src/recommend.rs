@@ -86,13 +86,15 @@ pub fn weights(prefs: &Prefs) -> Vec<(&'static str, f64)> {
     w
 }
 
+/// The per-dimension score the refresh job stored, or `None` for a row it has not written one for.
+pub fn breakdown(row: &EnrichedIndexer) -> Option<Breakdown> {
+    serde_json::from_value(row.score_breakdown.clone()?).ok()
+}
+
 /// What the ranking sorts on.
 ///
-/// `breakdown` is `None` for every row today: the refresh job computes a full per-dimension
-/// `Breakdown` and the `indexers` table has nowhere to put it, so nothing reaches this route.
-/// Falling back to the composite score is a real ranking; defaulting the breakdown to zeroes
-/// would score every indexer 0 and hand a delegator whichever one sorted first, presented as a
-/// considered pick. See #87.
+/// Without a breakdown, the composite score. Defaulting a missing one to zeroes would score every
+/// indexer 0 and hand a delegator whichever one sorted first, presented as a considered pick.
 pub fn rank_score(
     row: &EnrichedIndexer,
     breakdown: Option<&Breakdown>,
@@ -263,7 +265,13 @@ pub fn legacy_indexer(row: &EnrichedIndexer) -> Value {
         },
         "score": row.score.as_deref().map(|s| jsnum(num(Some(s)))),
         "scoreGrade": row.score_grade,
-        "scoreBreakdown": Value::Null,
+        "scoreBreakdown": breakdown(row).map_or(Value::Null, |b| {
+            WEIGHTS
+                .iter()
+                .map(|(dim, _)| (dim.to_string(), json!(b.dimension(dim).unwrap_or(0))))
+                .collect::<serde_json::Map<_, _>>()
+                .into()
+        }),
 
         "queryFeeCut": 0,
         "delegatorParameterCooldown": 0,
@@ -389,6 +397,7 @@ mod tests {
             reo_status: Some("eligible".into()),
             last_updated: None,
             q_score: None,
+            score_breakdown: None,
         }
     }
 
@@ -575,6 +584,26 @@ mod tests {
         assert_eq!(said[1], "16.0% estimated APR");
         assert_eq!(said[2], "32.3% effective cut");
         assert!(said[3].contains("preference sliders"), "{}", said[3]);
+    }
+
+    /// The refresh job writes the breakdown with serde and this reads it back with serde. A rename
+    /// on either side would turn every stored row into `None` and silently switch the sliders off.
+    #[test]
+    fn a_stored_breakdown_is_read_back_as_written() {
+        let b = Breakdown {
+            reo: 100,
+            allocation_efficiency: 40,
+            delegator_apy: 70,
+            ..Breakdown::default()
+        };
+        let mut r = row("0xaa");
+        r.score_breakdown = Some(serde_json::to_value(b).unwrap());
+        assert_eq!(breakdown(&r), Some(b));
+
+        // Served under the dimension names lodestar's `scoreBreakdown` type uses.
+        let value = legacy_indexer(&r);
+        assert_eq!(value["scoreBreakdown"]["allocationEfficiency"], 40);
+        assert_eq!(value["scoreBreakdown"]["delegatorAPY"], 70);
     }
 
     /// The path that comes alive when the breakdown is stored: the sliders reorder the answer.

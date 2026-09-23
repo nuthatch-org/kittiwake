@@ -267,6 +267,9 @@ async fn main() -> anyhow::Result<()> {
             kittiwake_db::ensure_qos_quality_table(p)
                 .await
                 .context("creating the QoS quality table")?;
+            kittiwake_db::ensure_score_breakdown_table(p)
+                .await
+                .context("creating the score breakdown table")?;
             kittiwake_db::ensure_qos_day_tables(p)
                 .await
                 .context("creating the QoS day tables")?;

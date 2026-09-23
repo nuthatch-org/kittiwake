@@ -3515,12 +3515,17 @@ pub async fn delegate_recommend(
     };
     let weights = kittiwake_read::recommend::weights(&prefs);
 
-    // `None` for every row: the refresh job computes a per-dimension breakdown and the `indexers`
-    // table has nowhere to keep it, so the sliders cannot move anything yet and the ranking is the
-    // composite score. `reasons` says so rather than implying otherwise. #87
+    // A row the refresh has not yet written a breakdown for ranks on its composite, and `reasons`
+    // says so rather than implying the sliders moved it. #87
     let mut ranked: Vec<(&kittiwake_db::EnrichedIndexer, f64)> = eligible
         .iter()
-        .map(|r| (*r, kittiwake_read::recommend::rank_score(r, None, &weights)))
+        .map(|r| {
+            let b = kittiwake_read::recommend::breakdown(r);
+            (
+                *r,
+                kittiwake_read::recommend::rank_score(r, b.as_ref(), &weights),
+            )
+        })
         .collect();
     // Stable, so indexers on the same score keep the database's order: score first, then self
     // stake. An unstable sort would reshuffle the top of the board between two identical requests.
@@ -3530,7 +3535,11 @@ pub async fn delegate_recommend(
         serde_json::json!({
             "indexer": kittiwake_read::recommend::legacy_indexer(row),
             "score": score.round() as i64,
-            "reasons": kittiwake_read::recommend::reasons(row, None, &weights),
+            "reasons": kittiwake_read::recommend::reasons(
+                row,
+                kittiwake_read::recommend::breakdown(row).as_ref(),
+                &weights,
+            ),
         })
     };
 
