@@ -88,6 +88,8 @@ pub struct AppState {
     pub ext: kittiwake_ext::Ext,
     /// The last probe of each indexer's own status endpoint, for `/api/indexer-status`.
     pub probes: kittiwake_read::status_probe::StatusProbes,
+    /// Deployment signal and stake, shared by every subgraph search.
+    pub search_figures: kittiwake_read::search::Figures,
     pub ipfs: kittiwake_ext::Ipfs,
     /// Present only when the Dock has its independently managed session secret.
     pub studio: Option<Studio>,
@@ -1273,6 +1275,7 @@ pub fn state(
         cors_patterns: None,
         read,
         probes: kittiwake_read::status_probe::StatusProbes::new(ext.clone()),
+        search_figures: kittiwake_read::search::Figures::default(),
         ext,
         ipfs,
         studio,

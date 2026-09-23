@@ -1889,7 +1889,11 @@ pub async fn subgraph_search(
     // already caps how fast anyone can mint keys.
     let query = q.q.unwrap_or_default();
     let key = query.trim().to_lowercase();
-    let (ipfs, gate) = (st.ipfs.clone(), st.read.gate.clone());
+    let (ipfs, gate, figures) = (
+        st.ipfs.clone(),
+        st.read.gate.clone(),
+        st.search_figures.clone(),
+    );
     let read = st
         .read
         .cached_external_keyed(
@@ -1898,13 +1902,19 @@ pub async fn subgraph_search(
             std::time::Duration::from_secs(60),
             kittiwake_types::ServedFrom::Nest,
             std::sync::Arc::new(move || {
-                let (pool, ipfs, gate, query) =
-                    (pool.clone(), ipfs.clone(), gate.clone(), query.clone());
+                let (pool, ipfs, gate, figures, query) = (
+                    pool.clone(),
+                    ipfs.clone(),
+                    gate.clone(),
+                    figures.clone(),
+                    query.clone(),
+                );
                 Box::pin(async move {
                     let hits = kittiwake_read::search::search(
                         &pool,
                         &ipfs,
                         &gate,
+                        &figures,
                         kittiwake_nest::Lane::Read,
                         &query,
                     )
