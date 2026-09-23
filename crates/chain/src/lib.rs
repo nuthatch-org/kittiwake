@@ -80,6 +80,8 @@ sol! {
     interface IRewardsManager {
         function getRewards(address rewardsIssuer, address allocationID)
             external view returns (uint256);
+        /// The L1 block a deployment was denied at, or zero when it is not denied.
+        function denylist(bytes32 subgraphDeploymentID) external view returns (uint256);
     }
 
     #[sol(rpc)]
@@ -568,6 +570,40 @@ impl Chain {
         Ok(PendingRewards { block, wei })
     }
 
+    /// For each deployment, the L1 block its rewards were denied at, zero when they are not.
+    ///
+    /// Same shape as [`Self::pending_rewards`]: one block for the whole read, a reverted row is
+    /// `None`, and a failed batch fails the read rather than passing for "not denied".
+    pub async fn denylist(&self, deployments: &[String]) -> Result<Denylist, ApiError> {
+        let deployments = deployments
+            .iter()
+            .map(|d| B256::from_str(d))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ApiError::BadRequest("not a deployment id".into()))?;
+        let provider = self.arb()?;
+        let block = tokio::time::timeout(Duration::from_secs(8), provider.get_block_number())
+            .await
+            .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
+            .map_err(|e| ApiError::Unavailable(format!("arbitrum rpc: {e}")))?;
+        let rewards = IRewardsManager::new(
+            Address::from_str(REWARDS_MANAGER).expect("constant"),
+            &provider,
+        );
+
+        let mut since = Vec::with_capacity(deployments.len());
+        for batch in deployments.chunks(PENDING_REWARDS_BATCH) {
+            let multicall = MulticallBuilder::new_dynamic(&provider)
+                .block(block.into())
+                .extend_calls(batch.iter().map(|d| rewards.denylist(*d).into_call(true)));
+            let results = tokio::time::timeout(Duration::from_secs(20), multicall.aggregate3())
+                .await
+                .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
+                .map_err(|e| ApiError::Unavailable(format!("denylist multicall: {e}")))?;
+            since.extend(results.into_iter().map(|r| r.ok().map(u256_to_u64)));
+        }
+        Ok(Denylist { block, since })
+    }
+
     pub async fn block_number(&self) -> Result<u64, ApiError> {
         let provider = self.arb()?;
         tokio::time::timeout(Duration::from_secs(8), provider.get_block_number())
@@ -596,6 +632,14 @@ pub struct ChainBounty {
 pub struct PendingRewards {
     pub block: u64,
     pub wei: Vec<Option<String>>,
+}
+
+/// `since[i]` answers `deployments[i]` as passed to [`Chain::denylist`]: the L1 block its rewards
+/// were denied at, 0 when they are not, `None` when the call reverted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Denylist {
+    pub block: u64,
+    pub since: Vec<Option<u64>>,
 }
 
 /// GRT in circulation across both chains, in whole GRT.

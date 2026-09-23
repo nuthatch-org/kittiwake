@@ -950,7 +950,132 @@ pub async fn subgraph_deployment(
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
     let read = routes::subgraph_deployment(&st.read, &hash).await?;
-    Ok(envelope(named(&st, read).await))
+    let read = named(&st, read).await;
+    Ok(envelope(with_denied_one(&st, &hash, read).await))
+}
+
+/// The denylist moves by governance, a few times a month.
+const DENYLIST_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+/// How long a page waits on a cold denylist read. Past it the read carries on and warms the cache.
+const DENYLIST_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// The RewardsManager denylist over every directory deployment, read in pinned multicalls and
+/// cached for the hour. 5,566 deployments took 2.5 s against a public endpoint on 2026-09-23.
+async fn denylist(st: &AppState) -> Result<kittiwake_read::Read, ApiError> {
+    let chain = st
+        .chain
+        .clone()
+        .ok_or_else(|| ApiError::Unavailable("no arbitrum rpc configured".into()))?;
+    let ctx = st.read.clone();
+    let fetch: kittiwake_read::ExternalFetcher = std::sync::Arc::new(move || {
+        let chain = chain.clone();
+        let ctx = ctx.clone();
+        Box::pin(async move {
+            let set = routes::subgraph_directory(&ctx, thirty_days_back(now())).await?;
+            let ids = kittiwake_read::shape::directory_ids(&set.entry.value);
+            let d = chain.denylist(&ids).await?;
+            Ok(kittiwake_read::shape::denylist_read(
+                &ids,
+                &d.since,
+                d.block,
+                now(),
+            ))
+        })
+    });
+    st.read
+        .cached_external(
+            "denylist",
+            DENYLIST_TTL,
+            kittiwake_types::ServedFrom::Chain,
+            fetch,
+        )
+        .await
+}
+
+/// A denylist read bounded by [`DENYLIST_WAIT`], or the reason there is none.
+async fn bounded<F>(fut: F) -> Result<kittiwake_read::Read, String>
+where
+    F: std::future::Future<Output = Result<kittiwake_read::Read, ApiError>> + Send + 'static,
+{
+    // Spawned so that a read which outlasts the wait still lands in the cache for the next visit.
+    match tokio::time::timeout(DENYLIST_WAIT, tokio::spawn(fut)).await {
+        Ok(Ok(Ok(read))) => Ok(read),
+        Ok(Ok(Err(e))) => {
+            tracing::warn!("denylist unreadable: {e}");
+            Err(e.code().to_string())
+        }
+        Ok(Err(_)) => Err("internal".to_string()),
+        Err(_) => Err("chain_timeout".to_string()),
+    }
+}
+
+/// Put `denied` on the one deployment, from its own read so a deployment below the directory's
+/// signal floor is answered too.
+async fn with_denied_one(
+    st: &AppState,
+    hash: &str,
+    mut read: kittiwake_read::Read,
+) -> kittiwake_read::Read {
+    let (Some(chain), Some(id)) = (
+        st.chain.clone(),
+        kittiwake_read::shape::ipfs_hash_to_bytes32(hash.trim()).map(|i| i.to_lowercase()),
+    ) else {
+        return read;
+    };
+    let ctx = st.read.clone();
+    let subject = id.clone();
+    let fetch: kittiwake_read::ExternalFetcher = std::sync::Arc::new(move || {
+        let chain = chain.clone();
+        let ids = vec![id.clone()];
+        Box::pin(async move {
+            let d = chain.denylist(&ids).await?;
+            Ok(kittiwake_read::shape::denylist_read(
+                &ids,
+                &d.since,
+                d.block,
+                now(),
+            ))
+        })
+    });
+    let denied = bounded(async move {
+        ctx.cached_external_keyed(
+            "denylist-one",
+            &subject,
+            DENYLIST_TTL,
+            kittiwake_types::ServedFrom::Chain,
+            fetch,
+        )
+        .await
+    })
+    .await;
+    let mut data = (*read.entry.value).clone();
+    if let Some(rows) = data.as_array_mut() {
+        kittiwake_read::shape::put_denied(rows, denied.as_ref().ok().map(|r| &*r.entry.value));
+    }
+    read.entry = std::sync::Arc::new(kittiwake_cache::Entry {
+        value: std::sync::Arc::new(data),
+        provenance: read.entry.provenance.clone(),
+        fetched_at: read.entry.fetched_at,
+    });
+    read
+}
+
+/// `/api/denylist`: the deployments whose indexing rewards the RewardsManager denies, each with
+/// the L1 block it was denied at, over the directory's deployments.
+pub async fn denylist_route(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let mut read = denylist(&st).await?;
+    let summary = kittiwake_read::shape::denylist_summary(&read.entry.value);
+    read.entry = std::sync::Arc::new(kittiwake_cache::Entry {
+        value: std::sync::Arc::new(summary),
+        provenance: read.entry.provenance.clone(),
+        fetched_at: read.entry.fetched_at,
+    });
+    Ok(envelope(read))
 }
 
 /// Put the names on a deployment list, when there is a database to read them from.
@@ -1014,16 +1139,25 @@ pub async fn subgraph_directory(
     let now = now();
     let read = routes::subgraph_directory(&st.read, thirty_days_back(now)).await?;
     let set = &*read.entry.value;
-    let page = kittiwake_read::directory::select(set, &q, now);
-    let mut resp = axum::Json(serde_json::json!({
+    let mut page = kittiwake_read::directory::select(set, &q, now);
+    let st2 = st.clone();
+    let denied = bounded(async move { denylist(&st2).await }).await;
+    kittiwake_read::shape::put_denied(
+        &mut page.rows,
+        denied.as_ref().ok().map(|r| &*r.entry.value),
+    );
+    let mut body = serde_json::json!({
         "data": page.rows,
         "total": page.total,
         "unanalysed": set.get("unanalysed"),
         "facets": set.get("facets"),
         "source": "nuthatch",
         "provenance": &read.meta,
-    }))
-    .into_response();
+    });
+    if let Err(reason) = denied {
+        body["degraded"] = serde_json::json!([{ "part": "denied", "reason": reason }]);
+    }
+    let mut resp = axum::Json(body).into_response();
     crate::provenance_headers(resp.headers_mut(), &read.meta);
     crate::no_store(resp.headers_mut());
     Ok(resp)

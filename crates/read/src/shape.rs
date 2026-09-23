@@ -166,6 +166,64 @@ pub fn put_pending_rewards(data: &mut Value, read: &Value) {
     indexer["pendingRewardsAt"] = read.get("readAt").cloned().unwrap_or(Value::Null);
 }
 
+/// The deployment ids in the directory's cached set, lowercase.
+pub fn directory_ids(set: &Value) -> Vec<String> {
+    set.get("rows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.get("id")?.as_str().map(str::to_lowercase))
+        .collect()
+}
+
+/// `{ block, readAt, since: { id: l1Block } }` from a denylist read: 0 is not denied, null unread.
+pub fn denylist_read(ids: &[String], since: &[Option<u64>], block: u64, read_at: i64) -> Value {
+    let since: serde_json::Map<String, Value> = ids
+        .iter()
+        .zip(since)
+        .map(|(id, s)| (id.to_lowercase(), json!(s)))
+        .collect();
+    json!({ "block": block, "readAt": read_at, "since": since })
+}
+
+/// Put `denied` and `deniedSinceBlock` on each row with an `id`. A row the read did not cover, or
+/// whose call reverted, is null in both: the badge must never say "not denied" on a guess.
+pub fn put_denied(rows: &mut [Value], read: Option<&Value>) {
+    let since = read.and_then(|r| r.get("since")).and_then(Value::as_object);
+    for row in rows {
+        let at = row
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| since?.get(&id.to_lowercase()))
+            .and_then(Value::as_u64);
+        row["denied"] = at.map_or(Value::Null, |b| json!(b > 0));
+        row["deniedSinceBlock"] = at.filter(|b| *b > 0).map_or(Value::Null, |b| json!(b));
+    }
+}
+
+/// `/api/denylist`: only the denied deployments and the ones the read could not answer.
+pub fn denylist_summary(read: &Value) -> Value {
+    let mut denied = serde_json::Map::new();
+    let mut unread = Vec::new();
+    let since = read.get("since").and_then(Value::as_object);
+    for (id, at) in since.into_iter().flatten() {
+        match at.as_u64() {
+            Some(0) => {}
+            Some(b) => {
+                denied.insert(id.clone(), json!(b));
+            }
+            None => unread.push(json!(id)),
+        }
+    }
+    json!({
+        "block": read.get("block"),
+        "readAt": read.get("readAt"),
+        "checked": since.map_or(0, |s| s.len()),
+        "denied": denied,
+        "unread": unread,
+    })
+}
+
 fn put_name(row: &mut Value, names: &std::collections::HashMap<String, String>) {
     let Some(account) = row.get_mut("account") else {
         return;
@@ -1541,6 +1599,54 @@ mod tests {
             profile["indexer"]["account"]["defaultDisplayName"],
             json!("p2p-org-booster.eth")
         );
+    }
+
+    /// Blocks and ids from the read against Arbitrum One on 2026-09-23.
+    #[test]
+    fn a_denied_row_says_since_when_and_an_unread_or_uncovered_row_says_nothing() {
+        let denied = "0x3633a564d7b2044eae24f2741a91240188bba9d1822c7185e380ffdfbdbf4ca0";
+        let clean = "0xa97329b8da365c46407488297ba55fd43421a59702bd8aac0dabccd41947a400";
+        let reverted = "0x00000000000000000000000000000000000000000000000000000000000000aa";
+        let set =
+            json!({"rows": [{"id": denied.to_uppercase().replace("0X", "0x")}, {"id": clean}]});
+        assert_eq!(
+            directory_ids(&set),
+            vec![denied.to_string(), clean.to_string()]
+        );
+
+        let read = denylist_read(
+            &[denied.into(), clean.into(), reverted.into()],
+            &[Some(25_388_974), Some(0), None],
+            508_138_539,
+            1_790_200_000,
+        );
+        let mut rows = vec![
+            json!({"id": denied}),
+            json!({"id": clean}),
+            json!({"id": reverted}),
+            json!({"id": "0xbb"}),
+        ];
+        put_denied(&mut rows, Some(&read));
+        assert_eq!(rows[0]["denied"], json!(true));
+        assert_eq!(rows[0]["deniedSinceBlock"], json!(25_388_974u64));
+        assert_eq!(rows[1]["denied"], json!(false));
+        assert_eq!(rows[1]["deniedSinceBlock"], Value::Null);
+        assert_eq!(rows[2]["denied"], Value::Null, "the call reverted");
+        assert_eq!(rows[3]["denied"], Value::Null, "not in the read");
+
+        let mut failed = vec![json!({"id": denied})];
+        put_denied(&mut failed, None);
+        assert_eq!(
+            failed[0]["denied"],
+            Value::Null,
+            "a failed read is not a clean one"
+        );
+
+        let summary = denylist_summary(&read);
+        assert_eq!(summary["checked"], json!(3));
+        assert_eq!(summary["denied"], json!({ denied: 25_388_974u64 }));
+        assert_eq!(summary["unread"], json!([reverted]));
+        assert_eq!(summary["block"], json!(508_138_539u64));
     }
 
     #[test]

@@ -252,6 +252,11 @@ pub mod coverage {
             "the incumbent has no such route. It filters the whole deployment set here because the browser could only filter the page it had (lodestar#252); its rows and filters are tested in `kittiwake_read::directory`",
         ),
         (
+            "/api/denylist",
+            Excused::Entirely,
+            "the incumbent has no such route. It is a RewardsManager read rather than a nest fold; its shaping is tested in `kittiwake_read::shape`",
+        ),
+        (
             "/api/file-issue",
             Excused::Entirely,
             "opens a real issue in a public repository. A parity run would file one on each side, every run, in somebody else's tracker, and there is no way to un-file it",

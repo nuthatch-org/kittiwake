@@ -215,6 +215,10 @@ const SUMMARIES: &[Operation] = &[
         "Every listed deployment, filtered by signal, stake, ratio, fees, network, complexity, category and age, sorted and paged.",
     ),
     op(
+        "/api/denylist",
+        "Deployments whose indexing rewards the RewardsManager denies, with the L1 block each was denied at.",
+    ),
+    op(
         "/api/subgraph-search",
         "Search deployments by name, hash prefix or contract address.",
     ),
