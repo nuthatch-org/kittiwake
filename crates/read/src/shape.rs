@@ -230,6 +230,101 @@ pub fn provision_with_totals(r: &Value, totals: Option<&Value>, thawing: Option<
     out
 }
 
+/// `/api/provisions/detail`: the nest's provisions, pending thaw requests and activity, with the
+/// HorizonStaking and data service reads beside them. A value only the chain has is null when the
+/// chain was not read, never zero.
+pub fn provision_detail(
+    indexer: &str,
+    provisions: &[Value],
+    thaws: &[Value],
+    activity: &[Value],
+    chain: Option<&kittiwake_chain::HorizonProvisions>,
+    read_at: i64,
+) -> Value {
+    let on_chain =
+        |svc: &str| chain.and_then(|c| c.services.iter().find(|s| s.data_service == svc));
+    let range = |r: &Option<kittiwake_chain::Range>| match r {
+        Some(r) => json!({ "min": r.min.to_string(), "max": r.max.to_string() }),
+        None => Value::Null,
+    };
+    let services: Vec<Value> = provisions
+        .iter()
+        .map(|p| {
+            let svc = p
+                .get("data_service")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_lowercase();
+            let c = on_chain(&svc);
+            let prov = c.and_then(|c| c.provision.as_ref());
+            let requests: Vec<Value> = thaws
+                .iter()
+                .filter(|r| r.get("data_service").and_then(Value::as_str) == Some(svc.as_str()))
+                .map(|r| {
+                    let shares = r.get("shares").and_then(Value::as_str).unwrap_or_default();
+                    let nonce = r.get("nonce").and_then(Value::as_str);
+                    let tokens = prov
+                        .zip(nonce)
+                        .and_then(|(p, n)| p.thaw_request_tokens(shares, n));
+                    json!({
+                        "id": t(r, "id"),
+                        "shares": s(r, "shares"),
+                        "tokens": tokens,
+                        "thawingUntil": i(r, "thawing_until"),
+                        "createdAt": i(r, "created_at"),
+                        "txHash": t(r, "tx_hash"),
+                        "nonce": s(r, "nonce"),
+                        "valid": prov.zip(nonce).map(|(p, n)| p.thawing_nonce == n),
+                    })
+                })
+                .collect();
+            json!({
+                "dataService": svc,
+                "tokensProvisioned": s0(p, "tokens_provisioned"),
+                "tokensThawing": s0(p, "tokens_thawing"),
+                "maxVerifierCut": s(p, "max_verifier_cut"),
+                "thawingPeriod": s(p, "thawing_period"),
+                "maxVerifierCutPending": prov.map(|p| p.max_verifier_cut_pending),
+                "thawingPeriodPending": prov.map(|p| p.thawing_period_pending.to_string()),
+                "thawingPeriodRange": c.map_or(Value::Null, |c| range(&c.thawing_period_range)),
+                "verifierCutRange": c.map_or(Value::Null, |c| range(&c.verifier_cut_range)),
+                "delegationFeeCuts": c.map_or_else(
+                    || json!({ "queryFee": null, "indexingFee": null, "indexingRewards": null }),
+                    |c| json!(c.delegation_fee_cuts),
+                ),
+                "thawRequestCount": c.and_then(|c| c.thaw_request_count),
+                "thawRequests": requests,
+            })
+        })
+        .collect();
+    let activity: Vec<Value> = activity
+        .iter()
+        .map(|a| {
+            json!({
+                "kind": t(a, "kind"),
+                "dataService": t(a, "data_service"),
+                "tokens": s(a, "tokens"),
+                "shares": s(a, "shares"),
+                "thawingUntil": i(a, "thawing_until"),
+                "thawRequestId": t(a, "thaw_request_id"),
+                "valid": a.get("valid").and_then(Value::as_str).map(|v| v == "true"),
+                "paymentType": i(a, "payment_type"),
+                "feeCut": s(a, "fee_cut"),
+                "events": i0(a, "events"),
+                "blockNumber": i(a, "block_number"),
+                "timestamp": i(a, "block_timestamp"),
+                "txHash": t(a, "tx_hash"),
+            })
+        })
+        .collect();
+    json!({
+        "indexer": indexer,
+        "chain": chain.map(|c| json!({ "block": c.block, "readAt": read_at })),
+        "services": services,
+        "activity": activity,
+    })
+}
+
 /// Decode a sampled `eth_call` return - a 32-byte big-endian word, hex encoded - as a decimal
 /// string. Returns `None` rather than zero on anything unexpected: a thawing period of zero would
 /// read as "no waiting period", which is a different and dangerous claim.
@@ -2155,6 +2250,86 @@ mod tests {
         assert_eq!(delegation_activity_type("undelegation"), "undelegated");
         assert_eq!(delegation_activity_type("withdrawal"), "withdrawn");
         assert_eq!(delegation_activity_type("something_new"), "delegated");
+    }
+
+    #[test]
+    fn provision_detail_without_the_chain_is_null_rather_than_zero() {
+        let svc = "0xb2bb92d0de618878e438b55d5846cfecd9301105";
+        let provisions = [
+            json!({ "data_service": svc, "tokens_provisioned": "10", "tokens_thawing": "4",
+            "max_verifier_cut": "500000", "thawing_period": "2419200" }),
+        ];
+        let thaws = [
+            json!({ "data_service": svc, "id": "0x01", "shares": "4", "nonce": "0",
+            "thawing_until": "1790264157", "created_at": 1787844957, "tx_hash": "0xaa" }),
+        ];
+        let v = provision_detail("0xabc", &provisions, &thaws, &[], None, 0);
+        let row = &v["services"][0];
+        assert_eq!(v["chain"], Value::Null);
+        assert_eq!(row["maxVerifierCut"], "500000");
+        assert_eq!(row["delegationFeeCuts"]["queryFee"], Value::Null);
+        assert_eq!(row["thawingPeriodRange"], Value::Null);
+        assert_eq!(row["thawRequests"][0]["tokens"], Value::Null);
+        assert_eq!(row["thawRequests"][0]["valid"], Value::Null);
+        assert_eq!(row["thawRequests"][0]["thawingUntil"], 1790264157);
+    }
+
+    #[test]
+    fn provision_detail_prices_thaw_requests_from_the_chain() {
+        use kittiwake_chain::*;
+        let svc = "0xb2bb92d0de618878e438b55d5846cfecd9301105";
+        let provisions = [json!({ "data_service": svc, "tokens_provisioned": "100" })];
+        let thaws = [
+            json!({ "data_service": svc, "id": "0x01", "shares": "30", "nonce": "1" }),
+            json!({ "data_service": svc, "id": "0x02", "shares": "30", "nonce": "0" }),
+        ];
+        let chain = HorizonProvisions {
+            block: 7,
+            services: vec![ServiceProvisionOnChain {
+                data_service: svc.into(),
+                provision: Some(ProvisionOnChain {
+                    tokens: "100".into(),
+                    tokens_thawing: "45".into(),
+                    shares_thawing: "30".into(),
+                    max_verifier_cut: 500_000,
+                    thawing_period: 2_419_200,
+                    created_at: 0,
+                    max_verifier_cut_pending: 400_000,
+                    thawing_period_pending: 2_419_200,
+                    last_parameters_staged_at: 0,
+                    thawing_nonce: "1".into(),
+                }),
+                thaw_request_count: Some(1),
+                delegation_fee_cuts: DelegationFeeCuts {
+                    query_fee: Some(100_000),
+                    indexing_fee: None,
+                    indexing_rewards: Some(0),
+                },
+                thawing_period_range: Some(Range {
+                    min: 1_209_600,
+                    max: u64::MAX,
+                }),
+                verifier_cut_range: None,
+            }],
+        };
+        let v = provision_detail("0xabc", &provisions, &thaws, &[], Some(&chain), 9);
+        let row = &v["services"][0];
+        assert_eq!(v["chain"]["block"], 7);
+        assert_eq!(row["thawRequests"][0]["tokens"], "45");
+        assert_eq!(row["thawRequests"][0]["valid"], true);
+        assert_eq!(
+            row["thawRequests"][1]["tokens"], "0",
+            "a slash invalidated the older nonce"
+        );
+        assert_eq!(row["thawRequests"][1]["valid"], false);
+        assert_eq!(row["delegationFeeCuts"]["indexingFee"], Value::Null);
+        assert_eq!(row["delegationFeeCuts"]["indexingRewards"], 0);
+        assert_eq!(
+            row["thawingPeriodRange"]["max"],
+            u64::MAX.to_string(),
+            "past what a JS number holds"
+        );
+        assert_eq!(row["maxVerifierCutPending"], 400_000);
     }
 
     #[test]

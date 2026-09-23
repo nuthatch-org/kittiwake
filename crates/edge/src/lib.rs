@@ -1085,6 +1085,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/portfolio", get(handlers::portfolio))
         .route("/api/rewards-history", get(handlers::rewards_history))
         .route("/api/provisions", get(handlers::provisions))
+        .route("/api/provisions/detail", get(handlers::provision_detail))
         .route("/api/payments", get(handlers::payments))
         .route("/api/poi", get(handlers::poi))
         // Activity

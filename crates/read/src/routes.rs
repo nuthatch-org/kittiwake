@@ -984,6 +984,80 @@ pub async fn provisions_by_indexer(ctx: &ReadCtx, addr: &str) -> Result<Read, Ap
     .await
 }
 
+/// `/api/provisions/detail`: what the provisions route leaves out, for the Provisions tab.
+///
+/// Thaw requests and activity come from the nest. Delegation fee cuts, the service's parameter
+/// ranges, pending parameters and each request's current worth are contract reads; when the chain
+/// is unreachable they are null and `degraded` says so, while the nest's part is still served.
+pub async fn provision_detail(ctx: &ReadCtx, addr: &str) -> Result<Read, ApiError> {
+    let psql = addr_or_400!(sql::provisions_by_indexer_sql(addr), "address");
+    let tsql = addr_or_400!(sql::provision_thaw_requests_sql(addr), "address");
+    let asql = addr_or_400!(sql::indexer_horizon_activity_sql(addr, 100), "address");
+    let chain = ctx.chain.clone();
+    let indexer = addr.to_string();
+    let fetch: Fetcher = Arc::new(move |gate: NestGate, lane: Lane| {
+        let (psql, tsql, asql) = (psql.clone(), tsql.clone(), asql.clone());
+        let chain = chain.clone();
+        let indexer = indexer.clone();
+        Box::pin(async move {
+            let spec = |sql: String| {
+                let mut spec = QuerySpec::read(NestId::Alloc, sql).with_timeout(T_FOLD);
+                spec.lane = lane;
+                let key = format!("alloc:{}", blake3::hash(spec.sql.as_bytes()).to_hex());
+                (key, spec)
+            };
+            let ((pk, ps), (tk, ts), (ak, asp)) = (spec(psql), spec(tsql), spec(asql));
+            let (p, t, a) = tokio::join!(
+                gate.query_coalesced(&pk, ps),
+                gate.query_coalesced(&tk, ts),
+                gate.query_coalesced(&ak, asp),
+            );
+            let p = p.map_err(ApiError::from)?;
+            let t = t.map_err(ApiError::from)?;
+            let a = a.map_err(ApiError::from)?;
+
+            let services: Vec<String> = p
+                .rows
+                .iter()
+                .filter_map(|r| r.get("data_service").and_then(|s| s.as_str()))
+                .map(str::to_lowercase)
+                .collect();
+            let (onchain, degraded) = match &chain {
+                None => (None, Some("no_chain")),
+                Some(c) => match c.horizon_provisions(&indexer, &services).await {
+                    Ok(v) => (Some(v), None),
+                    Err(e) => {
+                        tracing::warn!(indexer, "horizon provision reads failed: {e}");
+                        (None, Some(e.code()))
+                    }
+                },
+            };
+            let mut value = crate::shape::provision_detail(
+                &indexer,
+                &p.rows,
+                &t.rows,
+                &a.rows,
+                onchain.as_ref(),
+                unix_now(),
+            );
+            if let Some(reason) = degraded {
+                value["degraded"] = serde_json::json!([{ "part": "chain", "reason": reason }]);
+            }
+            let prov = older_of(&older_of(&p.provenance, &t.provenance), &a.provenance);
+            Ok((value, prov))
+        })
+    });
+
+    ctx.cached(
+        "provisions-detail",
+        NestId::Alloc,
+        serde_json::json!({ "indexer": addr }),
+        indexer_page(cadence::LIVE),
+        fetch,
+    )
+    .await
+}
+
 pub async fn provisions_by_service(
     ctx: &ReadCtx,
     addr: &str,

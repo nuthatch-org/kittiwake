@@ -242,6 +242,11 @@ pub mod coverage {
             "a write. Comparing it against the incumbent would mean inserting a row into the shared analytics table on every parity run, and its answer is a fixed {ok:true} that says nothing about what was stored",
         ),
         (
+            "/api/provisions/detail",
+            Excused::Entirely,
+            "the incumbent has no such route. Its thaw requests and activity are nest folds checked against HorizonStaking's own thaw request lists and tokensThawing when it was written; the rest is contract reads, which parity cannot compare either",
+        ),
+        (
             "/api/subgraph-deployment/{hash}",
             Excused::Entirely,
             "the incumbent has no such route, so there is nothing to compare against. It was added here because the preview cards needed one deployment by hash and the list route cannot answer that: it is ordered by signal and filtered to a threshold. The rows it returns are the list route's own shaping, which parity does compare",
