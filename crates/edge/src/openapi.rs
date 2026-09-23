@@ -204,7 +204,7 @@ const SUMMARIES: &[Operation] = &[
     ),
     op(
         "/api/subgraph-deployments",
-        "Deployments with their signal, stake and fees.",
+        "Deployments with their signal, stake and fees. With ?hash=Qm…, that one deployment.",
     ),
     op(
         "/api/subgraph-fees-30d",
