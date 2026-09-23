@@ -510,6 +510,14 @@ CREATE TABLE IF NOT EXISTS indexer_rolling_apy (
   computed_at      TIMESTAMPTZ NOT NULL
 );
 
+-- Each indexer's per-dimension score, written by `refresh` beside the composite in `indexers` and
+-- weighted by the delegate sliders. A side table for the same reason as the APYs. #87
+CREATE TABLE IF NOT EXISTS indexer_score_breakdown (
+  indexer_address  TEXT PRIMARY KEY,
+  breakdown        JSONB NOT NULL,
+  computed_at      TIMESTAMPTZ NOT NULL
+);
+
 -- The directory's QoS Quality score, recomputed by `score-qos` over thirty days of qos-reo-nest.
 -- A side table for the same reason as the APYs, and not named `indexer_qos_score`: that was the
 -- incumbent's per-day history, and lodestar's migration 020 that drops it is run by hand.

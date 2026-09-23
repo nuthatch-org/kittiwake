@@ -259,6 +259,7 @@ pub async fn refresh(
 
     let mut rows = Vec::with_capacity(indexers.rows.len());
     let mut apys: Vec<(String, Option<f64>, Option<f64>)> = Vec::with_capacity(indexers.rows.len());
+    let mut breakdowns: Vec<(String, serde_json::Value)> = Vec::with_capacity(indexers.rows.len());
     for r in &indexers.rows {
         let Some(id) = s(r, "id").map(|v| v.to_lowercase()) else {
             continue;
@@ -364,6 +365,9 @@ pub async fn refresh(
             distinct_data_services: services_by_indexer.get(&id).copied().unwrap_or(0),
             now,
         });
+        if let Ok(b) = serde_json::to_value(score.breakdown) {
+            breakdowns.push((id.clone(), b));
+        }
 
         rows.push(Row {
             id: id.clone(),
@@ -417,6 +421,7 @@ pub async fn refresh(
 
     write_rows(pool, &rows).await?;
     kittiwake_db::write_rolling_apy(pool, &apys).await?;
+    kittiwake_db::write_score_breakdown(pool, &breakdowns).await?;
     crate::state::touch(pool, "indexers").await?;
     Ok(Ingested {
         rows: rows.len() as u64,

@@ -118,6 +118,46 @@ pub async fn write_rolling_apy(
     Ok(done)
 }
 
+/// Each indexer's per-dimension score, beside the composite in `indexers`. A side table for the
+/// same reason as the rolling APYs (#31); `/api/delegate/recommend` weights it by the sliders (#87).
+pub async fn ensure_score_breakdown_table(pool: &Pool) -> Result<(), DbError> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS indexer_score_breakdown ( \
+           indexer_address TEXT PRIMARY KEY, \
+           breakdown JSONB NOT NULL, \
+           computed_at TIMESTAMPTZ NOT NULL )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Replace every indexer's breakdown, in the refresh pass that writes its composite.
+pub async fn write_score_breakdown(
+    pool: &Pool,
+    rows: &[(String, serde_json::Value)],
+) -> Result<u64, DbError> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let done = sqlx::query(
+        "INSERT INTO indexer_score_breakdown (indexer_address, breakdown, computed_at) \
+         SELECT * FROM UNNEST($1::text[], $2::jsonb[]) AS t, LATERAL (SELECT NOW()) AS n(now) \
+         ON CONFLICT (indexer_address) DO UPDATE SET \
+         breakdown = EXCLUDED.breakdown, computed_at = NOW()",
+    )
+    .bind(rows.iter().map(|r| r.0.clone()).collect::<Vec<String>>())
+    .bind(
+        rows.iter()
+            .map(|r| r.1.clone())
+            .collect::<Vec<serde_json::Value>>(),
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(done)
+}
+
 /// Where the directory's QoS Quality score lives.
 ///
 /// Not `indexer_qos_score`: that was the incumbent's history table, keyed by day, and lodestar's
@@ -643,6 +683,10 @@ pub struct EnrichedIndexer {
     pub last_updated: Option<chrono::DateTime<chrono::Utc>>,
     /// The QoS Quality score, 0 to 100. Null for an indexer the oracle measured nothing for.
     pub q_score: Option<f64>,
+    /// `kittiwake_score::Breakdown` as JSON. Read by the recommender and not served, since the
+    /// directory has no use for it and lodestar's normaliser drops it.
+    #[serde(skip_serializing)]
+    pub score_breakdown: Option<serde_json::Value>,
 }
 
 /// The directory read. Held as a constant so the exclusion below can be asserted without a
@@ -663,9 +707,10 @@ pub const ENRICHED_INDEXERS_SQL: &str = "SELECT address, \
          delegation_capacity_pct::text, score::text, score_grade, allocation_count, \
          delegations_in_7d, undelegations_in_7d, net_flow_grt_7d::text, distinct_data_services, \
          reo_status, last_updated, query_fees_collected_grt::text, rewards_earned_grt::text, \
-         a.rolling_apy_30d::text, a.rolling_apy_90d::text, q.q_score \
+         a.rolling_apy_30d::text, a.rolling_apy_90d::text, q.q_score, b.breakdown AS score_breakdown \
          FROM indexers i LEFT JOIN indexer_rolling_apy a ON a.indexer_address = i.address \
          LEFT JOIN indexer_qos_quality q ON q.indexer_address = i.address \
+         LEFT JOIN indexer_score_breakdown b ON b.indexer_address = i.address \
          WHERE i.address <> $2 \
          ORDER BY i.score DESC NULLS LAST, i.self_stake_grt DESC LIMIT $1";
 
