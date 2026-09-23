@@ -516,15 +516,8 @@ pub async fn indexer_stake_history(
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
     let days = q.days.clamp(7, 730);
-    let step = 86_400 * 7;
-    let end = now();
-    let start = end - days * 86_400;
-    let cutoffs: Vec<i64> = (0..)
-        .map(|i| start + i * step)
-        .take_while(|t| *t <= end)
-        .collect();
     Ok(envelope(
-        routes::indexer_stake_history(&st.read, &addr(&address), &cutoffs).await?,
+        routes::indexer_stake_history(&st.read, &addr(&address), days).await?,
     ))
 }
 
@@ -762,10 +755,10 @@ pub async fn delegation_events(
     Query(q): Query<DelegationEventsQuery>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
-    let since = now() - q.days.clamp(1, 3650) * 86_400;
+    let days = q.days.clamp(1, 3650);
     let indexer = q.indexer.map(|i| addr(&i));
     Ok(envelope(
-        routes::delegation_events(&st.read, indexer.as_deref(), q.first, since).await?,
+        routes::delegation_events(&st.read, indexer.as_deref(), q.first, days).await?,
     ))
 }
 

@@ -36,6 +36,11 @@ absorbing bursts and the nest feels every page view. Stale-while-revalidate is c
 minutes, because past that, waiting for the truth beats serving something the reader would not
 accept if they knew its age.
 
+The exception is the slow answers behind an indexer's page, which the warmer refreshes for every
+indexer in the directory: those are served stale for up to an hour, and today's QoS figures for up
+to two. A cold indexer page waited 4 to 45 seconds on 2026-09-15, and holding a hundred of them
+inside five minutes would cost the allocation nest about 1,650 statements every five minutes.
+
 Three outcomes, in order: fresh, served silently; stale, served *labelled* with a refresh behind
 it; expired, fetched with everyone else waiting coalesced onto one query.
 
@@ -54,9 +59,12 @@ it; expired, fetched with everyone else waiting coalesced onto one query.
    restart. Neither is needed until Scuttlebutt's stream is ported and the warm-set matters across
    restarts. The in-process cache is the whole of L1 today, and a cold start refills it in about a
    minute.
-4. **The warmer warms list folds only.** Warming every per-address profile would spend a
-   four-permit budget on pages nobody is reading. Following the cache's own access frequency to
-   pick the hot N is the next step and wants real traffic to choose N from.
+4. **The warmer keeps every directory indexer's page, not only the list folds.** It began with list
+   folds only, so as not to spend a four-permit budget on pages nobody reads. But every restart
+   left each indexer page cold for its first reader, and restarts are routine. `warm-indexers`
+   walks the hundred directory rows on the cron lane. It does at most 30 seconds of work a minute
+   and rests as long again, refreshes only what would expire within 20 minutes, and leaves a nest
+   that refuses alone for ten.
 5. **`cron` the crate is a dependency but unused.** Schedules are `Every(Duration)` today, which is
    what all seventeen jobs actually are. The dependency stays for the moment a job needs a real
    cron expression, and should be dropped if that moment does not come.

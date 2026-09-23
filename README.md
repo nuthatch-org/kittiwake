@@ -32,7 +32,7 @@ Working, tested, and exercised end to end against a stand-in nest:
 | HTTP edge, per-IP budgets, error taxonomy, provenance headers | `edge` | done |
 | Public SQL: dataset allowlist, read-only screening | `sqlplay` | done |
 | Scheduler: stagger, jitter, overlap, `cron_runs` | `sched` | done |
-| Warmer | `warmer` | list folds done; per-address hot set pending real traffic |
+| Warmer | `warmer` | list folds, and every directory indexer's page |
 | Postgres pool and `cron_runs` writer | `db` | done |
 | Ingest jobs: epochs, delegations, allocations, disputes, network snapshot | `ingest` | done; RAV and the chain-dependent jobs remain |
 | SSRF guard, with the DNS-rebinding check | `ssrf` | done |

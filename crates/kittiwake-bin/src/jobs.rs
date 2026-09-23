@@ -493,8 +493,8 @@ mod tests {
     /// The earlier version of this only compared jobs that shared a period, which let a
     /// thirty-minute job and a ten-minute job both land on the fourth minute and contend for the
     /// same nest permits - exactly the collision the offsets exist to prevent. The one-minute
-    /// warmer is excluded because it fires every minute by definition and would make the property
-    /// unsatisfiable; it draws from the same background lane and queues rather than failing.
+    /// warmers are excluded because they fire every minute by definition and would make the
+    /// property unsatisfiable; they draw from the same background lane and queue rather than failing.
     #[test]
     fn no_two_jobs_fire_at_the_same_minute_of_the_hour() {
         let schedule: Vec<(&str, u64, u64)> = vec![
@@ -549,6 +549,7 @@ mod tests {
             ("refresh", mins(5), Duration::ZERO),
             ("snapshot-network", mins(5), mins(2)),
             ("warm", mins(1), Duration::ZERO),
+            ("warm-indexers", mins(1), Duration::from_secs(30)),
             ("warm-ipfs", mins(10), mins(4)),
             ("refresh-chain-health", mins(30), mins(6)),
             ("reconcile-bounties", mins(10), mins(9)),

@@ -29,6 +29,9 @@ const FRESH_FLOOR: Duration = Duration::from_secs(30);
 /// Stale-while-revalidate is generous but not unbounded: past this, waiting for the truth beats
 /// serving something the reader would not accept if they knew its age.
 const SWR_CAP: Duration = Duration::from_secs(300);
+/// The longest any entry may live regardless of policy. Longer than any warm window, or the
+/// store would drop a warmed entry before its policy let it expire.
+pub const MAX_AGE: Duration = Duration::from_secs(3 * 60 * 60);
 
 impl CachePolicy {
     /// Derive a policy from the cadence at which the source is expected to change.
@@ -43,6 +46,19 @@ impl CachePolicy {
             swr_for,
             hard_ttl: fresh_for + swr_for,
             neg_ttl: Duration::from_secs(5),
+        }
+    }
+
+    /// Served stale for `window` rather than the cap, for a dataset the warmer refreshes inside it.
+    ///
+    /// The cap assumes nothing refreshes an entry nobody reads. A cold indexer page waited 4 to 45
+    /// seconds for its answer (2026-09-15); a warmed one is served at once, labelled with its age.
+    pub fn kept_warm(self, window: Duration) -> Self {
+        let swr_for = self.swr_for.max(window);
+        Self {
+            swr_for,
+            hard_ttl: self.fresh_for + swr_for,
+            ..self
         }
     }
 }
@@ -157,9 +173,7 @@ impl Store {
         Self {
             inner: moka::future::Cache::builder()
                 .max_capacity(max_capacity)
-                // The longest any entry may live regardless of policy, so a dataset that stops
-                // being requested cannot pin memory for ever.
-                .time_to_live(Duration::from_secs(3600))
+                .time_to_live(MAX_AGE)
                 // In the store rather than in each policy, so no reader, revalidation or warmer can
                 // serve or keep a partial answer past it.
                 .expire_after(PartialExpiry(window))
@@ -238,6 +252,26 @@ mod tests {
             Freshness::Stale
         );
         assert_eq!(classify(p.hard_ttl, &p), Freshness::Expired);
+    }
+
+    #[test]
+    fn a_kept_warm_dataset_is_served_stale_for_its_window() {
+        let p = CachePolicy::from_poll_interval(Duration::from_secs(60))
+            .kept_warm(Duration::from_secs(3600));
+        assert_eq!(
+            p.fresh_for,
+            Duration::from_secs(60),
+            "freshness is unchanged"
+        );
+        assert_eq!(p.hard_ttl, Duration::from_secs(3660));
+        assert_eq!(classify(Duration::from_secs(1800), &p), Freshness::Stale);
+        assert_eq!(classify(p.hard_ttl, &p), Freshness::Expired);
+    }
+
+    #[test]
+    fn keeping_warm_never_shortens_a_policy() {
+        let p = CachePolicy::from_poll_interval(Duration::from_secs(300));
+        assert_eq!(p.kept_warm(Duration::from_secs(10)), p);
     }
 
     #[test]
