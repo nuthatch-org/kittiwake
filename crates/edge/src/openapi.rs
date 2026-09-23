@@ -289,6 +289,10 @@ const SUMMARIES: &[Operation] = &[
         "Indexing rewards, split between the indexer and its delegators, and query fees collected, to curators, to the protocol and what the indexer received after the delegators' cut, per UTC day. Dated by the event that paid them, not by allocation close.",
     ),
     op(
+        "/api/indexer/{address}/delegators",
+        "Every delegator of one indexer, a page at a time: `first` (at most 1,000), `skip`, `orderBy` one of stake, delegatedAt, lastChangeAt or thawingTokens, and `orderDirection`. Each row carries its shares, what they are worth now, what is thawing and until when, and when the position opened and last changed; `total` counts every listed position and `active` those still holding shares.",
+    ),
+    op(
         "/api/indexer/{address}/pnl",
         "That revenue netted against a modelled infrastructure cost. The cost side is an estimate the caller may override, not a measurement.",
     ),

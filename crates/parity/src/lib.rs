@@ -307,6 +307,11 @@ pub mod coverage {
             "authenticated shared-Postgres mutations require the Dock integration fixture rather than the public parity target",
         ),
         (
+            "/api/indexer/{address}/delegators",
+            Excused::Entirely,
+            "new with lodestar#265, so the incumbent never had it. Each position's value is checked against `lodestar_delegator_stakes` on the production nest instead: the top two on 0x2f09...f1ce agreed to the wei",
+        ),
+        (
             "/api/indexer/{address}/trends",
             Excused::Entirely,
             "the incumbent's route read a community subgraph through the gateway and was deleted with the key in nuthatch#1160, so nothing answers it to compare against. The figures are checked against the raw events on the nest instead: graph-allocations-nest's `lodestar_indexer_daily` PR records the totals",
