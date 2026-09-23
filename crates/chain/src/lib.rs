@@ -11,7 +11,7 @@ pub mod tap;
 use std::str::FromStr;
 use std::time::Duration;
 
-use alloy::ens::{EnsError, ProviderEnsExt};
+use alloy::ens::{EnsError, ProviderEnsExt, namehash};
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{MulticallBuilder, MulticallItem, Provider, ProviderBuilder};
 use alloy::sol;
@@ -167,6 +167,24 @@ fn ens_verified(name: String, forward: Address, asked: Address) -> Option<String
     (forward == asked).then_some(name)
 }
 
+/// A name `ens_address` will look up: plain lowercase ASCII labels under `.eth`.
+///
+/// ENS names are normalised with UTS-46 before hashing, and this does not implement it. Refusing
+/// anything outside the ASCII subset, where normalisation is lowercasing, means a name is never
+/// hashed into a node its owner did not register.
+pub fn ens_lookup_name(raw: &str) -> Option<String> {
+    let name = raw.trim().to_ascii_lowercase();
+    let ok = name.len() <= 255
+        && name.ends_with(".eth")
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        });
+    ok.then_some(name)
+}
+
 impl Chain {
     /// `arbitrum_rpc` is required: every protocol contract read goes there and there is no public
     /// endpoint that will carry the load politely.
@@ -310,6 +328,31 @@ impl Chain {
     ///
     /// Checked against mainnet by hand on 2026-09-10, because the tests here take no network:
     /// `0xd8da…6045` returned `Some("vitalik.eth")` and `0x0000…dead` returned `None`.
+    /// The address an ENS name resolves to, or `None` when it has no resolver or resolves to zero.
+    pub async fn ens_address(&self, name: &str) -> Result<Option<String>, ApiError> {
+        let name = ens_lookup_name(name)
+            .ok_or_else(|| ApiError::BadRequest("not a plain .eth name".into()))?;
+        let mut last = String::from("no mainnet endpoint configured");
+        for url in &self.mainnet {
+            let Ok(parsed) = url.parse() else { continue };
+            let provider = ProviderBuilder::new().connect_http(parsed);
+            // The registry first: the Universal Resolver reverts on an unregistered name, and a
+            // public RPC reports that revert as the same -32603 it uses for its own failures.
+            let lookup = async {
+                provider.get_resolver(namehash(&name), &name).await?;
+                provider.resolve_name(&name).await
+            };
+            match tokio::time::timeout(Duration::from_secs(10), lookup).await {
+                Ok(Ok(a)) if a == Address::ZERO => return Ok(None),
+                Ok(Ok(a)) => return Ok(Some(a.to_string().to_lowercase())),
+                Ok(Err(EnsError::ResolverNotFound(_))) => return Ok(None),
+                Ok(Err(e)) => last = e.to_string(),
+                Err(_) => last = "timed out".into(),
+            }
+        }
+        Err(ApiError::Unavailable(format!("ENS lookup failed: {last}")))
+    }
+
     pub async fn ens_name(&self, address: &str) -> Result<Option<String>, ApiError> {
         let address = Address::from_str(address)
             .map_err(|_| ApiError::BadRequest("not a 20-byte address".into()))?;
@@ -588,6 +631,27 @@ fn now_secs() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// Only names whose normalisation is lowercasing reach the chain; anything else would be hashed
+    /// into a node that is not the one its owner registered.
+    #[test]
+    fn only_plain_eth_names_are_looked_up() {
+        use super::ens_lookup_name as n;
+        assert_eq!(n(" Vitalik.ETH "), Some("vitalik.eth".to_string()));
+        assert_eq!(n("graphops.eth"), Some("graphops.eth".to_string()));
+        assert_eq!(n("sub.name-1.eth"), Some("sub.name-1.eth".to_string()));
+        for bad in [
+            "vitalik",
+            "vitalik.com",
+            ".eth",
+            "a..eth",
+            "vitalík.eth",
+            "a b.eth",
+            "0xabc",
+        ] {
+            assert_eq!(n(bad), None, "{bad} should not be looked up");
+        }
+    }
+
     /// A reverse record is a claim; the forward record is the name owner answering it. Printing an
     /// unverified reverse name next to somebody's stake is how one address wears another's name.
     #[test]

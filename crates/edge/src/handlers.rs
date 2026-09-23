@@ -2585,9 +2585,11 @@ async fn label_versions(pool: &kittiwake_db::Pool, value: &mut serde_json::Value
 #[derive(serde::Deserialize)]
 pub struct EnsQuery {
     pub address: Option<String>,
+    pub name: Option<String>,
 }
 
-/// `GET /api/ens?address=0x…`: the address's primary ENS name, or null.
+/// `GET /api/ens?address=0x…`: the address's primary ENS name, or null. With `?name=` instead, the
+/// address that name resolves to, or null.
 ///
 /// Cached a day per address, which is the incumbent's key and cadence: a primary name changes
 /// rarely and a mainnet round trip on every avatar render would not be worth it.
@@ -2598,6 +2600,9 @@ pub async fn ens(
     Query(q): Query<EnsQuery>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
+    if let Some(name) = q.name.as_deref() {
+        return ens_forward(&st, name).await;
+    }
     let raw = q
         .address
         .as_deref()
@@ -2632,6 +2637,41 @@ pub async fn ens(
                     let address = address.clone();
                     Box::pin(async move {
                         Ok(serde_json::json!({ "ensName": chain.ens_name(&address).await? }))
+                    })
+                })
+            },
+        )
+        .await?;
+    Ok(envelope_root(read))
+}
+
+async fn ens_forward(st: &AppState, raw: &str) -> Result<Response, ErrorResponse> {
+    let Some(name) = kittiwake_chain::ens_lookup_name(raw) else {
+        return Ok(axum::Json(serde_json::json!({ "address": null })).into_response());
+    };
+    let chain = st
+        .read
+        .chain
+        .as_ref()
+        .ok_or_else(|| {
+            ErrorResponse::from(ApiError::Unavailable(
+                "no mainnet RPC is configured, so ENS cannot be read".into(),
+            ))
+        })?
+        .clone();
+    let read = st
+        .read
+        .cached_external_keyed(
+            "ens-forward",
+            &name,
+            std::time::Duration::from_secs(86_400),
+            kittiwake_types::ServedFrom::Chain,
+            {
+                let name = name.clone();
+                std::sync::Arc::new(move || {
+                    let (chain, name) = (chain.clone(), name.clone());
+                    Box::pin(async move {
+                        Ok(serde_json::json!({ "address": chain.ens_address(&name).await? }))
                     })
                 })
             },

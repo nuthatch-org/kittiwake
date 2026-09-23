@@ -330,7 +330,7 @@ const SUMMARIES: &[Operation] = &[
     ),
     op(
         "/api/ens",
-        "The primary ENS name for an address, forward-verified, or null where it has none.",
+        "The primary ENS name for an address, forward-verified, or null where it has none. With ?name=, the address a .eth name resolves to.",
     ),
     op(
         "/api/subgraph-schema/{hash}",
