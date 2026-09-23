@@ -911,13 +911,25 @@ pub async fn developer_activity(
     ))
 }
 
+#[derive(serde::Deserialize)]
+pub struct DeploymentFilter {
+    pub hash: Option<String>,
+}
+
 pub async fn subgraph_deployments(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(q): Query<ListQuery>,
+    Query(filter): Query<DeploymentFilter>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
+    // `?hash=` was accepted and ignored, so a caller asking for one deployment got the top of the
+    // list with no error. Answered by the single-deployment read, which has the same shape.
+    if let Some(hash) = filter.hash.as_deref() {
+        let read = routes::subgraph_deployment(&st.read, hash).await?;
+        return Ok(envelope(named(&st, read).await));
+    }
     let read = routes::subgraph_deployments(
         &st.read,
         q.first,
@@ -4759,6 +4771,23 @@ mod indexer_page_tests {
 
 #[cfg(test)]
 mod list_query_tests {
+    /// The list parameters and `?hash=` are read from the same query string, neither refusing the other.
+    #[test]
+    fn a_hash_rides_alongside_the_list_parameters() {
+        use axum::extract::Query;
+        let uri =
+            "/?first=5&orderBy=signalledTokens&hash=QmZ6iEiUhPdUWbSJUYkiB75zjqvaVq2pcuR5X9bxp9jiQ1"
+                .parse()
+                .unwrap();
+        let Query(list) = Query::<super::ListQuery>::try_from_uri(&uri).unwrap();
+        let Query(filter) = Query::<super::DeploymentFilter>::try_from_uri(&uri).unwrap();
+        assert_eq!(list.first, 5);
+        assert_eq!(
+            filter.hash.as_deref(),
+            Some("QmZ6iEiUhPdUWbSJUYkiB75zjqvaVq2pcuR5X9bxp9jiQ1")
+        );
+    }
+
     /// Both spellings order the list; lodestar has always sent the camel-case one.
     #[test]
     fn list_ordering_is_read_in_either_case() {
