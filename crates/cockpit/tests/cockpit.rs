@@ -255,13 +255,9 @@ async fn a_tampered_or_expired_session_is_refused() {
 #[tokio::test]
 async fn nothing_reaches_the_agent_without_a_session() {
     let (agent, app) = harness().await;
-    let (status, _, _) = send(&app, get("/api/actions", None)).await;
+    let (status, _, _) = send(&app, get("/actions", None)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let (status, _, _) = send(
-        &app,
-        post("/api/actions/approve", json!({ "ids": [1] }), None),
-    )
-    .await;
+    let (status, _, _) = send(&app, post("/actions/approve", json!({ "ids": [1] }), None)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert!(agent.received_requests().await.unwrap().is_empty());
 }
@@ -272,10 +268,11 @@ async fn a_path_outside_the_allowlist_is_refused_without_touching_the_agent() {
     let (_, cookie) = sign_in(&app, &key(INDEXER_KEY)).await;
     let cookie = cookie.unwrap();
     for path in [
-        "/api/actions/execute",
-        "/api/actions/delete",
+        "/actions/execute",
+        "/actions/delete",
         "/api/graphql",
-        "/api/cost-models",
+        "/api/actions",
+        "/cost-models",
         "/graphql",
         "/",
     ] {
@@ -294,7 +291,7 @@ async fn a_path_outside_the_allowlist_is_refused_without_touching_the_agent() {
     let (status, _, _) = send(
         &app,
         post(
-            "/api/actions",
+            "/actions",
             json!({ "actions": [{ "type": "presentPOI", "deploymentID": DEPLOYMENT, "allocationID": ALLOC }] }),
             Some(&cookie),
         ),
@@ -330,7 +327,7 @@ async fn a_queue_goes_to_the_agent_as_variables_with_the_token_attached() {
     let (status, _, body) = send(
         &app,
         post(
-            "/api/actions",
+            "/actions",
             json!({ "actions": [{ "type": "unallocate", "deploymentID": DEPLOYMENT, "allocationID": ALLOC }] }),
             cookie.as_deref(),
         ),
@@ -359,27 +356,24 @@ async fn approve_cancel_list_and_rules_each_send_their_one_operation() {
     let (_, cookie) = sign_in(&app, &key(INDEXER_KEY)).await;
     let c = cookie.as_deref();
     assert_eq!(
-        send(
-            &app,
-            post("/api/actions/approve", json!({ "ids": [3, 4] }), c)
-        )
-        .await
-        .0,
-        StatusCode::OK
-    );
-    assert_eq!(
-        send(&app, post("/api/actions/cancel", json!({ "ids": [5] }), c))
+        send(&app, post("/actions/approve", json!({ "ids": [3, 4] }), c))
             .await
             .0,
         StatusCode::OK
     );
     assert_eq!(
-        send(&app, get("/api/actions?status=queued", c)).await.0,
+        send(&app, post("/actions/cancel", json!({ "ids": [5] }), c))
+            .await
+            .0,
         StatusCode::OK
     );
-    assert_eq!(send(&app, get("/api/rules", c)).await.0, StatusCode::OK);
     assert_eq!(
-        send(&app, get("/api/actions?status=everything", c)).await.0,
+        send(&app, get("/actions?status=queued", c)).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(send(&app, get("/rules", c)).await.0, StatusCode::OK);
+    assert_eq!(
+        send(&app, get("/actions?status=everything", c)).await.0,
         StatusCode::BAD_REQUEST
     );
 
@@ -414,7 +408,7 @@ async fn approve_cancel_list_and_rules_each_send_their_one_operation() {
 async fn a_write_from_another_origin_is_refused() {
     let (agent, app) = harness().await;
     let (_, cookie) = sign_in(&app, &key(INDEXER_KEY)).await;
-    let req = Request::post("/api/actions/approve")
+    let req = Request::post("/actions/approve")
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ORIGIN, "https://evil.example")
         .header(header::COOKIE, cookie.unwrap())
@@ -503,7 +497,7 @@ async fn cors_admits_only_the_lodestar_origin_with_credentials() {
     let preflight = |origin: &str| {
         Request::builder()
             .method("OPTIONS")
-            .uri("/api/actions")
+            .uri("/actions")
             .header(header::ORIGIN, origin)
             .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
             .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
