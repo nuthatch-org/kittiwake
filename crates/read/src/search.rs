@@ -12,7 +12,10 @@
 //! is not findable by name until the warm job has been round, which is a real limitation and is
 //! stated here rather than discovered.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use kittiwake_db::Pool;
@@ -282,11 +285,83 @@ pub async fn metadata_cids_by_deployment(
         .collect())
 }
 
+/// How long a figures snapshot is served before a refresh is started. Signal moves slowly, and the
+/// search response is cached for a minute on top of this anyway.
+const FIGURES_TTL: Duration = Duration::from_secs(300);
+
+type FigureMap = HashMap<String, (String, String)>;
+type Held = Option<(Instant, Arc<FigureMap>)>;
+
+/// Signal and stake for every deployment carrying either, read once and shared between searches.
+///
+/// `lodestar_deployments` is a computed view and costs about three seconds a query whatever the
+/// query selects, a `count(*)` included. Asked once per chunk of 100 candidates, it was most of a
+/// cold "graph" search's ten and a half seconds (2026-09-23). A stale snapshot is served while a
+/// refresh runs, so only the first search after a start waits for the view.
+#[derive(Clone, Default)]
+pub struct Figures {
+    held: Arc<tokio::sync::RwLock<Held>>,
+    first_load: Arc<tokio::sync::Mutex<()>>,
+    refreshing: Arc<AtomicBool>,
+}
+
+impl Figures {
+    async fn get(&self, gate: &NestGate, lane: Lane) -> Result<Arc<FigureMap>, ApiError> {
+        if let Some((at, map)) = self.held.read().await.clone() {
+            if at.elapsed() > FIGURES_TTL && !self.refreshing.swap(true, Ordering::AcqRel) {
+                let (this, gate) = (self.clone(), gate.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = this.load(&gate, lane).await {
+                        tracing::warn!(err = %e, "search figures refresh failed; serving the old ones");
+                    }
+                    this.refreshing.store(false, Ordering::Release);
+                });
+            }
+            return Ok(map);
+        }
+        let _one_at_a_time = self.first_load.lock().await;
+        if let Some((_, map)) = self.held.read().await.clone() {
+            return Ok(map);
+        }
+        self.load(gate, lane).await
+    }
+
+    async fn load(&self, gate: &NestGate, lane: Lane) -> Result<Arc<FigureMap>, ApiError> {
+        let rows = ask(
+            gate,
+            NestId::Alloc,
+            "SELECT id, CAST(signalled_tokens AS VARCHAR) AS signalled_tokens, \
+             CAST(staked_tokens AS VARCHAR) AS staked_tokens FROM lodestar_deployments \
+             WHERE signalled_tokens > 0 OR staked_tokens > 0"
+                .into(),
+            lane,
+        )
+        .await?;
+        let figure = |r: &serde_json::Value, k: &str| {
+            r.get(k).and_then(|v| v.as_str()).unwrap_or("0").to_string()
+        };
+        let map: Arc<FigureMap> = Arc::new(
+            rows.iter()
+                .filter_map(|r| {
+                    let id = r.get("id")?.as_str()?.to_lowercase();
+                    Some((
+                        id,
+                        (figure(r, "signalled_tokens"), figure(r, "staked_tokens")),
+                    ))
+                })
+                .collect(),
+        );
+        *self.held.write().await = Some((Instant::now(), map.clone()));
+        Ok(map)
+    }
+}
+
 /// Search hits for a set of deployment ids: each one's newest subgraph and name, most signal first.
 async fn hits_for_deployments(
     pool: &Pool,
     ipfs: &Ipfs,
     gate: &NestGate,
+    figures: &Figures,
     lane: Lane,
     ids: &[String],
     limit: usize,
@@ -302,47 +377,8 @@ async fn hits_for_deployments(
         return Ok(Vec::new());
     }
 
-    // Rank on the figures alone, then hydrate only what survives the truncation.
-    //
-    // These two used to run together under a `join!`, which read as the obvious thing and was the
-    // whole of #43's seven seconds. The ordering key is `signalled_tokens` and nothing else; the
-    // subgraph metadata decides only what a surviving row is *called*. So a search for "uniswap",
-    // which matches 434 deployments and returns ten, was asking the GNS nest about all 434 and then
-    // fetching up to 868 IPFS documents to name rows it was about to discard. The cost scaled with
-    // the candidate count instead of the result count, which is why "graphprotocol" answered in
-    // 0.17 s and "uniswap" took seven.
-    //
-    // Sequencing them costs one round trip against the alloc nest. Hydrating ten rows instead of
-    // 434 saves rather more than that.
-    let figures = ask_chunked(gate, NestId::Alloc, lane, &ids, |chunk| {
-        format!(
-            "SELECT id, CAST(signalled_tokens AS VARCHAR) AS signalled_tokens, \
-             CAST(staked_tokens AS VARCHAR) AS staked_tokens FROM lodestar_deployments \
-             WHERE id IN ({})",
-            quoted(chunk)
-        )
-    })
-    .await?;
-
-    let mut by_id: BTreeMap<String, (String, String)> = BTreeMap::new();
-    for f in &figures {
-        let Some(id) = f.get("id").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        by_id.insert(
-            id.to_lowercase(),
-            (
-                f.get("signalled_tokens")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("0")
-                    .to_string(),
-                f.get("staked_tokens")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("0")
-                    .to_string(),
-            ),
-        );
-    }
+    // Rank on the figures alone, then hydrate only what survives the truncation (#43).
+    let by_id = figures.get(gate, lane).await?;
 
     // Signal is wei and does not fit an f64. Sorting on a parsed float would order two subgraphs
     // whose signal differs in the last few digits arbitrarily, which is exactly the pair a user is
@@ -397,30 +433,24 @@ async fn hits_for_deployments(
 ///
 /// Base58 has no prefix relation to the underlying bytes, so this cannot be a range scan: every
 /// deployment carrying signal or stake is converted and filtered. That is a few thousand
-/// conversions, which is cheap, and it is why the id list is worth caching upstream.
+/// conversions, which is cheap, and it is why the id list is held in [`Figures`].
 pub async fn by_hash_prefix(
     pool: &Pool,
     ipfs: &Ipfs,
     gate: &NestGate,
+    figures: &Figures,
     lane: Lane,
     prefix: &str,
     limit: usize,
 ) -> Result<Vec<serde_json::Value>, ApiError> {
-    let rows = ask(
-        gate,
-        NestId::Alloc,
-        "SELECT id FROM lodestar_deployments WHERE signalled_tokens > 0 OR staked_tokens > 0"
-            .into(),
-        lane,
-    )
-    .await?;
-    let matching: Vec<String> = rows
-        .iter()
-        .filter_map(|r| r.get("id")?.as_str())
+    let matching: Vec<String> = figures
+        .get(gate, lane)
+        .await?
+        .keys()
         .filter(|id| deployment_ipfs_hash(id).is_some_and(|h| h.starts_with(prefix)))
-        .map(|id| id.to_lowercase())
+        .cloned()
         .collect();
-    hits_for_deployments(pool, ipfs, gate, lane, &matching, limit).await
+    hits_for_deployments(pool, ipfs, gate, figures, lane, &matching, limit).await
 }
 
 /// Subgraphs whose cached display name contains `q`.
@@ -431,6 +461,7 @@ pub async fn by_name(
     pool: &Pool,
     ipfs: &Ipfs,
     gate: &NestGate,
+    figures: &Figures,
     lane: Lane,
     q: &str,
     limit: usize,
@@ -462,7 +493,7 @@ pub async fn by_name(
     .iter()
     .filter_map(|r| Some(r.get("current_deployment_id")?.as_str()?.to_lowercase()))
     .collect();
-    hits_for_deployments(pool, ipfs, gate, lane, &ids, limit).await
+    hits_for_deployments(pool, ipfs, gate, figures, lane, &ids, limit).await
 }
 
 /// Deployments whose cached manifest mentions `address` - what `manifest_contains_nocase` did on
@@ -471,6 +502,7 @@ pub async fn by_manifest_address(
     pool: &Pool,
     ipfs: &Ipfs,
     gate: &NestGate,
+    figures: &Figures,
     lane: Lane,
     address: &str,
     limit: usize,
@@ -485,7 +517,7 @@ pub async fn by_manifest_address(
         .iter()
         .filter_map(|(c,)| ipfs_hash_to_bytes32(c))
         .collect();
-    hits_for_deployments(pool, ipfs, gate, lane, &ids, limit).await
+    hits_for_deployments(pool, ipfs, gate, figures, lane, &ids, limit).await
 }
 
 /// The search box: which of the three questions this is, and its answer.
@@ -493,6 +525,7 @@ pub async fn search(
     pool: &Pool,
     ipfs: &Ipfs,
     gate: &NestGate,
+    figures: &Figures,
     lane: Lane,
     q: &str,
 ) -> Result<Vec<serde_json::Value>, ApiError> {
@@ -510,12 +543,12 @@ pub async fn search(
     }
 
     if q.len() == 42 && q.starts_with("0x") && q[2..].bytes().all(|b| b.is_ascii_hexdigit()) {
-        return by_manifest_address(pool, ipfs, gate, lane, q, 20).await;
+        return by_manifest_address(pool, ipfs, gate, figures, lane, q, 20).await;
     }
     if q.starts_with("Qm") && q.len() >= 8 {
-        return by_hash_prefix(pool, ipfs, gate, lane, q, 10).await;
+        return by_hash_prefix(pool, ipfs, gate, figures, lane, q, 10).await;
     }
-    by_name(pool, ipfs, gate, lane, q, 10).await
+    by_name(pool, ipfs, gate, figures, lane, q, 10).await
 }
 
 /// Display names for deployments, keyed by the `Qm…` hash the caller asked with.
@@ -906,9 +939,11 @@ mod tests {
                 // Signal derived from the id itself, so the ranking is global rather than per
                 // chunk. Deriving it from the row's position within its chunk makes each chunk's
                 // own tail win, which is a property of the fixture and not of the code.
+                // The figures are one scan of every signalled deployment, so it answers with all of
+                // them rather than the ids in a list.
                 let rows: Vec<serde_json::Value> = if path.starts_with("/alloc") {
-                    ids_in(&q)
-                        .into_iter()
+                    (0..CANDIDATES)
+                        .map(|n| format!("{n:064x}"))
                         .map(|id| {
                             let signal = u64::from_str_radix(&id[48..], 16).unwrap_or(0);
                             serde_json::json!({
@@ -960,41 +995,50 @@ mod tests {
         let ipfs = Ipfs::new("http://127.0.0.1:1");
 
         let ids: Vec<String> = (0..CANDIDATES).map(|n| format!("{n:064x}")).collect();
-        let hits = hits_for_deployments(&pool, &ipfs, &gate, Lane::Read, &ids, LIMIT)
+        let figures = Figures::default();
+        let hits = hits_for_deployments(&pool, &ipfs, &gate, &figures, Lane::Read, &ids, LIMIT)
             .await
             .expect("the mock nest answers");
         assert_eq!(hits.len(), LIMIT);
 
-        let seen = seen.lock().unwrap();
-        let asked = |prefix: &str| -> Vec<String> {
-            seen.iter()
-                .filter(|(p, _)| p.starts_with(prefix))
-                .flat_map(|(_, q)| ids_in(q))
-                .collect()
-        };
+        let seen_all = seen.clone();
+        {
+            let seen = seen.lock().unwrap();
+            let asked = |prefix: &str| -> Vec<String> {
+                seen.iter()
+                    .filter(|(p, _)| p.starts_with(prefix))
+                    .flat_map(|(_, q)| ids_in(q))
+                    .collect()
+            };
 
-        // Ranking needs every candidate, so the alloc nest sees all of them.
+            // Naming needs only the survivors. This is the assertion the old shape failed.
+            let named = asked("/gns");
+            assert_eq!(
+                named.len(),
+                LIMIT,
+                "the gns nest was asked about {} deployments to name {LIMIT}",
+                named.len()
+            );
+
+            // And they are the right ten: the mock ranks by position, so the highest ids win.
+            let mut expected: Vec<String> = ids[CANDIDATES - LIMIT..].to_vec();
+            expected.sort();
+            let mut named = named;
+            named.sort();
+            assert_eq!(named, expected);
+        }
+
+        // A second search reads the figures already held rather than the view again: it costs
+        // seconds a query, so it is read once, not once per chunk of candidates or per search.
+        hits_for_deployments(&pool, &ipfs, &gate, &figures, Lane::Read, &ids[..20], LIMIT)
+            .await
+            .expect("the mock nest answers");
+        let seen = seen_all.lock().unwrap();
+        let alloc_reads = seen.iter().filter(|(p, _)| p.starts_with("/alloc")).count();
         assert_eq!(
-            asked("/alloc").len(),
-            CANDIDATES,
-            "the ranking must consider every candidate"
+            alloc_reads, 1,
+            "the alloc view was read {alloc_reads} times"
         );
-
-        // Naming needs only the survivors. This is the assertion the old shape failed.
-        let named = asked("/gns");
-        assert_eq!(
-            named.len(),
-            LIMIT,
-            "the gns nest was asked about {} deployments to name {LIMIT}",
-            named.len()
-        );
-
-        // And they are the right ten: the mock ranks by position, so the highest ids win.
-        let mut expected: Vec<String> = ids[CANDIDATES - LIMIT..].to_vec();
-        expected.sort();
-        let mut named = named;
-        named.sort();
-        assert_eq!(named, expected);
     }
 
     /// A fan-out asks the gate how wide the lane is rather than guessing. The inner lane is one
