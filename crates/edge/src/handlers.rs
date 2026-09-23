@@ -191,7 +191,91 @@ pub async fn indexer(
     Path(address): Path<String>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
-    Ok(envelope(routes::indexer(&st.read, &addr(&address)).await?))
+    let address = addr(&address);
+    let read = routes::indexer(&st.read, &address).await?;
+    Ok(envelope(with_pending_rewards(&st, &address, read).await))
+}
+
+/// An epoch on Arbitrum is 7,200 L1 blocks, a day.
+const PENDING_REWARDS_TTL: std::time::Duration = std::time::Duration::from_secs(86_400);
+/// How long the profile waits on a cold read. Past it the read carries on and warms the cache.
+const PENDING_REWARDS_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Put each open allocation's pending rewards on the profile, from RewardsManager multicalls cached
+/// per indexer and allocation set. A read that fails or is slow leaves the field off and says so
+/// under `degraded`; the rest of the profile does not wait on the chain.
+async fn with_pending_rewards(
+    st: &AppState,
+    address: &str,
+    mut read: kittiwake_read::Read,
+) -> kittiwake_read::Read {
+    let Some(chain) = st.chain.clone() else {
+        return read;
+    };
+    let ids = kittiwake_read::shape::active_allocation_ids(&read.entry.value);
+    if ids.is_empty() {
+        return read;
+    }
+    // Keyed on the allocation set too, so opening or closing one is a miss rather than a day of
+    // rows the cached read never covered.
+    let subject = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        ids.hash(&mut h);
+        format!("{address}:{:016x}", h.finish())
+    };
+    let ctx = st.read.clone();
+    let fetch: kittiwake_read::ExternalFetcher = std::sync::Arc::new(move || {
+        let chain = chain.clone();
+        let ids = ids.clone();
+        Box::pin(async move {
+            let p = chain.pending_rewards(&ids).await?;
+            let rewards: serde_json::Map<String, serde_json::Value> = ids
+                .into_iter()
+                .zip(p.wei.into_iter().map(Into::into))
+                .collect();
+            Ok(serde_json::json!({ "block": p.block, "readAt": now(), "rewards": rewards }))
+        })
+    });
+    // Spawned so that a read which outlasts the wait still lands in the cache for the next visit.
+    let task = tokio::spawn(async move {
+        ctx.cached_external_keyed(
+            "pending-rewards",
+            &subject,
+            PENDING_REWARDS_TTL,
+            kittiwake_types::ServedFrom::Chain,
+            fetch,
+        )
+        .await
+    });
+
+    let mut data = (*read.entry.value).clone();
+    match tokio::time::timeout(PENDING_REWARDS_WAIT, task).await {
+        Ok(Ok(Ok(rewards))) => {
+            kittiwake_read::shape::put_pending_rewards(&mut data, &rewards.entry.value);
+        }
+        outcome => {
+            let reason = match outcome {
+                Ok(Ok(Err(e))) => {
+                    tracing::warn!(address, "pending rewards unreadable: {e}");
+                    e.code().to_string()
+                }
+                Err(_) => "chain_timeout".to_string(),
+                _ => "internal".to_string(),
+            };
+            let part = serde_json::json!({ "part": "pendingRewards", "reason": reason });
+            match data.get_mut("degraded").and_then(|d| d.as_array_mut()) {
+                Some(parts) => parts.push(part),
+                None => data["degraded"] = serde_json::json!([part]),
+            }
+        }
+    }
+    read.entry = std::sync::Arc::new(kittiwake_cache::Entry {
+        value: std::sync::Arc::new(data),
+        provenance: read.entry.provenance.clone(),
+        fetched_at: read.entry.fetched_at,
+    });
+    read
 }
 
 /// Put the verified indexer names from Postgres on the accounts. A failed read leaves them null:
