@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use alloy::ens::{EnsError, ProviderEnsExt};
 use alloy::primitives::{Address, B256, U256};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::{MulticallBuilder, MulticallItem, Provider, ProviderBuilder};
 use alloy::sol;
 use kittiwake_types::ApiError;
 
@@ -30,6 +30,10 @@ pub const L1_BRIDGE_ESCROW: &str = "0x36aff7001294dae4c2ed4fdefc478a00de77f090";
 pub const HORIZON_STAKING: &str = "0x00669a4cf01450b64e8a2a20e9b1fcb71e61ef03";
 /// SubgraphService, which is the verifier a delegation pool is keyed by.
 pub const SUBGRAPH_SERVICE: &str = "0xb2bb92d0de618878e438b55d5846cfecd9301105";
+/// RewardsManager on Arbitrum One.
+pub const REWARDS_MANAGER: &str = "0x971b9d3d0ae3eca029cab5ea1fb0f72c85e6a525";
+/// Allocations per `aggregate3`, kept under what a public endpoint's `eth_call` gas cap carries.
+const PENDING_REWARDS_BATCH: usize = 250;
 
 sol! {
     #[sol(rpc)]
@@ -70,6 +74,12 @@ sol! {
             bool settled;
         }
         function getBounty(uint256 bountyId) external view returns (Bounty memory);
+    }
+
+    #[sol(rpc)]
+    interface IRewardsManager {
+        function getRewards(address rewardsIssuer, address allocationID)
+            external view returns (uint256);
     }
 
     #[sol(rpc)]
@@ -473,6 +483,48 @@ impl Chain {
         })
     }
 
+    /// What each open allocation would collect if a POI were presented now, before cuts, in wei.
+    ///
+    /// Every batch is pinned to one block so the rows add up. A row whose call reverts is `None`
+    /// rather than zero; the read as a whole failing is an error.
+    pub async fn pending_rewards(
+        &self,
+        allocations: &[String],
+    ) -> Result<PendingRewards, ApiError> {
+        let allocations = allocations
+            .iter()
+            .map(|a| Address::from_str(a))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ApiError::BadRequest("not an allocation address".into()))?;
+        let provider = self.arb()?;
+        let block = tokio::time::timeout(Duration::from_secs(8), provider.get_block_number())
+            .await
+            .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
+            .map_err(|e| ApiError::Unavailable(format!("arbitrum rpc: {e}")))?;
+        let issuer = Address::from_str(SUBGRAPH_SERVICE).expect("constant");
+        let rewards = IRewardsManager::new(
+            Address::from_str(REWARDS_MANAGER).expect("constant"),
+            &provider,
+        );
+
+        let mut wei = Vec::with_capacity(allocations.len());
+        for batch in allocations.chunks(PENDING_REWARDS_BATCH) {
+            let multicall = MulticallBuilder::new_dynamic(&provider)
+                .block(block.into())
+                .extend_calls(
+                    batch
+                        .iter()
+                        .map(|a| rewards.getRewards(issuer, *a).into_call(true)),
+                );
+            let results = tokio::time::timeout(Duration::from_secs(20), multicall.aggregate3())
+                .await
+                .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
+                .map_err(|e| ApiError::Unavailable(format!("getRewards multicall: {e}")))?;
+            wei.extend(results.into_iter().map(|r| r.ok().map(|v| v.to_string())));
+        }
+        Ok(PendingRewards { block, wei })
+    }
+
     pub async fn block_number(&self) -> Result<u64, ApiError> {
         let provider = self.arb()?;
         tokio::time::timeout(Duration::from_secs(8), provider.get_block_number())
@@ -494,6 +546,13 @@ pub struct ChainBounty {
     pub winner: String,
     /// Unix seconds, or 0 for no expiry.
     pub expires_at: u64,
+}
+
+/// `wei[i]` answers `allocations[i]` as passed to [`Chain::pending_rewards`], as a decimal string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRewards {
+    pub block: u64,
+    pub wei: Vec<Option<String>>,
 }
 
 /// GRT in circulation across both chains, in whole GRT.
@@ -579,7 +638,14 @@ mod tests {
 
     #[test]
     fn the_contract_addresses_parse() {
-        for a in [REO_ADDRESS, GRT_ARBITRUM, GRT_MAINNET, L1_BRIDGE_ESCROW] {
+        for a in [
+            REO_ADDRESS,
+            GRT_ARBITRUM,
+            GRT_MAINNET,
+            L1_BRIDGE_ESCROW,
+            REWARDS_MANAGER,
+            SUBGRAPH_SERVICE,
+        ] {
             assert!(Address::from_str(a).is_ok(), "{a}");
         }
     }

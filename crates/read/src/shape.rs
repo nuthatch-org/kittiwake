@@ -135,6 +135,37 @@ pub fn put_indexer_names(data: &mut Value, names: &std::collections::HashMap<Str
     }
 }
 
+/// The profile's open allocation ids, lowercase, in the order they are listed.
+pub fn active_allocation_ids(data: &Value) -> Vec<String> {
+    data.pointer("/indexer/allocations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|a| a.get("id")?.as_str().map(str::to_lowercase))
+        .collect()
+}
+
+/// Put `pendingRewards` on every open allocation from `{ block, readAt, rewards: { id: wei } }`.
+/// A row the read failed on, or did not cover because it opened since, is null: zero is a claim.
+pub fn put_pending_rewards(data: &mut Value, read: &Value) {
+    let Some(indexer) = data.get_mut("indexer") else {
+        return;
+    };
+    let rewards = read.get("rewards").and_then(Value::as_object);
+    if let Some(rows) = indexer.get_mut("allocations").and_then(Value::as_array_mut) {
+        for row in rows {
+            row["pendingRewards"] = row
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| rewards?.get(&id.to_lowercase()))
+                .cloned()
+                .unwrap_or(Value::Null);
+        }
+    }
+    indexer["pendingRewardsBlock"] = read.get("block").cloned().unwrap_or(Value::Null);
+    indexer["pendingRewardsAt"] = read.get("readAt").cloned().unwrap_or(Value::Null);
+}
+
 fn put_name(row: &mut Value, names: &std::collections::HashMap<String, String>) {
     let Some(account) = row.get_mut("account") else {
         return;
@@ -1464,6 +1495,49 @@ mod tests {
         assert_eq!(
             profile["indexer"]["account"]["defaultDisplayName"],
             json!("p2p-org-booster.eth")
+        );
+    }
+
+    #[test]
+    fn pending_rewards_join_by_allocation_and_an_unread_row_is_null_not_zero() {
+        let rows = [
+            json!({"id": "0x0143E96DE0A7E1510AFBFB1D8CD11BB231365BB0"}),
+            json!({"id": "0x00000000000000000000000000000000000000aa"}),
+            json!({"id": "0x00000000000000000000000000000000000000bb"}),
+        ];
+        let detail = indexer_detail(&json!({"id": "0x01"}), None, Some(&rows), None, 16.0);
+        let mut profile = json!({ "indexer": detail });
+        assert_eq!(
+            active_allocation_ids(&profile),
+            vec![
+                "0x0143e96de0a7e1510afbfb1d8cd11bb231365bb0",
+                "0x00000000000000000000000000000000000000aa",
+                "0x00000000000000000000000000000000000000bb",
+            ]
+        );
+
+        put_pending_rewards(
+            &mut profile,
+            &json!({
+                "block": 508_106_664u64,
+                "readAt": 1_790_162_998u64,
+                "rewards": {
+                    "0x0143e96de0a7e1510afbfb1d8cd11bb231365bb0": "3802500000000000000000",
+                    "0x00000000000000000000000000000000000000aa": null,
+                },
+            }),
+        );
+        let a = &profile["indexer"]["allocations"];
+        assert_eq!(a[0]["pendingRewards"], json!("3802500000000000000000"));
+        assert_eq!(a[1]["pendingRewards"], Value::Null, "the call reverted");
+        assert_eq!(a[2]["pendingRewards"], Value::Null, "opened after the read");
+        assert_eq!(
+            profile["indexer"]["pendingRewardsBlock"],
+            json!(508_106_664u64)
+        );
+        assert_eq!(
+            profile["indexer"]["pendingRewardsAt"],
+            json!(1_790_162_998u64)
         );
     }
 
