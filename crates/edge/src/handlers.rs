@@ -2620,6 +2620,49 @@ pub async fn subgraph_versions(
     Ok(envelope(read))
 }
 
+/// Children known from manifests the warm job or a reader has fetched into Postgres.
+pub async fn graft_children(
+    State(st): State<AppState>,
+    Path(hash): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let base = cid_v0(&hash)
+        .ok_or_else(|| ErrorResponse::from(ApiError::BadRequest("expected a CIDv0 hash".into())))?
+        .to_string();
+    let pool = pool(&st)?.clone();
+    let ipfs = st.ipfs.clone();
+    let gate = st.read.gate.clone();
+    let subject = base.clone();
+    let read = st
+        .read
+        .cached_external_keyed(
+            "graft-children",
+            &subject,
+            std::time::Duration::from_secs(300),
+            kittiwake_types::ServedFrom::Postgres,
+            std::sync::Arc::new(move || {
+                let pool = pool.clone();
+                let ipfs = ipfs.clone();
+                let gate = gate.clone();
+                let base = base.clone();
+                Box::pin(async move {
+                    kittiwake_read::graft::children(
+                        &pool,
+                        &ipfs,
+                        &gate,
+                        kittiwake_nest::Lane::Read,
+                        &base,
+                    )
+                    .await
+                })
+            }),
+        )
+        .await?;
+    Ok(envelope(read))
+}
+
 /// Replace each version's `versionMetadata` with the `label` from its IPFS document.
 ///
 /// A document the cache has not seen leaves the label null rather than blocking the response on a

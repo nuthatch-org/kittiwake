@@ -309,6 +309,10 @@ const SUMMARIES: &[Operation] = &[
         "Every version of the subgraph that published a deployment, with its signal and stake.",
     ),
     op(
+        "/api/subgraph-deployment/{hash}/graft-children",
+        "Deployments whose cached manifest grafts onto this hash, with graft block and published name and label where known.",
+    ),
+    op(
         "/api/qos/capture",
         "How allocated stake sits across quality bands. Unscored means not measured, which is most of it.",
     ),
