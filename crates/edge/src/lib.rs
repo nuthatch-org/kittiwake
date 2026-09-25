@@ -1429,6 +1429,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_named_foghorn_paths_take_a_post() {
+        for good in [
+            "qos/graphql",
+            "alerts/subscriptions",
+            "alerts/subscriptions/0f8fad5b-d9cb-469f-a165-70867728950e/delete",
+        ] {
+            assert!(
+                crate::handlers::foghorn_post_allowed(good),
+                "{good} takes a POST"
+            );
+        }
+        for bad in [
+            "qos/buckets",
+            "alerts",
+            "alerts/subscriptions/0f8fad5b-d9cb-469f-a165-70867728950e",
+            "alerts/subscriptions/not-a-uuid/delete",
+            "alerts/subscriptions/0f8fad5b-d9cb-469f-a165-70867728950e/delete/x",
+        ] {
+            assert!(
+                !crate::handlers::foghorn_post_allowed(bad),
+                "{bad} must not take a POST"
+            );
+        }
+    }
+
     /// A 404 from Foghorn is Foghorn answering. Reporting it as unreachable sent an indexer
     /// chasing an outage on our side on 2026-08-15, which is why the status is kept.
     #[test]
