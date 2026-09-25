@@ -252,6 +252,11 @@ pub mod coverage {
             "the incumbent has no such route, so there is nothing to compare against. It was added here because the preview cards needed one deployment by hash and the list route cannot answer that: it is ordered by signal and filtered to a threshold. The rows it returns are the list route's own shaping, which parity does compare",
         ),
         (
+            "/api/subgraph-deployment/{hash}/graft-children",
+            Excused::Entirely,
+            "the incumbent has no graft children route. This one reads cached manifests and parses graft.base exactly, so parity has no answer to compare",
+        ),
+        (
             "/api/subgraph-directory",
             Excused::Entirely,
             "the incumbent has no such route. It filters the whole deployment set here because the browser could only filter the page it had (lodestar#252); its rows and filters are tested in `kittiwake_read::directory`",

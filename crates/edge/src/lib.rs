@@ -1232,6 +1232,10 @@ pub fn router(state: AppState) -> Router {
             "/api/subgraph-versions/{hash}",
             get(handlers::subgraph_versions),
         )
+        .route(
+            "/api/subgraph-deployment/{hash}/graft-children",
+            get(handlers::graft_children),
+        )
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(tower_http::catch_panic::CatchPanicLayer::new());
 
