@@ -1085,6 +1085,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/portfolio", get(handlers::portfolio))
         .route("/api/rewards-history", get(handlers::rewards_history))
         .route("/api/provisions", get(handlers::provisions))
+        .route("/api/provisions/detail", get(handlers::provision_detail))
         .route("/api/payments", get(handlers::payments))
         .route("/api/poi", get(handlers::poi))
         // Activity
@@ -1230,6 +1231,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/subgraph-versions/{hash}",
             get(handlers::subgraph_versions),
+        )
+        .route(
+            "/api/subgraph-deployment/{hash}/graft-children",
+            get(handlers::graft_children),
         )
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(tower_http::catch_panic::CatchPanicLayer::new());

@@ -60,6 +60,40 @@ sol! {
             external view returns (DelegationPool memory);
         function isAuthorized(address serviceProvider, address verifier, address operator)
             external view returns (bool);
+
+        struct Provision {
+            uint256 tokens;
+            uint256 tokensThawing;
+            uint256 sharesThawing;
+            uint32 maxVerifierCut;
+            uint64 thawingPeriod;
+            uint64 createdAt;
+            uint32 maxVerifierCutPending;
+            uint64 thawingPeriodPending;
+            uint256 lastParametersStagedAt;
+            uint256 thawingNonce;
+        }
+        struct ThawRequestList {
+            bytes32 head;
+            bytes32 tail;
+            uint256 nonce;
+            uint256 count;
+        }
+        function getProvision(address serviceProvider, address verifier)
+            external view returns (Provision memory);
+        /// `requestType` 0 is a provision thaw; `owner` is then the service provider itself.
+        function getThawRequestList(uint8 requestType, address serviceProvider, address verifier, address owner)
+            external view returns (ThawRequestList memory);
+        /// PPM. `paymentType` 0 is query fees, 1 indexing fees, 2 indexing rewards.
+        function getDelegationFeeCut(address serviceProvider, address verifier, uint8 paymentType)
+            external view returns (uint256);
+    }
+
+    /// The ranges a data service accepts a provision's parameters within (ProvisionManager).
+    #[sol(rpc)]
+    interface IDataService {
+        function getThawingPeriodRange() external view returns (uint64 min, uint64 max);
+        function getVerifierCutRange() external view returns (uint32 min, uint32 max);
     }
 
     /// The Dock's bounty board. Read-only here: this service reconciles the cache against the
@@ -592,6 +626,138 @@ impl Chain {
         Ok(PendingRewards { block, wei })
     }
 
+    /// One indexer's provisions as HorizonStaking and each data service hold them, at one block.
+    ///
+    /// Five multicalls, one per call signature, so a data service that does not implement the
+    /// ProvisionManager views costs its own ranges and nothing else. A reverted call is `None`.
+    pub async fn horizon_provisions(
+        &self,
+        indexer: &str,
+        services: &[String],
+    ) -> Result<HorizonProvisions, ApiError> {
+        let sp = Address::from_str(indexer)
+            .map_err(|_| ApiError::BadRequest(format!("not an address: {indexer}")))?;
+        let verifiers = services
+            .iter()
+            .map(|s| Address::from_str(s))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ApiError::BadRequest("not a data service address".into()))?;
+        let provider = self.arb()?;
+        let block = tokio::time::timeout(Duration::from_secs(8), provider.get_block_number())
+            .await
+            .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
+            .map_err(|e| ApiError::Unavailable(format!("arbitrum rpc: {e}")))?;
+        if verifiers.is_empty() {
+            return Ok(HorizonProvisions {
+                block,
+                services: Vec::new(),
+            });
+        }
+        let staking = IHorizonStaking::new(
+            Address::from_str(HORIZON_STAKING).expect("constant"),
+            &provider,
+        );
+        let services_c: Vec<_> = verifiers
+            .iter()
+            .map(|v| IDataService::new(*v, &provider))
+            .collect();
+
+        let provisions = MulticallBuilder::new_dynamic(&provider)
+            .block(block.into())
+            .extend_calls(
+                verifiers
+                    .iter()
+                    .map(|v| staking.getProvision(sp, *v).into_call(true)),
+            );
+        let lists = MulticallBuilder::new_dynamic(&provider)
+            .block(block.into())
+            .extend_calls(
+                verifiers
+                    .iter()
+                    .map(|v| staking.getThawRequestList(0, sp, *v, sp).into_call(true)),
+            );
+        let cuts = MulticallBuilder::new_dynamic(&provider)
+            .block(block.into())
+            .extend_calls(verifiers.iter().flat_map(|v| {
+                (0u8..3).map(|t| staking.getDelegationFeeCut(sp, *v, t).into_call(true))
+            }));
+        let thawing = MulticallBuilder::new_dynamic(&provider)
+            .block(block.into())
+            .extend_calls(
+                services_c
+                    .iter()
+                    .map(|c| c.getThawingPeriodRange().into_call(true)),
+            );
+        let verifier_cut = MulticallBuilder::new_dynamic(&provider)
+            .block(block.into())
+            .extend_calls(
+                services_c
+                    .iter()
+                    .map(|c| c.getVerifierCutRange().into_call(true)),
+            );
+
+        let all = async {
+            tokio::join!(
+                provisions.aggregate3(),
+                lists.aggregate3(),
+                cuts.aggregate3(),
+                thawing.aggregate3(),
+                verifier_cut.aggregate3(),
+            )
+        };
+        let (provisions, lists, cuts, thawing, verifier_cut) =
+            tokio::time::timeout(Duration::from_secs(20), all)
+                .await
+                .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?;
+        let unavailable = |what: &str, e: alloy::providers::MulticallError| {
+            ApiError::Unavailable(format!("{what} multicall: {e}"))
+        };
+        let provisions = provisions.map_err(|e| unavailable("getProvision", e))?;
+        let lists = lists.map_err(|e| unavailable("getThawRequestList", e))?;
+        let cuts = cuts.map_err(|e| unavailable("getDelegationFeeCut", e))?;
+        let thawing = thawing.map_err(|e| unavailable("getThawingPeriodRange", e))?;
+        let verifier_cut = verifier_cut.map_err(|e| unavailable("getVerifierCutRange", e))?;
+
+        let mut cuts = cuts.into_iter().map(|r| r.ok().map(u256_to_u64));
+        let services = services
+            .iter()
+            .zip(provisions)
+            .zip(lists)
+            .zip(thawing)
+            .zip(verifier_cut)
+            .map(|((((id, p), l), t), v)| ServiceProvisionOnChain {
+                data_service: id.to_lowercase(),
+                provision: p.ok().map(|p| ProvisionOnChain {
+                    tokens: p.tokens.to_string(),
+                    tokens_thawing: p.tokensThawing.to_string(),
+                    shares_thawing: p.sharesThawing.to_string(),
+                    max_verifier_cut: p.maxVerifierCut,
+                    thawing_period: p.thawingPeriod,
+                    created_at: p.createdAt,
+                    max_verifier_cut_pending: p.maxVerifierCutPending,
+                    thawing_period_pending: p.thawingPeriodPending,
+                    last_parameters_staged_at: u256_to_u64(p.lastParametersStagedAt),
+                    thawing_nonce: p.thawingNonce.to_string(),
+                }),
+                thaw_request_count: l.ok().map(|l| u256_to_u64(l.count)),
+                delegation_fee_cuts: DelegationFeeCuts {
+                    query_fee: cuts.next().flatten(),
+                    indexing_fee: cuts.next().flatten(),
+                    indexing_rewards: cuts.next().flatten(),
+                },
+                thawing_period_range: t.ok().map(|r| Range {
+                    min: r.min,
+                    max: r.max,
+                }),
+                verifier_cut_range: v.ok().map(|r| Range {
+                    min: u64::from(r.min),
+                    max: u64::from(r.max),
+                }),
+            })
+            .collect();
+        Ok(HorizonProvisions { block, services })
+    }
+
     pub async fn block_number(&self) -> Result<u64, ApiError> {
         let provider = self.arb()?;
         tokio::time::timeout(Duration::from_secs(8), provider.get_block_number())
@@ -620,6 +786,73 @@ pub struct ChainBounty {
 pub struct PendingRewards {
     pub block: u64,
     pub wei: Vec<Option<String>>,
+}
+
+/// [`Chain::horizon_provisions`], one row per data service in the order asked.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HorizonProvisions {
+    pub block: u64,
+    pub services: Vec<ServiceProvisionOnChain>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceProvisionOnChain {
+    pub data_service: String,
+    pub provision: Option<ProvisionOnChain>,
+    /// Provision thaw requests still in HorizonStaking's list, fulfilled ones removed.
+    pub thaw_request_count: Option<u64>,
+    pub delegation_fee_cuts: DelegationFeeCuts,
+    pub thawing_period_range: Option<Range>,
+    pub verifier_cut_range: Option<Range>,
+}
+
+/// Token amounts are wei as decimal strings; cuts are PPM; periods and times are seconds.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvisionOnChain {
+    pub tokens: String,
+    pub tokens_thawing: String,
+    pub shares_thawing: String,
+    pub max_verifier_cut: u32,
+    pub thawing_period: u64,
+    pub created_at: u64,
+    pub max_verifier_cut_pending: u32,
+    pub thawing_period_pending: u64,
+    pub last_parameters_staged_at: u64,
+    pub thawing_nonce: String,
+}
+
+/// PPM per payment type.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegationFeeCuts {
+    pub query_fee: Option<u64>,
+    pub indexing_fee: Option<u64>,
+    pub indexing_rewards: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct Range {
+    pub min: u64,
+    pub max: u64,
+}
+
+impl ProvisionOnChain {
+    /// What a provision thaw request for `shares` is worth now, in wei. A request made under an
+    /// older thawing nonce was invalidated by a slash and releases nothing, so it is "0".
+    pub fn thaw_request_tokens(&self, shares: &str, nonce: &str) -> Option<String> {
+        let shares = U256::from_str(shares).ok()?;
+        if U256::from_str(nonce).ok()? != U256::from_str(&self.thawing_nonce).ok()? {
+            return Some("0".into());
+        }
+        let tokens = U256::from_str(&self.tokens_thawing).ok()?;
+        let total = U256::from_str(&self.shares_thawing).ok()?;
+        if total.is_zero() {
+            return None;
+        }
+        Some((shares.checked_mul(tokens)? / total).to_string())
+    }
 }
 
 /// GRT in circulation across both chains, in whole GRT.
@@ -722,6 +955,30 @@ mod tests {
     fn the_global_supply_does_not_count_bridged_tokens_twice() {
         let (l1, l2, escrow) = (10_800_262_816.0, 3_380_666_513.0, 2_694_465_409.0);
         assert_eq!(l1 + l2 - escrow, 11_486_463_920.0);
+    }
+
+    #[test]
+    fn a_thaw_request_is_worth_its_share_of_what_is_thawing() {
+        let p = ProvisionOnChain {
+            tokens: "100".into(),
+            tokens_thawing: "45".into(),
+            shares_thawing: "30".into(),
+            max_verifier_cut: 0,
+            thawing_period: 0,
+            created_at: 0,
+            max_verifier_cut_pending: 0,
+            thawing_period_pending: 0,
+            last_parameters_staged_at: 0,
+            thawing_nonce: "2".into(),
+        };
+        assert_eq!(p.thaw_request_tokens("10", "2"), Some("15".into()));
+        assert_eq!(p.thaw_request_tokens("10", "1"), Some("0".into()));
+        assert_eq!(p.thaw_request_tokens("x", "2"), None);
+        let empty = ProvisionOnChain {
+            shares_thawing: "0".into(),
+            ..p
+        };
+        assert_eq!(empty.thaw_request_tokens("10", "2"), None);
     }
 
     #[test]

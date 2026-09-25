@@ -679,6 +679,52 @@ pub fn data_service_totals_sql(addrs: &[String]) -> Option<String> {
 pub const MAX_THAWING_PERIOD_SQL: &str =
     "SELECT result FROM max_thawing_period WHERE NOT reverted ORDER BY block_number DESC LIMIT 1";
 
+/// An indexer's provision thaw requests that have not been fulfilled, oldest unlock first.
+pub fn provision_thaw_requests_sql(addr: &str) -> Option<String> {
+    if !is_address(addr) {
+        return None;
+    }
+    Some(format!(
+        "SELECT LOWER(c.verifier) AS data_service, c.\"thawRequestId\" AS id, c.shares, c.\"thawingUntil\" AS thawing_until, \
+         c.nonce, c.block_timestamp AS created_at, c.tx_hash FROM staking__thaw_request_created c \
+         WHERE c.\"requestType\" = '0' AND LOWER(c.\"serviceProvider\") = '{addr}' \
+         AND NOT EXISTS (SELECT 1 FROM staking__thaw_request_fulfilled f WHERE f.\"thawRequestId\" = c.\"thawRequestId\") \
+         ORDER BY CAST(c.\"thawingUntil\" AS BIGINT), c.block_number, c.log_index"
+    ))
+}
+
+/// An indexer's own Horizon events: provisions, their thaw requests, slashes and fee cuts.
+pub fn indexer_horizon_activity_sql(addr: &str, first: i64) -> Option<String> {
+    if !is_address(addr) {
+        return None;
+    }
+    let first = clamp(first, 1, 500);
+    let sp = format!("LOWER(\"serviceProvider\") = '{addr}'");
+    Some(format!(
+        "WITH created AS (SELECT * FROM staking__thaw_request_created WHERE \"requestType\" = '0' AND {sp}) \
+         SELECT 'ProvisionCreated' AS kind, LOWER(verifier) AS data_service, tokens, NULL AS shares, NULL AS thawing_until, \
+         NULL AS thaw_request_id, NULL AS valid, NULL AS payment_type, NULL AS fee_cut, 1 AS events, block_number, log_index, block_timestamp, tx_hash \
+         FROM staking__provision_created WHERE {sp} \
+         UNION ALL SELECT 'ProvisionIncreased', LOWER(verifier), CAST(SUM(CAST(tokens AS HUGEINT)) AS VARCHAR), NULL, NULL, NULL, NULL, NULL, NULL, \
+         COUNT(*), block_number, MAX(log_index), block_timestamp, tx_hash \
+         FROM staking__provision_increased WHERE {sp} GROUP BY LOWER(verifier), block_number, block_timestamp, tx_hash \
+         UNION ALL SELECT 'ProvisionThawed', LOWER(verifier), tokens, NULL, NULL, NULL, NULL, NULL, NULL, 1, block_number, log_index, block_timestamp, tx_hash \
+         FROM staking__provision_thawed WHERE {sp} \
+         UNION ALL SELECT 'TokensDeprovisioned', LOWER(verifier), tokens, NULL, NULL, NULL, NULL, NULL, NULL, 1, block_number, log_index, block_timestamp, tx_hash \
+         FROM staking__tokens_deprovisioned WHERE {sp} \
+         UNION ALL SELECT 'ProvisionSlashed', LOWER(verifier), tokens, NULL, NULL, NULL, NULL, NULL, NULL, 1, block_number, log_index, block_timestamp, tx_hash \
+         FROM staking__provision_slashed WHERE {sp} \
+         UNION ALL SELECT 'ThawRequestCreated', LOWER(verifier), NULL, shares, \"thawingUntil\", \"thawRequestId\", NULL, NULL, NULL, 1, block_number, log_index, block_timestamp, tx_hash \
+         FROM created \
+         UNION ALL SELECT 'ThawRequestFulfilled', LOWER(c.verifier), f.tokens, f.shares, f.\"thawingUntil\", f.\"thawRequestId\", f.valid, NULL, NULL, 1, \
+         f.block_number, f.log_index, f.block_timestamp, f.tx_hash \
+         FROM staking__thaw_request_fulfilled f JOIN created c ON c.\"thawRequestId\" = f.\"thawRequestId\" \
+         UNION ALL SELECT 'DelegationFeeCutSet', LOWER(verifier), NULL, NULL, NULL, NULL, NULL, \"paymentType\", \"feeCut\", 1, block_number, log_index, block_timestamp, tx_hash \
+         FROM staking__delegation_fee_cut_set WHERE {sp} \
+         ORDER BY block_number DESC, log_index DESC LIMIT {first}"
+    ))
+}
+
 pub const DATA_SERVICE_COUNTS_SQL: &str = "SELECT indexer, COUNT(DISTINCT data_service) AS n FROM lodestar_provisions WHERE tokens_provisioned > 0 GROUP BY 1";
 
 // ---------------------------------------------------------------------------------------------
@@ -1117,6 +1163,27 @@ pub fn dips_latest_per_target_sql(table: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn horizon_detail_sql_refuses_what_is_not_an_address() {
+        assert!(provision_thaw_requests_sql("0x0e91' OR 1=1 --").is_none());
+        assert!(indexer_horizon_activity_sql("nope", 10).is_none());
+        let a = "0x0e9193def3016ade132afbfc3f9a3018813700a0";
+        let thaws = provision_thaw_requests_sql(a).unwrap();
+        assert!(
+            thaws.contains("\"requestType\" = '0'"),
+            "provision thaws only"
+        );
+        assert!(
+            thaws.contains("NOT EXISTS"),
+            "fulfilled requests are not pending"
+        );
+        assert!(
+            indexer_horizon_activity_sql(a, 100_000)
+                .unwrap()
+                .ends_with("LIMIT 500")
+        );
+    }
+
     #[test]
     fn a_deployment_id_is_thirty_two_bytes_of_lower_hex() {
         assert!(is_deployment_id(

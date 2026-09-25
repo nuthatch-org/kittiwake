@@ -186,6 +186,10 @@ const SUMMARIES: &[Operation] = &[
     ),
     op("/api/provisions", "One indexer's Horizon provisions."),
     op(
+        "/api/provisions/detail",
+        "One indexer's thaw requests, fee cuts, service ranges and Horizon activity.",
+    ),
+    op(
         "/api/delegation-events",
         "Individual delegations and undelegations.",
     ),
@@ -303,6 +307,10 @@ const SUMMARIES: &[Operation] = &[
     op(
         "/api/subgraph-versions/{hash}",
         "Every version of the subgraph that published a deployment, with its signal and stake.",
+    ),
+    op(
+        "/api/subgraph-deployment/{hash}/graft-children",
+        "Deployments whose cached manifest grafts onto this hash, with graft block and published name and label where known.",
     ),
     op(
         "/api/qos/capture",
