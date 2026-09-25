@@ -1689,7 +1689,8 @@ pub fn subgraph_versions_fetcher(dep: String) -> Fetcher {
             let out: Vec<serde_json::Value> = versions
                 .rows
                 .iter()
-                .map(|row| {
+                .enumerate()
+                .map(|(position, row)| {
                     let id = row
                         .get("deployment_id")
                         .and_then(|v| v.as_str())
@@ -1710,7 +1711,8 @@ pub fn subgraph_versions_fetcher(dep: String) -> Fetcher {
                         "ipfsHash": ipfs_hash,
                         "signalledTokens": token("signalled_tokens"),
                         "stakedTokens": token("staked_tokens"),
-                        "isCurrent": ipfs_hash == shape::ipfs_or_id(&dep),
+                        // The GNS version number, not the hash used to open the page, decides.
+                        "isCurrent": position == 0,
                         // Carried so the caller can fill `label` from the document cache; replaced
                         // before the response is written.
                         "versionMetadata": row.get("version_metadata").cloned().unwrap_or(serde_json::Value::Null),
@@ -2134,6 +2136,30 @@ mod wiring_tests {
             1,
         );
         (ctx, seen, server)
+    }
+
+    #[tokio::test]
+    async fn an_old_deployments_page_marks_the_newest_gns_version_current() {
+        let current = format!("0x{}", "1".repeat(64));
+        let requested = format!("0x{}", "2".repeat(64));
+        let rows = vec![
+            serde_json::json!({
+                "subgraph_id": "1", "deployment_id": current,
+                "version_number": 10, "created_at": 2,
+            }),
+            serde_json::json!({
+                "subgraph_id": "1", "deployment_id": requested,
+                "version_number": 9, "created_at": 1,
+            }),
+        ];
+        let (ctx, _, _server) = ctx_answering(rows).await;
+
+        let read = subgraph_versions(&ctx, &requested)
+            .await
+            .expect("the nest answers");
+        let versions = read.entry.value["versions"].as_array().unwrap();
+        assert_eq!(versions[0]["isCurrent"], true);
+        assert_eq!(versions[1]["isCurrent"], false);
     }
 
     const INDEXER: &str = "0x2f09092aacd80196fc984908c5a9a7ab3ee4f1ce";
