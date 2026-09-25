@@ -131,6 +131,62 @@ pub async fn check_resolved(raw: &str) -> Result<url::Url, Refusal> {
     Ok(u)
 }
 
+/// Addresses refused even for a URL the operator wrote into their own config.
+///
+/// Loopback, RFC 1918 and 100.64/10 stay open because that is where an indexer agent lives
+/// (a Tailscale address is 100.64/10). Link-local is the cloud metadata service.
+pub fn is_never_a_service(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_never_a_service_v4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_never_a_service_v4(mapped);
+            }
+            v6.is_unspecified() || v6.is_multicast() || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn is_never_a_service_v4(ip: Ipv4Addr) -> bool {
+    ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.octets()[0] == 0
+        || ip.octets()[0] >= 224
+}
+
+/// The check for a URL that comes from the operator's own configuration rather than from a
+/// stranger: private networks allowed, metadata and unroutable addresses refused, every resolved
+/// address checked. Returns the addresses so the caller can pin its connections to them.
+pub async fn check_configured(raw: &str) -> Result<(url::Url, Vec<std::net::SocketAddr>), Refusal> {
+    let u = url::Url::parse(raw).map_err(|_| Refusal::NotAUrl)?;
+    match u.scheme() {
+        "http" | "https" => {}
+        other => return Err(Refusal::Scheme(other.to_string())),
+    }
+    let host = u.host_str().ok_or(Refusal::NotAUrl)?.to_lowercase();
+    let port = u.port_or_known_default().unwrap_or(80);
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let addrs: Vec<std::net::SocketAddr> = match bare.parse::<IpAddr>() {
+        Ok(ip) => vec![std::net::SocketAddr::new(ip, port)],
+        Err(_) => tokio::net::lookup_host(format!("{host}:{port}"))
+            .await
+            .map_err(|_| Refusal::Unresolvable(host.clone()))?
+            .collect(),
+    };
+    if addrs.is_empty() {
+        return Err(Refusal::Unresolvable(host));
+    }
+    if let Some(bad) = addrs.iter().find(|a| is_never_a_service(a.ip())) {
+        return Err(if bare.parse::<IpAddr>().is_ok() {
+            Refusal::Host(host)
+        } else {
+            Refusal::ResolvesToPrivate(format!("{host} ({})", bad.ip()))
+        });
+    }
+    Ok((u, addrs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +280,34 @@ mod tests {
 
     /// The check people skip: `localtest.me` and friends are public names that resolve to
     /// loopback, so the literal check passes and the fetch still goes inward.
+    #[tokio::test]
+    async fn a_configured_url_may_be_private_but_never_metadata() {
+        for ok in [
+            "http://127.0.0.1:18000/",
+            "http://10.0.0.5:18000/",
+            "http://192.168.1.20:18000/",
+            "http://100.101.102.103:18000/",
+            "http://localhost:18000/",
+        ] {
+            assert!(check_configured(ok).await.is_ok(), "{ok} should be allowed");
+        }
+        for bad in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[fe80::1]/",
+            "http://0.0.0.0:18000/",
+            "http://[::ffff:169.254.169.254]/",
+            "http://224.0.0.1/",
+            "file:///etc/passwd",
+            "gopher://10.0.0.5/",
+            "not a url",
+        ] {
+            assert!(
+                check_configured(bad).await.is_err(),
+                "{bad} should be refused"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_public_name_that_resolves_inward_is_refused() {
         // Resolved through the host's own resolver; a literal address needs no lookup and takes
