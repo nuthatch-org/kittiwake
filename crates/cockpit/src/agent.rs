@@ -37,6 +37,20 @@ const RULES: &str = "query indexingRules($protocolNetwork: String) {
   }
 }";
 
+// indexer-cli v0.25.11 `packages/indexer-cli/src/rules.ts`, the same fields as `RULES`.
+const SET_RULE: &str = "mutation setIndexingRule($rule: IndexingRuleInput!) {
+  setIndexingRule(rule: $rule) {
+    identifier identifierType allocationAmount allocationLifetime autoRenewal parallelAllocations
+    maxAllocationPercentage minSignal maxSignal minStake minAverageQueryFees custom decisionBasis
+    requireSupported safety protocolNetwork
+  }
+}";
+
+const DELETE_RULES: &str =
+    "mutation deleteIndexingRules($deployments: [IndexingRuleIdentifier!]!) {
+  deleteIndexingRules(identifiers: $deployments)
+}";
+
 pub const SOURCE: &str = "lodestar-cockpit";
 const MAX_BATCH: usize = 50;
 const STATUSES: [&str; 7] = [
@@ -186,6 +200,22 @@ impl Agent {
             .await
     }
 
+    pub async fn set_rule(&self, rule: &RuleRequest) -> Result<Value, AgentError> {
+        let input = rule.to_input(&self.network)?;
+        self.call(SET_RULE, json!({ "rule": input }), "setIndexingRule")
+            .await
+    }
+
+    pub async fn delete_rule(&self, identifier: &str) -> Result<Value, AgentError> {
+        rule_identifier(identifier)?;
+        self.call(
+            DELETE_RULES,
+            json!({ "deployments": [{ "identifier": identifier, "protocolNetwork": self.network }] }),
+            "deleteIndexingRules",
+        )
+        .await
+    }
+
     pub async fn rules(&self) -> Result<Value, AgentError> {
         self.call(
             RULES,
@@ -194,6 +224,130 @@ impl Agent {
         )
         .await
     }
+}
+
+/// The two identifiers the Cockpit edits: a deployment's IPFS hash, as indexer-cli normalises one,
+/// or the `global` group. Subgraph-ID rules are left to indexer-cli.
+fn rule_identifier(identifier: &str) -> Result<&'static str, AgentError> {
+    if identifier == "global" {
+        Ok("group")
+    } else if identifier.len() == 46 && identifier.starts_with("Qm") && is_deployment(identifier) {
+        Ok("deployment")
+    } else {
+        Err(AgentError::Invalid(format!(
+            "{identifier:?} is neither a Qm deployment hash nor \"global\""
+        )))
+    }
+}
+
+/// One rule as the browser writes it. GRT amounts as decimal strings; the agent takes wei.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuleRequest {
+    pub identifier: String,
+    #[serde(default)]
+    pub decision_basis: Option<String>,
+    #[serde(default)]
+    pub allocation_amount: Option<String>,
+    #[serde(default)]
+    pub parallel_allocations: Option<i64>,
+    #[serde(default)]
+    pub allocation_lifetime: Option<i64>,
+    #[serde(default)]
+    pub auto_renewal: Option<bool>,
+    #[serde(default)]
+    pub max_allocation_percentage: Option<f64>,
+    #[serde(default)]
+    pub min_signal: Option<String>,
+    #[serde(default)]
+    pub max_signal: Option<String>,
+    #[serde(default)]
+    pub min_stake: Option<String>,
+    #[serde(default)]
+    pub min_average_query_fees: Option<String>,
+    #[serde(default)]
+    pub require_supported: Option<bool>,
+    #[serde(default)]
+    pub safety: Option<bool>,
+}
+
+impl RuleRequest {
+    fn to_input(&self, network: &str) -> Result<Value, AgentError> {
+        let bad = |m: String| Err(AgentError::Invalid(m));
+        let kind = rule_identifier(&self.identifier)?;
+        let mut input = json!({
+            "identifier": self.identifier,
+            "identifierType": kind,
+            "protocolNetwork": network,
+        });
+        if let Some(d) = &self.decision_basis {
+            if !matches!(d.as_str(), "rules" | "never" | "always" | "offchain") {
+                return bad(format!("{d:?} is not a decision basis"));
+            }
+            input["decisionBasis"] = json!(d);
+        }
+        for (field, value) in [
+            ("allocationAmount", &self.allocation_amount),
+            ("minSignal", &self.min_signal),
+            ("maxSignal", &self.max_signal),
+            ("minStake", &self.min_stake),
+            ("minAverageQueryFees", &self.min_average_query_fees),
+        ] {
+            if let Some(v) = value {
+                let Some(wei) = grt_to_wei(v) else {
+                    return bad(format!("{field} must be a GRT amount"));
+                };
+                input[field] = json!(wei);
+            }
+        }
+        for (field, value, max) in [
+            ("parallelAllocations", self.parallel_allocations, 20),
+            ("allocationLifetime", self.allocation_lifetime, 10_000),
+        ] {
+            if let Some(n) = value {
+                if !(1..=max).contains(&n) {
+                    return bad(format!("{field} must be between 1 and {max}"));
+                }
+                input[field] = json!(n);
+            }
+        }
+        if let Some(p) = self.max_allocation_percentage {
+            if !(p > 0.0 && p <= 1.0) {
+                return bad("maxAllocationPercentage is a fraction above 0 and at most 1".into());
+            }
+            input["maxAllocationPercentage"] = json!(p);
+        }
+        for (field, value) in [
+            ("autoRenewal", self.auto_renewal),
+            ("requireSupported", self.require_supported),
+            ("safety", self.safety),
+        ] {
+            if let Some(b) = value {
+                input[field] = json!(b);
+            }
+        }
+        Ok(input)
+    }
+}
+
+/// Exact decimal GRT to wei, without a float in between. Zero is allowed here, unlike an
+/// allocation amount, because a zero signal floor is a rule someone means.
+fn grt_to_wei(s: &str) -> Option<String> {
+    let (int, frac) = s.split_once('.').unwrap_or((s, ""));
+    if int.is_empty()
+        || int.len() > 12
+        || frac.len() > 18
+        || !int.chars().chain(frac.chars()).all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let digits = format!("{int}{frac:0<18}");
+    let trimmed = digits.trim_start_matches('0');
+    Some(if trimmed.is_empty() {
+        "0".into()
+    } else {
+        trimmed.into()
+    })
 }
 
 fn check_ids(ids: &[i64]) -> Result<(), AgentError> {
@@ -297,6 +451,58 @@ fn is_grt(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grt_becomes_exact_wei() {
+        assert_eq!(grt_to_wei("1").as_deref(), Some("1000000000000000000"));
+        assert_eq!(grt_to_wei("0.000000000000000001").as_deref(), Some("1"));
+        assert_eq!(
+            grt_to_wei("100000.5").as_deref(),
+            Some("100000500000000000000000")
+        );
+        assert_eq!(grt_to_wei("0").as_deref(), Some("0"));
+        for bad in ["", ".5", "1e18", "-1", "1.0000000000000000001", "1,000"] {
+            assert_eq!(grt_to_wei(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_rule_is_checked_before_it_is_sent() {
+        let rule = |v: Value| {
+            serde_json::from_value::<RuleRequest>(v)
+                .unwrap()
+                .to_input("eip155:42161")
+        };
+        let ok = rule(json!({
+            "identifier": "QmSWxvd8SaQK6qZKJ7xtfxCCGoRzGnoi2WNzmJYYJW9BXY",
+            "decisionBasis": "always", "allocationAmount": "5000", "parallelAllocations": 2
+        }))
+        .unwrap();
+        assert_eq!(ok["identifierType"], "deployment");
+        assert_eq!(ok["allocationAmount"], "5000000000000000000000");
+        assert_eq!(ok["protocolNetwork"], "eip155:42161");
+        assert!(ok.get("minSignal").is_none());
+        assert_eq!(
+            rule(json!({ "identifier": "global" })).unwrap()["identifierType"],
+            "group"
+        );
+        for bad in [
+            json!({ "identifier": "all" }),
+            json!({ "identifier": "0x1234" }),
+            json!({ "identifier": "global", "decisionBasis": "sometimes" }),
+            json!({ "identifier": "global", "minSignal": "1e3" }),
+            json!({ "identifier": "global", "parallelAllocations": 0 }),
+            json!({ "identifier": "global", "maxAllocationPercentage": 1.5 }),
+        ] {
+            assert!(rule(bad.clone()).is_err(), "{bad}");
+        }
+        assert!(
+            serde_json::from_value::<RuleRequest>(
+                json!({ "identifier": "global", "custom": "{}" })
+            )
+            .is_err()
+        );
+    }
 
     fn req(kind: &str, alloc: Option<&str>, amount: Option<&str>) -> QueueRequest {
         QueueRequest {

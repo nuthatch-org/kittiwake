@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tower_http::cors::CorsLayer;
 
-use crate::agent::{Agent, AgentError, QueueRequest};
+use crate::agent::{Agent, AgentError, QueueRequest, RuleRequest};
 use crate::auth::{Auth, AuthError, COOKIE, Session};
 
 pub struct AppState {
@@ -50,7 +50,8 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/actions", get(list_actions).post(queue_actions))
         .route("/actions/approve", post(approve_actions))
         .route("/actions/cancel", post(cancel_actions))
-        .route("/rules", get(rules))
+        .route("/rules", get(rules).post(set_rule))
+        .route("/rules/delete", post(delete_rule))
         .fallback(|| async { err(StatusCode::NOT_FOUND, "not a Cockpit route") })
         .layer(cors)
         .with_state(state)
@@ -270,6 +271,47 @@ async fn cancel_actions(
         Ok(v) => {
             tracing::info!(signer = %s.signer, ids = ?body.ids, "cancelled actions");
             Json(json!({ "actions": v })).into_response()
+        }
+        Err(e) => agent_err(e),
+    }
+}
+
+async fn set_rule(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<RuleRequest>,
+) -> Response {
+    let s = match same_origin(&state, &headers).and_then(|_| current(&state, &headers)) {
+        Ok(s) => s,
+        Err(r) => return r.into_response(),
+    };
+    match state.agent.set_rule(&body).await {
+        Ok(v) => {
+            tracing::info!(signer = %s.signer, identifier = %body.identifier, "set indexing rule");
+            Json(json!({ "rule": v })).into_response()
+        }
+        Err(e) => agent_err(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct RuleIdBody {
+    identifier: String,
+}
+
+async fn delete_rule(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<RuleIdBody>,
+) -> Response {
+    let s = match same_origin(&state, &headers).and_then(|_| current(&state, &headers)) {
+        Ok(s) => s,
+        Err(r) => return r.into_response(),
+    };
+    match state.agent.delete_rule(&body.identifier).await {
+        Ok(v) => {
+            tracing::info!(signer = %s.signer, identifier = %body.identifier, "deleted indexing rule");
+            Json(json!({ "deleted": v })).into_response()
         }
         Err(e) => agent_err(e),
     }

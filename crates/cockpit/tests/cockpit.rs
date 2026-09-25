@@ -518,3 +518,101 @@ async fn cors_admits_only_the_lodestar_origin_with_credentials() {
     // A fixed origin is echoed as itself, never as the caller's, so the browser refuses.
     assert_eq!(evil.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], ORIGIN);
 }
+
+#[tokio::test]
+async fn a_rule_goes_to_the_agent_in_wei_and_a_bad_one_never_leaves() {
+    let (agent, app) = harness().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({
+            "variables": { "rule": {
+                "identifier": "global",
+                "identifierType": "group",
+                "decisionBasis": "rules",
+                "minSignal": "500000000000000000000",
+                "protocolNetwork": "eip155:42161",
+            } }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "setIndexingRule": { "identifier": "global", "decisionBasis": "rules" } }
+        })))
+        .expect(1)
+        .mount(&agent)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({
+            "variables": { "deployments": [{ "identifier": "global", "protocolNetwork": "eip155:42161" }] }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "deleteIndexingRules": true }
+        })))
+        .expect(1)
+        .mount(&agent)
+        .await;
+
+    let (_, cookie) = sign_in(&app, &key(INDEXER_KEY)).await;
+    let (status, _, body) = send(
+        &app,
+        post(
+            "/rules",
+            json!({ "identifier": "global", "decisionBasis": "rules", "minSignal": "500" }),
+            cookie.as_deref(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rule"]["decisionBasis"], "rules");
+
+    let (status, _, _) = send(
+        &app,
+        post(
+            "/rules",
+            json!({ "identifier": "all", "decisionBasis": "always" }),
+            cookie.as_deref(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _, body) = send(
+        &app,
+        post(
+            "/rules/delete",
+            json!({ "identifier": "global" }),
+            cookie.as_deref(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["deleted"], json!(true));
+
+    let sent = agent.received_requests().await.unwrap();
+    assert_eq!(sent.len(), 2, "the refused rule must not reach the agent");
+    let q: Value = serde_json::from_slice(&sent[0].body).unwrap();
+    assert!(
+        q["query"]
+            .as_str()
+            .unwrap()
+            .starts_with("mutation setIndexingRule(")
+    );
+}
+
+#[tokio::test]
+async fn a_rule_write_needs_a_session_and_the_lodestar_origin() {
+    let (agent, app) = harness().await;
+    let (status, _, _) = send(
+        &app,
+        post("/rules", json!({ "identifier": "global" }), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (_, cookie) = sign_in(&app, &key(INDEXER_KEY)).await;
+    let req = Request::post("/rules/delete")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ORIGIN, "https://evil.example")
+        .header(header::COOKIE, cookie.unwrap())
+        .body(Body::from(json!({ "identifier": "global" }).to_string()))
+        .unwrap();
+    let (status, _, _) = send(&app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(agent.received_requests().await.unwrap().is_empty());
+}
