@@ -288,6 +288,7 @@ pub fn row(r: &Value, fees_in_window: Option<&Value>) -> Value {
             _ => json!("0"),
         },
         "createdAt": i0(r, "created_at"),
+        "deniedSince": r.get("denied_since").cloned().unwrap_or(Value::Null),
         "indexerCount": i0(r, "active_allocation_count"),
         "curatorCount": i0(r, "curator_count"),
         "displayName": Value::Null,
@@ -582,6 +583,11 @@ mod tests {
         assert_eq!(r["queryFees30d"], "5000");
         assert_eq!(r["indexerCount"], 1);
         assert_eq!(r["network"], Value::Null);
+        assert_eq!(r["deniedSince"], Value::Null);
+        assert_eq!(
+            row(&json!({ "id": "0x00", "denied_since": 508000000 }), None)["deniedSince"],
+            508000000
+        );
 
         assert_eq!(row(&json!({ "id": "0x00" }), None)["queryFees30d"], "0");
     }

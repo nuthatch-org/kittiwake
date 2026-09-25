@@ -394,8 +394,14 @@ pub fn indexer_active_allocations_sql(addr: &str) -> Option<String> {
     Some(format!(
         "SELECT a.id, CAST(a.allocated_tokens AS VARCHAR) AS allocated_tokens, a.created_at_epoch, a.subgraph_deployment, \
          CAST(a.signalled_tokens AS VARCHAR) AS signalled_tokens, \
-         CAST((SELECT SUM(allocated_tokens) FROM lodestar_allocations d WHERE d.subgraph_deployment = a.subgraph_deployment AND d.status = 'Active') AS VARCHAR) AS deployment_staked_tokens \
-         FROM lodestar_allocations a WHERE LOWER(a.indexer) = '{addr}' AND a.status = 'Active' ORDER BY a.id"
+         CAST((SELECT SUM(allocated_tokens) FROM lodestar_allocations d WHERE d.subgraph_deployment = a.subgraph_deployment AND d.status = 'Active') AS VARCHAR) AS deployment_staked_tokens, \
+         NULLIF(deny.since_block, 0) AS denied_since \
+         FROM lodestar_allocations a \
+         LEFT JOIN (SELECT LOWER(\"subgraphDeploymentID\") AS dep, CAST(\"sinceBlock\" AS BIGINT) AS since_block \
+                    FROM rewards__rewards_denylist_updated \
+                    QUALIFY ROW_NUMBER() OVER (PARTITION BY LOWER(\"subgraphDeploymentID\") ORDER BY block_number DESC, log_index DESC) = 1) deny \
+           ON deny.dep = LOWER(a.subgraph_deployment) \
+         WHERE LOWER(a.indexer) = '{addr}' AND a.status = 'Active' ORDER BY a.id"
     ))
 }
 
@@ -847,7 +853,7 @@ pub fn tally_by_payer_sql(receiver: Option<&str>) -> Option<String> {
 // ---------------------------------------------------------------------------------------------
 
 const DEPLOYMENT_COLS: &str = "id, CAST(signalled_tokens AS VARCHAR) AS signalled_tokens, CAST(staked_tokens AS VARCHAR) AS staked_tokens, \
-     CAST(query_fees_amount AS VARCHAR) AS query_fees_amount, created_at, active_allocation_count, curator_count";
+     CAST(query_fees_amount AS VARCHAR) AS query_fees_amount, created_at, active_allocation_count, curator_count, denied_since";
 
 pub fn deployments_order_column(order_by: &str) -> &'static str {
     match order_by {

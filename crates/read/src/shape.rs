@@ -373,6 +373,7 @@ pub fn deployment(r: &Value, fees_30d: Option<&Value>) -> Value {
         "stakedTokens": s0(r, "staked_tokens"),
         "queryFeesAmount": s0(r, "query_fees_amount"),
         "createdAt": i0(r, "created_at"),
+        "deniedSince": r.get("denied_since").cloned().unwrap_or(Value::Null),
         "displayName": Value::Null,
         "categories": json!([]),
         "curatorSignals": placeholders(&id_str, i0(r, "curator_count").as_i64().unwrap_or(0)),
@@ -726,6 +727,7 @@ fn deployment_stub(r: &Value, with_stats: bool) -> Value {
     if with_stats {
         out["signalledTokens"] = s0(r, "signalled_tokens");
         out["stakedTokens"] = s0(r, "deployment_staked_tokens");
+        out["deniedSince"] = r.get("denied_since").cloned().unwrap_or(Value::Null);
     }
     out
 }
@@ -1736,6 +1738,14 @@ mod tests {
             deployment(&r, Some(&json!("42")))["queryFees30d"],
             json!("42")
         );
+    }
+
+    #[test]
+    fn deployment_denial_is_null_or_the_denial_block() {
+        let clear = deployment(&json!({"id": "0xabc", "denied_since": null}), None);
+        assert!(clear["deniedSince"].is_null());
+        let denied = deployment(&json!({"id": "0xabc", "denied_since": 508000000}), None);
+        assert_eq!(denied["deniedSince"], json!(508000000));
     }
 
     /// Locked stake is spoken for. Counting it as usable would flatter an indexer that has most of
@@ -3360,6 +3370,7 @@ mod provenance_tests {
             "id": "0xalloc-1",
             "allocated_tokens": "100",
             "created_at_epoch": 900,
+            "denied_since": 508000000,
             "subgraph_deployment":
                 "0x4d4a747d890c63f85e47b9df02a9d490284b9163cd8c23d91c956feaab063298",
         });
@@ -3379,5 +3390,14 @@ mod provenance_tests {
             assert_eq!(dep["displayName"], Value::Null);
             assert!(dep["ipfsHash"].as_str().unwrap().starts_with("Qm"));
         }
+        assert_eq!(
+            active_allocation(&row)["subgraphDeployment"]["deniedSince"],
+            json!(508000000)
+        );
+        assert!(
+            closed_allocation(&row)["subgraphDeployment"]
+                .get("deniedSince")
+                .is_none()
+        );
     }
 }
