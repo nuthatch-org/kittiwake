@@ -52,6 +52,8 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/actions/cancel", post(cancel_actions))
         .route("/rules", get(rules).post(set_rule))
         .route("/rules/delete", post(delete_rule))
+        .route("/cost-models", get(cost_models).post(set_price))
+        .route("/cost-models/delete", post(delete_cost_model))
         .fallback(|| async { err(StatusCode::NOT_FOUND, "not a Cockpit route") })
         .layer(cors)
         .with_state(state)
@@ -311,6 +313,64 @@ async fn delete_rule(
     match state.agent.delete_rule(&body.identifier).await {
         Ok(v) => {
             tracing::info!(signer = %s.signer, identifier = %body.identifier, "deleted indexing rule");
+            Json(json!({ "deleted": v })).into_response()
+        }
+        Err(e) => agent_err(e),
+    }
+}
+
+async fn cost_models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(r) = current(&state, &headers) {
+        return r.into_response();
+    }
+    match state.agent.cost_models().await {
+        Ok(v) => Json(json!({ "costModels": v })).into_response(),
+        Err(e) => agent_err(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PriceBody {
+    deployment: String,
+    price: String,
+}
+
+async fn set_price(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<PriceBody>,
+) -> Response {
+    let s = match same_origin(&state, &headers).and_then(|_| current(&state, &headers)) {
+        Ok(s) => s,
+        Err(r) => return r.into_response(),
+    };
+    match state.agent.set_price(&body.deployment, &body.price).await {
+        Ok(v) => {
+            tracing::info!(signer = %s.signer, deployment = %body.deployment, price = %body.price, "set cost model");
+            Json(json!({ "costModel": v })).into_response()
+        }
+        Err(e) => agent_err(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct DeploymentBody {
+    deployment: String,
+}
+
+async fn delete_cost_model(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<DeploymentBody>,
+) -> Response {
+    let s = match same_origin(&state, &headers).and_then(|_| current(&state, &headers)) {
+        Ok(s) => s,
+        Err(r) => return r.into_response(),
+    };
+    match state.agent.delete_cost_model(&body.deployment).await {
+        Ok(v) => {
+            tracing::info!(signer = %s.signer, deployment = %body.deployment, "deleted cost model");
             Json(json!({ "deleted": v })).into_response()
         }
         Err(e) => agent_err(e),

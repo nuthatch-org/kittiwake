@@ -272,7 +272,7 @@ async fn a_path_outside_the_allowlist_is_refused_without_touching_the_agent() {
         "/actions/delete",
         "/api/graphql",
         "/api/actions",
-        "/cost-models",
+        "/cost-models/raw",
         "/graphql",
         "/",
     ] {
@@ -615,4 +615,47 @@ async fn a_rule_write_needs_a_session_and_the_lodestar_origin() {
     let (status, _, _) = send(&app, req).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert!(agent.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_price_is_written_as_the_one_flat_model_the_gateway_reads() {
+    let (agent, app) = harness().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({
+            "variables": { "costModel": { "deployment": "global", "model": "default => 0.00004;" } }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "setCostModel": { "deployment": "global", "model": "default => 0.00004;" } }
+        })))
+        .expect(1)
+        .mount(&agent)
+        .await;
+
+    let (_, cookie) = sign_in(&app, &key(INDEXER_KEY)).await;
+    let (status, _, body) = send(
+        &app,
+        post(
+            "/cost-models",
+            json!({ "deployment": "global", "price": "0.00004" }),
+            cookie.as_deref(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["costModel"]["model"], "default => 0.00004;");
+
+    for bad in [
+        json!({ "deployment": "global", "price": "0.1; query { x } => 5" }),
+        json!({ "deployment": "global", "price": "2" }),
+        json!({ "deployment": "all", "price": "0.1" }),
+        json!({ "deployment": "global", "price": "0.1", "model": "default => 9;" }),
+    ] {
+        let (status, _, _) = send(&app, post("/cost-models", bad.clone(), cookie.as_deref())).await;
+        assert!(status.is_client_error(), "{bad} gave {status}");
+    }
+    assert_eq!(
+        agent.received_requests().await.unwrap().len(),
+        1,
+        "no refused price reaches the agent"
+    );
 }
