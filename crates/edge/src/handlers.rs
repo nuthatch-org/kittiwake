@@ -822,6 +822,26 @@ pub async fn provisions(
 }
 
 #[derive(serde::Deserialize)]
+pub struct IndexerQuery {
+    pub indexer: Option<String>,
+}
+
+pub async fn provision_detail(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<IndexerQuery>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    let Some(indexer) = q.indexer else {
+        return Err(ApiError::BadRequest("indexer is required".into()).into());
+    };
+    Ok(envelope(
+        routes::provision_detail(&st.read, &addr(&indexer)).await?,
+    ))
+}
+
+#[derive(serde::Deserialize)]
 pub struct ReceiverQuery {
     pub receiver: Option<String>,
 }

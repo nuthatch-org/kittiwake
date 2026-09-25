@@ -186,6 +186,10 @@ const SUMMARIES: &[Operation] = &[
     ),
     op("/api/provisions", "One indexer's Horizon provisions."),
     op(
+        "/api/provisions/detail",
+        "One indexer's thaw requests, fee cuts, service ranges and Horizon activity.",
+    ),
+    op(
         "/api/delegation-events",
         "Individual delegations and undelegations.",
     ),
