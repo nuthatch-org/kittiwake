@@ -2967,10 +2967,26 @@ pub async fn foghorn_get(
     foghorn_call(&st, &path, query, None).await
 }
 
-/// `POST /api/foghorn/qos/graphql`, and nothing else.
-///
-/// Deliberately narrow. GraphQL is the only POST surface Foghorn exposes, and forwarding arbitrary
-/// POSTs to an internal service is not a thing to do by accident.
+/// The Foghorn POST surfaces: oracle-compatible GraphQL, and creating or deleting an alert
+/// subscription (lodestar#256). Forwarding arbitrary POSTs to an internal service is not a thing to
+/// do by accident, so each is named.
+pub(crate) fn foghorn_post_allowed(path: &str) -> bool {
+    match path.split('/').collect::<Vec<_>>().as_slice() {
+        ["qos", "graphql"] | ["alerts", "subscriptions"] => true,
+        ["alerts", "subscriptions", id, "delete"] => uuid_shaped(id),
+        _ => false,
+    }
+}
+
+fn uuid_shaped(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
+/// `POST /api/foghorn/{*path}`, for the paths `foghorn_post_allowed` names.
 pub async fn foghorn_post(
     State(st): State<AppState>,
     Path(path): Path<String>,
@@ -2980,7 +2996,7 @@ pub async fn foghorn_post(
     body: String,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
-    if path != "qos/graphql" {
+    if !foghorn_post_allowed(&path) {
         return Err(ApiError::BadRequest("not a POST endpoint".into()).into());
     }
     foghorn_call(&st, &path, query, Some(body)).await
