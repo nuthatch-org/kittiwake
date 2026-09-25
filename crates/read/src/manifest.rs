@@ -156,6 +156,8 @@ pub struct Graft {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Analysis {
+    pub description: Option<String>,
+    pub repository: Option<String>,
     pub score: i64,
     pub category: Category,
     pub breakdown: Vec<Dimension>,
@@ -531,6 +533,8 @@ pub fn analyse(yaml: &str) -> Result<Analysis, NotAManifest> {
     );
 
     Ok(Analysis {
+        description: as_str(doc.get("description")),
+        repository: as_str(doc.get("repository")),
         score,
         category: category(score),
         breakdown,
@@ -586,6 +590,22 @@ dataSources:
         );
         assert_eq!(a.data_sources[0].event_handlers, 1);
         assert_eq!(a.data_sources[0].block_handlers, 0);
+    }
+
+    #[test]
+    fn preserves_optional_manifest_source_metadata() {
+        let a = manifest(
+            "description: Token balances\nrepository: https://github.com/example/token\ndataSources: []\n",
+        );
+        assert_eq!(a.description.as_deref(), Some("Token balances"));
+        assert_eq!(
+            a.repository.as_deref(),
+            Some("https://github.com/example/token")
+        );
+
+        let a = manifest(LIGHT);
+        assert!(a.description.is_none());
+        assert!(a.repository.is_none());
     }
 
     /// The two overrides are the whole reason the additive score is not the last word.
