@@ -51,6 +51,20 @@ const DELETE_RULES: &str =
   deleteIndexingRules(identifiers: $deployments)
 }";
 
+// indexer-cli v0.25.11 `packages/indexer-cli/src/cost.ts`. `deleteCostModels` returns `Int!` in the
+// agent schema, so this one selects no fields where indexer-cli's does.
+const COST_MODELS: &str = "query costModels($deployments: [String!]) {
+  costModels(deployments: $deployments) { deployment model }
+}";
+
+const SET_COST_MODEL: &str = "mutation setCostModel($costModel: CostModelInput!) {
+  setCostModel(costModel: $costModel) { deployment model }
+}";
+
+const DELETE_COST_MODELS: &str = "mutation deleteCostModels($deployments: [String!]!) {
+  deleteCostModels(deployments: $deployments)
+}";
+
 pub const SOURCE: &str = "lodestar-cockpit";
 const MAX_BATCH: usize = 50;
 const STATUSES: [&str; 7] = [
@@ -216,6 +230,36 @@ impl Agent {
         .await
     }
 
+    pub async fn cost_models(&self) -> Result<Value, AgentError> {
+        self.call(COST_MODELS, json!({ "deployments": null }), "costModels")
+            .await
+    }
+
+    /// Writes `default => price;` and nothing else: the gateway reads only that form, and a
+    /// free-form Agora model from the browser would be text the Cockpit cannot vouch for.
+    pub async fn set_price(&self, deployment: &str, price_grt: &str) -> Result<Value, AgentError> {
+        rule_identifier(deployment)?;
+        let price = flat_price(price_grt).ok_or_else(|| {
+            AgentError::Invalid("the price is GRT per query, a plain decimal below 1".into())
+        })?;
+        self.call(
+            SET_COST_MODEL,
+            json!({ "costModel": { "deployment": deployment, "model": format!("default => {price};") } }),
+            "setCostModel",
+        )
+        .await
+    }
+
+    pub async fn delete_cost_model(&self, deployment: &str) -> Result<Value, AgentError> {
+        rule_identifier(deployment)?;
+        self.call(
+            DELETE_COST_MODELS,
+            json!({ "deployments": [deployment] }),
+            "deleteCostModels",
+        )
+        .await
+    }
+
     pub async fn rules(&self) -> Result<Value, AgentError> {
         self.call(
             RULES,
@@ -328,6 +372,16 @@ impl RuleRequest {
         }
         Ok(input)
     }
+}
+
+/// A per-query price as the gateway parses it: a plain decimal, at most 18 places, under 1 GRT.
+fn flat_price(s: &str) -> Option<&str> {
+    let (int, frac) = s.split_once('.').unwrap_or((s, ""));
+    (int == "0"
+        && frac.len() <= 18
+        && frac.chars().all(|c| c.is_ascii_digit())
+        && (s == "0" || !frac.is_empty()))
+    .then_some(s)
 }
 
 /// Exact decimal GRT to wei, without a float in between. Zero is allowed here, unlike an
@@ -451,6 +505,27 @@ fn is_grt(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_plain_price_under_one_grt_is_written() {
+        for good in ["0", "0.00004", "0.000000000000000001", "0.5"] {
+            assert_eq!(flat_price(good), Some(good), "{good}");
+        }
+        for bad in [
+            "",
+            "1",
+            "1.0",
+            "0.",
+            ".1",
+            "4e-5",
+            "0.0000000000000000001",
+            "0.1; query { x } => 5",
+            "-0.1",
+            "00.1",
+        ] {
+            assert_eq!(flat_price(bad), None, "{bad}");
+        }
+    }
 
     #[test]
     fn grt_becomes_exact_wei() {
