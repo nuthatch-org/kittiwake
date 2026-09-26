@@ -978,7 +978,10 @@ mod tests {
         match err {
             NestError::Http { status, reason } => {
                 assert_eq!(status, 400);
-                assert_eq!(reason, "query failed: Out of Memory Error: failed to pin block");
+                assert_eq!(
+                    reason,
+                    "query failed: Out of Memory Error: failed to pin block"
+                );
             }
             other => panic!("expected Http, got {other:?}"),
         }
