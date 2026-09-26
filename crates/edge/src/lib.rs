@@ -912,7 +912,7 @@ async fn get_ready(State(st): State<AppState>) -> Response {
                 // The variant and the status, not the rendered sentence. Matching `"410"` in the
                 // message would break the day anyone rewords it, and would match a nest whose
                 // *lag* happened to contain those digits.
-                let retired = matches!(e, kittiwake_nest::NestError::Http(410));
+                let retired = matches!(e, kittiwake_nest::NestError::Http { status: 410, .. });
                 let reason = e.to_string();
                 if !nest.is_archival() && !retired {
                     all_ready = false;
@@ -2083,13 +2083,13 @@ mod readiness_tests {
     #[test]
     fn a_retired_nest_is_told_apart_from_a_broken_one() {
         use kittiwake_nest::NestError;
-        let retired = |e: &NestError| matches!(e, NestError::Http(410));
+        let retired = |e: &NestError| matches!(e, NestError::Http { status: 410, .. });
 
-        assert!(retired(&NestError::Http(410)));
+        assert!(retired(&NestError::Http { status: 410, reason: String::new() }));
 
         // Everything else is a nest that should still hold readiness down.
-        assert!(!retired(&NestError::Http(500)));
-        assert!(!retired(&NestError::Http(503)));
+        assert!(!retired(&NestError::Http { status: 500, reason: String::new() }));
+        assert!(!retired(&NestError::Http { status: 503, reason: String::new() }));
         assert!(!retired(&NestError::Timeout));
         assert!(!retired(&NestError::Transport("connection refused".into())));
         assert!(!retired(&NestError::Decode("not json".into())));

@@ -46,8 +46,8 @@ pub enum NestError {
     },
     #[error("nest did not answer within the timeout")]
     Timeout,
-    #[error("nest returned HTTP {0}")]
-    Http(u16),
+    #[error("nest returned HTTP {status}: {reason}")]
+    Http { status: u16, reason: String },
     #[error("could not decode the nest's answer: {0}")]
     Decode(String),
     #[error("could not reach the nest: {0}")]
@@ -71,11 +71,22 @@ impl From<NestError> for ApiError {
                 sealed_through,
             },
             NestError::Timeout => ApiError::NestTimeout,
-            NestError::Http(code) => ApiError::NestUpstream(code),
+            NestError::Http { status, reason } => ApiError::NestUpstream { status, reason },
             NestError::Decode(m) => ApiError::NestDecode(m),
             NestError::Transport(m) => ApiError::Unavailable(m),
         }
     }
+}
+
+/// The nest's `{"error": …}` body reduced to the sentence a caller can act on. Anything that is not
+/// that shape is passed through, trimmed: the point is that the reason reaches the alert at all.
+fn nest_reason(body: &str) -> String {
+    let text = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| body.trim().to_owned());
+    let first = text.lines().next().unwrap_or_default();
+    first.chars().take(240).collect()
 }
 
 /// The `/sql` envelope, as the nest actually sends it.
@@ -415,7 +426,9 @@ impl NestGate {
             .map_err(|_| NestError::Timeout)?
             .map_err(|e| NestError::Transport(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(NestError::Http(resp.status().as_u16()));
+            let status = resp.status().as_u16();
+            let reason = nest_reason(&resp.text().await.unwrap_or_default());
+            return Err(NestError::Http { status, reason });
         }
         let body: serde_json::Value = resp
             .json()
@@ -454,7 +467,10 @@ impl NestGate {
                 sealed_through: body.sealed_through,
             });
         }
-        Err(NestError::Http(status.as_u16()))
+        Err(NestError::Http {
+            status: status.as_u16(),
+            reason: body.explain(),
+        })
     }
 
     /// Run one query, through the gate. No caching, no coalescing: this is the raw path.
@@ -520,7 +536,14 @@ impl NestGate {
                 metrics::counter!("nest_busy_total", "nest" => spec.nest.as_str()).increment(1);
                 return Err(NestError::Busy);
             }
-            return Err(NestError::Http(status.as_u16()));
+            // The nest's own query budget ran out: the same fact as our timeout, told by the nest.
+            if status.as_u16() == 504 {
+                return Err(NestError::Timeout);
+            }
+            return Err(NestError::Http {
+                status: status.as_u16(),
+                reason: nest_reason(&body),
+            });
         }
 
         let env: SqlEnvelope = resp
@@ -911,6 +934,61 @@ mod tests {
             }
             other => panic!("expected Unready, got {other:?}"),
         }
+    }
+
+    /// The nest's query guard answers 504 when a sound query runs past its budget. That is the same
+    /// fact as our own timeout, so it is reported as one, not as an upstream fault.
+    #[tokio::test]
+    async fn a_nest_query_timeout_is_a_timeout() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sql"))
+            .respond_with(ResponseTemplate::new(504).set_body_json(serde_json::json!({
+                "error": "query exceeded the 30s time budget on the read-only SQL surface",
+                "timeout_secs": 30
+            })))
+            .mount(&server)
+            .await;
+
+        let gate = gate_for(&server, 4).await;
+        let err = gate
+            .query(&QuerySpec::read(NestId::Alloc, "SELECT 1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NestError::Timeout), "{err:?}");
+    }
+
+    /// Any other refusal keeps the nest's own sentence, so the alert built on it can say why.
+    #[tokio::test]
+    async fn an_upstream_error_carries_the_nests_reason() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sql"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "query failed: Out of Memory Error: failed to pin block\n\nhint: lower the query"
+            })))
+            .mount(&server)
+            .await;
+
+        let gate = gate_for(&server, 4).await;
+        let err = gate
+            .query(&QuerySpec::read(NestId::Alloc, "SELECT 1"))
+            .await
+            .unwrap_err();
+        match err {
+            NestError::Http { status, reason } => {
+                assert_eq!(status, 400);
+                assert_eq!(reason, "query failed: Out of Memory Error: failed to pin block");
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
+        let api: kittiwake_types::ApiError = NestError::Http {
+            status: 400,
+            reason: "query failed".into(),
+        }
+        .into();
+        assert_eq!(api.status(), 502);
+        assert_eq!(api.to_string(), "nest upstream error 400: query failed");
     }
 
     /// A frozen archive says `stalled` for ever and is right to. Alerting on it would cry wolf
