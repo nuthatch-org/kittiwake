@@ -159,8 +159,8 @@ pub enum ApiError {
     },
     #[error("nest timeout")]
     NestTimeout,
-    #[error("nest upstream error {0}")]
-    NestUpstream(u16),
+    #[error("nest upstream error {status}: {reason}")]
+    NestUpstream { status: u16, reason: String },
     #[error("nest response could not be decoded: {0}")]
     NestDecode(String),
     #[error("rate limited")]
@@ -184,7 +184,7 @@ impl ApiError {
             // and it is retryable — so 503 with a Retry-After rather than 500.
             ApiError::NestBusy { .. } | ApiError::NestUnready { .. } => 503,
             ApiError::NestTimeout => 504,
-            ApiError::NestUpstream(_) | ApiError::NestDecode(_) => 502,
+            ApiError::NestUpstream { .. } | ApiError::NestDecode(_) => 502,
             ApiError::RateLimited { .. } => 429,
             ApiError::BadRequest(_) => 400,
             ApiError::NotFound => 404,
@@ -200,7 +200,7 @@ impl ApiError {
             ApiError::NestBusy { .. } => "nest_busy",
             ApiError::NestUnready { .. } => "nest_unready",
             ApiError::NestTimeout => "nest_timeout",
-            ApiError::NestUpstream(_) => "nest_upstream",
+            ApiError::NestUpstream { .. } => "nest_upstream",
             ApiError::NestDecode(_) => "nest_decode",
             ApiError::RateLimited { .. } => "rate_limited",
             ApiError::BadRequest(_) => "bad_request",

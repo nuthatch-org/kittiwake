@@ -240,20 +240,35 @@ pub fn delegator_stakes_sql(addr: &str, first: i64, active_only: bool) -> Option
         return None;
     }
     let first = clamp(first, 1, 1000);
-    let active = if active_only { " AND s.active" } else { "" };
+    let active = if active_only { " AND p.active" } else { "" };
+    // `lodestar_delegator_positions` rather than `lodestar_delegator_stakes`: the stakes view joins
+    // the whole delegation pool for `staked_tokens`, and DuckDB pushes no filter into the right side
+    // of a LEFT JOIN, so one delegator paid the pool fold and the indexers fold both (21 s on
+    // 2026-09-26). The indexers row carries the same two pool figures, so the worth of the shares is
+    // computed here with the view's own formula, and only the indexers fold remains (8.6 s).
     Some(format!(
-        "SELECT s.id, s.indexer, CAST(s.total_delegated_tokens AS VARCHAR) AS staked_tokens, \
-         CAST(s.staked_tokens AS VARCHAR) AS current_tokens, CAST(s.share_amount AS VARCHAR) AS share_amount, \
-         CAST(s.locked_tokens AS VARCHAR) AS locked_tokens, s.locked_until, \
-         CAST(s.realized_rewards AS VARCHAR) AS realized_rewards, \
-         CAST(s.total_undelegated_tokens AS VARCHAR) AS unstaked_tokens, s.created_at, s.last_undelegated_at, s.active, \
-         CAST(i.staked_tokens AS VARCHAR) AS indexer_staked_tokens, \
-         CAST(i.delegated_tokens AS VARCHAR) AS indexer_delegated_tokens, \
-         CAST(i.delegated_thawing_tokens AS VARCHAR) AS indexer_delegated_thawing_tokens, \
-         CAST(i.delegator_shares AS VARCHAR) AS indexer_delegator_shares, \
+        "WITH s AS (SELECT p.id, p.indexer, p.total_delegated_tokens, p.share_amount, p.locked_tokens, p.locked_until, \
+         p.realized_rewards, p.total_undelegated_tokens, p.created_at, p.last_undelegated_at, p.active, \
+         CASE WHEN i.delegator_shares > 0 \
+              THEN (p.share_amount // i.delegator_shares) * i.delegated_tokens \
+                   + CAST(CAST(p.share_amount % i.delegator_shares AS DOUBLE) * CAST(i.delegated_tokens AS DOUBLE) / CAST(i.delegator_shares AS DOUBLE) AS HUGEINT) \
+              ELSE 0 END AS staked_tokens, \
+         i.staked_tokens AS indexer_staked_tokens, i.delegated_tokens AS indexer_delegated_tokens, \
+         i.delegated_thawing_tokens AS indexer_delegated_thawing_tokens, i.delegator_shares AS indexer_delegator_shares, \
          i.indexing_reward_cut, i.query_fee_cut, i.allocation_count, i.url, i.geohash \
-         FROM lodestar_delegator_stakes s LEFT JOIN lodestar_indexers i ON i.id = s.indexer \
-         WHERE s.delegator = '{addr}'{active} ORDER BY s.staked_tokens DESC, s.indexer LIMIT {first}"
+         FROM lodestar_delegator_positions p LEFT JOIN lodestar_indexers i ON i.id = p.indexer \
+         WHERE p.delegator = '{addr}'{active}) \
+         SELECT id, indexer, CAST(total_delegated_tokens AS VARCHAR) AS staked_tokens, \
+         CAST(staked_tokens AS VARCHAR) AS current_tokens, CAST(share_amount AS VARCHAR) AS share_amount, \
+         CAST(locked_tokens AS VARCHAR) AS locked_tokens, locked_until, \
+         CAST(realized_rewards AS VARCHAR) AS realized_rewards, \
+         CAST(total_undelegated_tokens AS VARCHAR) AS unstaked_tokens, created_at, last_undelegated_at, active, \
+         CAST(indexer_staked_tokens AS VARCHAR) AS indexer_staked_tokens, \
+         CAST(indexer_delegated_tokens AS VARCHAR) AS indexer_delegated_tokens, \
+         CAST(indexer_delegated_thawing_tokens AS VARCHAR) AS indexer_delegated_thawing_tokens, \
+         CAST(indexer_delegator_shares AS VARCHAR) AS indexer_delegator_shares, \
+         indexing_reward_cut, query_fee_cut, allocation_count, url, geohash \
+         FROM s ORDER BY staked_tokens DESC, indexer LIMIT {first}"
     ))
 }
 
