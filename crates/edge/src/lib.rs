@@ -2085,11 +2085,20 @@ mod readiness_tests {
         use kittiwake_nest::NestError;
         let retired = |e: &NestError| matches!(e, NestError::Http { status: 410, .. });
 
-        assert!(retired(&NestError::Http { status: 410, reason: String::new() }));
+        assert!(retired(&NestError::Http {
+            status: 410,
+            reason: String::new()
+        }));
 
         // Everything else is a nest that should still hold readiness down.
-        assert!(!retired(&NestError::Http { status: 500, reason: String::new() }));
-        assert!(!retired(&NestError::Http { status: 503, reason: String::new() }));
+        assert!(!retired(&NestError::Http {
+            status: 500,
+            reason: String::new()
+        }));
+        assert!(!retired(&NestError::Http {
+            status: 503,
+            reason: String::new()
+        }));
         assert!(!retired(&NestError::Timeout));
         assert!(!retired(&NestError::Transport("connection refused".into())));
         assert!(!retired(&NestError::Decode("not json".into())));
