@@ -1054,11 +1054,15 @@ pub const LEGACY_HISTORY_END_EXCLUSIVE: i64 = 1_787_555_748;
 ///
 /// `legacy` picks the schema: the frozen archive carries both the pre-Horizon `staking_legacy__`
 /// tables and the Horizon ones, while the live nest has only the latter.
+///
+/// The cast is from `tokens`, the exact text, not from `tokens_dec`: `_dec` is NULL past 38 digits,
+/// so a sum over it would drop those rows without a word, which is why Burrmill refuses to sum a
+/// `TRY_CAST` value (nuthatch shadow replay, 2026-09-27). A `DOUBLE` reads the text whole.
 pub fn daily_flow_sql(start: i64, end: i64, legacy: bool) -> String {
     let events = if legacy {
-        "SELECT block_timestamp, CAST(tokens_dec AS DOUBLE) / 1e18 AS tokens, 'inflow' AS direction          FROM staking_legacy__stake_delegated          UNION ALL SELECT block_timestamp, CAST(tokens_dec AS DOUBLE) / 1e18, 'outflow'          FROM staking_legacy__stake_delegated_locked          UNION ALL SELECT block_timestamp, CAST(tokens_dec AS DOUBLE) / 1e18, 'inflow'          FROM staking__tokens_delegated          UNION ALL SELECT block_timestamp, CAST(tokens_dec AS DOUBLE) / 1e18, 'outflow'          FROM staking__tokens_undelegated"
+        "SELECT block_timestamp, CAST(tokens AS DOUBLE) / 1e18 AS tokens, 'inflow' AS direction          FROM staking_legacy__stake_delegated          UNION ALL SELECT block_timestamp, CAST(tokens AS DOUBLE) / 1e18, 'outflow'          FROM staking_legacy__stake_delegated_locked          UNION ALL SELECT block_timestamp, CAST(tokens AS DOUBLE) / 1e18, 'inflow'          FROM staking__tokens_delegated          UNION ALL SELECT block_timestamp, CAST(tokens AS DOUBLE) / 1e18, 'outflow'          FROM staking__tokens_undelegated"
     } else {
-        "SELECT block_timestamp, CAST(tokens_dec AS DOUBLE) / 1e18 AS tokens, 'inflow' AS direction          FROM staking__tokens_delegated          UNION ALL SELECT block_timestamp, CAST(tokens_dec AS DOUBLE) / 1e18, 'outflow'          FROM staking__tokens_undelegated"
+        "SELECT block_timestamp, CAST(tokens AS DOUBLE) / 1e18 AS tokens, 'inflow' AS direction          FROM staking__tokens_delegated          UNION ALL SELECT block_timestamp, CAST(tokens AS DOUBLE) / 1e18, 'outflow'          FROM staking__tokens_undelegated"
     };
     format!(
         "WITH events AS ({events})          SELECT strftime(to_timestamp(block_timestamp), '%Y-%m-%d') AS date,          SUM(CASE WHEN direction = 'inflow' THEN tokens ELSE 0 END) AS inflows,          SUM(CASE WHEN direction = 'outflow' THEN tokens ELSE 0 END) AS outflows          FROM events WHERE block_timestamp >= {start} AND block_timestamp < {end}          GROUP BY 1 ORDER BY 1"
