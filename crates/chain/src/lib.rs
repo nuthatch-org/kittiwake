@@ -5,6 +5,7 @@
 //! other. So these values carry no nest provenance and are cached briefly rather than folded, and
 //! a failed read is reported rather than replaced with the last known answer.
 
+mod metered;
 pub mod registry;
 pub mod tap;
 
@@ -13,7 +14,7 @@ use std::time::Duration;
 
 use alloy::ens::{EnsError, ProviderEnsExt, namehash};
 use alloy::primitives::{Address, B256, U256};
-use alloy::providers::{MulticallBuilder, MulticallItem, Provider, ProviderBuilder};
+use alloy::providers::{MulticallBuilder, MulticallItem, Provider};
 use alloy::sol;
 use kittiwake_types::ApiError;
 
@@ -234,19 +235,19 @@ impl Chain {
         }
     }
 
-    fn arb(&self) -> Result<impl Provider + Clone, ApiError> {
+    fn arb(&self, op: &'static str) -> Result<impl Provider + Clone, ApiError> {
         let url = self
             .arbitrum
             .parse()
             .map_err(|_| ApiError::Internal(format!("bad arbitrum rpc url: {}", self.arbitrum)))?;
-        Ok(ProviderBuilder::new().connect_http(url))
+        Ok(metered::connect(url, "arbitrum", op))
     }
 
     /// The oracle's network-wide state. Read once per refresh, not once per indexer.
     pub async fn oracle_context(&self) -> Result<OracleContext, ApiError> {
         let oracle = IRewardsEligibilityOracle::new(
             Address::from_str(REO_ADDRESS).expect("REO address is a constant"),
-            self.arb()?,
+            self.arb("oracle_context")?,
         );
         let c_period = oracle.getEligibilityPeriod();
         let c_enforced = oracle.getEligibilityValidation();
@@ -279,7 +280,7 @@ impl Chain {
         &self,
         indexers: &[String],
     ) -> Result<Vec<Option<bool>>, ApiError> {
-        let provider = self.arb()?;
+        let provider = self.arb("eligibility_batch")?;
         let oracle = IRewardsEligibilityOracle::new(
             Address::from_str(REO_ADDRESS).expect("REO address is a constant"),
             &provider,
@@ -315,7 +316,7 @@ impl Chain {
             .map_err(|_| ApiError::BadRequest(format!("not an address: {indexer}")))?;
         let oracle = IRewardsEligibilityOracle::new(
             Address::from_str(REO_ADDRESS).expect("REO address is a constant"),
-            self.arb()?,
+            self.arb("eligibility")?,
         );
 
         let c_eligible = oracle.isEligible(addr);
@@ -348,16 +349,16 @@ impl Chain {
     /// A string rather than a number on purpose: the supply exceeds what an f64 holds exactly, and
     /// a total supply that is subtly wrong is worse than one that is missing.
     pub async fn grt_total_supply(&self, chain: SupplyChain) -> Result<String, ApiError> {
-        let (token, urls) = match chain {
-            SupplyChain::Arbitrum => (GRT_ARBITRUM, vec![self.arbitrum.clone()]),
-            SupplyChain::Mainnet => (GRT_MAINNET, self.mainnet.clone()),
+        let (token, urls, label) = match chain {
+            SupplyChain::Arbitrum => (GRT_ARBITRUM, vec![self.arbitrum.clone()], "arbitrum"),
+            SupplyChain::Mainnet => (GRT_MAINNET, self.mainnet.clone(), "mainnet"),
         };
         let token = Address::from_str(token).expect("token address is a constant");
 
         let mut last: Option<String> = None;
         for url in urls {
             let Ok(parsed) = url.parse() else { continue };
-            let provider = ProviderBuilder::new().connect_http(parsed);
+            let provider = metered::connect(parsed, label, "grt_total_supply");
             let erc20 = IERC20::new(token, provider);
             match tokio::time::timeout(Duration::from_secs(10), erc20.totalSupply().call()).await {
                 Ok(Ok(v)) => return Ok(v.to_string()),
@@ -393,7 +394,7 @@ impl Chain {
         let mut last = String::from("no mainnet endpoint configured");
         for url in &self.mainnet {
             let Ok(parsed) = url.parse() else { continue };
-            let provider = ProviderBuilder::new().connect_http(parsed);
+            let provider = metered::connect(parsed, "mainnet", "ens_address");
             // The registry first: the Universal Resolver reverts on an unregistered name, and a
             // public RPC reports that revert as the same -32603 it uses for its own failures.
             let lookup = async {
@@ -417,7 +418,7 @@ impl Chain {
         let mut last = String::from("no mainnet endpoint configured");
         for url in &self.mainnet {
             let Ok(parsed) = url.parse() else { continue };
-            let provider = ProviderBuilder::new().connect_http(parsed);
+            let provider = metered::connect(parsed, "mainnet", "ens_name");
             let lookup = async {
                 let name = provider.lookup_address(&address).await?;
                 let forward = provider.resolve_name(&name).await?;
@@ -458,7 +459,7 @@ impl Chain {
             let Ok(parsed) = url.parse() else { continue };
             let registry = IEnsRegistry::new(
                 alloy::ens::ENS_ADDRESS,
-                ProviderBuilder::new().connect_http(parsed),
+                metered::connect(parsed, "mainnet", "verified_default_name"),
             );
             let owner = registry.owner(node);
             match tokio::time::timeout(Duration::from_secs(10), owner.call()).await {
@@ -484,7 +485,7 @@ impl Chain {
             let mut last = String::from("none configured");
             for url in &self.mainnet {
                 let Ok(parsed) = url.parse() else { continue };
-                let provider = ProviderBuilder::new().connect_http(parsed);
+                let provider = metered::connect(parsed, "mainnet", "grt_supply_breakdown");
                 let erc20 = IERC20::new(token_l1, provider);
                 let c_supply = erc20.totalSupply();
                 let c_balance = erc20.balanceOf(escrow);
@@ -538,8 +539,7 @@ impl Chain {
     ///
     /// `None` when the call reverts, which is what an indexer with no provision looks like.
     pub async fn delegation_pool(&self, indexer: &str) -> Option<(f64, f64)> {
-        let provider =
-            alloy::providers::ProviderBuilder::new().connect_http(self.arbitrum.parse().ok()?);
+        let provider = metered::connect(self.arbitrum.parse().ok()?, "arbitrum", "delegation_pool");
         let staking: alloy::primitives::Address = HORIZON_STAKING.parse().ok()?;
         let verifier: alloy::primitives::Address = SUBGRAPH_SERVICE.parse().ok()?;
         let who: alloy::primitives::Address = indexer.parse().ok()?;
@@ -570,7 +570,7 @@ impl Chain {
     ) -> Result<bool, ApiError> {
         let staking = Address::from_str(HORIZON_STAKING).expect("staking address is a constant");
         let verifier = Address::from_str(SUBGRAPH_SERVICE).expect("verifier is a constant");
-        let c = IHorizonStaking::new(staking, self.arb()?);
+        let c = IHorizonStaking::new(staking, self.arb("is_subgraph_service_operator")?);
         match tokio::time::timeout(
             Duration::from_secs(10),
             c.isAuthorized(indexer, verifier, operator).call(),
@@ -594,7 +594,7 @@ impl Chain {
     pub async fn bounty(&self, board: &str, id: u64) -> Result<ChainBounty, ApiError> {
         let addr = Address::from_str(board.trim())
             .map_err(|_| ApiError::Internal(format!("bad bounty board address: {board}")))?;
-        let c = IBountyBoard::new(addr, self.arb()?);
+        let c = IBountyBoard::new(addr, self.arb("bounty")?);
         let b = tokio::time::timeout(Duration::from_secs(8), c.getBounty(U256::from(id)).call())
             .await
             .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
@@ -619,7 +619,7 @@ impl Chain {
             .map(|a| Address::from_str(a))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| ApiError::BadRequest("not an allocation address".into()))?;
-        let provider = self.arb()?;
+        let provider = self.arb("pending_rewards")?;
         let block = tokio::time::timeout(Duration::from_secs(8), provider.get_block_number())
             .await
             .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
@@ -664,7 +664,7 @@ impl Chain {
             .map(|s| Address::from_str(s))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| ApiError::BadRequest("not a data service address".into()))?;
-        let provider = self.arb()?;
+        let provider = self.arb("horizon_provisions")?;
         let block = tokio::time::timeout(Duration::from_secs(8), provider.get_block_number())
             .await
             .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
@@ -781,7 +781,7 @@ impl Chain {
     }
 
     pub async fn block_number(&self) -> Result<u64, ApiError> {
-        let provider = self.arb()?;
+        let provider = self.arb("block_number")?;
         tokio::time::timeout(Duration::from_secs(8), provider.get_block_number())
             .await
             .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?

@@ -6,7 +6,7 @@
 use std::str::FromStr;
 
 use alloy::primitives::{Address, U256};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::Provider;
 use alloy::sol;
 use kittiwake_types::ApiError;
 
@@ -40,7 +40,10 @@ impl super::Chain {
     pub async fn provision_ranges(&self, address: &str) -> Option<ProvisionRanges> {
         let address = Address::from_str(address).ok()?;
         let parsed = self.arbitrum.parse().ok()?;
-        let contract = IDataService::new(address, ProviderBuilder::new().connect_http(parsed));
+        let contract = IDataService::new(
+            address,
+            crate::metered::connect(parsed, "arbitrum", "provision_ranges"),
+        );
 
         let (tokens_call, thawing_call, cut_call) = (
             contract.getProvisionTokensRange(),
@@ -132,7 +135,7 @@ impl super::Chain {
             .arbitrum
             .parse()
             .map_err(|_| ApiError::Unavailable("the Arbitrum endpoint is not a URL".into()))?;
-        let provider = ProviderBuilder::new().connect_http(parsed);
+        let provider = crate::metered::connect(parsed, "arbitrum", "preflight_reads");
 
         let staking = IHorizonStaking::new(
             Address::from_str(HORIZON_STAKING).expect("constant"),
