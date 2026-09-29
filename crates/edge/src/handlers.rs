@@ -3481,6 +3481,18 @@ async fn probe_provider(provider: &census::Provider, kind: census::Probe) -> cen
     out
 }
 
+async fn registry_events(
+    gate: &kittiwake_nest::NestGate,
+    service: &census::Service,
+) -> Result<Vec<census::RegistryEvent>, String> {
+    let spec = kittiwake_nest::QuerySpec::read(
+        kittiwake_types::NestId::Services,
+        census::registry_sql(service),
+    );
+    let answer = gate.query(&spec).await.map_err(|e| e.to_string())?;
+    census::registry_events(&answer.rows)
+}
+
 /// `GET /api/service-census`: registry versus reality across every data service.
 ///
 /// One service failing does not fail the census. A census returning nothing because one RPC call
@@ -3496,6 +3508,7 @@ pub async fn service_census(
             "no Arbitrum RPC is configured, so no registry can be read".into(),
         ))
     })?;
+    let gate = st.read.gate.clone();
 
     let read = st
         .read
@@ -3505,21 +3518,12 @@ pub async fn service_census(
             kittiwake_types::ServedFrom::Chain,
             std::sync::Arc::new(move || {
                 let chain = chain.clone();
+                let gate = gate.clone();
                 Box::pin(async move {
                     let mut services = Vec::new();
                     for service in census::SERVICES {
-                        services.push(match chain.provider_registry(service.address).await {
-                            Ok(logs) => {
-                                let events: Vec<census::RegistryEvent> = logs
-                                    .into_iter()
-                                    .map(|l| census::RegistryEvent {
-                                        provider: l.provider,
-                                        endpoint: l.endpoint,
-                                        block_number: l.block_number,
-                                        log_index: l.log_index,
-                                        registered: l.registered,
-                                    })
-                                    .collect();
+                        services.push(match registry_events(&gate, service).await {
+                            Ok(events) => {
                                 let mut probes = Vec::new();
                                 for provider in census::current_providers(&events) {
                                     probes.push(probe_provider(&provider, service.probe).await);
@@ -3548,7 +3552,7 @@ pub async fn service_census(
                                 lying: 0,
                                 providers: Vec::new(),
                                 requirements: None,
-                                error: Some(e.to_string()),
+                                error: Some(e),
                             },
                         });
                     }
@@ -3634,22 +3638,10 @@ pub async fn operator_preflight(
     });
     // Whether the registry lists this address. Read here rather than taken from the census cache,
     // so a preflight is never answered from a picture of the registry that has since moved.
-    let registered = match chain.provider_registry(service.address).await {
-        Ok(logs) => {
-            let events: Vec<census::RegistryEvent> = logs
-                .into_iter()
-                .map(|l| census::RegistryEvent {
-                    provider: l.provider,
-                    endpoint: l.endpoint,
-                    block_number: l.block_number,
-                    log_index: l.log_index,
-                    registered: l.registered,
-                })
-                .collect();
-            census::current_providers(&events)
-                .iter()
-                .any(|p| p.address == address)
-        }
+    let registered = match registry_events(&st.read.gate, service).await {
+        Ok(events) => census::current_providers(&events)
+            .iter()
+            .any(|p| p.address == address),
         Err(_) => false,
     };
 

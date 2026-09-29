@@ -32,6 +32,8 @@ pub struct Service {
     pub id: &'static str,
     pub name: &'static str,
     pub address: &'static str,
+    /// Table prefix in data-services-nest: `{table}__provider_registered`.
+    pub table: &'static str,
     pub probe: Probe,
 }
 
@@ -43,30 +45,35 @@ pub const SERVICES: &[Service] = &[
         id: "dispatch",
         name: "Dispatch",
         address: "0x7101d5c1a5c89c3647f5118da118e56c023ba0b9",
+        table: "dispatch",
         probe: Probe::JsonRpc,
     },
     Service {
         id: "seahorn",
         name: "Seahorn",
         address: "0xdDE3F913cb6D1332Bc018Eb63647020a87dD7B37",
+        table: "seahorn",
         probe: Probe::Http,
     },
     Service {
         id: "sdsce",
         name: "SDSCE",
         address: "0x1c3e9cca124ad19b9ed3c202d2e6cd106944640c",
+        table: "sdsce",
         probe: Probe::Http,
     },
     Service {
         id: "nuthatch-data-service",
         name: "Nuthatch Data Service",
         address: "0x647D1Fd14AF2DE3947522B74F1de5B99d317c10A",
+        table: "nuthatch_data_service",
         probe: Probe::Paywall,
     },
     Service {
         id: "mainline-firehose",
         name: "Mainline",
         address: "0x12C722149804a8C1Bb5924374e675956315B4456",
+        table: "mainline",
         probe: Probe::Http,
     },
 ];
@@ -83,6 +90,47 @@ pub struct RegistryEvent {
     pub block_number: u64,
     pub log_index: u64,
     pub registered: bool,
+}
+
+/// Every registration and deregistration `service` has emitted, from data-services-nest.
+///
+/// Read from a nest because the chain read was one `getLogs` from block 0, which only Alchemy served.
+pub fn registry_sql(service: &Service) -> String {
+    let t = service.table;
+    format!(
+        "SELECT provider, endpoint, block_number, log_index, true AS registered \
+         FROM {t}__provider_registered \
+         UNION ALL \
+         SELECT provider, NULL AS endpoint, block_number, log_index, false AS registered \
+         FROM {t}__provider_deregistered"
+    )
+}
+
+/// The rows [`registry_sql`] returns. A row missing a field fails the whole read rather than being
+/// skipped, because a dropped deregistration would report a departed provider as present.
+pub fn registry_events(rows: &[serde_json::Value]) -> Result<Vec<RegistryEvent>, String> {
+    let int = |row: &serde_json::Value, key: &str| {
+        let v = &row[key];
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            .ok_or_else(|| format!("registry row has no integer {key}: {row}"))
+    };
+    rows.iter()
+        .map(|row| {
+            Ok(RegistryEvent {
+                provider: row["provider"]
+                    .as_str()
+                    .ok_or_else(|| format!("registry row has no provider: {row}"))?
+                    .to_lowercase(),
+                endpoint: row["endpoint"].as_str().map(str::to_string),
+                block_number: int(row, "block_number")?,
+                log_index: int(row, "log_index")?,
+                registered: row["registered"]
+                    .as_bool()
+                    .ok_or_else(|| format!("registry row has no registered flag: {row}"))?,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -491,7 +539,59 @@ mod tests {
         let ids: std::collections::BTreeSet<&str> = SERVICES.iter().map(|s| s.id).collect();
         let addresses: std::collections::BTreeSet<String> =
             SERVICES.iter().map(|s| s.address.to_lowercase()).collect();
+        let tables: std::collections::BTreeSet<&str> = SERVICES.iter().map(|s| s.table).collect();
         assert_eq!(ids.len(), SERVICES.len());
         assert_eq!(addresses.len(), SERVICES.len());
+        assert_eq!(tables.len(), SERVICES.len());
+    }
+
+    #[test]
+    fn the_registry_query_reads_both_of_the_services_own_tables() {
+        let sql = registry_sql(&SERVICES[0]);
+        assert!(sql.contains("FROM dispatch__provider_registered"), "{sql}");
+        assert!(
+            sql.contains("FROM dispatch__provider_deregistered"),
+            "{sql}"
+        );
+    }
+
+    /// Dispatch's real history as data-services-nest returns it: deregistered at 456,950,409 and
+    /// registered again ten blocks later, with the nest's integers arriving as strings.
+    #[test]
+    fn nest_rows_fold_into_the_same_providers_the_chain_read_gave() {
+        let rows = vec![
+            serde_json::json!({"provider": "0xAA", "endpoint": "https://a", "block_number": "456917519", "log_index": "3", "registered": true}),
+            serde_json::json!({"provider": "0xbb", "endpoint": "https://b", "block_number": 456940000, "log_index": 1, "registered": true}),
+            serde_json::json!({"provider": "0xaa", "endpoint": null, "block_number": 456950409, "log_index": 0, "registered": false}),
+            serde_json::json!({"provider": "0xaa", "endpoint": "https://a2", "block_number": 456950419, "log_index": 0, "registered": true}),
+        ];
+        let providers = current_providers(&registry_events(&rows).unwrap());
+        assert_eq!(
+            providers,
+            vec![
+                Provider {
+                    address: "0xaa".into(),
+                    endpoint: "https://a2".into()
+                },
+                Provider {
+                    address: "0xbb".into(),
+                    endpoint: "https://b".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_registry_row_missing_a_field_fails_the_read() {
+        for row in [
+            serde_json::json!({"endpoint": null, "block_number": 1, "log_index": 0, "registered": false}),
+            serde_json::json!({"provider": "0xaa", "block_number": 1, "registered": false}),
+            serde_json::json!({"provider": "0xaa", "block_number": 1, "log_index": 0}),
+        ] {
+            assert!(
+                registry_events(std::slice::from_ref(&row)).is_err(),
+                "accepted {row}"
+            );
+        }
     }
 }

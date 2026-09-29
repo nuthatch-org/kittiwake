@@ -22,6 +22,8 @@ pub enum NestId {
     LegacyFlows,
     /// `/qos` — qos-reo-nest on Gnosis, Edge & Node's QoS oracle read from its own postings.
     Qos,
+    /// `/services` - data-services-nest: provider registrations for the census services.
+    Services,
 }
 
 impl NestId {
@@ -35,6 +37,7 @@ impl NestId {
             NestId::DipsSepolia => "/dips-sepolia",
             NestId::LegacyFlows => "/legacy-flows",
             NestId::Qos => "/qos",
+            NestId::Services => "/services",
         }
     }
 
@@ -53,16 +56,18 @@ impl NestId {
             NestId::DipsSepolia => "dips-sepolia",
             NestId::LegacyFlows => "legacy-flows",
             NestId::Qos => "qos",
+            NestId::Services => "services",
         }
     }
 
-    pub const ALL: [NestId; 6] = [
+    pub const ALL: [NestId; 7] = [
         NestId::Alloc,
         NestId::Gns,
         NestId::Dips,
         NestId::DipsSepolia,
         NestId::LegacyFlows,
         NestId::Qos,
+        NestId::Services,
     ];
 }
 
