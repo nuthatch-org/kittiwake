@@ -9,7 +9,12 @@ use std::time::Duration;
 
 use kittiwake_types::ApiError;
 
-const COINGECKO: &str = "https://api.coingecko.com/api/v3/simple/price?ids=the-graph&vs_currencies=usd&include_24hr_change=true";
+/// DefiLlama's coins API, keyed by CoinGecko id. CoinGecko itself was the source until
+/// 2026-09-29, when its CDN began answering every request from a server address with a 403
+/// "Request blocked" page: not a rate limit, a refusal, and one no retry gets past. DefiLlama was
+/// already the TVL source, answers from the same box, and needs no key.
+const PRICE_BASE: &str = "https://coins.llama.fi";
+const GRT: &str = "coingecko:the-graph";
 const DEFILLAMA: &str = "https://api.llama.fi/v2/historicalChainTvl/Arbitrum";
 
 /// The whole graph-support archive in one request.
@@ -43,7 +48,8 @@ const GRAPH_SUPPORT_TEMPLATES: &str =
 #[derive(Clone)]
 pub struct Ext {
     pub(crate) http: reqwest::Client,
-    /// Overridable so the tests can point at a stand-in rather than the live API.
+    /// Base of the coins API. Overridable so the tests can point at a stand-in rather than the
+    /// live API.
     price_url: String,
     tvl_url: String,
     graph_support_url: String,
@@ -53,7 +59,7 @@ pub struct Ext {
 
 impl Default for Ext {
     fn default() -> Self {
-        Self::new(COINGECKO, DEFILLAMA)
+        Self::new(PRICE_BASE, DEFILLAMA)
     }
 }
 
@@ -76,10 +82,15 @@ impl Ext {
     }
 
     /// The GRT price in USD, and the 24-hour change if the source gave one.
+    ///
+    /// Two requests: DefiLlama serves the price and the change from separate endpoints. The price
+    /// is the figure; if it fails the whole call fails. The change is a decoration on it, so a
+    /// failed change request is `None` rather than a failed price.
     pub async fn grt_price(&self) -> Result<(f64, Option<f64>), ApiError> {
+        let base = self.price_url.trim_end_matches('/');
         let body: serde_json::Value = self
             .http
-            .get(&self.price_url)
+            .get(format!("{base}/prices/current/{GRT}"))
             .send()
             .await
             .map_err(|e| ApiError::Unavailable(format!("price source: {e}")))?
@@ -89,14 +100,29 @@ impl Ext {
             .await
             .map_err(|e| ApiError::Unavailable(format!("price source: {e}")))?;
 
-        let node = body.get("the-graph").ok_or_else(|| {
+        let node = body.pointer(&format!("/coins/{GRT}")).ok_or_else(|| {
             ApiError::Unavailable("price source answered without a the-graph entry".into())
         })?;
-        let usd = node.get("usd").and_then(|v| v.as_f64()).ok_or_else(|| {
+        let usd = node.get("price").and_then(|v| v.as_f64()).ok_or_else(|| {
             ApiError::Unavailable("price source answered without a usd price".into())
         })?;
-        let change = node.get("usd_24h_change").and_then(|v| v.as_f64());
-        Ok((usd, change))
+        Ok((usd, self.grt_change(base).await))
+    }
+
+    async fn grt_change(&self, base: &str) -> Option<f64> {
+        let body: serde_json::Value = self
+            .http
+            .get(format!("{base}/percentage/{GRT}"))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        body.pointer(&format!("/coins/{GRT}"))
+            .and_then(|v| v.as_f64())
     }
 
     /// The newest Arbitrum TVL point. The series is returned oldest-first, so the answer is the
@@ -444,29 +470,73 @@ mod tests {
     async fn a_price_is_read_with_its_change() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/price"))
+            .and(path("/prices/current/coingecko:the-graph"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "the-graph": {"usd": 0.0871, "usd_24h_change": -2.4}
+                "coins": {"coingecko:the-graph": {"price": 0.0871, "symbol": "GRT", "confidence": 0.99}}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/percentage/coingecko:the-graph"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "coins": {"coingecko:the-graph": -2.4}
             })))
             .mount(&server)
             .await;
 
-        let ext = Ext::new(format!("{}/price", server.uri()), "unused");
+        let ext = Ext::new(server.uri(), "unused");
         let (usd, change) = ext.grt_price().await.unwrap();
         assert_eq!(usd, 0.0871);
         assert_eq!(change, Some(-2.4));
+    }
+
+    /// The change is a decoration. Losing it must not cost the price.
+    #[tokio::test]
+    async fn a_missing_change_leaves_the_price_standing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/prices/current/coingecko:the-graph"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "coins": {"coingecko:the-graph": {"price": 0.0307}}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/percentage/coingecko:the-graph"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let ext = Ext::new(server.uri(), "unused");
+        assert_eq!(ext.grt_price().await.unwrap(), (0.0307, None));
+    }
+
+    /// The failure that prompted the move: a CDN refusal is a failure, reported as one.
+    #[tokio::test]
+    async fn a_refused_price_request_is_a_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/prices/current/coingecko:the-graph"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let ext = Ext::new(server.uri(), "unused");
+        assert!(ext.grt_price().await.is_err());
     }
 
     #[tokio::test]
     async fn a_price_source_that_answers_without_a_price_is_a_failure_not_a_zero() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/price"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .and(path("/prices/current/coingecko:the-graph"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"coins": {}})),
+            )
             .mount(&server)
             .await;
 
-        let ext = Ext::new(format!("{}/price", server.uri()), "unused");
+        let ext = Ext::new(server.uri(), "unused");
         assert!(
             ext.grt_price().await.is_err(),
             "an empty answer must not become 0.0"
