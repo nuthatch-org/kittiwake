@@ -271,19 +271,41 @@ impl Chain {
         })
     }
 
-    /// Is this one indexer eligible? One call, which is what makes a whole-directory pass affordable.
-    pub async fn is_eligible(&self, indexer: &str) -> Result<bool, ApiError> {
-        let addr = Address::from_str(indexer)
-            .map_err(|_| ApiError::BadRequest(format!("not an address: {indexer}")))?;
+    /// Every indexer's verdict, in the order given, `PENDING_REWARDS_BATCH` to an `aggregate3`.
+    ///
+    /// One `eth_call` per indexer was 21 calls a minute from the five-minute refresh alone. A reverted
+    /// read or an unparseable address is `None` for that indexer and costs no other verdict.
+    pub async fn eligibility_batch(
+        &self,
+        indexers: &[String],
+    ) -> Result<Vec<Option<bool>>, ApiError> {
+        let provider = self.arb()?;
         let oracle = IRewardsEligibilityOracle::new(
             Address::from_str(REO_ADDRESS).expect("REO address is a constant"),
-            self.arb()?,
+            &provider,
         );
-        oracle
-            .isEligible(addr)
-            .call()
-            .await
-            .map_err(|e| ApiError::Unavailable(format!("oracle: {e}")))
+        let parsed: Vec<(usize, Address)> = indexers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| Address::from_str(s).ok().map(|a| (i, a)))
+            .collect();
+
+        let mut out = vec![None; indexers.len()];
+        for batch in parsed.chunks(PENDING_REWARDS_BATCH) {
+            let multicall = MulticallBuilder::new_dynamic(&provider).extend_calls(
+                batch
+                    .iter()
+                    .map(|(_, a)| oracle.isEligible(*a).into_call(true)),
+            );
+            let results = tokio::time::timeout(Duration::from_secs(20), multicall.aggregate3())
+                .await
+                .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
+                .map_err(|e| ApiError::Unavailable(format!("isEligible multicall: {e}")))?;
+            for ((i, _), r) in batch.iter().zip(results) {
+                out[*i] = r.ok();
+            }
+        }
+        Ok(out)
     }
 
     /// The full picture for one indexer: its verdict, plus the context needed to read that verdict
@@ -1025,6 +1047,33 @@ mod tests {
             1
         );
         assert_eq!(Chain::new("x", None).mainnet.len(), PUBLIC_MAINNET.len());
+    }
+
+    /// Against a live Arbitrum RPC: the batched verdicts must equal one-at-a-time reads, and a
+    /// malformed address is `None` without costing its neighbours theirs.
+    /// `KITTIWAKE_LIVE_ARB_RPC=… KITTIWAKE_LIVE_INDEXERS=0xa,0xb cargo test -- --ignored live_`
+    #[test]
+    #[ignore = "needs a live Arbitrum RPC"]
+    fn live_batched_eligibility_matches_single_reads() {
+        let rpc = std::env::var("KITTIWAKE_LIVE_ARB_RPC").expect("KITTIWAKE_LIVE_ARB_RPC");
+        let mut ids: Vec<String> = std::env::var("KITTIWAKE_LIVE_INDEXERS")
+            .expect("KITTIWAKE_LIVE_INDEXERS")
+            .split(',')
+            .map(str::to_string)
+            .collect();
+        ids.insert(1, "not-an-address".into());
+        let chain = Chain::new(rpc, None);
+        let batch = futures_lite_block(chain.eligibility_batch(&ids)).unwrap();
+        assert_eq!(batch.len(), ids.len());
+        assert_eq!(batch[1], None);
+        for (id, verdict) in ids
+            .iter()
+            .zip(&batch)
+            .filter(|(id, _)| id.starts_with("0x"))
+        {
+            let single = futures_lite_block(chain.eligibility(id)).unwrap().eligible;
+            assert_eq!(*verdict, Some(single), "{id}");
+        }
     }
 
     /// A tiny runtime so the address-validation test does not need the tokio macro.

@@ -19,10 +19,6 @@ use crate::{IngestError, Ingested, i, page, s};
 
 use kittiwake_rewards::L1_BLOCKS_PER_YEAR;
 
-/// How many indexers we ask the oracle about at once. The oracle is five calls per indexer against
-/// one RPC endpoint, so this is politeness rather than throughput.
-const REO_CONCURRENCY: usize = 8;
-
 const WEI: f64 = 1e18;
 
 fn grt(v: Option<String>) -> f64 {
@@ -587,23 +583,21 @@ async fn write_parameter_changes(pool: &Pool, changes: &[ParamChange]) -> Result
     Ok(())
 }
 
-/// Ask the oracle about every indexer, a few at a time.
+/// Ask the oracle about every indexer, batched into multicalls.
 ///
 /// A failed read is `None` rather than `Some(false)`: "we could not check" and "the protocol says
 /// no" are different claims, and only one of them is about the indexer.
 async fn read_eligibility(chain: &Chain, ids: &[String]) -> HashMap<String, Option<bool>> {
-    use futures::StreamExt;
-    // One call per indexer. The oracle's network-wide state is read separately, once, because
-    // three of its five views take no arguments and reading them per indexer would triple the cost
-    // of a whole-directory pass for no extra information.
-    futures::stream::iter(ids.iter().cloned())
-        .map(|id| async move {
-            let verdict = chain.is_eligible(&id).await.ok();
-            (id.to_lowercase(), verdict)
-        })
-        .buffer_unordered(REO_CONCURRENCY)
-        .collect()
+    // The oracle's network-wide state is read separately, once, because three of its five views
+    // take no arguments and reading them per indexer would add nothing.
+    let verdicts = chain
+        .eligibility_batch(ids)
         .await
+        .unwrap_or_else(|_| vec![None; ids.len()]);
+    ids.iter()
+        .map(|id| id.to_lowercase())
+        .zip(verdicts)
+        .collect()
 }
 
 struct Row {
