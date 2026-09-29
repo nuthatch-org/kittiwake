@@ -235,6 +235,22 @@ impl Chain {
         }
     }
 
+    /// A paid endpoint tried after every other mainnet endpoint has failed.
+    ///
+    /// The public endpoints are free and carry these reads fine on a normal day; this is what keeps
+    /// ENS names and the mainnet supply on the page on the day all three throttle or fall over at
+    /// once. Last, never first, because it bills per call and the reads it covers are decorations,
+    /// not protocol figures. A call only reaches it when every endpoint before it has already
+    /// failed, so on a healthy day it costs nothing.
+    pub fn with_mainnet_fallback(mut self, url: Option<String>) -> Self {
+        if let Some(url) = url.filter(|u| !u.trim().is_empty())
+            && !self.mainnet.contains(&url)
+        {
+            self.mainnet.push(url);
+        }
+        self
+    }
+
     fn arb(&self, op: &'static str) -> Result<impl Provider + Clone, ApiError> {
         let url = self
             .arbitrum
@@ -1047,6 +1063,65 @@ mod tests {
             1
         );
         assert_eq!(Chain::new("x", None).mainnet.len(), PUBLIC_MAINNET.len());
+    }
+
+    #[test]
+    fn the_paid_fallback_is_tried_last_and_only_once() {
+        let chain = Chain::new("x", None).with_mainnet_fallback(Some("https://paid".into()));
+        assert_eq!(chain.mainnet.len(), PUBLIC_MAINNET.len() + 1);
+        assert_eq!(
+            chain.mainnet.last().map(String::as_str),
+            Some("https://paid")
+        );
+        assert_eq!(
+            chain.mainnet[..PUBLIC_MAINNET.len()],
+            PUBLIC_MAINNET.map(String::from)
+        );
+
+        let mine = Chain::new("x", Some("https://mine".into()))
+            .with_mainnet_fallback(Some("https://paid".into()));
+        assert_eq!(mine.mainnet, ["https://mine", "https://paid"]);
+
+        let same = Chain::new("x", Some("https://paid".into()))
+            .with_mainnet_fallback(Some("https://paid".into()));
+        assert_eq!(same.mainnet, ["https://paid"], "never asked twice");
+
+        for none in [None, Some(String::new()), Some("  ".into())] {
+            assert_eq!(
+                Chain::new("x", None)
+                    .with_mainnet_fallback(none)
+                    .mainnet
+                    .len(),
+                PUBLIC_MAINNET.len()
+            );
+        }
+    }
+
+    /// The point of the fallback: every endpoint before it refuses, and the read still lands.
+    #[tokio::test]
+    async fn a_read_reaches_the_fallback_when_every_endpoint_before_it_fails() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let dead = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&dead)
+            .await;
+        let paid = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "result": format!("0x{:064x}", 10_000_000_000u128 * 10u128.pow(18)),
+            })))
+            .expect(1)
+            .mount(&paid)
+            .await;
+
+        let chain = Chain::new("x", Some(dead.uri())).with_mainnet_fallback(Some(paid.uri()));
+        let supply = chain.grt_total_supply(SupplyChain::Mainnet).await.unwrap();
+        assert_eq!(supply, "10000000000000000000000000000");
     }
 
     /// Against a live Arbitrum RPC: the batched verdicts must equal one-at-a-time reads, and a

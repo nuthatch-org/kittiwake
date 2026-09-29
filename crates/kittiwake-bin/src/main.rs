@@ -152,10 +152,13 @@ async fn main() -> anyhow::Result<()> {
     let chain = match cfg.arbitrum_rpc_url.as_deref() {
         Some(url) => {
             tracing::info!("arbitrum rpc configured");
-            Some(kittiwake_chain::Chain::new(
-                url,
-                cfg.mainnet_rpc_url.clone(),
-            ))
+            if cfg.mainnet_rpc_fallback_url.is_some() {
+                tracing::info!("mainnet fallback rpc configured");
+            }
+            Some(
+                kittiwake_chain::Chain::new(url, cfg.mainnet_rpc_url.clone())
+                    .with_mainnet_fallback(cfg.mainnet_rpc_fallback_url.clone()),
+            )
         }
         None => {
             tracing::warn!(
