@@ -43,14 +43,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --bin kittiwake --bin lodestar-cockpit
       - run: objdump -T target/release/kittiwake | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -3
+      # Seven days, not thirty: every build on main uploads ~10 MB, a private repo on the free plan
+      # has 500 MB of artifact storage, and thirty days of builds filled it on 2026-09-29 and failed
+      # v0.3.0's release. A week is the rollback window `deploy/ship.sh <run-id>` needs; older than
+      # that is a rebuild.
       - uses: actions/upload-artifact@v4
         with:
           name: kittiwake-linux-x86_64
           path: target/release/kittiwake
-          retention-days: 30
+          retention-days: 7
       # What an indexer runs beside its own agent for a self-hosted /cockpit (lodestar#259).
       - uses: actions/upload-artifact@v4
         with:
           name: lodestar-cockpit-linux-x86_64
           path: target/release/lodestar-cockpit
-          retention-days: 30
+          retention-days: 7
