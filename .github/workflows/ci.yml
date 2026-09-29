@@ -51,10 +51,10 @@ jobs:
         with:
           name: kittiwake-linux-x86_64
           path: target/release/kittiwake
-          retention-days: 7
+          retention-days: 2
       # What an indexer runs beside its own agent for a self-hosted /cockpit (lodestar#259).
       - uses: actions/upload-artifact@v4
         with:
           name: lodestar-cockpit-linux-x86_64
           path: target/release/lodestar-cockpit
-          retention-days: 7
+          retention-days: 2
