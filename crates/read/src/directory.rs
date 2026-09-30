@@ -299,7 +299,7 @@ pub fn select(set: &Value, q: &Query, now: i64) -> Page {
 /// One directory row from a `lodestar_deployments` row and its fees in the window.
 ///
 /// The labels (`displayName`, `categories`, `network`, `complexity`) start empty and are put on by
-/// [`crate::naming::Naming::label_directory`].
+/// [`crate::naming::Naming::label_directory`]; `deniedAt` by [`mark_denied`].
 pub fn row(r: &Value, fees_in_window: Option<&Value>) -> Value {
     use crate::shape::{i0, ipfs_or_id, s0};
     let id = r.get("id").and_then(Value::as_str).unwrap_or_default();
@@ -315,8 +315,7 @@ pub fn row(r: &Value, fees_in_window: Option<&Value>) -> Value {
             _ => json!("0"),
         },
         "createdAt": i0(r, "created_at"),
-        // The block denial took effect from; null while the deployment earns rewards.
-        "deniedAt": crate::shape::i(r, "denied_since"),
+        "deniedAt": Value::Null,
         "indexerCount": i0(r, "active_allocation_count"),
         "curatorCount": i0(r, "curator_count"),
         "displayName": Value::Null,
@@ -324,6 +323,15 @@ pub fn row(r: &Value, fees_in_window: Option<&Value>) -> Value {
         "network": Value::Null,
         "complexity": Value::Null,
     })
+}
+
+/// Puts the RewardsManager denylist on the rows, `since` in the same order. Zero is not denied.
+pub fn mark_denied(rows: &mut [Value], since: &[Option<u64>]) {
+    for (r, s) in rows.iter_mut().zip(since) {
+        if let Some(block) = s.filter(|b| *b > 0) {
+            r["deniedAt"] = json!(block);
+        }
+    }
 }
 
 /// The cached value: the labelled rows, what their filters can be set to, and how many rows have
@@ -637,8 +645,15 @@ mod tests {
         assert_eq!(r["network"], Value::Null);
         assert_eq!(r["deniedAt"], Value::Null);
 
-        let bare = row(&json!({ "id": "0x00", "denied_since": "250000000" }), None);
-        assert_eq!(bare["queryFees30d"], "0");
-        assert_eq!(bare["deniedAt"], 250_000_000);
+        assert_eq!(row(&json!({ "id": "0x00" }), None)["queryFees30d"], "0");
+    }
+
+    #[test]
+    fn the_denylist_marks_only_the_denied_and_an_unread_one_stays_unmarked() {
+        let mut rows = vec![dep("0xa", 10, 10), dep("0xb", 10, 10), dep("0xc", 10, 10)];
+        mark_denied(&mut rows, &[Some(17_292_847), Some(0), None]);
+        assert_eq!(rows[0]["deniedAt"], 17_292_847);
+        assert_eq!(rows[1]["deniedAt"], Value::Null);
+        assert_eq!(rows[2]["deniedAt"], Value::Null);
     }
 }

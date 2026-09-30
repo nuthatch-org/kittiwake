@@ -373,7 +373,6 @@ pub fn deployment(r: &Value, fees_30d: Option<&Value>) -> Value {
         "stakedTokens": s0(r, "staked_tokens"),
         "queryFeesAmount": s0(r, "query_fees_amount"),
         "createdAt": i0(r, "created_at"),
-        "deniedAt": i(r, "denied_since"),
         "displayName": Value::Null,
         "categories": json!([]),
         "curatorSignals": placeholders(&id_str, i0(r, "curator_count").as_i64().unwrap_or(0)),
