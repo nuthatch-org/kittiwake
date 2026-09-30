@@ -4828,7 +4828,10 @@ mod indexer_page_tests {
             .iter()
             .filter(|p| p.starts_with("/alloc"))
             .count();
-        assert_eq!(asked, 2, "the set and its fees, once between them");
+        assert_eq!(
+            asked, 3,
+            "the set, its fees and its denylist, once between them"
+        );
     }
 
     #[test]
