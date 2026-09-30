@@ -48,15 +48,6 @@ impl Range {
     }
 }
 
-/// Whether the RewardsManager denylist filters the set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Denied {
-    #[default]
-    Any,
-    Hide,
-    Only,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub window: Window,
@@ -73,7 +64,6 @@ pub struct Query {
     pub complexity: Option<String>,
     pub category: Option<String>,
     pub created_within_days: Option<i64>,
-    pub denied: Denied,
     pub sort: SortKey,
     pub descending: bool,
     pub first: usize,
@@ -93,7 +83,6 @@ impl Default for Query {
             complexity: None,
             category: None,
             created_within_days: None,
-            denied: Denied::default(),
             sort: SortKey::default(),
             descending: true,
             first: DEFAULT_PAGE,
@@ -154,12 +143,6 @@ impl Query {
             Some("curators") => SortKey::Curators,
             Some(_) => return Err("sort is not a column the directory sorts by".into()),
         };
-        let denied = match get("denied") {
-            None => Denied::Any,
-            Some("hide") => Denied::Hide,
-            Some("only") => Denied::Only,
-            Some(_) => return Err("denied must be hide or only".into()),
-        };
         let descending = match get("dir") {
             None | Some("desc") => true,
             Some("asc") => false,
@@ -179,7 +162,6 @@ impl Query {
             created_within_days: get("createdWithinDays")
                 .map(|_| whole("createdWithinDays", 1, 3650, 0).map(|d| d as i64))
                 .transpose()?,
-            denied,
             sort,
             descending,
             first: whole("first", 1, MAX_PAGE, DEFAULT_PAGE)?,
@@ -249,15 +231,6 @@ fn admits(row: &Value, q: &Query, now: i64) -> bool {
                 .is_some_and(|cs| cs.iter().any(|x| x.as_str() == Some(c)))
         })
         && q.created_within_days.is_none_or(|d| count(row, "createdAt") >= (now - d * 86_400) as f64)
-        && match q.denied {
-            Denied::Any => true,
-            Denied::Hide => !is_denied(row),
-            Denied::Only => is_denied(row),
-        }
-}
-
-fn is_denied(row: &Value) -> bool {
-    row.get("deniedAt").is_some_and(|v| !v.is_null())
 }
 
 /// One page of the rows that match, and how many match in all.
@@ -299,7 +272,7 @@ pub fn select(set: &Value, q: &Query, now: i64) -> Page {
 /// One directory row from a `lodestar_deployments` row and its fees in the window.
 ///
 /// The labels (`displayName`, `categories`, `network`, `complexity`) start empty and are put on by
-/// [`crate::naming::Naming::label_directory`]; `deniedAt` by [`mark_denied`].
+/// [`crate::naming::Naming::label_directory`]; `deniedSince` by [`mark_denied`].
 pub fn row(r: &Value, fees_in_window: Option<&Value>) -> Value {
     use crate::shape::{i0, ipfs_or_id, s0};
     let id = r.get("id").and_then(Value::as_str).unwrap_or_default();
@@ -315,7 +288,7 @@ pub fn row(r: &Value, fees_in_window: Option<&Value>) -> Value {
             _ => json!("0"),
         },
         "createdAt": i0(r, "created_at"),
-        "deniedAt": Value::Null,
+        "deniedSince": Value::Null,
         "indexerCount": i0(r, "active_allocation_count"),
         "curatorCount": i0(r, "curator_count"),
         "displayName": Value::Null,
@@ -329,7 +302,7 @@ pub fn row(r: &Value, fees_in_window: Option<&Value>) -> Value {
 pub fn mark_denied(rows: &mut [Value], since: &[Option<u64>]) {
     for (r, s) in rows.iter_mut().zip(since) {
         if let Some(block) = s.filter(|b| *b > 0) {
-            r["deniedAt"] = json!(block);
+            r["deniedSince"] = json!(block);
         }
     }
 }
@@ -369,8 +342,7 @@ pub fn set(rows: Vec<Value>, unanalysed: usize) -> Value {
         "complexities": listed(complexities),
         "categories": listed(categories),
     });
-    let denied = rows.iter().filter(|r| is_denied(r)).count();
-    json!({ "rows": rows, "unanalysed": unanalysed, "denied": denied, "facets": facets })
+    json!({ "rows": rows, "unanalysed": unanalysed, "facets": facets })
 }
 
 #[cfg(test)]
@@ -390,7 +362,7 @@ mod tests {
             "createdAt": NOW - 400 * 86_400,
             "indexerCount": if stake > 0 { 3 } else { 0 },
             "curatorCount": 1,
-            "deniedAt": null,
+            "deniedSince": null,
             "displayName": null,
             "categories": [],
             "network": null,
@@ -470,27 +442,6 @@ mod tests {
         assert_eq!(ids(&p), ["0xa"]);
         let p = select(&set, &q(&[("complexity", "Light")]), NOW);
         assert_eq!(p.total, 0);
-    }
-
-    #[test]
-    fn denied_deployments_can_be_hidden_or_picked_out() {
-        let set = set(
-            vec![
-                with(dep("0xdenied", 10, 10), "deniedAt", json!(250_000_000)),
-                dep("0xearning", 10, 10),
-            ],
-            0,
-        );
-        assert_eq!(set["denied"], 1);
-        assert_eq!(select(&set, &q(&[]), NOW).total, 2);
-        assert_eq!(
-            ids(&select(&set, &q(&[("denied", "hide")]), NOW)),
-            ["0xearning"]
-        );
-        assert_eq!(
-            ids(&select(&set, &q(&[("denied", "only")]), NOW)),
-            ["0xdenied"]
-        );
     }
 
     #[test]
@@ -587,7 +538,6 @@ mod tests {
             ("sort", "name"),
             ("dir", "up"),
             ("createdWithinDays", "0"),
-            ("denied", "yes"),
         ] {
             assert!(
                 Query::parse(&params(&[bad])).is_err(),
@@ -643,7 +593,7 @@ mod tests {
         assert_eq!(r["queryFees30d"], "5000");
         assert_eq!(r["indexerCount"], 1);
         assert_eq!(r["network"], Value::Null);
-        assert_eq!(r["deniedAt"], Value::Null);
+        assert_eq!(r["deniedSince"], Value::Null);
 
         assert_eq!(row(&json!({ "id": "0x00" }), None)["queryFees30d"], "0");
     }
@@ -652,8 +602,8 @@ mod tests {
     fn the_denylist_marks_only_the_denied_and_an_unread_one_stays_unmarked() {
         let mut rows = vec![dep("0xa", 10, 10), dep("0xb", 10, 10), dep("0xc", 10, 10)];
         mark_denied(&mut rows, &[Some(17_292_847), Some(0), None]);
-        assert_eq!(rows[0]["deniedAt"], 17_292_847);
-        assert_eq!(rows[1]["deniedAt"], Value::Null);
-        assert_eq!(rows[2]["deniedAt"], Value::Null);
+        assert_eq!(rows[0]["deniedSince"], 17_292_847);
+        assert_eq!(rows[1]["deniedSince"], Value::Null);
+        assert_eq!(rows[2]["deniedSince"], Value::Null);
     }
 }

@@ -1389,14 +1389,14 @@ pub async fn subgraph_deployment(ctx: &ReadCtx, ipfs_hash: &str) -> Result<Read,
         let (shaped, chain, dep) = (shaped.clone(), chain.clone(), dep.clone());
         Box::pin(async move {
             let (mut v, p) = shaped(gate, lane).await?;
-            // `deniedAt` is left off, not null, when the chain could not be read.
+            // `deniedSince` is left off, not null, when the chain could not be read.
             let since = match &chain {
                 Some(c) => c.denylist_batch(std::slice::from_ref(&dep)).await.ok(),
                 None => None,
             };
             if let (Some(since), Some(rows)) = (since, v.as_array_mut()) {
                 for r in rows.iter_mut() {
-                    r["deniedAt"] = serde_json::Value::Null;
+                    r["deniedSince"] = serde_json::Value::Null;
                 }
                 crate::directory::mark_denied(rows, &since);
             }
@@ -1532,21 +1532,18 @@ pub async fn subgraph_directory(ctx: &ReadCtx, since: i64) -> Result<Read, ApiEr
                 .iter()
                 .map(|r| r["id"].as_str().unwrap_or_default().to_string())
                 .collect();
-            let denylist = match &chain {
-                Some(c) => c.denylist_batch(&ids).await.map_err(|e| {
-                    tracing::warn!("directory denylist unreadable, serving without it: {e}");
-                }),
-                None => Err(()),
-            };
-            if let Ok(since) = &denylist {
-                crate::directory::mark_denied(&mut rows, since);
+            if let Some(c) = &chain {
+                match c.denylist_batch(&ids).await {
+                    Ok(since) => crate::directory::mark_denied(&mut rows, &since),
+                    Err(e) => {
+                        tracing::warn!("directory denylist unreadable, serving without it: {e}")
+                    }
+                }
             }
-            let mut set = crate::directory::set(rows, unanalysed);
-            // Unknown rather than zero, so no page says "none denied" when it could not look.
-            if denylist.is_err() {
-                set["denied"] = serde_json::Value::Null;
-            }
-            Ok((set, older_of(&dep_rows.provenance, &fee_rows.provenance)))
+            Ok((
+                crate::directory::set(rows, unanalysed),
+                older_of(&dep_rows.provenance, &fee_rows.provenance),
+            ))
         })
     });
 

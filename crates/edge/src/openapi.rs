@@ -216,7 +216,7 @@ const SUMMARIES: &[Operation] = &[
     ),
     op(
         "/api/subgraph-directory",
-        "Every listed deployment, filtered by signal, stake, ratio, fees, network, complexity, category, age and rewards denial, sorted and paged.",
+        "Every listed deployment, filtered by signal, stake, ratio, fees, network, complexity, category and age, sorted and paged.",
     ),
     op(
         "/api/subgraph-search",

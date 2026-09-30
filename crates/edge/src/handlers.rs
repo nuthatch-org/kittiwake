@@ -1039,7 +1039,6 @@ pub async fn subgraph_directory(
         "data": page.rows,
         "total": page.total,
         "unanalysed": set.get("unanalysed"),
-        "denied": set.get("denied"),
         "facets": set.get("facets"),
         "source": "nuthatch",
         "provenance": &read.meta,
