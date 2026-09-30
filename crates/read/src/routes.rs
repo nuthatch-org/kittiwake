@@ -1376,18 +1376,37 @@ pub async fn subgraph_deployment(ctx: &ReadCtx, ipfs_hash: &str) -> Result<Read,
     let sql = sql::deployments_by_id_sql(std::slice::from_ref(&id))
         .ok_or_else(|| ApiError::BadRequest("not a deployment hash".into()))?;
 
+    let denied_sql = sql::denied_since_sql(Some(std::slice::from_ref(&id)))
+        .ok_or_else(|| ApiError::BadRequest("not a deployment hash".into()))?;
+    let fetch: Fetcher = Arc::new(move |gate: NestGate, lane: Lane| {
+        let (sql, denied_sql) = (sql.clone(), denied_sql.clone());
+        Box::pin(async move {
+            let mut deps = QuerySpec::read(NestId::Alloc, sql).with_timeout(T_FOLD);
+            deps.lane = lane;
+            let dkey = format!("alloc:{}", blake3::hash(deps.sql.as_bytes()).to_hex());
+            let (dep_rows, denied) = tokio::join!(
+                gate.query_coalesced(&dkey, deps),
+                denied_since(&gate, lane, denied_sql),
+            );
+            let dep_rows = dep_rows.map_err(ApiError::from)?;
+            let mapped: Vec<serde_json::Value> = dep_rows
+                .rows
+                .iter()
+                .map(|r| with_denied(crate::shape::deployment(r, None), denied.as_ref()))
+                .collect();
+            Ok((
+                serde_json::Value::Array(mapped),
+                dep_rows.provenance.clone(),
+            ))
+        })
+    });
+
     ctx.cached(
         "subgraph-deployment",
         NestId::Alloc,
         serde_json::json!({ "id": id }),
         CachePolicy::from_poll_interval(cadence::LIVE),
-        rows_shaped(
-            NestId::Alloc,
-            sql,
-            T_FOLD,
-            |r| crate::shape::deployment(r, None),
-            None,
-        ),
+        fetch,
     )
     .await
 }
@@ -1462,6 +1481,57 @@ pub async fn subgraph_fees_30d(ctx: &ReadCtx, since: i64) -> Result<Read, ApiErr
     .await
 }
 
+/// `denied_since` by deployment id, from [`sql::denied_since_sql`].
+///
+/// `None` means the nest could not say, most likely because it predates graph-allocations-nest#24.
+/// The caller then leaves `deniedSince` null, which the frontend reads as "not denied": a missing
+/// badge is the failure mode, never a missing page.
+async fn denied_since(
+    gate: &NestGate,
+    lane: Lane,
+    sql: String,
+) -> Option<std::collections::HashMap<String, i64>> {
+    let mut spec = QuerySpec::read(NestId::Alloc, sql).with_timeout(T_FOLD);
+    spec.lane = lane;
+    let key = format!("alloc:{}", blake3::hash(spec.sql.as_bytes()).to_hex());
+    match gate.query_coalesced(&key, spec).await {
+        Ok(rows) => Some(
+            rows.rows
+                .iter()
+                .filter_map(|r| {
+                    let id = r.get("id")?.as_str()?.to_lowercase();
+                    let since = match r.get("denied_since")? {
+                        serde_json::Value::Number(n) => n.as_i64()?,
+                        serde_json::Value::String(s) => s.parse().ok()?,
+                        _ => return None,
+                    };
+                    (since > 0).then_some((id, since))
+                })
+                .collect(),
+        ),
+        Err(e) => {
+            tracing::debug!(error = %e, "denied_since unavailable; deployments render without the badge");
+            None
+        }
+    }
+}
+
+/// Put `deniedSince` on a shaped deployment: the block it was denied from, or null.
+fn with_denied(
+    mut row: serde_json::Value,
+    denied: Option<&std::collections::HashMap<String, i64>>,
+) -> serde_json::Value {
+    let id = row
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    row["deniedSince"] = denied
+        .and_then(|d| d.get(&id))
+        .map_or(serde_json::Value::Null, |n| serde_json::json!(n));
+    row
+}
+
 /// `/api/subgraph-directory`'s whole set: every listed deployment with its fees since `since`,
 /// labelled. The route filters and pages it per request; see [`crate::directory`].
 pub async fn subgraph_directory(ctx: &ReadCtx, since: i64) -> Result<Read, ApiError> {
@@ -1477,9 +1547,11 @@ pub async fn subgraph_directory(ctx: &ReadCtx, since: i64) -> Result<Read, ApiEr
             fees.lane = lane;
             let dkey = format!("alloc:{}", blake3::hash(deps.sql.as_bytes()).to_hex());
             let fkey = format!("alloc:{}", blake3::hash(fees.sql.as_bytes()).to_hex());
-            let (dep_rows, fee_rows) = tokio::join!(
+            let denied_sql = sql::denied_since_sql(None).expect("unfiltered is always a query");
+            let (dep_rows, fee_rows, denied) = tokio::join!(
                 gate.query_coalesced(&dkey, deps),
                 gate.query_coalesced(&fkey, fees),
+                denied_since(&gate, lane, denied_sql),
             );
             let (dep_rows, fee_rows) = (
                 dep_rows.map_err(ApiError::from)?,
@@ -1496,7 +1568,10 @@ pub async fn subgraph_directory(ctx: &ReadCtx, since: i64) -> Result<Read, ApiEr
                 .iter()
                 .map(|r| {
                     let id = r.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-                    crate::directory::row(r, by_id.get(id.to_lowercase().as_str()).copied())
+                    with_denied(
+                        crate::directory::row(r, by_id.get(id.to_lowercase().as_str()).copied()),
+                        denied.as_ref(),
+                    )
                 })
                 .collect();
             let unanalysed = match &naming {
@@ -1962,6 +2037,122 @@ mod wiring_tests {
                 "provenance": {"as_of": 1, "sealed_through": 1, "source": "mock"}
             }))
         }
+    }
+
+    const DENIED: &str = "0x00000000000000000000000000000000000000000000000000000000000000d1";
+    const CLEAN: &str = "0x00000000000000000000000000000000000000000000000000000000000000c1";
+
+    /// The alloc nest as it stands after graph-allocations-nest#24 (`has_denied`), or before it,
+    /// when asking for `denied_since` is a 400 because the column does not exist.
+    struct AllocNest {
+        has_denied: bool,
+    }
+
+    impl Respond for AllocNest {
+        fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+            if req.url.path().ends_with("/ready") {
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ready": true, "lag_blocks": 0, "tip": 1, "last_block": 1,
+                    "sealed_through": 1, "stalled": false
+                }));
+            }
+            let q = req
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "q")
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default();
+            let prov = serde_json::json!({"as_of": 1, "sealed_through": 1, "source": "mock"});
+            let rows = if q.contains("denied_since") {
+                if !self.has_denied {
+                    return ResponseTemplate::new(400).set_body_string(
+                        "Binder Error: Referenced column \"denied_since\" not found",
+                    );
+                }
+                vec![serde_json::json!({"id": DENIED, "denied_since": 398_000_000})]
+            } else if q.contains("lodestar_deployments") {
+                [DENIED, CLEAN]
+                    .iter()
+                    .filter(|id| !q.contains(" IN (") || q.contains(*id))
+                    .map(|id| {
+                        serde_json::json!({
+                            "id": id, "signalled_tokens": "5000000000000000000000",
+                            "staked_tokens": "1000000000000000000000", "query_fees_amount": "0",
+                            "created_at": 1, "active_allocation_count": 1, "curator_count": 1
+                        })
+                    })
+                    .collect()
+            } else {
+                vec![]
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count": rows.len(), "rows": rows, "provenance": prov
+            }))
+        }
+    }
+
+    async fn alloc_ctx(has_denied: bool) -> (MockServer, ReadCtx) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(AllocNest { has_denied })
+            .mount(&server)
+            .await;
+        let mut cfg = kittiwake_nest::NestConfig::new(server.uri());
+        for n in NestId::ALL {
+            cfg.base_paths.insert(n, format!("/{}", n.as_str()));
+        }
+        let ctx = ReadCtx::new(
+            NestGate::new(cfg).unwrap(),
+            kittiwake_cache::Store::new(64),
+            1,
+        );
+        (server, ctx)
+    }
+
+    fn denied_of(rows: &serde_json::Value, id: &str) -> serde_json::Value {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .unwrap_or_else(|| panic!("{id} missing from {rows}"))["deniedSince"]
+            .clone()
+    }
+
+    /// lodestar#253 shipped the badge and nothing ever sent `deniedSince`, so it never showed.
+    #[tokio::test]
+    async fn the_directory_says_which_deployments_are_denied() {
+        let (_server, ctx) = alloc_ctx(true).await;
+        let read = subgraph_directory(&ctx, 0)
+            .await
+            .expect("directory answers");
+        let rows = &read.entry.value["rows"];
+        assert_eq!(denied_of(rows, DENIED), serde_json::json!(398_000_000));
+        assert_eq!(denied_of(rows, CLEAN), serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn the_deployment_page_says_whether_it_is_denied() {
+        let (_server, ctx) = alloc_ctx(true).await;
+        let denied_hash = crate::shape::ipfs_or_id(DENIED);
+        let read = subgraph_deployment(&ctx, &denied_hash)
+            .await
+            .expect("answers");
+        assert_eq!(
+            denied_of(&read.entry.value, DENIED),
+            serde_json::json!(398_000_000)
+        );
+    }
+
+    /// A nest still on the NID from before the column must cost the badge, not the page.
+    #[tokio::test]
+    async fn a_nest_without_the_column_still_serves_the_directory() {
+        let (_server, ctx) = alloc_ctx(false).await;
+        let read = subgraph_directory(&ctx, 0)
+            .await
+            .expect("the directory must not fail");
+        let rows = &read.entry.value["rows"];
+        assert_eq!(rows.as_array().unwrap().len(), 2);
+        assert_eq!(denied_of(rows, DENIED), serde_json::Value::Null);
     }
 
     #[tokio::test]

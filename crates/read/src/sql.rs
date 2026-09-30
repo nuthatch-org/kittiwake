@@ -893,6 +893,33 @@ pub fn directory_sql() -> String {
     )
 }
 
+/// Deployments on the RewardsManager denylist, each with the block it was denied from.
+///
+/// Its own query rather than a column in [`DEPLOYMENT_COLS`], on purpose: `denied_since` arrived in
+/// graph-allocations-nest#24, and a nest still serving the NID from before it has no such column.
+/// Selected with the rest, that one missing column would fail the whole directory; asked for here,
+/// it fails only this query, and the directory renders without the badge. `ids` narrows it to the
+/// given deployments and must already be vetted by the caller; `None` asks about all of them.
+pub fn denied_since_sql(ids: Option<&[String]>) -> Option<String> {
+    let base = "SELECT id, CAST(denied_since AS BIGINT) AS denied_since FROM lodestar_deployments \
+                WHERE denied_since > 0";
+    match ids {
+        None => Some(base.to_string()),
+        Some(ids)
+            if ids.is_empty() || ids.len() > 500 || !ids.iter().all(|i| is_deployment_id(i)) =>
+        {
+            None
+        }
+        Some(ids) => Some(format!(
+            "{base} AND id IN ({})",
+            ids.iter()
+                .map(|i| format!("'{i}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 pub fn deployments_by_id_sql(ids: &[String]) -> Option<String> {
     if ids.is_empty() || ids.len() > 500 || !ids.iter().all(|i| is_deployment_id(i)) {
         return None;
@@ -1178,6 +1205,27 @@ pub fn dips_latest_per_target_sql(table: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn denied_since_sql_asks_only_for_vetted_deployment_ids() {
+        let all = denied_since_sql(None).unwrap();
+        assert!(
+            all.contains("denied_since > 0"),
+            "a zero update clears denial: {all}"
+        );
+        assert!(!all.contains(" IN ("), "unfiltered means every deployment");
+
+        let id = format!("0x{}", "ab".repeat(32));
+        let one = denied_since_sql(Some(std::slice::from_ref(&id))).unwrap();
+        assert!(one.ends_with(&format!("AND id IN ('{id}')")), "{one}");
+
+        assert!(denied_since_sql(Some(&["0xab' OR 1=1 --".to_string()])).is_none());
+        assert!(denied_since_sql(Some(&["QmNotAnId".to_string()])).is_none());
+        assert!(
+            denied_since_sql(Some(&[])).is_none(),
+            "nothing to ask about"
+        );
+    }
+
     #[test]
     fn horizon_detail_sql_refuses_what_is_not_an_address() {
         assert!(provision_thaw_requests_sql("0x0e91' OR 1=1 --").is_none());
