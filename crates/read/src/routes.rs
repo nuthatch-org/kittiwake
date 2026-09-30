@@ -1376,18 +1376,40 @@ pub async fn subgraph_deployment(ctx: &ReadCtx, ipfs_hash: &str) -> Result<Read,
     let sql = sql::deployments_by_id_sql(std::slice::from_ref(&id))
         .ok_or_else(|| ApiError::BadRequest("not a deployment hash".into()))?;
 
+    let shaped = rows_shaped(
+        NestId::Alloc,
+        sql,
+        T_FOLD,
+        |r| crate::shape::deployment(r, None),
+        None,
+    );
+    let chain = ctx.chain.clone();
+    let dep = id.clone();
+    let fetch: Fetcher = Arc::new(move |gate: NestGate, lane: Lane| {
+        let (shaped, chain, dep) = (shaped.clone(), chain.clone(), dep.clone());
+        Box::pin(async move {
+            let (mut v, p) = shaped(gate, lane).await?;
+            // `deniedSince` is left off, not null, when the chain could not be read.
+            let since = match &chain {
+                Some(c) => c.denylist_batch(std::slice::from_ref(&dep)).await.ok(),
+                None => None,
+            };
+            if let (Some(since), Some(rows)) = (since, v.as_array_mut()) {
+                for r in rows.iter_mut() {
+                    r["deniedSince"] = serde_json::Value::Null;
+                }
+                crate::directory::mark_denied(rows, &since);
+            }
+            Ok((v, p))
+        })
+    });
+
     ctx.cached(
         "subgraph-deployment",
         NestId::Alloc,
         serde_json::json!({ "id": id }),
         CachePolicy::from_poll_interval(cadence::LIVE),
-        rows_shaped(
-            NestId::Alloc,
-            sql,
-            T_FOLD,
-            |r| crate::shape::deployment(r, None),
-            None,
-        ),
+        fetch,
     )
     .await
 }
@@ -1466,8 +1488,10 @@ pub async fn subgraph_fees_30d(ctx: &ReadCtx, since: i64) -> Result<Read, ApiErr
 /// labelled. The route filters and pages it per request; see [`crate::directory`].
 pub async fn subgraph_directory(ctx: &ReadCtx, since: i64) -> Result<Read, ApiError> {
     let naming = ctx.naming.clone();
+    let chain = ctx.chain.clone();
     let fetch: Fetcher = Arc::new(move |gate: NestGate, lane: Lane| {
         let naming = naming.clone();
+        let chain = chain.clone();
         Box::pin(async move {
             let mut deps =
                 QuerySpec::read(NestId::Alloc, sql::directory_sql()).with_timeout(T_FOLD);
@@ -1503,6 +1527,19 @@ pub async fn subgraph_directory(ctx: &ReadCtx, since: i64) -> Result<Read, ApiEr
                 Some(n) => n.label_directory(&gate, lane, &mut rows).await,
                 None => rows.len(),
             };
+            // Not in any nest the dashboard reads, so asked of the RewardsManager directly.
+            let ids: Vec<String> = rows
+                .iter()
+                .map(|r| r["id"].as_str().unwrap_or_default().to_string())
+                .collect();
+            if let Some(c) = &chain {
+                match c.denylist_batch(&ids).await {
+                    Ok(since) => crate::directory::mark_denied(&mut rows, &since),
+                    Err(e) => {
+                        tracing::warn!("directory denylist unreadable, serving without it: {e}")
+                    }
+                }
+            }
             Ok((
                 crate::directory::set(rows, unanalysed),
                 older_of(&dep_rows.provenance, &fee_rows.provenance),

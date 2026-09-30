@@ -117,6 +117,7 @@ sol! {
     interface IRewardsManager {
         function getRewards(address rewardsIssuer, address allocationID)
             external view returns (uint256);
+        function denylist(bytes32 subgraphDeploymentID) external view returns (uint256);
     }
 
     #[sol(rpc)]
@@ -320,6 +321,41 @@ impl Chain {
                 .map_err(|e| ApiError::Unavailable(format!("isEligible multicall: {e}")))?;
             for ((i, _), r) in batch.iter().zip(results) {
                 out[*i] = r.ok();
+            }
+        }
+        Ok(out)
+    }
+
+    /// The block each deployment was denied rewards from, in the order given, or 0 where it earns.
+    /// A reverted read or an id that is not 32 bytes is `None` for that deployment alone.
+    pub async fn denylist_batch(
+        &self,
+        deployments: &[String],
+    ) -> Result<Vec<Option<u64>>, ApiError> {
+        let provider = self.arb("denylist_batch")?;
+        let rewards = IRewardsManager::new(
+            Address::from_str(REWARDS_MANAGER).expect("RewardsManager address is a constant"),
+            &provider,
+        );
+        let parsed: Vec<(usize, B256)> = deployments
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| B256::from_str(s).ok().map(|d| (i, d)))
+            .collect();
+
+        let mut out = vec![None; deployments.len()];
+        for batch in parsed.chunks(PENDING_REWARDS_BATCH) {
+            let multicall = MulticallBuilder::new_dynamic(&provider).extend_calls(
+                batch
+                    .iter()
+                    .map(|(_, d)| rewards.denylist(*d).into_call(true)),
+            );
+            let results = tokio::time::timeout(Duration::from_secs(20), multicall.aggregate3())
+                .await
+                .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
+                .map_err(|e| ApiError::Unavailable(format!("denylist multicall: {e}")))?;
+            for ((i, _), r) in batch.iter().zip(results) {
+                out[*i] = r.ok().map(u256_to_u64);
             }
         }
         Ok(out)
@@ -1126,6 +1162,33 @@ mod tests {
 
     /// Against a live Arbitrum RPC: the batched verdicts must equal one-at-a-time reads, and a
     /// malformed address is `None` without costing its neighbours theirs.
+    /// `KITTIWAKE_LIVE_ARB_RPC=… cargo test -- --ignored live_denylist`, with
+    /// `KITTIWAKE_LIVE_DEPLOYMENTS` naming a file of ids, one a line, to time a directory's worth.
+    #[test]
+    #[ignore = "needs a live Arbitrum RPC"]
+    fn live_denylist_reads_the_block_denial_began() {
+        let rpc = std::env::var("KITTIWAKE_LIVE_ARB_RPC").expect("KITTIWAKE_LIVE_ARB_RPC");
+        let mut ids: Vec<String> = vec![
+            "0x02ccf00ae4852ac24e2d4f00657171aca0f5c9cc4243e9a975d51650dd76c628".into(),
+            "not-a-deployment".into(),
+            "0xc915fae50b8dc6976b454869031c52761538b1354ff5587a207dbdbbe66e73fa".into(),
+        ];
+        if let Ok(path) = std::env::var("KITTIWAKE_LIVE_DEPLOYMENTS") {
+            ids.extend(
+                std::fs::read_to_string(path)
+                    .unwrap()
+                    .lines()
+                    .map(str::to_string),
+            );
+        }
+        let chain = Chain::new(rpc, None);
+        let began = std::time::Instant::now();
+        let since = futures_lite_block(chain.denylist_batch(&ids)).unwrap();
+        let denied = since.iter().filter(|s| s.is_some_and(|b| b > 0)).count();
+        eprintln!("{} read, {denied} denied, {:?}", ids.len(), began.elapsed());
+        assert_eq!(&since[..3], &[Some(17_292_847), None, Some(0)]);
+    }
+
     /// `KITTIWAKE_LIVE_ARB_RPC=… KITTIWAKE_LIVE_INDEXERS=0xa,0xb cargo test -- --ignored live_`
     #[test]
     #[ignore = "needs a live Arbitrum RPC"]
