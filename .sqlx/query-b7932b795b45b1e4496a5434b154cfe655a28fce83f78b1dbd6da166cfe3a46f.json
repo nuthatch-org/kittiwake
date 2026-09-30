@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT indexer, deployment, network, latest_block, head_block, observed_at FROM sync_observations WHERE observed_at >= $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "indexer",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sync_observations",
+            "name": "indexer"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "deployment",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sync_observations",
+            "name": "deployment"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "network",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "sync_observations",
+            "name": "network"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "latest_block",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "sync_observations",
+            "name": "latest_block"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "head_block",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "sync_observations",
+            "name": "head_block"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "observed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "sync_observations",
+            "name": "observed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b7932b795b45b1e4496a5434b154cfe655a28fce83f78b1dbd6da166cfe3a46f"
+}

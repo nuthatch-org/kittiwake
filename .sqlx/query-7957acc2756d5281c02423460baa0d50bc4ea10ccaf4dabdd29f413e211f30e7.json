@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO sync_observations (indexer, deployment, network, latest_block, head_block, observed_at) SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::bigint[], $5::bigint[], $6::timestamptz[]) ON CONFLICT (indexer, deployment) DO UPDATE SET network = EXCLUDED.network, latest_block = EXCLUDED.latest_block, head_block = EXCLUDED.head_block, observed_at = EXCLUDED.observed_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "Int8Array",
+        "Int8Array",
+        "TimestamptzArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7957acc2756d5281c02423460baa0d50bc4ea10ccaf4dabdd29f413e211f30e7"
+}

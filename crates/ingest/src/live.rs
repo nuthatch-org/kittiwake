@@ -102,6 +102,7 @@ pub enum History {
 pub struct MemoryHistory {
     heads: tokio::sync::Mutex<std::collections::BTreeMap<String, crate::liveness::ChainHeadRecord>>,
     chains: tokio::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>>,
+    sync_looks: tokio::sync::Mutex<Vec<kittiwake_db::SyncObservationRow>>,
 }
 
 impl History {
@@ -180,6 +181,42 @@ impl History {
                 for (addr, chains) in rows {
                     held.insert(addr.clone(), chains.clone());
                 }
+                Ok(())
+            }
+        }
+    }
+
+    async fn sync_looks(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<kittiwake_db::SyncObservationRow>, IngestError> {
+        match self {
+            History::Db(pool) => kittiwake_db::sync_observations(pool, since)
+                .await
+                .map_err(|e| IngestError::Refused(format!("sync looks unreadable: {e}"))),
+            History::Memory(m) => Ok(m.sync_looks.lock().await.clone()),
+        }
+    }
+
+    /// Nothing reads the speeds without a database, so the memory history keeps only the looks.
+    async fn put_sync(
+        &self,
+        looks: &[kittiwake_db::SyncObservationRow],
+        speeds: &[kittiwake_db::SyncSpeedRow],
+        prune_before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), IngestError> {
+        match self {
+            History::Db(pool) => {
+                kittiwake_db::upsert_sync_speeds(pool, speeds)
+                    .await
+                    .map_err(|e| IngestError::Refused(format!("sync speeds unwritable: {e}")))?;
+                kittiwake_db::put_sync_observations(pool, looks, prune_before)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| IngestError::Refused(format!("sync looks unwritable: {e}")))
+            }
+            History::Memory(m) => {
+                *m.sync_looks.lock().await = looks.to_vec();
                 Ok(())
             }
         }
@@ -398,7 +435,94 @@ pub async fn chain_health(
     )
     .await;
 
+    if let Err(e) = measure_sync_speeds(history, &probed, now_ms).await {
+        tracing::warn!("sync speeds not measured this run: {e}");
+    }
+
     Ok(Ingested { rows: count })
+}
+
+/// Compare this run's looks at deployments indexers are behind on with the last run's, and keep
+/// the speeds that come out (lodestar#319).
+async fn measure_sync_speeds(
+    history: &History,
+    probed: &[(String, kittiwake_ext::ProbeResult)],
+    now_ms: i64,
+) -> Result<(), IngestError> {
+    use kittiwake_read::sync_speed::{MAX_GAP_MS, MIN_BEHIND, Observation, speeds};
+
+    let at = |ms: i64| chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default();
+    let now: Vec<Observation> = probed
+        .iter()
+        .filter(|(_, p)| p.reachable)
+        .flat_map(|(addr, p)| {
+            p.statuses.iter().filter_map(move |st| {
+                let (latest, head) = (st.latest_block?, st.chain_head_block?);
+                (st.health != "failed" && head - latest >= MIN_BEHIND).then(|| Observation {
+                    indexer: addr.clone(),
+                    deployment: st.deployment.clone(),
+                    network: st.network.clone().unwrap_or_default(),
+                    latest,
+                    head,
+                    at_ms: now_ms,
+                })
+            })
+        })
+        .collect();
+
+    let prev = history
+        .sync_looks(at(now_ms - MAX_GAP_MS))
+        .await?
+        .into_iter()
+        .map(|(indexer, deployment, network, latest, head, at_ms)| {
+            (
+                (indexer.clone(), deployment.clone()),
+                Observation {
+                    indexer,
+                    deployment,
+                    network,
+                    latest,
+                    head,
+                    at_ms,
+                },
+            )
+        })
+        .collect();
+    let measured: Vec<kittiwake_db::SyncSpeedRow> = speeds(&prev, &now)
+        .into_iter()
+        .map(|s| {
+            (
+                s.deployment,
+                s.network,
+                s.blocks_per_hour,
+                s.chain_blocks_per_hour,
+                s.indexers as i32,
+                s.head,
+                s.measured_at_ms,
+            )
+        })
+        .collect();
+    let looks: Vec<kittiwake_db::SyncObservationRow> = now
+        .into_iter()
+        .map(|o| {
+            (
+                o.indexer,
+                o.deployment,
+                o.network,
+                o.latest,
+                o.head,
+                o.at_ms,
+            )
+        })
+        .collect();
+    tracing::info!(
+        looks = looks.len(),
+        measured = measured.len(),
+        "sync speeds"
+    );
+    history
+        .put_sync(&looks, &measured, at(now_ms - MAX_GAP_MS))
+        .await
 }
 
 /// Which chains each indexer has stopped serving since we last looked.
@@ -482,7 +606,61 @@ pub async fn warm_ipfs(
 
 #[cfg(test)]
 mod tests {
-    use super::{History, dropped_since, median};
+    /// `KITTIWAKE_TEST_DATABASE_URL=postgres://… cargo test -p kittiwake-ingest -- --ignored sync_`
+    #[tokio::test]
+    #[ignore = "needs a Postgres"]
+    async fn sync_speeds_go_through_the_database_and_come_back() {
+        let url =
+            std::env::var("KITTIWAKE_TEST_DATABASE_URL").expect("KITTIWAKE_TEST_DATABASE_URL");
+        let pool = kittiwake_db::connect(&url, 2).await.unwrap();
+        kittiwake_db::ensure_chain_health_tables(&pool)
+            .await
+            .unwrap();
+        let history = History::Db(pool.clone());
+        let probe = |latest: i64, head: i64| {
+            vec![(
+                "0xindexer".to_string(),
+                kittiwake_ext::ProbeResult {
+                    url: "http://x".into(),
+                    reachable: true,
+                    elapsed_ms: 1,
+                    statuses: vec![kittiwake_ext::IndexingStatus {
+                        deployment: "QmSyncSpeedTest".into(),
+                        network: Some("mainnet".into()),
+                        health: "healthy".into(),
+                        synced: false,
+                        latest_block: Some(latest),
+                        chain_head_block: Some(head),
+                        blocks_behind: Some(head - latest),
+                    }],
+                    error: None,
+                },
+            )]
+        };
+        let t0 = chrono::Utc::now().timestamp_millis() - 30 * 60 * 1000;
+        measure_sync_speeds(&history, &probe(15_600_000, 23_500_000), t0)
+            .await
+            .unwrap();
+        measure_sync_speeds(
+            &history,
+            &probe(15_606_000, 23_500_150),
+            t0 + 30 * 60 * 1000,
+        )
+        .await
+        .unwrap();
+        let since = chrono::Utc::now() - chrono::Duration::hours(1);
+        let got = kittiwake_db::sync_speeds(&pool, since, None).await.unwrap();
+        let row = got
+            .iter()
+            .find(|r| r.0 == "QmSyncSpeedTest")
+            .expect("measured");
+        assert_eq!(
+            (row.2, row.3, row.4, row.5),
+            (12_000.0, 300.0, 1, 23_500_150)
+        );
+    }
+
+    use super::{History, dropped_since, measure_sync_speeds, median};
     use std::collections::BTreeMap;
 
     fn prev(pairs: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {

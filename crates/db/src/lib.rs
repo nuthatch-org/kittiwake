@@ -984,6 +984,30 @@ pub async fn ensure_chain_health_tables(pool: &Pool) -> Result<(), DbError> {
     )
     .execute(pool)
     .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS sync_observations ( \
+           indexer TEXT NOT NULL, \
+           deployment TEXT NOT NULL, \
+           network TEXT NOT NULL, \
+           latest_block BIGINT NOT NULL, \
+           head_block BIGINT NOT NULL, \
+           observed_at TIMESTAMPTZ NOT NULL, \
+           PRIMARY KEY (indexer, deployment) )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS sync_speeds ( \
+           deployment TEXT PRIMARY KEY, \
+           network TEXT NOT NULL, \
+           blocks_per_hour DOUBLE PRECISION NOT NULL, \
+           chain_blocks_per_hour DOUBLE PRECISION NOT NULL, \
+           indexers INTEGER NOT NULL, \
+           head_block BIGINT NOT NULL, \
+           measured_at TIMESTAMPTZ NOT NULL )",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -1062,6 +1086,141 @@ pub async fn upsert_indexer_chains(
         .rows_affected();
     }
     Ok(written)
+}
+
+/// One indexer's look at one deployment it is behind on: `(indexer, deployment, network, latest,
+/// head, observed_at_ms)`.
+pub type SyncObservationRow = (String, String, String, i64, i64, i64);
+
+/// The looks from the last `max_age`, which is all a speed can be measured against.
+pub async fn sync_observations(
+    pool: &Pool,
+    since: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<SyncObservationRow>, DbError> {
+    let rows = sqlx::query!(
+        "SELECT indexer, deployment, network, latest_block, head_block, observed_at \
+         FROM sync_observations WHERE observed_at >= $1",
+        since
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.indexer,
+                r.deployment,
+                r.network,
+                r.latest_block,
+                r.head_block,
+                r.observed_at.timestamp_millis(),
+            )
+        })
+        .collect())
+}
+
+/// Replace each pair's look with this run's, and drop looks older than `prune_before`. One
+/// statement for the lot: a run holds a few thousand pairs.
+pub async fn put_sync_observations(
+    pool: &Pool,
+    rows: &[SyncObservationRow],
+    prune_before: chrono::DateTime<chrono::Utc>,
+) -> Result<u64, DbError> {
+    let indexers: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
+    let deployments: Vec<String> = rows.iter().map(|r| r.1.clone()).collect();
+    let networks: Vec<String> = rows.iter().map(|r| r.2.clone()).collect();
+    let latest: Vec<i64> = rows.iter().map(|r| r.3).collect();
+    let head: Vec<i64> = rows.iter().map(|r| r.4).collect();
+    let at: Vec<chrono::DateTime<chrono::Utc>> = rows
+        .iter()
+        .map(|r| chrono::DateTime::from_timestamp_millis(r.5).unwrap_or_default())
+        .collect();
+    let written = sqlx::query!(
+        "INSERT INTO sync_observations \
+           (indexer, deployment, network, latest_block, head_block, observed_at) \
+         SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::bigint[], $5::bigint[], \
+           $6::timestamptz[]) \
+         ON CONFLICT (indexer, deployment) DO UPDATE SET network = EXCLUDED.network, \
+           latest_block = EXCLUDED.latest_block, head_block = EXCLUDED.head_block, \
+           observed_at = EXCLUDED.observed_at",
+        &indexers,
+        &deployments,
+        &networks,
+        &latest,
+        &head,
+        &at
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
+    sqlx::query!(
+        "DELETE FROM sync_observations WHERE observed_at < $1",
+        prune_before
+    )
+    .execute(pool)
+    .await?;
+    Ok(written)
+}
+
+/// `(deployment, network, blocks_per_hour, chain_blocks_per_hour, indexers, head, measured_at_ms)`.
+pub type SyncSpeedRow = (String, String, f64, f64, i32, i64, i64);
+
+/// The latest measurement per deployment. A run that saw nobody syncing it leaves it as it was.
+pub async fn upsert_sync_speeds(pool: &Pool, rows: &[SyncSpeedRow]) -> Result<u64, DbError> {
+    let mut written = 0;
+    for (d, n, bph, cbph, ix, head, t) in rows {
+        written += sqlx::query!(
+            "INSERT INTO sync_speeds (deployment, network, blocks_per_hour, chain_blocks_per_hour, \
+               indexers, head_block, measured_at) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (deployment) DO UPDATE SET network = EXCLUDED.network, \
+               blocks_per_hour = EXCLUDED.blocks_per_hour, \
+               chain_blocks_per_hour = EXCLUDED.chain_blocks_per_hour, \
+               indexers = EXCLUDED.indexers, head_block = EXCLUDED.head_block, \
+               measured_at = EXCLUDED.measured_at",
+            d,
+            n,
+            bph,
+            cbph,
+            ix,
+            head,
+            chrono::DateTime::from_timestamp_millis(*t).unwrap_or_default()
+        )
+        .execute(pool)
+        .await?
+        .rows_affected();
+    }
+    Ok(written)
+}
+
+/// Every measurement since `since`, or only `deployment`'s when one is named.
+pub async fn sync_speeds(
+    pool: &Pool,
+    since: chrono::DateTime<chrono::Utc>,
+    deployment: Option<&str>,
+) -> Result<Vec<SyncSpeedRow>, DbError> {
+    let rows = sqlx::query!(
+        "SELECT deployment, network, blocks_per_hour, chain_blocks_per_hour, indexers, head_block, \
+           measured_at FROM sync_speeds WHERE measured_at >= $1 \
+           AND ($2::text IS NULL OR deployment = $2)",
+        since,
+        deployment
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.deployment,
+                r.network,
+                r.blocks_per_hour,
+                r.chain_blocks_per_hour,
+                r.indexers,
+                r.head_block,
+                r.measured_at.timestamp_millis(),
+            )
+        })
+        .collect())
 }
 
 /// Keep a live job's answer, so a restart has something to serve until the job runs again.

@@ -1384,11 +1384,16 @@ pub async fn subgraph_deployment(ctx: &ReadCtx, ipfs_hash: &str) -> Result<Read,
         None,
     );
     let chain = ctx.chain.clone();
+    let naming = ctx.naming.clone();
     let dep = id.clone();
     let fetch: Fetcher = Arc::new(move |gate: NestGate, lane: Lane| {
-        let (shaped, chain, dep) = (shaped.clone(), chain.clone(), dep.clone());
+        let (shaped, chain, naming, dep) =
+            (shaped.clone(), chain.clone(), naming.clone(), dep.clone());
         Box::pin(async move {
             let (mut v, p) = shaped(gate, lane).await?;
+            if let (Some(n), Some(rows)) = (&naming, v.as_array_mut()) {
+                n.label_difficulty(rows).await;
+            }
             // `deniedSince` is left off, not null, when the chain could not be read.
             let since = match &chain {
                 Some(c) => c.denylist_batch(std::slice::from_ref(&dep)).await.ok(),

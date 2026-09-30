@@ -224,7 +224,7 @@ fn admits(row: &Value, q: &Query, now: i64) -> bool {
         // An unread manifest has no network, so it matches no network: passing it would put rows
         // in a filtered view that nobody has shown belong there.
         && q.network.as_deref().is_none_or(|n| text(row, "network") == Some(n))
-        && q.complexity.as_deref().is_none_or(|c| text(row, "complexity") == Some(c))
+        && q.complexity.as_deref().is_none_or(|c| text(row, "difficulty") == Some(c))
         && q.category.as_deref().is_none_or(|c| {
             row.get("categories")
                 .and_then(Value::as_array)
@@ -295,7 +295,35 @@ pub fn row(r: &Value, fees_in_window: Option<&Value>) -> Value {
         "categories": [],
         "network": Value::Null,
         "complexity": Value::Null,
+        "syncSpeed": Value::Null,
+        "difficulty": Value::Null,
+        "difficultySource": Value::Null,
     })
+}
+
+/// The row's difficulty: measured from indexers syncing it where there is a measurement and a start
+/// block to measure from, the manifest's estimate otherwise (lodestar#319).
+pub fn put_difficulty(
+    r: &mut Value,
+    speed: Option<&crate::sync_speed::Speed>,
+    start_block: Option<i64>,
+) {
+    use crate::sync_speed::{days_to_sync, label};
+    if let (Some(s), Some(start)) = (speed, start_block) {
+        let days = days_to_sync(s, start);
+        r["syncSpeed"] = json!({
+            "blocksPerHour": s.blocks_per_hour.round(),
+            "chainBlocksPerHour": s.chain_blocks_per_hour.round(),
+            "indexers": s.indexers,
+            "measuredAt": s.measured_at_ms / 1000,
+            "daysToSync": days.map(|d| (d * 10.0).round() / 10.0),
+        });
+        r["difficulty"] = json!(label(days));
+        r["difficultySource"] = json!("measured");
+    } else if let Some(c) = r.get("complexity").filter(|c| !c.is_null()).cloned() {
+        r["difficulty"] = c;
+        r["difficultySource"] = json!("manifest");
+    }
 }
 
 /// Puts the RewardsManager denylist on the rows, `since` in the same order. Zero is not denied.
@@ -317,7 +345,7 @@ pub fn set(rows: Vec<Value>, unanalysed: usize) -> Value {
         if let Some(n) = text(r, "network") {
             *networks.entry(n).or_default() += 1;
         }
-        if let Some(c) = text(r, "complexity") {
+        if let Some(c) = text(r, "difficulty") {
             *complexities.entry(c).or_default() += 1;
         }
         for c in r
@@ -554,7 +582,7 @@ mod tests {
             vec![
                 with(
                     with(dep("0xa", 10, 10), "network", json!("mainnet")),
-                    "complexity",
+                    "difficulty",
                     json!("Light"),
                 ),
                 with(dep("0xb", 10, 10), "network", json!("mainnet")),
@@ -570,6 +598,66 @@ mod tests {
             set["facets"]["complexities"],
             json!([{ "id": "Light", "count": 1 }])
         );
+    }
+
+    fn speed(bph: f64, chain: f64, head: i64) -> crate::sync_speed::Speed {
+        crate::sync_speed::Speed {
+            deployment: "Qm".into(),
+            network: "mainnet".into(),
+            blocks_per_hour: bph,
+            chain_blocks_per_hour: chain,
+            indexers: 7,
+            head,
+            measured_at_ms: 1_790_000_000_000,
+        }
+    }
+
+    /// Uniswap V2 on Ethereum: Light by its manifest, about 48 days by its indexers.
+    #[test]
+    fn a_measured_speed_outranks_the_manifest_and_the_filter_follows_it() {
+        let mut v2 = with(dep("0xv2", 10, 10), "complexity", json!("Light"));
+        put_difficulty(
+            &mut v2,
+            Some(&speed(12_000.0, 300.0, 23_500_000)),
+            Some(10_000_835),
+        );
+        assert_eq!(v2["difficulty"], "Extreme");
+        assert_eq!(v2["difficultySource"], "measured");
+        assert_eq!(v2["syncSpeed"]["daysToSync"], 48.1);
+        assert_eq!(v2["syncSpeed"]["indexers"], 7);
+
+        let mut light = with(dep("0xlight", 10, 10), "complexity", json!("Light"));
+        put_difficulty(&mut light, None, Some(0));
+        assert_eq!(light["difficulty"], "Light");
+        assert_eq!(light["difficultySource"], "manifest");
+
+        let set = set(vec![v2, light], 0);
+        assert_eq!(
+            ids(&select(&set, &q(&[("complexity", "Light")]), NOW)),
+            ["0xlight"]
+        );
+        assert_eq!(
+            ids(&select(&set, &q(&[("complexity", "Extreme")]), NOW)),
+            ["0xv2"]
+        );
+    }
+
+    #[test]
+    fn a_speed_without_a_start_block_or_a_manifest_labels_nothing() {
+        let mut r = dep("0xa", 10, 10);
+        put_difficulty(&mut r, Some(&speed(12_000.0, 300.0, 23_500_000)), None);
+        assert_eq!(
+            (r["difficulty"].clone(), r["syncSpeed"].clone()),
+            (Value::Null, Value::Null)
+        );
+    }
+
+    #[test]
+    fn a_sync_that_never_catches_up_is_extreme_with_no_eta() {
+        let mut r = dep("0xa", 10, 10);
+        put_difficulty(&mut r, Some(&speed(1_800.0, 1_800.0, 36_000_000)), Some(0));
+        assert_eq!(r["difficulty"], "Extreme");
+        assert_eq!(r["syncSpeed"]["daysToSync"], Value::Null);
     }
 
     #[test]
