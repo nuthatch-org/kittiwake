@@ -862,7 +862,7 @@ pub fn tally_by_payer_sql(receiver: Option<&str>) -> Option<String> {
 // ---------------------------------------------------------------------------------------------
 
 const DEPLOYMENT_COLS: &str = "id, CAST(signalled_tokens AS VARCHAR) AS signalled_tokens, CAST(staked_tokens AS VARCHAR) AS staked_tokens, \
-     CAST(query_fees_amount AS VARCHAR) AS query_fees_amount, created_at, active_allocation_count, curator_count";
+     CAST(query_fees_amount AS VARCHAR) AS query_fees_amount, created_at, active_allocation_count, curator_count, denied_since";
 
 pub fn deployments_order_column(order_by: &str) -> &'static str {
     match order_by {
