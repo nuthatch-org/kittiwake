@@ -41,10 +41,19 @@ fn main() {
     push(indexer_detail_sql(ADDR));
     push(indexer_operators_sql(ADDR));
     push(indexer_delegators_sql(ADDR, 100));
-    push(indexer_delegators_page_sql(ADDR, 50, 0, "stakedTokens", true));
+    push(indexer_delegators_page_sql(
+        ADDR,
+        50,
+        0,
+        "stakedTokens",
+        true,
+    ));
     push(indexer_active_allocations_sql(ADDR));
     push(indexer_closed_allocations_sql(ADDR, 50));
-    push(indexer_stake_history_sql(ADDR, &[CUTOFF - 86_400 * 30, CUTOFF - 86_400 * 7, CUTOFF]));
+    push(indexer_stake_history_sql(
+        ADDR,
+        &[CUTOFF - 86_400 * 30, CUTOFF - 86_400 * 7, CUTOFF],
+    ));
     push(indexer_daily_sql(ADDR, SINCE));
     push(indexer_revenue_daily_sql(ADDR, SINCE));
     push(indexer_revenue_by_deployment_sql(ADDR, SINCE));
@@ -53,7 +62,10 @@ fn main() {
     push(Some(ALLOCATION_SHARES_ALL_SQL.to_string()));
     push(provisions_by_indexer_sql(ADDR));
     push(provisions_by_service_sql(ADDR, 50, 0));
-    push(data_service_totals_sql(&[ADDR.to_string(), RECEIVER.to_string()]));
+    push(data_service_totals_sql(&[
+        ADDR.to_string(),
+        RECEIVER.to_string(),
+    ]));
     push(Some(MAX_THAWING_PERIOD_SQL.to_string()));
     push(provision_thaw_requests_sql(ADDR));
     push(indexer_horizon_activity_sql(ADDR, 50));
@@ -97,7 +109,9 @@ fn main() {
     push(Some(SUBGRAPH_METADATA_SQL.to_string()));
     push(Some(DIPS_CURRENT_ALLOCATION_SQL.to_string()));
     push(Some(DIPS_TIMELINE_SQL.to_string()));
-    push(dips_latest_per_target_sql("issuance_allocator__issuance_distributed"));
+    push(dips_latest_per_target_sql(
+        "issuance_allocator__issuance_distributed",
+    ));
     push(Some(QOS_PROVENANCE_SQL.to_string()));
     push(Some(QOS_FRESHNESS_SQL.to_string()));
     push(Some(qos_day_probe_sql(20_300)));
