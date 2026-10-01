@@ -476,7 +476,7 @@ CREATE INDEX IF NOT EXISTS idx_sb_ban_tripcode ON scuttlebutt_bans (tripcode);
 
 -- ── Ours, and only ours ───────────────────────────────────────────────────────
 --
--- The four tables this service created for itself. Nothing else reads or writes them, which is
+-- The six tables this service created for itself. Nothing else reads or writes them, which is
 -- what keeps the migration reversible: the old handlers do not know they exist and do not care.
 -- `crates/db` also creates them at start-up, so a box that has not had this file applied still
 -- comes up; the two must agree and this file is the one to read.
@@ -498,6 +498,28 @@ CREATE TABLE IF NOT EXISTS live_answers (
   key          TEXT PRIMARY KEY,
   value        JSONB NOT NULL,
   computed_at  TIMESTAMPTZ NOT NULL
+);
+
+-- How fast indexers sync each deployment (lodestar#319). The chain-health job keeps each indexer's
+-- last look at a deployment it is behind on, and a second look is a measured speed.
+CREATE TABLE IF NOT EXISTS sync_observations (
+  indexer       TEXT NOT NULL,
+  deployment    TEXT NOT NULL,
+  network       TEXT NOT NULL,
+  latest_block  BIGINT NOT NULL,
+  head_block    BIGINT NOT NULL,
+  observed_at   TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (indexer, deployment)
+);
+
+CREATE TABLE IF NOT EXISTS sync_speeds (
+  deployment             TEXT PRIMARY KEY,
+  network                TEXT NOT NULL,
+  blocks_per_hour        DOUBLE PRECISION NOT NULL,
+  chain_blocks_per_hour  DOUBLE PRECISION NOT NULL,
+  indexers               INTEGER NOT NULL,
+  head_block             BIGINT NOT NULL,
+  measured_at            TIMESTAMPTZ NOT NULL
 );
 
 -- The rolling APYs live beside `indexers` rather than in it: that table is the platform's and a

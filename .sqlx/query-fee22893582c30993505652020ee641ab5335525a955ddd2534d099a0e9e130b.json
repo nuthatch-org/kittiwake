@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO sync_speeds (deployment, network, blocks_per_hour, chain_blocks_per_hour, indexers, head_block, measured_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (deployment) DO UPDATE SET network = EXCLUDED.network, blocks_per_hour = EXCLUDED.blocks_per_hour, chain_blocks_per_hour = EXCLUDED.chain_blocks_per_hour, indexers = EXCLUDED.indexers, head_block = EXCLUDED.head_block, measured_at = EXCLUDED.measured_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Float8",
+        "Float8",
+        "Int4",
+        "Int8",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fee22893582c30993505652020ee641ab5335525a955ddd2534d099a0e9e130b"
+}

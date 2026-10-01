@@ -18,6 +18,7 @@ pub mod qos;
 pub mod recommend;
 pub mod sql;
 pub mod status_probe;
+pub mod sync_speed;
 
 use std::sync::Arc;
 use std::time::Duration;

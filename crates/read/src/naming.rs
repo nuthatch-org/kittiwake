@@ -34,6 +34,7 @@ const MANIFEST_BATCH: usize = 250;
 struct ManifestFacts {
     network: Option<String>,
     complexity: Option<String>,
+    start_block: Option<i64>,
 }
 
 impl ManifestFacts {
@@ -47,6 +48,7 @@ impl ManifestFacts {
             complexity: serde_json::to_value(&a.category)
                 .ok()
                 .and_then(|c| c.as_str().map(str::to_string)),
+            start_block: a.data_sources.iter().map(|s| s.start_block).min(),
         }
     }
 }
@@ -167,6 +169,8 @@ impl Naming {
             );
         }
 
+        let speeds = self.sync_speeds(None).await;
+
         let mut unanalysed = 0;
         for r in rows.iter_mut() {
             if let Some(doc) = id_of(r)
@@ -185,15 +189,77 @@ impl Naming {
                     .collect();
                 r["categories"] = serde_json::json!(categories);
             }
-            match field(r, "ipfsHash").and_then(|cid| facts.get(&cid)) {
+            let cid = field(r, "ipfsHash").unwrap_or_default();
+            let fact = facts.get(&cid);
+            match fact {
                 Some(f) => {
                     r["network"] = serde_json::json!(f.network);
                     r["complexity"] = serde_json::json!(f.complexity);
                 }
                 None => unanalysed += 1,
             }
+            crate::directory::put_difficulty(r, speeds.get(&cid), fact.and_then(|f| f.start_block));
         }
         unanalysed
+    }
+
+    /// The measured sync speeds, keyed by CID; only `cid`'s when one is named. Empty when the
+    /// database cannot say, so the manifest estimate stands alone.
+    async fn sync_speeds(&self, cid: Option<&str>) -> HashMap<String, crate::sync_speed::Speed> {
+        let since = chrono::Utc::now() - chrono::Duration::days(crate::sync_speed::KEPT_DAYS);
+        kittiwake_db::sync_speeds(&self.pool, since, cid)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("sync speeds unreadable, serving the manifest estimate alone: {e}");
+                Vec::new()
+            })
+            .into_iter()
+            .map(|(deployment, network, bph, cbph, indexers, head, at)| {
+                (
+                    deployment.clone(),
+                    crate::sync_speed::Speed {
+                        deployment,
+                        network,
+                        blocks_per_hour: bph,
+                        chain_blocks_per_hour: cbph,
+                        indexers: indexers.max(0) as usize,
+                        head,
+                        measured_at_ms: at,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Put the directory's `complexity`, `syncSpeed` and `difficulty` on one deployment's rows.
+    pub async fn label_difficulty(&self, rows: &mut [serde_json::Value]) {
+        for r in rows.iter_mut() {
+            let Some(cid) = r
+                .get("ipfsHash")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let facts = match self.manifests.get(&cid).await {
+                Some(f) => Some(f),
+                None => kittiwake_ext::cached_docs(&self.pool, std::slice::from_ref(&cid))
+                    .await
+                    .ok()
+                    .and_then(|d| d.into_iter().next())
+                    .and_then(|d| d.text)
+                    .map(|yaml| ManifestFacts::of(&yaml)),
+            };
+            if let Some(f) = &facts {
+                r["complexity"] = serde_json::json!(f.complexity);
+            }
+            let speeds = self.sync_speeds(Some(&cid)).await;
+            crate::directory::put_difficulty(
+                r,
+                speeds.get(&cid),
+                facts.and_then(|f| f.start_block),
+            );
+        }
     }
 
     /// Name the account and the allocations on `/api/indexer`'s answer, asking on `lane`.
