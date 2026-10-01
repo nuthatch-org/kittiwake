@@ -184,6 +184,10 @@ impl DeploymentMeta {
 /// "Most recently" is `ROW_NUMBER() ... ORDER BY created_at DESC`, not "the current version": a
 /// deployment can be published by several subgraphs, and the newest publisher is the one whose name
 /// a reader would recognise.
+///
+/// Two subgraphs can publish one deployment in the same second, and then `created_at` does not say
+/// which is newer. `subgraph_id` breaks the tie, so the answer is the same on every run and on any
+/// engine: DuckDB and Burrmill each picked a different one of the two (GNS nest, 2026-10-01).
 pub async fn subgraph_metadata_for_deployments(
     pool: &Pool,
     ipfs: &Ipfs,
@@ -206,7 +210,8 @@ pub async fn subgraph_metadata_for_deployments(
         format!(
             "SELECT deployment_id, subgraph_id, subgraph_metadata, version_metadata FROM (\
              SELECT *, ROW_NUMBER() OVER (PARTITION BY LOWER(deployment_id) ORDER BY created_at \
-             DESC) AS rn FROM deployment_subgraphs WHERE LOWER(deployment_id) IN ({})) WHERE rn = 1",
+             DESC, subgraph_id) AS rn FROM deployment_subgraphs WHERE LOWER(deployment_id) IN ({})) \
+             WHERE rn = 1",
             quoted(chunk)
         )
     })
@@ -263,7 +268,7 @@ pub async fn metadata_cids_by_deployment(
         NestId::Gns,
         "SELECT LOWER(deployment_id) AS deployment_id, subgraph_metadata FROM (\
          SELECT deployment_id, subgraph_metadata, ROW_NUMBER() OVER (PARTITION BY \
-         LOWER(deployment_id) ORDER BY created_at DESC) AS rn FROM deployment_subgraphs) \
+         LOWER(deployment_id) ORDER BY created_at DESC, subgraph_id) AS rn FROM deployment_subgraphs) \
          WHERE rn = 1",
     );
     spec.lane = lane;

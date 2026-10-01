@@ -1111,7 +1111,7 @@ pub fn deployment_subgraph_sql(dep: &str) -> Option<String> {
     }
     Some(format!(
         "SELECT subgraph_id FROM deployment_subgraphs WHERE LOWER(deployment_id) = '{dep}' \
-         ORDER BY created_at DESC LIMIT 1"
+         ORDER BY created_at DESC, subgraph_id LIMIT 1"
     ))
 }
 
