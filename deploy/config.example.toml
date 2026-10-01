@@ -17,6 +17,13 @@ database_max_connections = 16
 # public endpoint that would throttle under the directory's fan-out.
 # arbitrum_rpc_url = "https://arb1.example/..."
 
+# Ethereum mainnet, for ENS names and the mainnet GRT supply only. Unset means three public
+# endpoints are tried in order, which is the normal setup: these are not protocol figures.
+# mainnet_rpc_url = "https://eth.example/..."
+# A paid endpoint tried only after every one above has failed, so the names survive the public
+# endpoints all throttling at once. Bills per call, but on a healthy day nothing reaches it.
+# mainnet_rpc_fallback_url = "https://eth.example/..."
+
 # The Dock's BountyBoard, on Arbitrum. Absent means `reconcile-bounties` does not run, which is the
 # right answer: with no board there is nothing to reconcile against.
 # bounty_board_address = "0x..."

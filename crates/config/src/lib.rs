@@ -257,6 +257,10 @@ pub struct Config {
     /// Ethereum mainnet JSON-RPC. Optional: three public endpoints are tried in order when unset,
     /// which is acceptable here because ENS is not a protocol figure.
     pub mainnet_rpc_url: Option<String>,
+    /// A paid mainnet endpoint tried only after every endpoint above has failed, so ENS names and
+    /// the mainnet supply survive the public endpoints all throttling at once. It bills per call;
+    /// on a healthy day nothing reaches it.
+    pub mainnet_rpc_fallback_url: Option<String>,
     /// The Dock's BountyBoard, on Arbitrum. Absent means `reconcile-bounties` does not run, which
     /// is right: with no board there is nothing to reconcile against, and guessing an address
     /// would be worse than not looking. Deployed per environment, unlike the protocol contracts,
@@ -605,6 +609,7 @@ mod tests {
             support: None,
             arbitrum_rpc_url: None,
             mainnet_rpc_url: None,
+            mainnet_rpc_fallback_url: None,
             bounty_board_address: None,
             database_max_connections: 16,
             cache: None,

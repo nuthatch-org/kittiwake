@@ -272,7 +272,7 @@ pub fn select(set: &Value, q: &Query, now: i64) -> Page {
 /// One directory row from a `lodestar_deployments` row and its fees in the window.
 ///
 /// The labels (`displayName`, `categories`, `network`, `complexity`) start empty and are put on by
-/// [`crate::naming::Naming::label_directory`].
+/// [`crate::naming::Naming::label_directory`]; `deniedSince` by [`mark_denied`].
 pub fn row(r: &Value, fees_in_window: Option<&Value>) -> Value {
     use crate::shape::{i0, ipfs_or_id, s0};
     let id = r.get("id").and_then(Value::as_str).unwrap_or_default();
@@ -288,6 +288,7 @@ pub fn row(r: &Value, fees_in_window: Option<&Value>) -> Value {
             _ => json!("0"),
         },
         "createdAt": i0(r, "created_at"),
+        "deniedSince": Value::Null,
         "indexerCount": i0(r, "active_allocation_count"),
         "curatorCount": i0(r, "curator_count"),
         "displayName": Value::Null,
@@ -295,6 +296,15 @@ pub fn row(r: &Value, fees_in_window: Option<&Value>) -> Value {
         "network": Value::Null,
         "complexity": Value::Null,
     })
+}
+
+/// Puts the RewardsManager denylist on the rows, `since` in the same order. Zero is not denied.
+pub fn mark_denied(rows: &mut [Value], since: &[Option<u64>]) {
+    for (r, s) in rows.iter_mut().zip(since) {
+        if let Some(block) = s.filter(|b| *b > 0) {
+            r["deniedSince"] = json!(block);
+        }
+    }
 }
 
 /// The cached value: the labelled rows, what their filters can be set to, and how many rows have
@@ -352,6 +362,7 @@ mod tests {
             "createdAt": NOW - 400 * 86_400,
             "indexerCount": if stake > 0 { 3 } else { 0 },
             "curatorCount": 1,
+            "deniedSince": null,
             "displayName": null,
             "categories": [],
             "network": null,
@@ -582,7 +593,17 @@ mod tests {
         assert_eq!(r["queryFees30d"], "5000");
         assert_eq!(r["indexerCount"], 1);
         assert_eq!(r["network"], Value::Null);
+        assert_eq!(r["deniedSince"], Value::Null);
 
         assert_eq!(row(&json!({ "id": "0x00" }), None)["queryFees30d"], "0");
+    }
+
+    #[test]
+    fn the_denylist_marks_only_the_denied_and_an_unread_one_stays_unmarked() {
+        let mut rows = vec![dep("0xa", 10, 10), dep("0xb", 10, 10), dep("0xc", 10, 10)];
+        mark_denied(&mut rows, &[Some(17_292_847), Some(0), None]);
+        assert_eq!(rows[0]["deniedSince"], 17_292_847);
+        assert_eq!(rows[1]["deniedSince"], Value::Null);
+        assert_eq!(rows[2]["deniedSince"], Value::Null);
     }
 }

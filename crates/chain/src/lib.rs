@@ -5,6 +5,7 @@
 //! other. So these values carry no nest provenance and are cached briefly rather than folded, and
 //! a failed read is reported rather than replaced with the last known answer.
 
+mod metered;
 pub mod registry;
 pub mod tap;
 
@@ -13,7 +14,7 @@ use std::time::Duration;
 
 use alloy::ens::{EnsError, ProviderEnsExt, namehash};
 use alloy::primitives::{Address, B256, U256};
-use alloy::providers::{MulticallBuilder, MulticallItem, Provider, ProviderBuilder};
+use alloy::providers::{MulticallBuilder, MulticallItem, Provider};
 use alloy::sol;
 use kittiwake_types::ApiError;
 
@@ -116,6 +117,7 @@ sol! {
     interface IRewardsManager {
         function getRewards(address rewardsIssuer, address allocationID)
             external view returns (uint256);
+        function denylist(bytes32 subgraphDeploymentID) external view returns (uint256);
     }
 
     #[sol(rpc)]
@@ -234,19 +236,35 @@ impl Chain {
         }
     }
 
-    fn arb(&self) -> Result<impl Provider + Clone, ApiError> {
+    /// A paid endpoint tried after every other mainnet endpoint has failed.
+    ///
+    /// The public endpoints are free and carry these reads fine on a normal day; this is what keeps
+    /// ENS names and the mainnet supply on the page on the day all three throttle or fall over at
+    /// once. Last, never first, because it bills per call and the reads it covers are decorations,
+    /// not protocol figures. A call only reaches it when every endpoint before it has already
+    /// failed, so on a healthy day it costs nothing.
+    pub fn with_mainnet_fallback(mut self, url: Option<String>) -> Self {
+        if let Some(url) = url.filter(|u| !u.trim().is_empty())
+            && !self.mainnet.contains(&url)
+        {
+            self.mainnet.push(url);
+        }
+        self
+    }
+
+    fn arb(&self, op: &'static str) -> Result<impl Provider + Clone, ApiError> {
         let url = self
             .arbitrum
             .parse()
             .map_err(|_| ApiError::Internal(format!("bad arbitrum rpc url: {}", self.arbitrum)))?;
-        Ok(ProviderBuilder::new().connect_http(url))
+        Ok(metered::connect(url, "arbitrum", op))
     }
 
     /// The oracle's network-wide state. Read once per refresh, not once per indexer.
     pub async fn oracle_context(&self) -> Result<OracleContext, ApiError> {
         let oracle = IRewardsEligibilityOracle::new(
             Address::from_str(REO_ADDRESS).expect("REO address is a constant"),
-            self.arb()?,
+            self.arb("oracle_context")?,
         );
         let c_period = oracle.getEligibilityPeriod();
         let c_enforced = oracle.getEligibilityValidation();
@@ -271,19 +289,76 @@ impl Chain {
         })
     }
 
-    /// Is this one indexer eligible? One call, which is what makes a whole-directory pass affordable.
-    pub async fn is_eligible(&self, indexer: &str) -> Result<bool, ApiError> {
-        let addr = Address::from_str(indexer)
-            .map_err(|_| ApiError::BadRequest(format!("not an address: {indexer}")))?;
+    /// Every indexer's verdict, in the order given, `PENDING_REWARDS_BATCH` to an `aggregate3`.
+    ///
+    /// One `eth_call` per indexer was 21 calls a minute from the five-minute refresh alone. A reverted
+    /// read or an unparseable address is `None` for that indexer and costs no other verdict.
+    pub async fn eligibility_batch(
+        &self,
+        indexers: &[String],
+    ) -> Result<Vec<Option<bool>>, ApiError> {
+        let provider = self.arb("eligibility_batch")?;
         let oracle = IRewardsEligibilityOracle::new(
             Address::from_str(REO_ADDRESS).expect("REO address is a constant"),
-            self.arb()?,
+            &provider,
         );
-        oracle
-            .isEligible(addr)
-            .call()
-            .await
-            .map_err(|e| ApiError::Unavailable(format!("oracle: {e}")))
+        let parsed: Vec<(usize, Address)> = indexers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| Address::from_str(s).ok().map(|a| (i, a)))
+            .collect();
+
+        let mut out = vec![None; indexers.len()];
+        for batch in parsed.chunks(PENDING_REWARDS_BATCH) {
+            let multicall = MulticallBuilder::new_dynamic(&provider).extend_calls(
+                batch
+                    .iter()
+                    .map(|(_, a)| oracle.isEligible(*a).into_call(true)),
+            );
+            let results = tokio::time::timeout(Duration::from_secs(20), multicall.aggregate3())
+                .await
+                .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
+                .map_err(|e| ApiError::Unavailable(format!("isEligible multicall: {e}")))?;
+            for ((i, _), r) in batch.iter().zip(results) {
+                out[*i] = r.ok();
+            }
+        }
+        Ok(out)
+    }
+
+    /// The block each deployment was denied rewards from, in the order given, or 0 where it earns.
+    /// A reverted read or an id that is not 32 bytes is `None` for that deployment alone.
+    pub async fn denylist_batch(
+        &self,
+        deployments: &[String],
+    ) -> Result<Vec<Option<u64>>, ApiError> {
+        let provider = self.arb("denylist_batch")?;
+        let rewards = IRewardsManager::new(
+            Address::from_str(REWARDS_MANAGER).expect("RewardsManager address is a constant"),
+            &provider,
+        );
+        let parsed: Vec<(usize, B256)> = deployments
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| B256::from_str(s).ok().map(|d| (i, d)))
+            .collect();
+
+        let mut out = vec![None; deployments.len()];
+        for batch in parsed.chunks(PENDING_REWARDS_BATCH) {
+            let multicall = MulticallBuilder::new_dynamic(&provider).extend_calls(
+                batch
+                    .iter()
+                    .map(|(_, d)| rewards.denylist(*d).into_call(true)),
+            );
+            let results = tokio::time::timeout(Duration::from_secs(20), multicall.aggregate3())
+                .await
+                .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
+                .map_err(|e| ApiError::Unavailable(format!("denylist multicall: {e}")))?;
+            for ((i, _), r) in batch.iter().zip(results) {
+                out[*i] = r.ok().map(u256_to_u64);
+            }
+        }
+        Ok(out)
     }
 
     /// The full picture for one indexer: its verdict, plus the context needed to read that verdict
@@ -293,7 +368,7 @@ impl Chain {
             .map_err(|_| ApiError::BadRequest(format!("not an address: {indexer}")))?;
         let oracle = IRewardsEligibilityOracle::new(
             Address::from_str(REO_ADDRESS).expect("REO address is a constant"),
-            self.arb()?,
+            self.arb("eligibility")?,
         );
 
         let c_eligible = oracle.isEligible(addr);
@@ -326,16 +401,16 @@ impl Chain {
     /// A string rather than a number on purpose: the supply exceeds what an f64 holds exactly, and
     /// a total supply that is subtly wrong is worse than one that is missing.
     pub async fn grt_total_supply(&self, chain: SupplyChain) -> Result<String, ApiError> {
-        let (token, urls) = match chain {
-            SupplyChain::Arbitrum => (GRT_ARBITRUM, vec![self.arbitrum.clone()]),
-            SupplyChain::Mainnet => (GRT_MAINNET, self.mainnet.clone()),
+        let (token, urls, label) = match chain {
+            SupplyChain::Arbitrum => (GRT_ARBITRUM, vec![self.arbitrum.clone()], "arbitrum"),
+            SupplyChain::Mainnet => (GRT_MAINNET, self.mainnet.clone(), "mainnet"),
         };
         let token = Address::from_str(token).expect("token address is a constant");
 
         let mut last: Option<String> = None;
         for url in urls {
             let Ok(parsed) = url.parse() else { continue };
-            let provider = ProviderBuilder::new().connect_http(parsed);
+            let provider = metered::connect(parsed, label, "grt_total_supply");
             let erc20 = IERC20::new(token, provider);
             match tokio::time::timeout(Duration::from_secs(10), erc20.totalSupply().call()).await {
                 Ok(Ok(v)) => return Ok(v.to_string()),
@@ -371,7 +446,7 @@ impl Chain {
         let mut last = String::from("no mainnet endpoint configured");
         for url in &self.mainnet {
             let Ok(parsed) = url.parse() else { continue };
-            let provider = ProviderBuilder::new().connect_http(parsed);
+            let provider = metered::connect(parsed, "mainnet", "ens_address");
             // The registry first: the Universal Resolver reverts on an unregistered name, and a
             // public RPC reports that revert as the same -32603 it uses for its own failures.
             let lookup = async {
@@ -395,7 +470,7 @@ impl Chain {
         let mut last = String::from("no mainnet endpoint configured");
         for url in &self.mainnet {
             let Ok(parsed) = url.parse() else { continue };
-            let provider = ProviderBuilder::new().connect_http(parsed);
+            let provider = metered::connect(parsed, "mainnet", "ens_name");
             let lookup = async {
                 let name = provider.lookup_address(&address).await?;
                 let forward = provider.resolve_name(&name).await?;
@@ -436,7 +511,7 @@ impl Chain {
             let Ok(parsed) = url.parse() else { continue };
             let registry = IEnsRegistry::new(
                 alloy::ens::ENS_ADDRESS,
-                ProviderBuilder::new().connect_http(parsed),
+                metered::connect(parsed, "mainnet", "verified_default_name"),
             );
             let owner = registry.owner(node);
             match tokio::time::timeout(Duration::from_secs(10), owner.call()).await {
@@ -462,7 +537,7 @@ impl Chain {
             let mut last = String::from("none configured");
             for url in &self.mainnet {
                 let Ok(parsed) = url.parse() else { continue };
-                let provider = ProviderBuilder::new().connect_http(parsed);
+                let provider = metered::connect(parsed, "mainnet", "grt_supply_breakdown");
                 let erc20 = IERC20::new(token_l1, provider);
                 let c_supply = erc20.totalSupply();
                 let c_balance = erc20.balanceOf(escrow);
@@ -516,8 +591,7 @@ impl Chain {
     ///
     /// `None` when the call reverts, which is what an indexer with no provision looks like.
     pub async fn delegation_pool(&self, indexer: &str) -> Option<(f64, f64)> {
-        let provider =
-            alloy::providers::ProviderBuilder::new().connect_http(self.arbitrum.parse().ok()?);
+        let provider = metered::connect(self.arbitrum.parse().ok()?, "arbitrum", "delegation_pool");
         let staking: alloy::primitives::Address = HORIZON_STAKING.parse().ok()?;
         let verifier: alloy::primitives::Address = SUBGRAPH_SERVICE.parse().ok()?;
         let who: alloy::primitives::Address = indexer.parse().ok()?;
@@ -548,7 +622,7 @@ impl Chain {
     ) -> Result<bool, ApiError> {
         let staking = Address::from_str(HORIZON_STAKING).expect("staking address is a constant");
         let verifier = Address::from_str(SUBGRAPH_SERVICE).expect("verifier is a constant");
-        let c = IHorizonStaking::new(staking, self.arb()?);
+        let c = IHorizonStaking::new(staking, self.arb("is_subgraph_service_operator")?);
         match tokio::time::timeout(
             Duration::from_secs(10),
             c.isAuthorized(indexer, verifier, operator).call(),
@@ -572,7 +646,7 @@ impl Chain {
     pub async fn bounty(&self, board: &str, id: u64) -> Result<ChainBounty, ApiError> {
         let addr = Address::from_str(board.trim())
             .map_err(|_| ApiError::Internal(format!("bad bounty board address: {board}")))?;
-        let c = IBountyBoard::new(addr, self.arb()?);
+        let c = IBountyBoard::new(addr, self.arb("bounty")?);
         let b = tokio::time::timeout(Duration::from_secs(8), c.getBounty(U256::from(id)).call())
             .await
             .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
@@ -597,7 +671,7 @@ impl Chain {
             .map(|a| Address::from_str(a))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| ApiError::BadRequest("not an allocation address".into()))?;
-        let provider = self.arb()?;
+        let provider = self.arb("pending_rewards")?;
         let block = tokio::time::timeout(Duration::from_secs(8), provider.get_block_number())
             .await
             .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
@@ -642,7 +716,7 @@ impl Chain {
             .map(|s| Address::from_str(s))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| ApiError::BadRequest("not a data service address".into()))?;
-        let provider = self.arb()?;
+        let provider = self.arb("horizon_provisions")?;
         let block = tokio::time::timeout(Duration::from_secs(8), provider.get_block_number())
             .await
             .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
@@ -759,7 +833,7 @@ impl Chain {
     }
 
     pub async fn block_number(&self) -> Result<u64, ApiError> {
-        let provider = self.arb()?;
+        let provider = self.arb("block_number")?;
         tokio::time::timeout(Duration::from_secs(8), provider.get_block_number())
             .await
             .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
@@ -1025,6 +1099,119 @@ mod tests {
             1
         );
         assert_eq!(Chain::new("x", None).mainnet.len(), PUBLIC_MAINNET.len());
+    }
+
+    #[test]
+    fn the_paid_fallback_is_tried_last_and_only_once() {
+        let chain = Chain::new("x", None).with_mainnet_fallback(Some("https://paid".into()));
+        assert_eq!(chain.mainnet.len(), PUBLIC_MAINNET.len() + 1);
+        assert_eq!(
+            chain.mainnet.last().map(String::as_str),
+            Some("https://paid")
+        );
+        assert_eq!(
+            chain.mainnet[..PUBLIC_MAINNET.len()],
+            PUBLIC_MAINNET.map(String::from)
+        );
+
+        let mine = Chain::new("x", Some("https://mine".into()))
+            .with_mainnet_fallback(Some("https://paid".into()));
+        assert_eq!(mine.mainnet, ["https://mine", "https://paid"]);
+
+        let same = Chain::new("x", Some("https://paid".into()))
+            .with_mainnet_fallback(Some("https://paid".into()));
+        assert_eq!(same.mainnet, ["https://paid"], "never asked twice");
+
+        for none in [None, Some(String::new()), Some("  ".into())] {
+            assert_eq!(
+                Chain::new("x", None)
+                    .with_mainnet_fallback(none)
+                    .mainnet
+                    .len(),
+                PUBLIC_MAINNET.len()
+            );
+        }
+    }
+
+    /// The point of the fallback: every endpoint before it refuses, and the read still lands.
+    #[tokio::test]
+    async fn a_read_reaches_the_fallback_when_every_endpoint_before_it_fails() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let dead = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&dead)
+            .await;
+        let paid = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "result": format!("0x{:064x}", 10_000_000_000u128 * 10u128.pow(18)),
+            })))
+            .expect(1)
+            .mount(&paid)
+            .await;
+
+        let chain = Chain::new("x", Some(dead.uri())).with_mainnet_fallback(Some(paid.uri()));
+        let supply = chain.grt_total_supply(SupplyChain::Mainnet).await.unwrap();
+        assert_eq!(supply, "10000000000000000000000000000");
+    }
+
+    /// Against a live Arbitrum RPC: the batched verdicts must equal one-at-a-time reads, and a
+    /// malformed address is `None` without costing its neighbours theirs.
+    /// `KITTIWAKE_LIVE_ARB_RPC=… cargo test -- --ignored live_denylist`, with
+    /// `KITTIWAKE_LIVE_DEPLOYMENTS` naming a file of ids, one a line, to time a directory's worth.
+    #[test]
+    #[ignore = "needs a live Arbitrum RPC"]
+    fn live_denylist_reads_the_block_denial_began() {
+        let rpc = std::env::var("KITTIWAKE_LIVE_ARB_RPC").expect("KITTIWAKE_LIVE_ARB_RPC");
+        let mut ids: Vec<String> = vec![
+            "0x02ccf00ae4852ac24e2d4f00657171aca0f5c9cc4243e9a975d51650dd76c628".into(),
+            "not-a-deployment".into(),
+            "0xc915fae50b8dc6976b454869031c52761538b1354ff5587a207dbdbbe66e73fa".into(),
+        ];
+        if let Ok(path) = std::env::var("KITTIWAKE_LIVE_DEPLOYMENTS") {
+            ids.extend(
+                std::fs::read_to_string(path)
+                    .unwrap()
+                    .lines()
+                    .map(str::to_string),
+            );
+        }
+        let chain = Chain::new(rpc, None);
+        let began = std::time::Instant::now();
+        let since = futures_lite_block(chain.denylist_batch(&ids)).unwrap();
+        let denied = since.iter().filter(|s| s.is_some_and(|b| b > 0)).count();
+        eprintln!("{} read, {denied} denied, {:?}", ids.len(), began.elapsed());
+        assert_eq!(&since[..3], &[Some(17_292_847), None, Some(0)]);
+    }
+
+    /// `KITTIWAKE_LIVE_ARB_RPC=… KITTIWAKE_LIVE_INDEXERS=0xa,0xb cargo test -- --ignored live_`
+    #[test]
+    #[ignore = "needs a live Arbitrum RPC"]
+    fn live_batched_eligibility_matches_single_reads() {
+        let rpc = std::env::var("KITTIWAKE_LIVE_ARB_RPC").expect("KITTIWAKE_LIVE_ARB_RPC");
+        let mut ids: Vec<String> = std::env::var("KITTIWAKE_LIVE_INDEXERS")
+            .expect("KITTIWAKE_LIVE_INDEXERS")
+            .split(',')
+            .map(str::to_string)
+            .collect();
+        ids.insert(1, "not-an-address".into());
+        let chain = Chain::new(rpc, None);
+        let batch = futures_lite_block(chain.eligibility_batch(&ids)).unwrap();
+        assert_eq!(batch.len(), ids.len());
+        assert_eq!(batch[1], None);
+        for (id, verdict) in ids
+            .iter()
+            .zip(&batch)
+            .filter(|(id, _)| id.starts_with("0x"))
+        {
+            let single = futures_lite_block(chain.eligibility(id)).unwrap().eligible;
+            assert_eq!(*verdict, Some(single), "{id}");
+        }
     }
 
     /// A tiny runtime so the address-validation test does not need the tokio macro.
