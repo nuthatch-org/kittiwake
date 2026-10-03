@@ -73,16 +73,17 @@ user = "$NEST_USER"
 password = "$NEST_PASS"
 
 [nest.permits]
-# Four, because that is what the nest admits: `NUTHATCH_SQL_MAX_CONCURRENCY=4` on the allocations
-# nest. The rule above is not advice - a pool wider than the nest means the surplus is sent anyway
+# Two, because that is what the nest admits: `NUTHATCH_SQL_MAX_CONCURRENCY=2` on the allocations
+# nest since its Burrmill switch on 2026-10-01 (it was 4 before). The rule above is not advice - a
+# pool wider than the nest means the surplus is sent anyway
 # and shed, and `nest_busy` climbs while every page shows a console error for work the backend was
 # never able to take.
 #
 # It was briefly eight, as a mitigation for a fold that starved itself by needing more permits than
 # existed. That is fixed properly in `many()`, which admits at most `lane_width - 1` at a time, so
-# a six-part fold fits inside four permits and the mitigation is no longer needed. Raising this
+# a six-part fold fits inside any pool of two or more and the mitigation is no longer needed. Raising this
 # again only moves the shedding from kittiwake's gate to the nest's.
-alloc = 4
+alloc = 2
 gns = 2
 dips = 2
 "dips-sepolia" = 2
