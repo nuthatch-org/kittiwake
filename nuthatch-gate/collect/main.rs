@@ -268,12 +268,6 @@ fn alloc(q: &mut Set) {
          WHERE c.block_timestamp >= {} \
          ORDER BY c.block_timestamp, c.tx_hash, c.log_index LIMIT 10000", NOW - DAY)));
     q.add("qos.allocation_shares_all", k, &format!("{ingest}/qos_score.rs"), s(sql::ALLOCATION_SHARES_ALL_SQL));
-
-    // Found by gating production twice on one copy a minute apart; re-run that after a refresh.
-    // Both page with ORDER BY ... LIMIT on a key with ties, so which tied rows make the page is the
-    // engine's choice; a tiebreaker in kittiwake would make them exact.
-    q.volatile("payments.accounts", "ORDER BY SUM(mv.d) DESC LIMIT 100: equal balances tie across the limit");
-    q.volatile("delegation_events", "ORDER BY ts DESC LIMIT 100: events in one block share a timestamp");
 }
 
 // A closed day two days before the pin, 2026-10-01. Production asks the QoS nest one day at a time,
