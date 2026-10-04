@@ -842,7 +842,7 @@ pub fn tally_collected_sql(receiver: Option<&str>, first: i64) -> Option<String>
     Some(format!(
         "SELECT LOWER(payer) AS payer, LOWER(receiver) AS receiver, \"collectionId\" AS collection_id, \
          CAST(SUM(CAST(tokens AS HUGEINT)) AS VARCHAR) AS tokens FROM tally__payment_collected WHERE 1=1{rc} \
-         GROUP BY 1, 2, 3 ORDER BY SUM(CAST(tokens AS HUGEINT)) DESC LIMIT {first}"
+         GROUP BY 1, 2, 3 ORDER BY SUM(CAST(tokens AS HUGEINT)) DESC, 1, 2, 3 LIMIT {first}"
     ))
 }
 
@@ -853,7 +853,7 @@ pub fn tally_by_payer_sql(receiver: Option<&str>) -> Option<String> {
     Some(format!(
         "SELECT LOWER(payer) AS payer, COUNT(DISTINCT \"collectionId\") AS collections, \
          CAST(SUM(CAST(tokens AS HUGEINT)) AS VARCHAR) AS tokens FROM tally__payment_collected WHERE 1=1{rc} \
-         GROUP BY 1 ORDER BY SUM(CAST(tokens AS HUGEINT)) DESC"
+         GROUP BY 1 ORDER BY SUM(CAST(tokens AS HUGEINT)) DESC, 1"
     ))
 }
 
@@ -1425,6 +1425,26 @@ mod tests {
         for indexer in [None, Some(addr)] {
             let q = delegation_events_sql(indexer, 100, 0).unwrap();
             assert!(q.ends_with("ORDER BY ts DESC, id DESC LIMIT 100"), "{q}");
+        }
+    }
+
+    /// Equal collection totals tie the same way, on the tally page and on the per-payer fold.
+    #[test]
+    fn a_tally_ordered_by_its_total_ends_its_order_on_its_group_key() {
+        let addr = "0xb43b2cccceada5292732a8c58ae134adefce09bb";
+        for receiver in [None, Some(addr)] {
+            let q = tally_collected_sql(receiver, 50).unwrap();
+            assert!(
+                q.ends_with(
+                    "GROUP BY 1, 2, 3 ORDER BY SUM(CAST(tokens AS HUGEINT)) DESC, 1, 2, 3 LIMIT 50"
+                ),
+                "{q}"
+            );
+            let q = tally_by_payer_sql(receiver).unwrap();
+            assert!(
+                q.ends_with("GROUP BY 1 ORDER BY SUM(CAST(tokens AS HUGEINT)) DESC, 1"),
+                "{q}"
+            );
         }
     }
 
