@@ -28,6 +28,8 @@ jobs:
       - run: cargo clippy --all-targets --all-features
       # No network and no database: every test runs against an in-process mock nest.
       - run: cargo test --all
+      # The statements nuthatch's release gate replays; a change to sql.rs that leaves them stale fails here.
+      - run: nuthatch-gate/collect/collect-queries.sh --check
 
   release:
     # The binary a deploy installs, so `deploy/install.sh` stops depending on whoever's laptop has
