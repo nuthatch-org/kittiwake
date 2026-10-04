@@ -1,12 +1,18 @@
-// Prints the allocations nest's query set: every statement Lodestar's dashboard (through kittiwake's
+// Prints one production nest's query set: every statement Lodestar's dashboard (through kittiwake's
 // read API) and kittiwake's own jobs send to that nest's `/sql`. Built by collect-queries.sh, which
-// compiles this against a copy of kittiwake's crates/read/src/sql.rs; nothing here runs in nuthatch.
+// compiles this against a copy of kittiwake's crates/read/src/sql.rs and the few constants it
+// extracts from elsewhere (extract.rs); nothing here runs in nuthatch.
 //
-// Statements built in sql.rs are called with representative literals and so refresh themselves.
-// Statements written inline at a call site are copied here by hand and say so (`inline`): on a
-// refresh, re-read those call sites. Literals are pinned to 2026-10-03 so the set is deterministic.
+//   collect <set>   the set's rows        collect --sets   the set names
+//   collect --describe <set>              the set's one-line header
+//
+// Statements built in sql.rs or extract.rs are called with representative literals and so refresh
+// themselves. Statements written inline at a call site are copied here by hand and say so
+// (`inline`): on a refresh, re-read those call sites. Literals are pinned to 2026-10-03 so the set
+// is deterministic.
 
 #![allow(dead_code)]
+mod extract;
 mod sql;
 
 const NOW: i64 = 1_790_985_600; // 2026-10-03T00:00:00Z
@@ -64,9 +70,17 @@ fn stake_history_cutoffs(end: i64, days: i64) -> Vec<i64> {
 
 struct Set {
     rows: Vec<(String, String, String, String)>,
+    volatile: Vec<(&'static str, &'static str)>,
 }
 
 impl Set {
+    // A statement release-gate.sh holds to its row count, because its answer moves without the
+    // binary changing (#1772).
+    fn volatile(&mut self, id: &'static str, why: &'static str) {
+        assert!(self.rows.iter().any(|r| r.0 == id), "{id}: tagged volatile but not in the set");
+        self.volatile.push((id, why));
+    }
+
     fn add(&mut self, id: &str, consumer: &str, site: &str, sql: impl Into<Option<String>>) {
         let sql = sql
             .into()
@@ -91,9 +105,12 @@ fn s(v: &str) -> Option<String> {
     Some(v.to_string())
 }
 
-fn main() {
-    let mut q = Set { rows: Vec::new() };
-    let l = "lodestar";
+const LODESTAR: &str = "lodestar";
+const KITTIWAKE: &str = "kittiwake";
+
+// The allocations nest, graph-allocations-nest-next (`NestId::Alloc`).
+fn alloc(q: &mut Set) {
+    let l = LODESTAR;
     let k = "kittiwake";
     let routes = "kittiwake crates/read/src/routes.rs";
     let since30 = NOW - 30 * DAY;
@@ -252,19 +269,159 @@ fn main() {
          ORDER BY c.block_timestamp, c.tx_hash, c.log_index LIMIT 10000", NOW - DAY)));
     q.add("qos.allocation_shares_all", k, &format!("{ingest}/qos_score.rs"), s(sql::ALLOCATION_SHARES_ALL_SQL));
 
-    // Statements release-gate.sh holds to their row count, because their answer moves without the
-    // binary changing (#1772). Found by gating production twice on one copy a minute apart; re-run
-    // that after a refresh. Both page with ORDER BY ... LIMIT on a key with ties, so which tied
-    // rows make the page is the engine's choice; a tiebreaker in kittiwake would make them exact.
-    let volatile: &[(&str, &str)] = &[
-        ("payments.accounts", "ORDER BY SUM(mv.d) DESC LIMIT 100: equal balances tie across the limit"),
-        ("delegation_events", "ORDER BY ts DESC LIMIT 100: events in one block share a timestamp"),
-    ];
-    for (id, why) in volatile {
-        assert!(q.rows.iter().any(|r| r.0 == *id), "{id}: tagged volatile but not in the set");
-        println!("# volatile: {id} {why}");
+    // Found by gating production twice on one copy a minute apart; re-run that after a refresh.
+    // Both page with ORDER BY ... LIMIT on a key with ties, so which tied rows make the page is the
+    // engine's choice; a tiebreaker in kittiwake would make them exact.
+    q.volatile("payments.accounts", "ORDER BY SUM(mv.d) DESC LIMIT 100: equal balances tie across the limit");
+    q.volatile("delegation_events", "ORDER BY ts DESC LIMIT 100: events in one block share a timestamp");
+}
+
+// A closed day two days before the pin, 2026-10-01. Production asks the QoS nest one day at a time,
+// a closed day for the job and today for the live reads, so the set asks one day for both: never a
+// count over the full history, which no production caller sends.
+const QOS_DAY: i64 = NOW / DAY - 2;
+
+// qos-reo-nest on the ThinkPad (`NestId::Qos`).
+fn qos(q: &mut Set) {
+    let (l, k) = (LODESTAR, KITTIWAKE);
+    let job = "kittiwake crates/ingest/src/qos_days.rs";
+    let live = "kittiwake crates/read/src/qos.rs";
+    q.add("provenance", k, &format!("{job} fill_qos_days"), s(sql::QOS_PROVENANCE_SQL));
+    q.add("day_probe", k, &format!("{job} probe_day, compute_day"), s(&sql::qos_day_probe_sql(QOS_DAY)));
+    q.add("indexer_day", k, &format!("{job} compute_day"), s(&sql::qos_indexer_day_sql(QOS_DAY)));
+    q.add("seconds_behind_day", k, &format!("{job} compute_day"), s(&sql::qos_seconds_behind_day_sql(QOS_DAY)));
+    q.add("network_rows", k, &format!("{job} compute_day"), s(&sql::qos_network_rows_sql(QOS_DAY)));
+    q.add("network_today", l, &format!("{live} network_today (indexer QoS card; warmer)"), s(&sql::qos_network_rows_sql(QOS_DAY)));
+    q.add("indexer_daily", l, &format!("{live} today_reads days (indexer QoS card; warmer)"), sql::qos_indexer_daily_sql(IX, QOS_DAY));
+    q.add("indexer_gateways", l, &format!("{live} today_reads gateways"), sql::qos_indexer_gateways_sql(IX, QOS_DAY));
+    q.add("indexer_seconds_behind", l, &format!("{live} today_reads behind"), sql::qos_indexer_seconds_behind_sql(IX, QOS_DAY));
+    q.add("freshness", l, &format!("{live} today_reads freshness"), s(sql::QOS_FRESHNESS_SQL));
+    // Gated twice on one copy, 4.4.0 on 2026-10-04: its answer moved between fresh servers.
+    q.volatile("network_rows", "float sums over 6,219 rows land in a different order per run, and a value on the 12th digit's rounding boundary moves");
+}
+
+// The subgraph id kittiwake's own tests carry as the one the gns nest really returned
+// (sql.rs subgraph_id_tests::REAL). The versions statement's id is the previous statement's answer
+// in production; the set cannot chain, so it asks a known one.
+const SUBGRAPH_ID: &str = "89208477503844421768723574082634065786850291557104984756921772861043965025630";
+
+// graph-gns-nest-next (`NestId::Gns`).
+fn gns(q: &mut Set) {
+    let (l, k) = (LODESTAR, KITTIWAKE);
+    let routes = "kittiwake crates/read/src/routes.rs";
+    let search = "kittiwake crates/read/src/search.rs";
+    let fee_ids: Vec<String> = FEE_DEPLOYMENTS.iter().map(|s| s.to_string()).collect();
+    q.add("default_names", k, "kittiwake crates/ingest/src/names.rs names", s(extract::DEFAULT_NAMES_SQL));
+    q.add("published_30d", l, &format!("{routes} developer_activity (/api/developer-activity, 30 days)"), s(&sql::subgraphs_published_since_sql(NOW - 30 * DAY)));
+    q.add("deployment_subgraph", l, &format!("{routes} subgraph_versions_fetcher (/api/subgraph-versions/[hash])"), sql::deployment_subgraph_sql(DEP));
+    q.add("subgraph_versions", l, &format!("{routes} subgraph_versions_fetcher"), sql::subgraph_versions_sql(SUBGRAPH_ID, 100));
+    q.add("deployment_meta", l, &format!("{search} subgraph_metadata_for_deployments (inline, one chunk)"), s(&format!(
+        "SELECT deployment_id, subgraph_id, subgraph_metadata, version_metadata FROM (\
+         SELECT *, ROW_NUMBER() OVER (PARTITION BY LOWER(deployment_id) ORDER BY created_at \
+         DESC, subgraph_id) AS rn FROM deployment_subgraphs WHERE LOWER(deployment_id) IN ({})) \
+         WHERE rn = 1",
+        quoted(&fee_ids)
+    )));
+    q.add("metadata_cids", l, &format!("{search} metadata_cids_by_deployment (inline; subgraph directory)"), s(
+        "SELECT LOWER(deployment_id) AS deployment_id, subgraph_metadata FROM (\
+         SELECT deployment_id, subgraph_metadata, ROW_NUMBER() OVER (PARTITION BY \
+         LOWER(deployment_id) ORDER BY created_at DESC, subgraph_id) AS rn FROM deployment_subgraphs) \
+         WHERE rn = 1"));
+    // The hashes come from the IPFS cache's display-name search, which the set cannot run; the
+    // fee deployments stand in, so it times the scan and answers no rows.
+    q.add("by_name", l, &format!("{search} by_name (inline, one chunk)"), s(&format!(
+        "SELECT current_deployment_id FROM subgraph_current WHERE NOT deprecated \
+         AND LOWER(subgraph_metadata) IN ({})",
+        quoted(&fee_ids)
+    )));
+    q.add("current_metadata", k, &format!("{search} warm (inline)"), s(sql::SUBGRAPH_METADATA_SQL));
+    q.add("sqlplay.sample", l, "kittiwake crates/sqlplay/src/lib.rs DATASETS gns sample (/sql page)", s(extract::LIST_TABLES));
+}
+
+// kittiwake_read::search::quoted
+fn quoted(ids: &[String]) -> String {
+    ids.iter()
+        .map(|i| format!("'{}'", i.to_lowercase()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+// nuthatch-dips on Arbitrum One (`NestId::Dips`).
+fn dips(q: &mut Set) {
+    let (l, k) = (LODESTAR, KITTIWAKE);
+    let routes = "kittiwake crates/read/src/routes.rs";
+    q.add("current_allocation", k, "kittiwake crates/ingest/src/refresh.rs refresh", s(sql::DIPS_CURRENT_ALLOCATION_SQL));
+    q.add("dips.allocations", l, &format!("{routes} dips (/api/dips)"), s(sql::DIPS_CURRENT_ALLOCATION_SQL));
+    q.add("timeline", l, &format!("{routes} dips"), s(sql::DIPS_TIMELINE_SQL));
+    q.add("distributed", l, &format!("{routes} dips"), sql::dips_latest_per_target_sql("issuance_allocator__issuance_distributed"));
+    q.add("self_minted", l, &format!("{routes} dips"), sql::dips_latest_per_target_sql("issuance_allocator__issuance_self_mint_allowance"));
+    for stage in extract::STAGES {
+        let table = stage.table();
+        q.add(&format!("agreements.{table}"), l, &format!("{routes} dips_agreements (/api/dips/agreements; inline)"), s(&format!("SELECT * FROM {table} LIMIT 5000")));
     }
-    for (id, consumer, site, sql) in &q.rows {
-        println!("{id}\t{consumer}\t{site}\t{sql}");
+    let named = "kittiwake crates/sqlplay/src/named.rs";
+    q.add("sqlplay.sample", l, "kittiwake crates/sqlplay/src/lib.rs DATASETS dips sample (/sql page)", s(extract::LIST_TABLES));
+    q.add("sqlplay.issuance_rate_changes", l, &format!("{named} issuance_rate_changes (inline)"), s(&format!(
+        "SELECT block_number, block_timestamp, oldIssuancePerBlock, newIssuancePerBlock, tx_hash \
+         FROM issuance_allocator__issuance_per_block_updated WHERE block_number <= {BEFORE_BLOCK} \
+         ORDER BY block_number DESC LIMIT 200")));
+    q.add("sqlplay.dips_agreements", l, &format!("{named} dips_agreements (inline)"), s(&format!(
+        "SELECT block_number, block_timestamp, agreementId, collector, dataService, provider \
+         FROM recurring_agreement_manager__agreement_added WHERE block_number <= {BEFORE_BLOCK} \
+         ORDER BY block_number DESC LIMIT 200")));
+}
+
+// data-services-nest (`NestId::Services`).
+fn data_services(q: &mut Set) {
+    for service in extract::SERVICES {
+        q.add(&format!("registry.{}", service.id), LODESTAR, "kittiwake crates/edge/src/handlers.rs registry_events (/api/service-census)", s(&extract::registry_sql(service)));
+    }
+}
+
+// graph-staking-legacy-readonly, the frozen pre-Horizon archive, a serve-only unit
+// (`NestId::LegacyFlows`). Only a window reaching back past LEGACY_HISTORY_END_EXCLUSIVE asks it.
+fn staking_archive(q: &mut Set) {
+    let routes = "kittiwake crates/read/src/routes.rs";
+    let end = sql::LEGACY_HISTORY_END_EXCLUSIVE;
+    for days in [90, 365] {
+        let since = NOW - days * DAY;
+        assert!(since < end, "a {days}-day window no longer reaches the archive");
+        q.add(&format!("flows_{days}d"), LODESTAR, &format!("{routes} delegation_flows (archive half, {days} days)"), s(&sql::daily_flow_sql(since, end, true)));
+    }
+    q.add("sqlplay.sample", LODESTAR, "kittiwake crates/sqlplay/src/lib.rs DATASETS legacy-flows sample (/sql page)", s(extract::LIST_TABLES));
+}
+
+type Build = fn(&mut Set);
+
+const SETS: &[(&str, &str, Build)] = &[
+    ("alloc", "The allocations nest's query set: what Lodestar (via kittiwake's read API) and kittiwake's jobs send to its /sql.", alloc),
+    ("qos", "The QoS nest's query set: what kittiwake's QoS day job and Lodestar's QoS card send to its /sql, one day at a time.", qos),
+    ("gns", "The GNS nest's query set: what Lodestar (via kittiwake's read API) and kittiwake's jobs send to its /sql.", gns),
+    ("dips", "The dips nest's query set: what Lodestar (via kittiwake's read API) and kittiwake's jobs send to its /sql.", dips),
+    ("data-services", "The data services nest's query set: what Lodestar's service census (via kittiwake) sends to its /sql.", data_services),
+    ("staking-archive", "The frozen staking archive's query set: what Lodestar's delegation flows (via kittiwake) send to its /sql.", staking_archive),
+];
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let find = |name: &str| {
+        SETS.iter()
+            .find(|s| s.0 == name)
+            .unwrap_or_else(|| panic!("no set named {name}"))
+    };
+    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["--sets"] => SETS.iter().for_each(|s| println!("{}", s.0)),
+        ["--describe", name] => println!("{}", find(name).1),
+        [name] => {
+            let mut q = Set { rows: Vec::new(), volatile: Vec::new() };
+            (find(name).2)(&mut q);
+            for (id, why) in &q.volatile {
+                println!("# volatile: {id} {why}");
+            }
+            for (id, consumer, site, sql) in &q.rows {
+                println!("{id}\t{consumer}\t{site}\t{sql}");
+            }
+        }
+        _ => panic!("usage: collect <set> | --sets | --describe <set>"),
     }
 }
