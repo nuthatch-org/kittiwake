@@ -126,7 +126,7 @@ pub fn delegation_events_sql(indexer: Option<&str>, first: i64, since: i64) -> O
     }
     Some(format!(
         "SELECT id, \"eventType\", indexer, delegator, tokens, CAST(ts AS VARCHAR) AS \"timestamp\", \"txHash\" \
-         FROM ({union}) t WHERE {where_clause} ORDER BY ts DESC LIMIT {first}"
+         FROM ({union}) t WHERE {where_clause} ORDER BY ts DESC, id DESC LIMIT {first}"
     ))
 }
 
@@ -795,7 +795,7 @@ pub fn escrow_accounts_sql(receiver: Option<&str>, first: i64) -> Option<String>
          SELECT mv.p AS payer, mv.c AS collector, mv.r AS receiver, CAST(SUM(mv.d) AS VARCHAR) AS balance, \
          CAST(COALESCE(MAX(lt.t), 0) AS VARCHAR) AS thawing, CAST(COALESCE(MAX(lt.te), 0) AS VARCHAR) AS thaw_end \
          FROM mv LEFT JOIN last_th lt ON lt.p = mv.p AND lt.c = mv.c AND lt.r = mv.r \
-         GROUP BY 1, 2, 3 {having}ORDER BY SUM(mv.d) DESC LIMIT {first}"
+         GROUP BY 1, 2, 3 {having}ORDER BY SUM(mv.d) DESC, 1, 2, 3 LIMIT {first}"
     ))
 }
 
@@ -1407,6 +1407,25 @@ mod tests {
                 .unwrap()
                 .contains("HAVING")
         );
+    }
+
+    /// Equal balances and events sharing a block timestamp tie across the LIMIT, so without a unique
+    /// key last in the ORDER BY which tied rows make the page changes between runs.
+    #[test]
+    fn a_page_cut_through_ties_ends_its_order_on_a_unique_key() {
+        let addr = "0xb43b2cccceada5292732a8c58ae134adefce09bb";
+        for receiver in [None, Some(addr)] {
+            let q = escrow_accounts_sql(receiver, 100).unwrap();
+            assert!(
+                q.ends_with("GROUP BY 1, 2, 3 HAVING SUM(mv.d) > 0 ORDER BY SUM(mv.d) DESC, 1, 2, 3 LIMIT 100")
+                    || q.ends_with("GROUP BY 1, 2, 3 ORDER BY SUM(mv.d) DESC, 1, 2, 3 LIMIT 100"),
+                "{q}"
+            );
+        }
+        for indexer in [None, Some(addr)] {
+            let q = delegation_events_sql(indexer, 100, 0).unwrap();
+            assert!(q.ends_with("ORDER BY ts DESC, id DESC LIMIT 100"), "{q}");
+        }
     }
 
     #[test]
