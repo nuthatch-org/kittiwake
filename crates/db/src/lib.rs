@@ -624,6 +624,26 @@ pub async fn qos_cohort_days(
     Ok(rows.into_iter().map(QosAllocationDay::from).collect())
 }
 
+/// One indexer's own stored rows from `from` to `to` inclusive, without its peers.
+pub async fn qos_indexer_allocation_days(
+    pool: &Pool,
+    indexer: &str,
+    from: i64,
+    to: i64,
+) -> Result<Vec<QosAllocationDay>, DbError> {
+    let rows = sqlx::query_as::<_, QosAllocationDayRow>(
+        "SELECT indexer, deployment, chain, gateway, day, query_count, num_200, latency_ms, \
+         blocks_behind, total_query_fees, buckets::bigint AS buckets FROM qos_allocation_day \
+         WHERE indexer = $1 AND day BETWEEN $2 AND $3",
+    )
+    .bind(indexer)
+    .bind(qos_date(from))
+    .bind(qos_date(to))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(QosAllocationDay::from).collect())
+}
+
 /// Every stored allocation row from `from` to `to` inclusive, for scoring the directory.
 pub async fn qos_network_days(
     pool: &Pool,

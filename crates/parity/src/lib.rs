@@ -347,6 +347,11 @@ pub mod coverage {
             "deleted with qos-score in nuthatch#1160; same arithmetic, same equivalence test",
         ),
         (
+            "/api/indexer/{address}/qos-qualifying-days",
+            Excused::Entirely,
+            "new with kittiwake#170, so there is no incumbent to compare against. The counts are held to the stored rows by kittiwake-read's own tests",
+        ),
+        (
             "/api/sql/query",
             Excused::Entirely,
             "POST with a body; the harness only issues GETs",

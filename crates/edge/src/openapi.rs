@@ -285,6 +285,10 @@ const SUMMARIES: &[Operation] = &[
         "The deployments behind the QoS Quality score, heaviest drag first.",
     ),
     op(
+        "/api/indexer/{address}/qos-qualifying-days",
+        "For each UTC day of the Rewards Eligibility Oracle's 28-day window, the deployments this indexer answered with at least one HTTP 200, and how many of them carried 500 GRT of signal at that day's end. The QoS feed has no per-query latency or freshness, so each count bounds the oracle's from above; `qualifying_test_applied` and `signal_floor_applied` say what was and was not applied, with the reason.",
+    ),
+    op(
         "/api/indexer/{address}/revenue",
         "What an indexer received over a window ending today, by UTC day and by deployment: query fees after the protocol, curators and delegators, and rewards after the delegators, each dated by the collection that paid it, with the collected figures beside them.",
     ),

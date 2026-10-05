@@ -593,6 +593,24 @@ pub async fn indexer_qos_deployments(
     ))
 }
 
+pub async fn indexer_qos_qualifying_days(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(address): Path<String>,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    Ok(envelope(
+        kittiwake_read::qos::indexer_qos_qualifying_days(
+            &st.read,
+            qos_store(&st),
+            &addr(&address),
+            now().div_euclid(86_400),
+        )
+        .await?,
+    ))
+}
+
 /// Weekly points over the last two years, which is what the chart draws.
 pub async fn indexer_stake_history(
     State(st): State<AppState>,

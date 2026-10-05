@@ -370,6 +370,17 @@ mod tests {
         ) -> BoxFuture<'a, Result<Vec<QosAllocationDay>, ApiError>> {
             Box::pin(async { Ok(Vec::new()) })
         }
+        fn indexer_allocation_days<'a>(
+            &'a self,
+            _: &'a str,
+            _: i64,
+            _: i64,
+        ) -> BoxFuture<'a, Result<Vec<QosAllocationDay>, ApiError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn stored_days(&self, _: i64, _: i64) -> BoxFuture<'_, Result<Vec<i64>, ApiError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 
     /// Asked the way each handler asks, every warmed read is answered without the nest. An entry
