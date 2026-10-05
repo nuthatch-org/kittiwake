@@ -290,8 +290,6 @@ fn qos(q: &mut Set) {
     q.add("indexer_gateways", l, &format!("{live} today_reads gateways"), sql::qos_indexer_gateways_sql(IX, QOS_DAY));
     q.add("indexer_seconds_behind", l, &format!("{live} today_reads behind"), sql::qos_indexer_seconds_behind_sql(IX, QOS_DAY));
     q.add("freshness", l, &format!("{live} today_reads freshness"), s(sql::QOS_FRESHNESS_SQL));
-    // Gated twice on one copy, 4.4.0 on 2026-10-04: its answer moved between fresh servers.
-    q.volatile("network_rows", "float sums over 6,219 rows land in a different order per run, and a value on the 12th digit's rounding boundary moves");
 }
 
 // The subgraph id kittiwake's own tests carry as the one the gns nest really returned
