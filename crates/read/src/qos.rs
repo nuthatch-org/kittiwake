@@ -6,7 +6,7 @@
 //! `qos_indexer_seconds_behind` and `qos_freshness`. `qos_deployment_daily` has no reader: served
 //! share is attempts over every indexer's attempts, not over the gateway's query count.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,6 +54,14 @@ pub trait QosStore: Send + Sync {
         to: i64,
         also: &'a [String],
     ) -> BoxFuture<'a, Result<Vec<QosAllocationDay>, ApiError>>;
+    fn indexer_allocation_days<'a>(
+        &'a self,
+        addr: &'a str,
+        from: i64,
+        to: i64,
+    ) -> BoxFuture<'a, Result<Vec<QosAllocationDay>, ApiError>>;
+    /// The days from `from` to `to` that have been computed, whether or not anyone was measured on them.
+    fn stored_days(&self, from: i64, to: i64) -> BoxFuture<'_, Result<Vec<i64>, ApiError>>;
 }
 
 fn database(e: kittiwake_db::DbError) -> ApiError {
@@ -84,6 +92,28 @@ impl QosStore for kittiwake_db::Pool {
             kittiwake_db::qos_cohort_days(self, addr, from, to, also)
                 .await
                 .map_err(database)
+        })
+    }
+    fn indexer_allocation_days<'a>(
+        &'a self,
+        addr: &'a str,
+        from: i64,
+        to: i64,
+    ) -> BoxFuture<'a, Result<Vec<QosAllocationDay>, ApiError>> {
+        Box::pin(async move {
+            kittiwake_db::qos_indexer_allocation_days(self, addr, from, to)
+                .await
+                .map_err(database)
+        })
+    }
+    fn stored_days(&self, from: i64, to: i64) -> BoxFuture<'_, Result<Vec<i64>, ApiError>> {
+        Box::pin(async move {
+            Ok(kittiwake_db::qos_day_states(self, from, to)
+                .await
+                .map_err(database)?
+                .into_iter()
+                .map(|s| s.day)
+                .collect())
         })
     }
 }
@@ -796,6 +826,260 @@ pub fn deployments_answer(cohort: &Cohort, addr: &str, today: i64) -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------------------------
+// REO coverage
+// ---------------------------------------------------------------------------------------------
+
+/// The Rewards Eligibility Oracle's window, today included.
+pub const REO_WINDOW_DAYS: i64 = 28;
+
+/// The curation floor a qualifying subgraph needs from 2026-10-06, per the Foundation's announcement
+/// of 22 September. The oracle's criteria document does not state it.
+pub const REO_SIGNAL_FLOOR_GRT: i128 = 500;
+
+/// One deployment an indexer answered on one day, summed over chains and gateways later.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Served {
+    /// Unix day number.
+    pub day: i64,
+    pub deployment: String,
+    pub num_200: f64,
+}
+
+/// Per `Qm…` deployment asked about, the change in signal (wei) per unix day; the earliest key holds
+/// every change before the window. A deployment with no curation events has an empty map.
+pub type SignalDeltas = HashMap<String, BTreeMap<i64, i128>>;
+
+/// `/api/indexer/[address]/qos-qualifying-days`: per UTC day of the oracle's window, the
+/// deployments that answered at least one query with HTTP 200, with signal on each as of that day.
+pub async fn indexer_qos_qualifying_days(
+    ctx: &ReadCtx,
+    store: Option<&dyn QosStore>,
+    addr: &str,
+    today: i64,
+) -> Result<Read, ApiError> {
+    let store = store_or_unavailable(store)?;
+    if !sql::is_address(addr) {
+        return Err(bad_address());
+    }
+    let from = today - (REO_WINDOW_DAYS - 1);
+    let (closed, stored) = futures::try_join!(
+        store.indexer_allocation_days(addr, from, today - 1),
+        store.stored_days(from, today - 1),
+    )?;
+    let today_rows = live(ctx, network_today(today)).await;
+
+    let mut served: Vec<Served> = closed
+        .iter()
+        .filter(|r| r.day < today)
+        .map(|r| Served {
+            day: r.day,
+            deployment: r.deployment.clone(),
+            num_200: r.num_200.unwrap_or(0.0),
+        })
+        .collect();
+    let mut measured: BTreeSet<i64> = stored.into_iter().filter(|d| *d < today).collect();
+    if let Some(r) = &today_rows {
+        measured.insert(today);
+        let rows = r
+            .entry
+            .value
+            .get("rows")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        served.extend(
+            rows.iter()
+                .filter_map(allocation_daily_from)
+                .filter(|a| a.indexer == addr)
+                .map(|a| Served {
+                    day: a.day_start.div_euclid(86_400),
+                    deployment: a.deployment,
+                    num_200: a.num_200.unwrap_or(0.0),
+                }),
+        );
+    }
+
+    let deployments: BTreeSet<&str> = served
+        .iter()
+        .filter(|s| s.num_200 > 0.0)
+        .map(|s| s.deployment.as_str())
+        .collect();
+    let (signal, read) = match signal_days(&deployments, from) {
+        Err(why) => (Err(why), None),
+        Ok(None) => (Ok(SignalDeltas::new()), None),
+        Ok(Some((asked, read))) => match live(ctx, read).await {
+            Some(r) => {
+                let mut deltas = signal_deltas_from(
+                    &r.entry
+                        .value
+                        .as_object()
+                        .map(|parts| {
+                            parts
+                                .values()
+                                .filter_map(Value::as_array)
+                                .flatten()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                );
+                for cid in asked {
+                    deltas.entry(cid).or_default();
+                }
+                (Ok(deltas), Some(Some(r)))
+            }
+            None => (
+                Err("the allocations nest did not answer, so signal on each day is unknown"),
+                Some(None),
+            ),
+        },
+    };
+    let value = qualifying_days_answer(&served, &measured, today, signal.as_ref().map_err(|e| *e));
+    let mut lives = vec![today_rows.as_ref()];
+    if let Some(r) = &read {
+        lives.push(r.as_ref());
+    }
+    Ok(merged(value, &lives))
+}
+
+/// The allocations nest read behind the floor, and the `Qm…` ids it asks about, or `None` when there
+/// is nothing to ask. Two hundred ids per statement keeps each under the nest's 16 KiB limit on a query.
+fn signal_days(
+    deployments: &BTreeSet<&str>,
+    from: i64,
+) -> Result<Option<(Vec<String>, LiveRead)>, &'static str> {
+    const PARTS: [&str; 16] = [
+        "signal0", "signal1", "signal2", "signal3", "signal4", "signal5", "signal6", "signal7",
+        "signal8", "signal9", "signal10", "signal11", "signal12", "signal13", "signal14",
+        "signal15",
+    ];
+    let ids: Vec<(String, String)> = deployments
+        .iter()
+        .filter_map(|cid| Some((cid.to_string(), shape::ipfs_hash_to_bytes32(cid)?)))
+        .collect();
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let hexes: Vec<String> = ids.iter().map(|(_, h)| h.clone()).collect();
+    if hexes.len() > 200 * PARTS.len() {
+        return Err("more deployments than the signal read asks about in one answer");
+    }
+    let parts = hexes
+        .chunks(200)
+        .zip(PARTS)
+        .filter_map(|(chunk, name)| {
+            Some(Part::rows(
+                name,
+                NestId::Alloc,
+                sql::deployment_signal_days_sql(chunk, from)?,
+            ))
+        })
+        .collect();
+    Ok(Some((
+        ids.into_iter().map(|(cid, _)| cid).collect(),
+        LiveRead {
+            route: "qos-qualifying-signal",
+            nest: NestId::Alloc,
+            params: json!({"from": from, "deployments": hexes}),
+            parts,
+        },
+    )))
+}
+
+/// The rows the nest answers [`sql::deployment_signal_days_sql`] with, keyed by `Qm…`.
+pub fn signal_deltas_from(rows: &[Value]) -> SignalDeltas {
+    let mut out = SignalDeltas::new();
+    for r in rows {
+        let (Some(cid), Some(day), Some(delta)) = (
+            r.get("deployment")
+                .and_then(Value::as_str)
+                .and_then(shape::deployment_ipfs_hash),
+            shape::i(r, "unix_day").as_i64(),
+            r.get("delta")
+                .and_then(Value::as_str)
+                .and_then(|d| d.parse::<i128>().ok()),
+        ) else {
+            continue;
+        };
+        *out.entry(cid).or_default().entry(day).or_default() += delta;
+    }
+    out
+}
+
+const QUALIFYING_TEST_REASON: &str = "the QoS rows give each deployment and day a count of HTTP 200s \
+     and the mean latency and blocks behind of all its queries, not each query's, so whether a 200 \
+     was also under 5,000 ms and under 50,000 blocks behind cannot be told. Each count is deployments \
+     with at least one HTTP 200 that day, which bounds the oracle's count from above: under 5 here is \
+     under 5 for the oracle, and 5 or more is not proof of 5";
+
+/// The route's shape. `measured` is every day the oracle's feed is known to cover, so a day in it with
+/// no rows for this indexer is a zero rather than a gap.
+pub fn qualifying_days_answer(
+    served: &[Served],
+    measured: &BTreeSet<i64>,
+    today: i64,
+    signal: Result<&SignalDeltas, &str>,
+) -> Value {
+    let floor = REO_SIGNAL_FLOOR_GRT * 1_000_000_000_000_000_000;
+    let from = today - (REO_WINDOW_DAYS - 1);
+    let mut by_day: BTreeMap<i64, BTreeMap<&str, f64>> = measured
+        .iter()
+        .filter(|d| (from..=today).contains(*d))
+        .map(|d| (*d, BTreeMap::new()))
+        .collect();
+    for s in served.iter().filter(|s| (from..=today).contains(&s.day)) {
+        *by_day
+            .entry(s.day)
+            .or_default()
+            .entry(s.deployment.as_str())
+            .or_default() += s.num_200;
+    }
+    let days: Vec<Value> = by_day
+        .into_iter()
+        .map(|(day, deps)| {
+            let mut deps: Vec<(&str, f64)> = deps.into_iter().filter(|(_, n)| *n > 0.0).collect();
+            deps.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(b.0)));
+            let rows: Vec<(&str, f64, Option<i128>)> = deps
+                .into_iter()
+                .map(|(d, n)| {
+                    let at = signal
+                        .ok()
+                        .and_then(|s| s.get(d))
+                        .map(|deltas| deltas.range(..=day).map(|(_, v)| v).sum::<i128>());
+                    (d, n, at)
+                })
+                .collect();
+            let over = rows
+                .iter()
+                .filter(|(_, _, s)| s.is_some_and(|s| s >= floor))
+                .count();
+            json!({
+                "date": unix_day_date(day),
+                "partial": day == today,
+                "count": if signal.is_ok() { over } else { rows.len() },
+                "count_without_floor": rows.len(),
+                "deployments": rows.iter().map(|(d, n, s)| json!({
+                    "deployment_id": d,
+                    "num_200": num(Some(*n)),
+                    "signal_grt": num(s.map(|s| s as f64 / 1e18)),
+                    "over_floor": s.map(|s| s >= floor),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    json!({
+        "window_days": REO_WINDOW_DAYS,
+        "qualifying_test_applied": false,
+        "bound": "upper",
+        "qualifying_test_reason": QUALIFYING_TEST_REASON,
+        "signal_floor_grt": REO_SIGNAL_FLOOR_GRT,
+        "signal_floor_applied": signal.is_ok(),
+        "signal_floor_reason": signal.err(),
+        "days": days,
+    })
+}
+
 /// Every indexer's score on `today` (a Graph day number), for the directory.
 pub fn score_network(
     cohort: &Cohort,
@@ -921,6 +1205,7 @@ mod tests {
     struct MemStore {
         indexer: Vec<QosIndexerDay>,
         allocation: Vec<QosAllocationDay>,
+        days: Vec<i64>,
     }
 
     impl QosStore for MemStore {
@@ -953,6 +1238,29 @@ mod tests {
                 .collect();
             Box::pin(async move { Ok(out) })
         }
+        fn indexer_allocation_days<'a>(
+            &'a self,
+            addr: &'a str,
+            from: i64,
+            to: i64,
+        ) -> BoxFuture<'a, Result<Vec<QosAllocationDay>, ApiError>> {
+            let out = self
+                .allocation
+                .iter()
+                .filter(|d| d.indexer == addr && (from..=to).contains(&d.day))
+                .cloned()
+                .collect();
+            Box::pin(async move { Ok(out) })
+        }
+        fn stored_days(&self, from: i64, to: i64) -> BoxFuture<'_, Result<Vec<i64>, ApiError>> {
+            let out = self
+                .days
+                .iter()
+                .copied()
+                .filter(|d| (from..=to).contains(d))
+                .collect();
+            Box::pin(async move { Ok(out) })
+        }
     }
 
     /// A stand-in nest that answers today for indexer A, and records every statement.
@@ -974,7 +1282,14 @@ mod tests {
                 .unwrap_or_default();
             self.0.lock().unwrap().push(q.clone());
             let today = unix_day_date(TODAY_UNIX);
-            let rows = if q.contains("qos_freshness") {
+            let rows = if q.contains("curation__signalled") {
+                let hex = shape::ipfs_hash_to_bytes32(DEP).unwrap();
+                // 400 GRT before the window, 150 more two days ago: under the floor until then.
+                json!([
+                    {"deployment": hex, "unix_day": TODAY_UNIX - REO_WINDOW_DAYS, "delta": "400000000000000000000"},
+                    {"deployment": hex, "unix_day": TODAY_UNIX - 2, "delta": "150000000000000000000"},
+                ])
+            } else if q.contains("qos_freshness") {
                 json!([{"topic": "indexer", "newest_bucket_start": 1_789_171_000_i64, "last_post_time": 1_789_172_000_i64}])
             } else if q.contains("qos_indexer_seconds_behind") && q.contains(A) {
                 json!([{"indexer": A, "seconds_behind_peers": 7.0, "share_with_block_time": 1.0}])
@@ -1317,6 +1632,7 @@ mod tests {
             indexer_qos(&ctx, None, A, TODAY_UNIX - 89, TODAY_UNIX).await,
             indexer_qos_score(&ctx, None, A, TODAY_UNIX).await,
             indexer_qos_deployments(&ctx, None, A, TODAY_UNIX).await,
+            indexer_qos_qualifying_days(&ctx, None, A, TODAY_UNIX).await,
         ] {
             assert!(matches!(result, Err(ApiError::Unavailable(_))));
         }
@@ -1351,5 +1667,268 @@ mod tests {
             .unwrap();
         assert_eq!(dates(&read), vec!["2026-09-11"]);
         assert!(read.entry.provenance.degraded);
+    }
+
+    const DEP2: &str = "QmTXzATwNfgGVukV1fX2T6xw9f6LAYRVWpsdXyRWzUR2H9";
+
+    fn served(day: i64, deployment: &str, num_200: f64) -> Served {
+        Served {
+            day,
+            deployment: deployment.into(),
+            num_200,
+        }
+    }
+
+    fn grt(n: i128) -> i128 {
+        n * 1_000_000_000_000_000_000
+    }
+
+    fn signal(entries: &[(&str, &[(i64, i128)])]) -> SignalDeltas {
+        entries
+            .iter()
+            .map(|(d, deltas)| (d.to_string(), deltas.iter().copied().collect()))
+            .collect()
+    }
+
+    fn day_of<'a>(out: &'a Value, date: &str) -> &'a Value {
+        out["days"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["date"] == json!(date))
+            .unwrap_or_else(|| panic!("no {date} in {out}"))
+    }
+
+    /// The count is distinct deployments with a 200 that day: two gateways on one deployment are one,
+    /// and a deployment that answered only errors is none. The rows cannot apply the oracle's latency
+    /// and freshness bars, so the answer says the count bounds the oracle's from above.
+    #[test]
+    fn a_day_counts_distinct_deployments_that_answered_a_200() {
+        let rows = [
+            served(TODAY_UNIX - 1, DEP, 10.0),
+            served(TODAY_UNIX - 1, DEP, 5.0),
+            served(TODAY_UNIX - 1, DEP2, 0.0),
+        ];
+        let measured = BTreeSet::from([TODAY_UNIX - 1]);
+        let sig = signal(&[(DEP, &[(TODAY_UNIX - 30, grt(600))])]);
+        let out = qualifying_days_answer(&rows, &measured, TODAY_UNIX, Ok(&sig));
+        let day = day_of(&out, "2026-09-11");
+        assert_eq!(day["count_without_floor"], json!(1));
+        assert_eq!(day["count"], json!(1));
+        assert_eq!(day["deployments"][0]["deployment_id"], json!(DEP));
+        assert_eq!(day["deployments"][0]["num_200"], json!(15.0));
+        assert_eq!(out["qualifying_test_applied"], json!(false));
+        assert_eq!(out["bound"], json!("upper"));
+        assert!(
+            out["qualifying_test_reason"]
+                .as_str()
+                .unwrap()
+                .contains("5,000 ms")
+        );
+        assert_eq!(out["window_days"], json!(28));
+    }
+
+    /// Signal is read as of each day's end, so a deployment that crossed the floor mid-window counts
+    /// from that day on and not before, and one that fell under it stops counting.
+    #[test]
+    fn the_floor_is_applied_with_the_signal_each_day_had() {
+        let rows = [
+            served(TODAY_UNIX - 3, DEP, 1.0),
+            served(TODAY_UNIX - 3, DEP2, 1.0),
+            served(TODAY_UNIX - 1, DEP, 1.0),
+            served(TODAY_UNIX - 1, DEP2, 1.0),
+        ];
+        let measured = BTreeSet::from([TODAY_UNIX - 3, TODAY_UNIX - 1]);
+        let sig = signal(&[
+            (
+                DEP,
+                &[(TODAY_UNIX - 28, grt(400)), (TODAY_UNIX - 2, grt(100))],
+            ),
+            (
+                DEP2,
+                &[(TODAY_UNIX - 28, grt(900)), (TODAY_UNIX - 2, -grt(500))],
+            ),
+        ]);
+        let out = qualifying_days_answer(&rows, &measured, TODAY_UNIX, Ok(&sig));
+        assert_eq!(out["signal_floor_applied"], json!(true));
+        assert_eq!(out["signal_floor_reason"], Value::Null);
+        assert_eq!(out["signal_floor_grt"], json!(500));
+        let before = day_of(&out, "2026-09-09");
+        assert_eq!(before["count_without_floor"], json!(2));
+        assert_eq!(before["count"], json!(1));
+        let over: Vec<&Value> = before["deployments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|d| d["over_floor"] == json!(true))
+            .map(|d| &d["deployment_id"])
+            .collect();
+        assert_eq!(over, vec![&json!(DEP2)]);
+        let after = day_of(&out, "2026-09-11");
+        assert_eq!(after["count"], json!(1));
+        let dep = after["deployments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["deployment_id"] == json!(DEP))
+            .unwrap();
+        assert_eq!(dep["over_floor"], json!(true));
+        assert_eq!(dep["signal_grt"], json!(500.0));
+    }
+
+    /// Without signal the count is the unfiltered one, and the answer says the floor was not applied
+    /// and why, rather than counting every deployment as over it.
+    #[test]
+    fn without_signal_the_floor_is_not_applied_and_the_answer_says_so() {
+        let rows = [served(TODAY_UNIX - 1, DEP, 3.0)];
+        let measured = BTreeSet::from([TODAY_UNIX - 1]);
+        let out = qualifying_days_answer(
+            &rows,
+            &measured,
+            TODAY_UNIX,
+            Err("the allocations nest did not answer"),
+        );
+        assert_eq!(out["signal_floor_applied"], json!(false));
+        assert_eq!(
+            out["signal_floor_reason"],
+            json!("the allocations nest did not answer")
+        );
+        let day = day_of(&out, "2026-09-11");
+        assert_eq!(day["count"], json!(1));
+        assert_eq!(day["deployments"][0]["over_floor"], Value::Null);
+        assert_eq!(day["deployments"][0]["signal_grt"], Value::Null);
+    }
+
+    /// A computed day with nothing for this indexer is a measured zero; a day nobody computed is a
+    /// gap, and today is partial because its buckets are still arriving.
+    #[test]
+    fn a_measured_day_without_rows_is_zero_and_an_unmeasured_one_is_absent() {
+        let rows = [served(TODAY_UNIX, DEP, 1.0)];
+        let measured = BTreeSet::from([TODAY_UNIX - 2, TODAY_UNIX]);
+        let sig = signal(&[(DEP, &[])]);
+        let out = qualifying_days_answer(&rows, &measured, TODAY_UNIX, Ok(&sig));
+        let dates: Vec<&str> = out["days"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["date"].as_str().unwrap())
+            .collect();
+        assert_eq!(dates, vec!["2026-09-10", "2026-09-12"]);
+        assert_eq!(day_of(&out, "2026-09-10")["count"], json!(0));
+        assert_eq!(day_of(&out, "2026-09-10")["partial"], json!(false));
+        let today = day_of(&out, "2026-09-12");
+        assert_eq!(today["partial"], json!(true));
+        assert_eq!(today["count_without_floor"], json!(1));
+        assert_eq!(today["count"], json!(0), "no curation events is no signal");
+    }
+
+    #[test]
+    fn signal_rows_are_keyed_by_cid_and_kept_in_wei() {
+        let hex = shape::ipfs_hash_to_bytes32(DEP).unwrap();
+        let sig = signal_deltas_from(&[
+            json!({"deployment": hex, "unix_day": 20_000, "delta": "170141183460469231731687303715884105727"}),
+            json!({"deployment": hex, "unix_day": "20001", "delta": "-1"}),
+        ]);
+        assert_eq!(sig[DEP][&20_000], i128::MAX);
+        assert_eq!(sig[DEP][&20_001], -1);
+    }
+
+    /// Closed days from the store, today from the nest's shared statement, and signal from the
+    /// allocations nest. The QoS nest is still asked for today alone.
+    #[tokio::test]
+    async fn the_route_joins_stored_days_today_and_signal_as_of_each_day() {
+        let (ctx, seen, _server) = ctx().await;
+        let store = MemStore {
+            allocation: vec![
+                alloc_day(A, TODAY_UNIX - 3, 800.0),
+                alloc_day(B, TODAY_UNIX - 3, 300.0),
+            ],
+            days: vec![TODAY_UNIX - 3, TODAY_UNIX - 2, TODAY_UNIX - 1],
+            ..MemStore::default()
+        };
+        let read = indexer_qos_qualifying_days(&ctx, Some(&store), A, TODAY_UNIX)
+            .await
+            .unwrap();
+        let out = &*read.entry.value;
+        assert_eq!(out["signal_floor_applied"], json!(true));
+        let dates: Vec<&str> = out["days"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["date"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            dates,
+            vec!["2026-09-09", "2026-09-10", "2026-09-11", "2026-09-12"]
+        );
+        let three_ago = day_of(out, "2026-09-09");
+        assert_eq!(three_ago["count_without_floor"], json!(1));
+        assert_eq!(three_ago["count"], json!(0), "400 GRT then");
+        assert_eq!(day_of(out, "2026-09-10")["count"], json!(0));
+        let today = day_of(out, "2026-09-12");
+        assert_eq!(today["count"], json!(1), "550 GRT by today");
+        assert_eq!(today["deployments"][0]["num_200"], json!(100.0));
+        assert!(!read.entry.provenance.degraded);
+        every_statement_names_one_day_at_most(&seen.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_refused_signal_read_serves_the_counts_without_the_floor() {
+        let (ctx, _server) = ctx_with(Refusing {
+            refuse: "curation__signalled",
+            unready: false,
+        })
+        .await;
+        let store = MemStore {
+            allocation: vec![alloc_day(A, TODAY_UNIX - 1, 800.0)],
+            days: vec![TODAY_UNIX - 1],
+            ..MemStore::default()
+        };
+        let read = indexer_qos_qualifying_days(&ctx, Some(&store), A, TODAY_UNIX)
+            .await
+            .unwrap();
+        let out = &*read.entry.value;
+        assert_eq!(out["signal_floor_applied"], json!(false));
+        assert!(out["signal_floor_reason"].is_string());
+        assert_eq!(day_of(out, "2026-09-11")["count"], json!(1));
+        assert!(read.entry.provenance.degraded);
+    }
+
+    /// The nest refuses a statement over 16 KiB, so a busy indexer's deployments are asked about two
+    /// hundred at a time.
+    #[tokio::test]
+    async fn signal_for_many_deployments_is_asked_in_statements_the_nest_accepts() {
+        let (ctx, seen, _server) = ctx().await;
+        let allocation = (1..=450)
+            .map(|n| QosAllocationDay {
+                deployment: shape::deployment_ipfs_hash(&format!("{n:064x}")).unwrap(),
+                ..alloc_day(A, TODAY_UNIX - 1, 1.0)
+            })
+            .collect();
+        let store = MemStore {
+            allocation,
+            days: vec![TODAY_UNIX - 1],
+            ..MemStore::default()
+        };
+        let read = indexer_qos_qualifying_days(&ctx, Some(&store), A, TODAY_UNIX)
+            .await
+            .unwrap();
+        assert_eq!(read.entry.value["signal_floor_applied"], json!(true));
+        assert_eq!(
+            day_of(&read.entry.value, "2026-09-11")["count_without_floor"],
+            json!(450)
+        );
+        let signal: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|q| q.contains("curation__signalled"))
+            .cloned()
+            .collect();
+        assert_eq!(signal.len(), 3);
+        assert!(
+            signal.iter().all(|q| q.len() < 16_384),
+            "a statement over the nest's limit"
+        );
     }
 }

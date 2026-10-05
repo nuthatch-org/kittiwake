@@ -630,6 +630,30 @@ pub fn indexer_allocation_shares_sql(addr: &str) -> Option<String> {
     ))
 }
 
+/// Per deployment and UTC day from `from_unix_day`, the change in the subgraph's `signalledTokens`
+/// (deposits net of curation tax, plus query fees collected into the pool, less burns), with every
+/// earlier change folded into `from_unix_day - 1`. A running sum then gives signal at each day's end.
+pub fn deployment_signal_days_sql(ids: &[String], from_unix_day: i64) -> Option<String> {
+    if ids.is_empty() || ids.len() > 200 || !ids.iter().all(|i| is_deployment_id(i)) {
+        return None;
+    }
+    let list = ids
+        .iter()
+        .map(|i| format!("'{i}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let before = clamp(from_unix_day, 1, i64::from(i32::MAX)) - 1;
+    Some(format!(
+        "SELECT dep AS deployment, CAST(GREATEST(ts // 86400, {before}) AS BIGINT) AS unix_day, \
+         CAST(SUM(tok) AS VARCHAR) AS delta FROM (\
+         SELECT LOWER(\"subgraphDeploymentID\") AS dep, CAST(tokens AS HUGEINT) - CAST(\"curationTax\" AS HUGEINT) AS tok, \
+         CAST(block_timestamp AS BIGINT) AS ts FROM curation__signalled \
+         UNION ALL SELECT LOWER(\"subgraphDeploymentID\"), -CAST(tokens AS HUGEINT), CAST(block_timestamp AS BIGINT) FROM curation__burned \
+         UNION ALL SELECT LOWER(\"subgraphDeploymentID\"), CAST(tokens AS HUGEINT), CAST(block_timestamp AS BIGINT) FROM curation__collected\
+         ) WHERE dep IN ({list}) GROUP BY 1, 2"
+    ))
+}
+
 /// Open stake per indexer and deployment, network-wide.
 pub const ALLOCATION_SHARES_ALL_SQL: &str = "SELECT LOWER(indexer) AS indexer, subgraph_deployment, \
      CAST(SUM(allocated_tokens) AS VARCHAR) AS allocated_tokens \
@@ -1327,6 +1351,28 @@ mod tests {
         assert!(deployment_subgraph_sql(bad).is_none());
         assert!(subgraph_versions_sql(bad, 100).is_none());
         assert!(deployments_signal_stake_sql(&[bad.to_string()]).is_none());
+        assert!(deployment_signal_days_sql(&[bad.to_string()], 20_000).is_none());
+    }
+
+    /// Signal as of a day is the subgraph's `signalledTokens` cut at that day, so its three terms are
+    /// lodestar_deployments' own, and nothing older than the window comes back as its own row.
+    #[test]
+    fn signal_days_read_the_deployment_views_terms_and_fold_older_changes() {
+        let dep = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let q = deployment_signal_days_sql(&[dep.to_string()], 20_704).unwrap();
+        let filter = format!("WHERE dep IN ('{dep}')");
+        for fragment in [
+            "CAST(tokens AS HUGEINT) - CAST(\"curationTax\" AS HUGEINT)",
+            "-CAST(tokens AS HUGEINT)",
+            "FROM curation__burned",
+            "FROM curation__collected",
+            "GREATEST(ts // 86400, 20703)",
+            filter.as_str(),
+        ] {
+            assert!(q.contains(fragment), "{fragment} missing from {q}");
+        }
+        assert!(deployment_signal_days_sql(&[], 20_704).is_none());
+        assert!(deployment_signal_days_sql(&vec![dep.to_string(); 201], 20_704).is_none());
     }
 
     /// The version list and the deployment page must agree about the same deployment, so both read

@@ -1194,6 +1194,10 @@ pub fn router(state: AppState) -> Router {
             get(handlers::indexer_qos_deployments),
         )
         .route(
+            "/api/indexer/{address}/qos-qualifying-days",
+            get(handlers::indexer_qos_qualifying_days),
+        )
+        .route(
             "/api/indexer/{address}/revenue",
             get(handlers::indexer_revenue),
         )

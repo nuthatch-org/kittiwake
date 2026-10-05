@@ -136,6 +136,8 @@ fn alloc(q: &mut Set) {
     q.add("indexer.revenue_daily", l, &format!("{routes} indexer_revenue (30 days; warmer)"), sql::indexer_revenue_daily_sql(IX, window_start(NOW, 30)));
     q.add("indexer.revenue_by_deployment", l, &format!("{routes} indexer_revenue by_deployment (/api/indexer/[a]/pnl; warmer)"), sql::indexer_revenue_by_deployment_sql(IX, window_start(NOW, 30)));
     q.add("indexer.allocation_shares", l, "kittiwake crates/read/src/qos.rs allocation_shares (warmer)", sql::indexer_allocation_shares_sql(IX));
+    // The deployments the indexer answered in the 28 days, stood in for by the fee list.
+    q.add("indexer.qos_qualifying_signal", l, "kittiwake crates/read/src/qos.rs signal_days (/api/indexer/[a]/qos-qualifying-days)", sql::deployment_signal_days_sql(&fee_ids, NOW / DAY - 27));
 
     // Portfolios.
     q.add("delegator", l, &format!("{routes} delegator_portfolio (/api/portfolio)"), sql::delegator_sql(DELEGATOR));
