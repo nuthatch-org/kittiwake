@@ -74,11 +74,15 @@ pub fn add_wei(a: &Value, key_a: &str, key_b: &str) -> Value {
 // ---------------------------------------------------------------------------------------------
 
 /// One epoch. `totalQueryFees` is the two fee columns summed, as the incumbent reports it.
+/// `startL1Block`/`endL1Block` are EpochManager's exact range, null from a nest that predates them;
+/// `startBlock`/`endBlock` are then the L2 blocks the nest first and last holds in the epoch.
 pub fn epoch(r: &Value) -> Value {
     json!({
         "id": s(r, "id"),
         "startBlock": i(r, "start_block"),
         "endBlock": i(r, "end_block"),
+        "startL1Block": i(r, "start_l1_block"),
+        "endL1Block": i(r, "end_l1_block"),
         "signalledTokens": s0(r, "signalled_tokens"),
         "stakeDeposited": s0(r, "stake_deposited"),
         "totalRewards": s0(r, "total_rewards"),
@@ -1695,6 +1699,21 @@ mod tests {
         );
         assert_eq!(e["startBlock"], json!(100));
         assert_eq!(e["totalQueryFees"], json!("15"));
+    }
+
+    #[test]
+    fn an_epoch_carries_its_l1_range_and_null_from_a_nest_without_it() {
+        let with = epoch(&json!({
+            "id": 1401, "start_block": 511341470, "end_block": 511653760,
+            "start_l1_block": 26112737, "end_l1_block": 26119936
+        }));
+        assert_eq!(with["startL1Block"], json!(26112737));
+        assert_eq!(with["endL1Block"], json!(26119936));
+
+        let without = epoch(&json!({"id": 1401, "start_block": 511341461, "end_block": 511653764}));
+        assert_eq!(without["startL1Block"], Value::Null);
+        assert_eq!(without["endL1Block"], Value::Null);
+        assert_eq!(without["startBlock"], json!(511341461));
     }
 
     #[test]

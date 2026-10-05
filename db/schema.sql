@@ -77,8 +77,14 @@ CREATE TABLE IF NOT EXISTS epochs (
   query_fees_collected    NUMERIC,
   curator_query_fees      NUMERIC,
   query_fee_rebates       NUMERIC,
-  taxed_query_fees        NUMERIC
+  taxed_query_fees        NUMERIC,
+  -- EpochManager's exact L1 range (nightswatchhq/nuthatch#1882). Null until the allocations nest
+  -- carries it; start_block/end_block are L2 blocks, and approximate once it does.
+  start_l1_block          INTEGER,
+  end_l1_block            INTEGER
 );
+ALTER TABLE epochs ADD COLUMN IF NOT EXISTS start_l1_block INTEGER;
+ALTER TABLE epochs ADD COLUMN IF NOT EXISTS end_l1_block INTEGER;
 
 CREATE TABLE IF NOT EXISTS indexers (
   address                          TEXT PRIMARY KEY,

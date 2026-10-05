@@ -235,6 +235,22 @@ pub fn rows_shaped(
     })
 }
 
+/// `primary`, or `legacy` when the nest refuses `primary` in the way `absent` recognises: a statement
+/// naming columns a nest older than this binary does not have yet. Anything else stays an error.
+pub fn or_legacy(primary: Fetcher, legacy: Fetcher, absent: fn(&str) -> bool) -> Fetcher {
+    Arc::new(move |gate: NestGate, lane: Lane| {
+        let (primary, legacy) = (primary.clone(), legacy.clone());
+        Box::pin(async move {
+            match primary(gate.clone(), lane).await {
+                Err(ApiError::NestUpstream { reason, .. }) if absent(&reason) => {
+                    legacy(gate, lane).await
+                }
+                other => other,
+            }
+        })
+    })
+}
+
 /// One query whose rows are the whole answer.
 pub fn rows_only(nest: NestId, sql: String, timeout: Duration) -> Fetcher {
     let part = Part::rows("rows", nest, sql);
@@ -332,12 +348,22 @@ pub async fn epochs(ctx: &ReadCtx, first: i64) -> Result<Read, ApiError> {
         NestId::Alloc,
         serde_json::json!({"first": first}),
         CachePolicy::from_poll_interval(cadence::SLOW),
-        rows_shaped(
-            NestId::Alloc,
-            sql::epochs_sql(first),
-            T_QUICK,
-            crate::shape::epoch,
-            Some("epoches"),
+        or_legacy(
+            rows_shaped(
+                NestId::Alloc,
+                sql::epochs_l1_sql(first),
+                T_QUICK,
+                crate::shape::epoch,
+                Some("epoches"),
+            ),
+            rows_shaped(
+                NestId::Alloc,
+                sql::epochs_sql(first),
+                T_QUICK,
+                crate::shape::epoch,
+                Some("epoches"),
+            ),
+            sql::lacks_epoch_l1,
         ),
     )
     .await
@@ -2281,5 +2307,102 @@ mod wiring_tests {
         let none = indexer_delegators(&ctx, INDEXER, page(0)).await.unwrap();
         assert_eq!(none.entry.value["total"], 0);
         assert_eq!(none.entry.value["pool"], serde_json::Value::Null);
+    }
+}
+
+#[cfg(test)]
+mod epoch_l1_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
+
+    /// An allocations nest that has the epoch L1 columns or does not, answering the way 4.7.0 does.
+    struct Nest {
+        has_l1: bool,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Respond for Nest {
+        fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+            if req.url.path().ends_with("/ready") {
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ready": true, "lag_blocks": 0, "tip": 1, "last_block": 1,
+                    "sealed_through": 1, "stalled": false
+                }));
+            }
+            let q = req
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "q")
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default();
+            self.seen.lock().unwrap().push(q.clone());
+            if q.contains("start_l1_block") && !self.has_l1 {
+                return ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error": "plan error: Binder Error: Referenced column \"start_l1_block\" not found in FROM clause!\nSchema error: No field named start_l1_block."
+                }));
+            }
+            let mut row = serde_json::json!({
+                "id": 1401, "start_block": 511341461, "end_block": 511653764,
+                "query_fees_collected": "10", "curator_query_fees": "5"
+            });
+            if self.has_l1 {
+                row["start_l1_block"] = serde_json::json!(26112737);
+                row["end_l1_block"] = serde_json::json!(26119936);
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "count": 1, "rows": [row],
+                "provenance": {"as_of": 1, "sealed_through": 1, "source": "mock"}
+            }))
+        }
+    }
+
+    async fn ask(has_l1: bool) -> (serde_json::Value, Vec<String>) {
+        let server = MockServer::start().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("GET"))
+            .respond_with(Nest {
+                has_l1,
+                seen: seen.clone(),
+            })
+            .mount(&server)
+            .await;
+        let mut cfg = kittiwake_nest::NestConfig::new(server.uri());
+        cfg.base_paths.insert(NestId::Alloc, "/alloc".into());
+        let ctx = ReadCtx::new(
+            NestGate::new(cfg).unwrap(),
+            kittiwake_cache::Store::new(64),
+            1,
+        );
+        let read = epochs(&ctx, 5).await.expect("epochs answers either way");
+        let epoch = read.entry.value["epoches"][0].clone();
+        let seen = seen.lock().unwrap().clone();
+        (epoch, seen)
+    }
+
+    #[tokio::test]
+    async fn a_nest_with_the_l1_range_is_asked_for_it_once() {
+        let (epoch, seen) = ask(true).await;
+        assert_eq!(epoch["startL1Block"], serde_json::json!(26112737));
+        assert_eq!(epoch["endL1Block"], serde_json::json!(26119936));
+        assert_eq!(
+            seen.len(),
+            1,
+            "no second statement when the first answers: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_nest_from_before_the_l1_range_still_serves_epochs() {
+        let (epoch, seen) = ask(false).await;
+        assert_eq!(epoch["startBlock"], serde_json::json!(511341461));
+        assert_eq!(epoch["startL1Block"], serde_json::Value::Null);
+        assert_eq!(
+            seen.len(),
+            2,
+            "the L1 statement, then the legacy one: {seen:?}"
+        );
+        assert!(!seen[1].contains("start_l1_block"));
     }
 }

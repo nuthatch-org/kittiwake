@@ -87,25 +87,48 @@ pub struct Ingested {
 
 /// Walks forward from the last epoch ingested. Query fee rebates are zero under Horizon: the
 /// concept does not exist there, and writing null would read as "unknown" rather than "none".
+///
+/// The L1 range is asked for first. A nest from before its `l1_blocks` re-index refuses that, and
+/// the page is read without it. Once the nest has it, epochs already stored without one are read
+/// again from the first of them, so the range fills in behind the swap rather than only ahead of it.
 pub async fn epochs(pool: &Pool, gate: &NestGate, lane: Lane) -> Result<Ingested, IngestError> {
     let cursor = state::get(pool, "epochs").await?.last_epoch.unwrap_or(0) as i64;
-    let sql = format!(
-        "SELECT id, start_block, end_block, CAST(signalled_tokens AS VARCHAR) AS signalled_tokens, \
-         CAST(stake_deposited AS VARCHAR) AS stake_deposited, CAST(total_rewards AS VARCHAR) AS total_rewards, \
-         CAST(total_indexer_rewards AS VARCHAR) AS total_indexer_rewards, \
-         CAST(total_delegator_rewards AS VARCHAR) AS total_delegator_rewards, \
-         CAST(query_fees_collected AS VARCHAR) AS query_fees_collected, \
-         CAST(curator_query_fees AS VARCHAR) AS curator_query_fees, \
-         CAST(taxed_query_fees AS VARCHAR) AS taxed_query_fees \
-         FROM lodestar_epochs WHERE id > {cursor} ORDER BY id ASC LIMIT 500"
-    );
-    let answer = page(gate, NestId::Alloc, sql, lane, "epochs").await?;
+    let refill: Option<i32> =
+        sqlx::query_scalar("SELECT MIN(id) FROM epochs WHERE start_l1_block IS NULL AND id <= $1")
+            .bind(cursor as i32)
+            .fetch_one(pool)
+            .await?;
+    let from = refill.map_or(cursor, |id| i64::from(id) - 1).min(cursor);
+    let answer = match page(
+        gate,
+        NestId::Alloc,
+        epochs_page_sql(from, true),
+        lane,
+        "epochs",
+    )
+    .await
+    {
+        Err(IngestError::Nest(kittiwake_nest::NestError::Http { reason, .. }))
+            if kittiwake_read::sql::lacks_epoch_l1(&reason) =>
+        {
+            page(
+                gate,
+                NestId::Alloc,
+                epochs_page_sql(cursor, false),
+                lane,
+                "epochs",
+            )
+            .await?
+        }
+        other => other?,
+    };
     if answer.rows.is_empty() {
         state::touch(pool, "epochs").await?;
         return Ok(Ingested { rows: 0 });
     }
 
     let (mut ids, mut starts, mut ends) = (vec![], vec![], vec![]);
+    let (mut l1_starts, mut l1_ends) = (vec![], vec![]);
     let (mut stake, mut signalled, mut rewards) = (vec![], vec![], vec![]);
     let (mut ind_rewards, mut del_rewards) = (vec![], vec![]);
     let (mut fees, mut curator_fees, mut taxed) = (vec![], vec![], vec![]);
@@ -114,6 +137,8 @@ pub async fn epochs(pool: &Pool, gate: &NestGate, lane: Lane) -> Result<Ingested
         ids.push(i(r, "id").unwrap_or(0) as i32);
         starts.push(i(r, "start_block").unwrap_or(0) as i32);
         ends.push(i(r, "end_block").unwrap_or(0) as i32);
+        l1_starts.push(i(r, "start_l1_block").map(|b| b as i32));
+        l1_ends.push(i(r, "end_l1_block").map(|b| b as i32));
         stake.push(s(r, "stake_deposited").unwrap_or_else(|| "0".into()));
         signalled.push(s(r, "signalled_tokens").unwrap_or_else(|| "0".into()));
         rewards.push(s(r, "total_rewards").unwrap_or_else(|| "0".into()));
@@ -123,8 +148,16 @@ pub async fn epochs(pool: &Pool, gate: &NestGate, lane: Lane) -> Result<Ingested
         curator_fees.push(s(r, "curator_query_fees").unwrap_or_else(|| "0".into()));
         taxed.push(s(r, "taxed_query_fees").unwrap_or_else(|| "0".into()));
     }
-    let highest = ids.iter().copied().max().unwrap_or(0);
-    let highest_block = starts.iter().copied().max().unwrap_or(0);
+    // A refill page sits behind the cursor and must not move it back.
+    let (highest, highest_block) = if ids.iter().copied().max().unwrap_or(0) as i64 >= cursor {
+        (
+            ids.iter().copied().max().unwrap_or(0),
+            starts.iter().copied().max().unwrap_or(0),
+        )
+    } else {
+        let st = state::get(pool, "epochs").await?;
+        (st.last_epoch.unwrap_or(0), st.last_block.unwrap_or(0))
+    };
 
     // Deliberately not `query!`. Every amount here is wei carried as a decimal string and cast to
     // `numeric` by Postgres, which keeps all of it; a wei figure does not fit an `f64` and two
@@ -134,20 +167,25 @@ pub async fn epochs(pool: &Pool, gate: &NestGate, lane: Lane) -> Result<Ingested
     sqlx::query(
         "INSERT INTO epochs (id, start_block, end_block, stake_deposited, signalled_tokens, \
          total_rewards, total_indexer_rewards, total_delegator_rewards, total_query_fees, \
-         query_fees_collected, curator_query_fees, query_fee_rebates, taxed_query_fees) \
+         query_fees_collected, curator_query_fees, query_fee_rebates, taxed_query_fees, \
+         start_l1_block, end_l1_block) \
          SELECT id, start_block, end_block, stake / 1e18, signalled / 1e18, rewards / 1e18, \
-         ind / 1e18, del / 1e18, (fees + cur) / 1e18, fees / 1e18, cur / 1e18, 0, taxed / 1e18 \
+         ind / 1e18, del / 1e18, (fees + cur) / 1e18, fees / 1e18, cur / 1e18, 0, taxed / 1e18, \
+         l1_start, l1_end \
          FROM UNNEST($1::int[], $2::int[], $3::int[], $4::numeric[], $5::numeric[], $6::numeric[], \
-         $7::numeric[], $8::numeric[], $9::numeric[], $10::numeric[], $11::numeric[]) \
-         AS t(id, start_block, end_block, stake, signalled, rewards, ind, del, fees, cur, taxed) \
+         $7::numeric[], $8::numeric[], $9::numeric[], $10::numeric[], $11::numeric[], $12::int[], $13::int[]) \
+         AS t(id, start_block, end_block, stake, signalled, rewards, ind, del, fees, cur, taxed, l1_start, l1_end) \
          ON CONFLICT (id) DO UPDATE SET \
+         start_block = EXCLUDED.start_block, \
          end_block = EXCLUDED.end_block, stake_deposited = EXCLUDED.stake_deposited, \
          signalled_tokens = EXCLUDED.signalled_tokens, total_rewards = EXCLUDED.total_rewards, \
          total_indexer_rewards = EXCLUDED.total_indexer_rewards, \
          total_delegator_rewards = EXCLUDED.total_delegator_rewards, \
          total_query_fees = EXCLUDED.total_query_fees, query_fees_collected = EXCLUDED.query_fees_collected, \
          curator_query_fees = EXCLUDED.curator_query_fees, query_fee_rebates = EXCLUDED.query_fee_rebates, \
-         taxed_query_fees = EXCLUDED.taxed_query_fees",
+         taxed_query_fees = EXCLUDED.taxed_query_fees, \
+         start_l1_block = COALESCE(EXCLUDED.start_l1_block, epochs.start_l1_block), \
+         end_l1_block = COALESCE(EXCLUDED.end_l1_block, epochs.end_l1_block)",
     )
     .bind(&ids)
     .bind(&starts)
@@ -160,6 +198,8 @@ pub async fn epochs(pool: &Pool, gate: &NestGate, lane: Lane) -> Result<Ingested
     .bind(&fees)
     .bind(&curator_fees)
     .bind(&taxed)
+    .bind(&l1_starts)
+    .bind(&l1_ends)
     .execute(pool)
     .await?;
 
@@ -167,6 +207,25 @@ pub async fn epochs(pool: &Pool, gate: &NestGate, lane: Lane) -> Result<Ingested
     Ok(Ingested {
         rows: answer.rows.len() as u64,
     })
+}
+
+/// One page of `lodestar_epochs` after epoch `after`, with the L1 range or without it.
+fn epochs_page_sql(after: i64, l1: bool) -> String {
+    format!(
+        "SELECT id, start_block, end_block, {}CAST(signalled_tokens AS VARCHAR) AS signalled_tokens, \
+         CAST(stake_deposited AS VARCHAR) AS stake_deposited, CAST(total_rewards AS VARCHAR) AS total_rewards, \
+         CAST(total_indexer_rewards AS VARCHAR) AS total_indexer_rewards, \
+         CAST(total_delegator_rewards AS VARCHAR) AS total_delegator_rewards, \
+         CAST(query_fees_collected AS VARCHAR) AS query_fees_collected, \
+         CAST(curator_query_fees AS VARCHAR) AS curator_query_fees, \
+         CAST(taxed_query_fees AS VARCHAR) AS taxed_query_fees \
+         FROM lodestar_epochs WHERE id > {after} ORDER BY id ASC LIMIT 500",
+        if l1 {
+            "start_l1_block, end_l1_block, "
+        } else {
+            ""
+        }
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -519,6 +578,32 @@ pub async fn network_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The legacy page is the statement the gate set records as `ingest.epochs`, byte for byte, so a
+    /// nest from before the L1 range is asked exactly what it was asked before.
+    #[test]
+    fn the_legacy_epochs_page_is_unchanged_and_the_l1_page_only_adds_the_range() {
+        let legacy = "SELECT id, start_block, end_block, CAST(signalled_tokens AS VARCHAR) AS signalled_tokens, \
+         CAST(stake_deposited AS VARCHAR) AS stake_deposited, CAST(total_rewards AS VARCHAR) AS total_rewards, \
+         CAST(total_indexer_rewards AS VARCHAR) AS total_indexer_rewards, \
+         CAST(total_delegator_rewards AS VARCHAR) AS total_delegator_rewards, \
+         CAST(query_fees_collected AS VARCHAR) AS query_fees_collected, \
+         CAST(curator_query_fees AS VARCHAR) AS curator_query_fees, \
+         CAST(taxed_query_fees AS VARCHAR) AS taxed_query_fees \
+         FROM lodestar_epochs WHERE id > 0 ORDER BY id ASC LIMIT 500";
+        assert_eq!(epochs_page_sql(0, false), legacy);
+        assert_eq!(
+            epochs_page_sql(0, true),
+            legacy.replacen(
+                "end_block, ",
+                "end_block, start_l1_block, end_l1_block, ",
+                1
+            )
+        );
+        assert!(kittiwake_read::sql::lacks_epoch_l1(
+            "plan error: Binder Error: Referenced column \"start_l1_block\" not found"
+        ));
+    }
 
     #[test]
     fn numbers_arrive_as_strings_or_numbers_and_both_are_read() {

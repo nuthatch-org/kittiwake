@@ -80,6 +80,21 @@ pub fn epochs_sql(first: i64) -> String {
     )
 }
 
+/// [`epochs_sql`] with the exact L1 range EpochManager counts in. A nest from before its `l1_blocks`
+/// re-index has no such columns and refuses this; [`lacks_epoch_l1`] recognises that refusal.
+pub fn epochs_l1_sql(first: i64) -> String {
+    epochs_sql(first).replacen(
+        "start_block, end_block,",
+        "start_block, end_block, start_l1_block, end_l1_block,",
+        1,
+    )
+}
+
+/// The nest's refusal of a statement naming the epoch L1 columns it does not have yet.
+pub fn lacks_epoch_l1(reason: &str) -> bool {
+    reason.contains("start_l1_block") || reason.contains("end_l1_block")
+}
+
 /// The delegation feed: a UNION over the four HorizonStaking delegation-event tables, mapped to
 /// the vocabulary the frontend already speaks.
 pub fn delegation_events_sql(indexer: Option<&str>, first: i64, since: i64) -> Option<String> {
@@ -1182,6 +1197,31 @@ pub fn dips_latest_per_target_sql(table: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_l1_epochs_statement_is_the_legacy_one_plus_the_range() {
+        let l1 = super::epochs_l1_sql(20);
+        assert!(
+            l1.starts_with(
+                "SELECT id, start_block, end_block, start_l1_block, end_l1_block, CAST("
+            )
+        );
+        assert_eq!(
+            l1.replace(" start_l1_block, end_l1_block,", ""),
+            super::epochs_sql(20)
+        );
+    }
+
+    #[test]
+    fn a_nest_without_the_l1_columns_is_recognised_by_its_refusal() {
+        // The first line of 4.7.0's answer from a nest indexed before `l1_blocks`, as `nest_reason` keeps it.
+        let refusal = "plan error: Binder Error: Referenced column \"start_l1_block\" not found in FROM clause!";
+        assert!(super::lacks_epoch_l1(refusal));
+        assert!(!super::lacks_epoch_l1(
+            "plan error: Binder Error: Referenced column \"start_block\" not found in FROM clause!"
+        ));
+        assert!(!super::lacks_epoch_l1("server busy"));
+    }
+
     #[test]
     fn horizon_detail_sql_refuses_what_is_not_an_address() {
         assert!(provision_thaw_requests_sql("0x0e91' OR 1=1 --").is_none());
