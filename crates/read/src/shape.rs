@@ -2710,6 +2710,7 @@ pub fn grt_flow(
     p: &Value,
     supply: Option<&kittiwake_chain::SupplyBreakdown>,
     burns: Option<&Value>,
+    burns_mainnet: Option<&Value>,
     as_of: i64,
 ) -> Value {
     /// The circulating supply used when the contracts cannot be read. Approximate by construction.
@@ -2755,17 +2756,28 @@ pub fn grt_flow(
         })),
         "minted": as_grt(minted),
         "burned": as_grt(burned),
-        // From grt-supply-nest. `burned` and `issued` have the bridge taken out, which the
-        // network subgraph's totals do not (graph-network-subgraph#337). Null when the nest is
-        // not answering: absent, not zero.
-        "burns": burns.map(|b| json!({
-            "burned": as_grt(wei(b, "burned")),
-            "issued": as_grt(wei(b, "issued")),
-            "grossBurned": as_grt(wei(b, "gross_burned")),
-            "bridgeBurned": as_grt(wei(b, "bridge_burned")),
-            "grossMinted": as_grt(wei(b, "gross_minted")),
-            "bridgeMinted": as_grt(wei(b, "bridge_minted")),
-        })),
+        // From grt-supply-nest, one nest per chain. Arbitrum's `burned` and `issued` have the
+        // bridge taken out, which the network subgraph's totals do not
+        // (graph-network-subgraph#337); mainnet needs no correction, its side of the bridge
+        // escrows. Each is null when its nest is not answering, and so is the total: absent, not
+        // zero.
+        "burns": {
+            "arbitrum": burns.map(|b| json!({
+                "burned": as_grt(wei(b, "burned")),
+                "issued": as_grt(wei(b, "issued")),
+                "grossBurned": as_grt(wei(b, "gross_burned")),
+                "bridgeBurned": as_grt(wei(b, "bridge_burned")),
+                "grossMinted": as_grt(wei(b, "gross_minted")),
+                "bridgeMinted": as_grt(wei(b, "bridge_minted")),
+            })),
+            "mainnet": burns_mainnet.map(|b| json!({
+                "burned": as_grt(wei(b, "burned")),
+                "minted": as_grt(wei(b, "minted")),
+            })),
+            "totalBurned": burns
+                .zip(burns_mainnet)
+                .map(|(a, m)| as_grt(wei(a, "burned") + wei(m, "burned"))),
+        },
         "indexingRewards": num(grt(n, "total_indexing_rewards")),
         "queryFees": num(grt(n, "total_query_fees")),
         "staked": num(grt(n, "total_tokens_staked")),
@@ -2828,7 +2840,7 @@ mod grt_flow_tests {
     /// dividing after loses the low digits before the division; this pins the exact figure.
     #[test]
     fn mints_and_burns_are_summed_as_integers_and_divided_once() {
-        let f = grt_flow(&net(), &params(), None, None, 100);
+        let f = grt_flow(&net(), &params(), None, None, None, 100);
         // 2e9 bridge + 3e9 rewards.
         assert_eq!(f["minted"].as_f64().unwrap(), 5_000_000_000.0);
         // 1e9 bridge + 5e6 curation + 1e6 protocol. Within a ten-millionth of a GRT: the sum is
@@ -2844,7 +2856,7 @@ mod grt_flow_tests {
     /// is a guess.
     #[test]
     fn the_supply_basis_says_whether_the_chain_answered() {
-        let f = grt_flow(&net(), &params(), None, None, 100);
+        let f = grt_flow(&net(), &params(), None, None, None, 100);
         assert_eq!(f["supplyBasis"], json!("approx"));
         assert_eq!(f["globalSupply"].as_f64().unwrap(), 11_500_000_000.0);
         assert_eq!(f["supplyBreakdown"], Value::Null);
@@ -2855,7 +2867,7 @@ mod grt_flow_tests {
             bridge_escrow: 1.0e9,
             global_supply: 11.0e9,
         };
-        let f = grt_flow(&net(), &params(), Some(&b), None, 100);
+        let f = grt_flow(&net(), &params(), Some(&b), None, None, 100);
         assert_eq!(f["supplyBasis"], json!("onchain"));
         assert_eq!(f["globalSupply"].as_f64().unwrap(), 11.0e9);
         assert_eq!(
@@ -2866,7 +2878,7 @@ mod grt_flow_tests {
 
     #[test]
     fn issuance_uses_the_one_blocks_per_year_figure() {
-        let f = grt_flow(&net(), &params(), None, None, 100);
+        let f = grt_flow(&net(), &params(), None, None, None, 100);
         let per_block = f["issuancePerBlock"].as_f64().unwrap();
         assert!((per_block - 114.0).abs() < 1e-9);
         let annual = f["annualIssuance"].as_f64().unwrap();
@@ -2882,7 +2894,7 @@ mod grt_flow_tests {
     /// A ppm cut of 10,000 is one percent, not ten thousand.
     #[test]
     fn cuts_are_parts_per_million_rather_than_percentages() {
-        let f = grt_flow(&net(), &params(), None, None, 100);
+        let f = grt_flow(&net(), &params(), None, None, None, 100);
         assert_eq!(f["params"]["protocolFeePct"].as_f64().unwrap(), 1.0);
         assert_eq!(f["params"]["curationTaxPct"].as_f64().unwrap(), 1.0);
         assert_eq!(f["params"]["delegationTaxPct"].as_i64().unwrap(), 0);
@@ -2891,7 +2903,7 @@ mod grt_flow_tests {
     /// Nothing in the row must panic or invent a figure.
     #[test]
     fn an_empty_row_gives_zeroes_rather_than_nonsense() {
-        let f = grt_flow(&json!({}), &json!({}), None, None, 0);
+        let f = grt_flow(&json!({}), &json!({}), None, None, None, 0);
         assert_eq!(f["minted"].as_f64().unwrap(), 0.0);
         assert_eq!(f["issuanceRatePct"].as_f64().unwrap(), 0.0);
         assert_eq!(f["blockNumber"], json!(0));
@@ -2901,8 +2913,9 @@ mod grt_flow_tests {
     /// leaves `burns` null rather than a zero that reads as "nothing was burned".
     #[test]
     fn burns_carry_the_bridge_apart_and_are_null_without_the_nest() {
-        let f = grt_flow(&net(), &params(), None, None, 100);
-        assert_eq!(f["burns"], Value::Null);
+        let f = grt_flow(&net(), &params(), None, None, None, 100);
+        assert_eq!(f["burns"]["arbitrum"], Value::Null);
+        assert_eq!(f["burns"]["totalBurned"], Value::Null);
 
         let b = json!({
             "gross_burned": "1326791691745000000000000000",
@@ -2912,10 +2925,18 @@ mod grt_flow_tests {
             "bridge_minted": "3689732064311000000000000000",
             "issued": "866480624340000000000000000",
         });
-        let f = grt_flow(&net(), &params(), None, Some(&b), 100);
-        assert!((f["burns"]["burned"].as_f64().unwrap() - 10_253_200.36).abs() < 1e-6);
-        assert!((f["burns"]["bridgeBurned"].as_f64().unwrap() - 1_316_538_491.385).abs() < 1e-3);
-        assert!((f["burns"]["issued"].as_f64().unwrap() - 866_480_624.34).abs() < 1e-3);
+        let f = grt_flow(&net(), &params(), None, Some(&b), None, 100);
+        let a = &f["burns"]["arbitrum"];
+        assert!((a["burned"].as_f64().unwrap() - 10_253_200.36).abs() < 1e-6);
+        assert!((a["bridgeBurned"].as_f64().unwrap() - 1_316_538_491.385).abs() < 1e-3);
+        assert!((a["issued"].as_f64().unwrap() - 866_480_624.34).abs() < 1e-3);
+        // A total over one chain would read as the whole, so it waits for both.
+        assert_eq!(f["burns"]["totalBurned"], Value::Null);
+
+        let m = json!({ "burned": "27088912106000000000000000", "minted": "10000000000000000000000000000" });
+        let f = grt_flow(&net(), &params(), None, Some(&b), Some(&m), 100);
+        assert!((f["burns"]["mainnet"]["burned"].as_f64().unwrap() - 27_088_912.106).abs() < 1e-6);
+        assert!((f["burns"]["totalBurned"].as_f64().unwrap() - 37_342_112.466).abs() < 1e-6);
     }
 }
 

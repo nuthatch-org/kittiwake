@@ -26,6 +26,8 @@ pub enum NestId {
     Services,
     /// `/supply` - grt-supply-nest: L2GraphToken mints and burns, with the bridge share apart.
     Supply,
+    /// `/supply-mainnet` - grt-supply-nest's mainnet half: GRT burned and minted on Ethereum.
+    SupplyMainnet,
 }
 
 impl NestId {
@@ -41,6 +43,7 @@ impl NestId {
             NestId::Qos => "/qos",
             NestId::Services => "/services",
             NestId::Supply => "/supply",
+            NestId::SupplyMainnet => "/supply-mainnet",
         }
     }
 
@@ -61,10 +64,11 @@ impl NestId {
             NestId::Qos => "qos",
             NestId::Services => "services",
             NestId::Supply => "supply",
+            NestId::SupplyMainnet => "supply-mainnet",
         }
     }
 
-    pub const ALL: [NestId; 8] = [
+    pub const ALL: [NestId; 9] = [
         NestId::Alloc,
         NestId::Gns,
         NestId::Dips,
@@ -73,6 +77,7 @@ impl NestId {
         NestId::Qos,
         NestId::Services,
         NestId::Supply,
+        NestId::SupplyMainnet,
     ];
 }
 

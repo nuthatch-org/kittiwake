@@ -498,20 +498,32 @@ pub async fn grt_flow(ctx: &ReadCtx) -> Result<Read, ApiError> {
                 },
                 None => None,
             };
-            let mut sup = QuerySpec::read(NestId::Supply, sql::grt_supply_sql());
-            sup.lane = lane;
-            let burns = match gate.query_coalesced("supply:grt-supply", sup).await {
-                Ok(r) => r.rows.first().cloned(),
-                Err(e) => {
-                    tracing::warn!(error = %e, "grt burns unavailable for the flow");
-                    None
-                }
-            };
+            let mut l2 = QuerySpec::read(NestId::Supply, sql::grt_supply_sql());
+            let mut l1 = QuerySpec::read(NestId::SupplyMainnet, sql::grt_supply_mainnet_sql());
+            l2.lane = lane;
+            l1.lane = lane;
+            let (l2, l1) = tokio::join!(
+                gate.query_coalesced("supply:grt-supply", l2),
+                gate.query_coalesced("supply-mainnet:grt-supply", l1),
+            );
+            let l2 = l2
+                .map_err(
+                    |e| tracing::warn!(error = %e, "arbitrum grt burns unavailable for the flow"),
+                )
+                .ok()
+                .and_then(|r| r.rows.first().cloned());
+            let l1 = l1
+                .map_err(
+                    |e| tracing::warn!(error = %e, "mainnet grt burns unavailable for the flow"),
+                )
+                .ok()
+                .and_then(|r| r.rows.first().cloned());
             let value = shape::grt_flow(
                 &n,
                 &p,
                 supply.as_ref(),
-                burns.as_ref(),
+                l2.as_ref(),
+                l1.as_ref(),
                 net.provenance.as_of.unwrap_or(0),
             );
             Ok((value, older_of(&net.provenance, &par.provenance)))

@@ -65,6 +65,10 @@ pub fn grt_supply_sql() -> &'static str {
     "SELECT gross_burned, bridge_burned, burned, gross_minted, bridge_minted, issued FROM grt_supply"
 }
 
+pub fn grt_supply_mainnet_sql() -> &'static str {
+    "SELECT burned, minted FROM grt_supply"
+}
+
 pub fn network_params_sql() -> &'static str {
     "SELECT delegation_ratio, curation_tax_percentage, protocol_payment_cut, max_thawing_period_seconds, \
      epoch_length, last_length_update_epoch, last_length_update_block, \

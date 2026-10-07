@@ -90,6 +90,7 @@ dips = 2
 "legacy-flows" = 2
 qos = 2
 supply = 2
+"supply-mainnet" = 2
 
 [cache]
 max_entries = 8192
