@@ -498,7 +498,22 @@ pub async fn grt_flow(ctx: &ReadCtx) -> Result<Read, ApiError> {
                 },
                 None => None,
             };
-            let value = shape::grt_flow(&n, &p, supply.as_ref(), net.provenance.as_of.unwrap_or(0));
+            let mut sup = QuerySpec::read(NestId::Supply, sql::grt_supply_sql());
+            sup.lane = lane;
+            let burns = match gate.query_coalesced("supply:grt-supply", sup).await {
+                Ok(r) => r.rows.first().cloned(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "grt burns unavailable for the flow");
+                    None
+                }
+            };
+            let value = shape::grt_flow(
+                &n,
+                &p,
+                supply.as_ref(),
+                burns.as_ref(),
+                net.provenance.as_of.unwrap_or(0),
+            );
             Ok((value, older_of(&net.provenance, &par.provenance)))
         })
     });

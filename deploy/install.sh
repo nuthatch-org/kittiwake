@@ -89,6 +89,7 @@ dips = 2
 "dips-sepolia" = 2
 "legacy-flows" = 2
 qos = 2
+supply = 2
 
 [cache]
 max_entries = 8192

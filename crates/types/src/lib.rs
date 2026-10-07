@@ -24,6 +24,8 @@ pub enum NestId {
     Qos,
     /// `/services` - data-services-nest: provider registrations for the census services.
     Services,
+    /// `/supply` - grt-supply-nest: L2GraphToken mints and burns, with the bridge share apart.
+    Supply,
 }
 
 impl NestId {
@@ -38,6 +40,7 @@ impl NestId {
             NestId::LegacyFlows => "/legacy-flows",
             NestId::Qos => "/qos",
             NestId::Services => "/services",
+            NestId::Supply => "/supply",
         }
     }
 
@@ -57,10 +60,11 @@ impl NestId {
             NestId::LegacyFlows => "legacy-flows",
             NestId::Qos => "qos",
             NestId::Services => "services",
+            NestId::Supply => "supply",
         }
     }
 
-    pub const ALL: [NestId; 7] = [
+    pub const ALL: [NestId; 8] = [
         NestId::Alloc,
         NestId::Gns,
         NestId::Dips,
@@ -68,6 +72,7 @@ impl NestId {
         NestId::LegacyFlows,
         NestId::Qos,
         NestId::Services,
+        NestId::Supply,
     ];
 }
 
