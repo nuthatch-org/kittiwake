@@ -1,4 +1,4 @@
-//! Mirroring the community triage archive at nightswatchhq/graph-support.
+//! Mirroring the community triage archive at nuthatch-org/graph-support.
 //!
 //! The dashboard's `/support` page used to call GitHub itself on a cache miss, which made a page
 //! of thirty-three write-ups depend on a credential in the frontend's environment. That credential

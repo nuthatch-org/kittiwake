@@ -14,7 +14,7 @@ set -euo pipefail
 
 HOST=${HOST:-root@167.235.29.213}
 KEY=${KEY:-$HOME/.ssh/hetzner_drpc}
-REPO=${REPO:-nightswatchhq/kittiwake}
+REPO=${REPO:-nuthatch-org/kittiwake}
 
 command -v gh >/dev/null || { echo "this needs the gh CLI" >&2; exit 1; }
 

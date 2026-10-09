@@ -1795,7 +1795,7 @@ mod schema_coverage {
 // ---------------------------------------------------------------------------------------------
 // graph-support: the community triage archive
 
-/// One issue from nightswatchhq/graph-support, as the mirror job last saw it.
+/// One issue from nuthatch-org/graph-support, as the mirror job last saw it.
 ///
 /// `labels` is the flat list of names rather than anything parsed. The taxonomy in that repo's
 /// `TRIAGE.md` is not exhaustive - `area/governance` and `kind/question` are both in use and in

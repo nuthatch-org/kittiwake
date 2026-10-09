@@ -194,7 +194,7 @@ impl std::fmt::Debug for ReceiptSettings {
     }
 }
 
-/// The credential that opens an issue in `nightswatchhq/graph-support`.
+/// The credential that opens an issue in `nuthatch-org/graph-support`.
 ///
 /// Absent means this deployment reads the forms and refuses to file, which is what it does today:
 /// the token has never been minted, so the incumbent's filing route has answered "not configured"

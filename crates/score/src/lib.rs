@@ -553,7 +553,7 @@ mod tests {
     /// The dashboard said "an operationally excellent indexer that takes 100% of rewards still
     /// scores poorly because delegators earn nothing". The arithmetic disagrees: cut is weighted
     /// at ten and stability at six, so taking everything is a deduction rather than a
-    /// disqualification. The copy has been corrected in nightswatchhq/lodestar; see kittiwake#14.
+    /// disqualification. The copy has been corrected in nuthatch-org/lodestar; see kittiwake#14.
     ///
     /// This case is the `base()` fixture with the cut turned up, so it is a *good* indexer rather
     /// than a flawless one: it also carries queryVolume 70, dataServiceDiversity 40 and a neutral

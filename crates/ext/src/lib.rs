@@ -26,7 +26,7 @@ const DEFILLAMA: &str = "https://api.llama.fi/v2/historicalChainTvl/Arbitrum";
 /// No credential. The repository is public and the job that calls this runs twice a day, which is
 /// two of the sixty requests an hour GitHub allows unauthenticated. A token here would be a thing
 /// that can expire in exchange for headroom nothing needs.
-const GRAPH_SUPPORT: &str = "https://api.github.com/repos/nightswatchhq/graph-support/issues?state=all&sort=updated&direction=desc&per_page=100";
+const GRAPH_SUPPORT: &str = "https://api.github.com/repos/nuthatch-org/graph-support/issues?state=all&sort=updated&direction=desc&per_page=100";
 
 /// Every comment in the repository, in one request rather than one per issue.
 ///
@@ -36,14 +36,14 @@ const GRAPH_SUPPORT: &str = "https://api.github.com/repos/nightswatchhq/graph-su
 /// halfway through a run. This endpoint is one request for all of them, with `issue_url` to map
 /// each back, and stays one request however large the repository gets.
 const GRAPH_SUPPORT_COMMENTS: &str =
-    "https://api.github.com/repos/nightswatchhq/graph-support/issues/comments?per_page=100";
+    "https://api.github.com/repos/nuthatch-org/graph-support/issues/comments?per_page=100";
 
 /// The issue-form directory, listed rather than enumerated.
 ///
 /// Naming the six files here would mean a seventh template, or a rename, silently never reaching
 /// the dashboard's compose form. Listing the directory costs one request and cannot go stale.
 const GRAPH_SUPPORT_TEMPLATES: &str =
-    "https://api.github.com/repos/nightswatchhq/graph-support/contents/.github/ISSUE_TEMPLATE";
+    "https://api.github.com/repos/nuthatch-org/graph-support/contents/.github/ISSUE_TEMPLATE";
 
 #[derive(Clone)]
 pub struct Ext {
@@ -273,7 +273,7 @@ impl Ext {
         Ok(collected)
     }
 
-    /// Every issue in nightswatchhq/graph-support, pull requests removed.
+    /// Every issue in nuthatch-org/graph-support, pull requests removed.
     ///
     /// An empty answer is a failure rather than an empty archive. That repository has never had
     /// zero issues, so a 200 with nothing in it means the request was wrong, not the repository -
@@ -1372,7 +1372,7 @@ mod ipfs_tests {
         serde_json::json!({
             "number": number,
             "title": format!("bad indexers: BadResponse(400) #{number}"),
-            "html_url": format!("https://github.com/nightswatchhq/graph-support/issues/{number}"),
+            "html_url": format!("https://github.com/nuthatch-org/graph-support/issues/{number}"),
             "state": state,
             "labels": [{"name": "area/gateway"}, {"name": "owner/edge-and-node"}],
             "comments": 4,
@@ -1467,8 +1467,8 @@ mod ipfs_tests {
     fn gh_comment(id: i64, issue: i32) -> serde_json::Value {
         serde_json::json!({
             "id": id,
-            "issue_url": format!("https://api.github.com/repos/nightswatchhq/graph-support/issues/{issue}"),
-            "html_url": format!("https://github.com/nightswatchhq/graph-support/issues/{issue}#issuecomment-{id}"),
+            "issue_url": format!("https://api.github.com/repos/nuthatch-org/graph-support/issues/{issue}"),
+            "html_url": format!("https://github.com/nuthatch-org/graph-support/issues/{issue}#issuecomment-{id}"),
             "body": "the gateway is routing to an indexer whose store is down",
             "user": {"login": "cargopete"},
             "created_at": "2026-09-02T00:00:00Z",

@@ -1,7 +1,7 @@
 //! The same six templates through both implementations, compared field by field.
 //!
 //! `reference.json` was produced by lodestar's `src/lib/issue-form.ts` on 2026-09-11 over the YAML
-//! beside it, which is what `nightswatchhq/graph-support` actually ships. Regenerating it needs the
+//! beside it, which is what `nuthatch-org/graph-support` actually ships. Regenerating it needs the
 //! Next repository, so it is committed rather than computed: a shape diff cannot see this, because
 //! both sides return a string and only its content differs.
 //!

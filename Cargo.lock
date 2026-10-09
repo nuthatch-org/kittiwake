@@ -5579,7 +5579,7 @@ checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 [[package]]
 name = "tattler"
 version = "0.1.0"
-source = "git+https://github.com/nightswatchhq/tattler.git?rev=0d94f0bdea9d7d854c69d78f0b4f13d72184e091#0d94f0bdea9d7d854c69d78f0b4f13d72184e091"
+source = "git+https://github.com/nuthatch-org/tattler.git?rev=0d94f0bdea9d7d854c69d78f0b4f13d72184e091#0d94f0bdea9d7d854c69d78f0b4f13d72184e091"
 dependencies = [
  "anyhow",
  "ed25519-dalek",

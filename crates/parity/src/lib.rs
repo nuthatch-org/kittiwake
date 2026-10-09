@@ -411,7 +411,7 @@ pub mod coverage {
              the incumbent's hand-rolled decoder marks a module using SIMD or atomics partial and \
              wasmparser does not, its decode audit carries an `unavailable` flag for a classifier \
              that here is a linked dependency, and `sourceHint` is not ported because \
-             nightswatchhq/lodestar#144 deletes its only reader. A fourth is in the diff: its \
+             nuthatch-org/lodestar#144 deletes its only reader. A fourth is in the diff: its \
              handler keys are joined with a literal NUL byte where its own comment says a \
              triangle. See docs/decisions.md. \
              \
