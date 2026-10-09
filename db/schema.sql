@@ -1,6 +1,6 @@
 -- The database this service reads and writes.
 --
--- **This file is authoritative.** It moved here from `nightswatchhq/lodestar`'s
+-- **This file is authoritative.** It moved here from `nuthatch-org/lodestar`'s
 -- `scripts/schema.sql` on 2026-09-09, and a new column is added here and nowhere else. #31
 --
 -- WHY IT MOVED
@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS epochs (
   curator_query_fees      NUMERIC,
   query_fee_rebates       NUMERIC,
   taxed_query_fees        NUMERIC,
-  -- EpochManager's exact L1 range (nightswatchhq/nuthatch#1882). Null until the allocations nest
+  -- EpochManager's exact L1 range (nuthatch-org/nuthatch#1882). Null until the allocations nest
   -- carries it; start_block/end_block are L2 blocks, and approximate once it does.
   start_l1_block          INTEGER,
   end_l1_block            INTEGER

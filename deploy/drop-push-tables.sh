@@ -3,7 +3,7 @@
 # Drop what push left behind.
 #
 # Push notifications were discontinued on 2026-09-06. The crons that fed them were struck the same
-# week, the routes and the UI went in nightswatchhq/lodestar#136 on 2026-09-09, and these tables
+# week, the routes and the UI went in nuthatch-org/lodestar#136 on 2026-09-09, and these tables
 # have had no reader or writer since. `docs/migration.md` said they could stay "until someone
 # decides to drop them"; this is that decision.
 #

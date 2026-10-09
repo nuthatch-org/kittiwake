@@ -12,7 +12,7 @@
 //! pure - the job owns the IO, the clock and the storage - so the decision is exhaustively
 //! testable without any of them.
 //!
-//! See nightswatchhq/graph-support#15. Moonbeam stopped producing blocks around 2026-08-10 and
+//! See nuthatch-org/graph-support#15. Moonbeam stopped producing blocks around 2026-08-10 and
 //! every subgraph on it entered exactly that state; two Celo subgraphs sat behind an indexer
 //! reporting itself 99.98% synced against a head that had not moved in 85 hours.
 

@@ -426,7 +426,7 @@ mod tests {
     /// The golden file, and the only test here that proves the delegate page will render.
     ///
     /// Produced by running the fixture above through the incumbent's own
-    /// `normaliseEnrichedResponse` (`nightswatchhq/lodestar`, `src/lib/enriched-normalise.ts`)
+    /// `normaliseEnrichedResponse` (`nuthatch-org/lodestar`, `src/lib/enriched-normalise.ts`)
     /// under tsx and pasting the result. Whole numbers are written without a point because that
     /// is what `JSON.stringify` does, and the parity harness compares parsed numbers.
     #[test]

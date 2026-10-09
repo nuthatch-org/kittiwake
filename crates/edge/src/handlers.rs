@@ -3454,7 +3454,7 @@ use kittiwake_read::census;
 ///
 /// **The endpoint is a string somebody put on chain**, so it goes through the SSRF guard before it
 /// goes anywhere near a socket. The incumbent fetched it unchecked, which made a public route into
-/// an SSRF with a status code and a latency for an oracle; see nightswatchhq/lodestar#149.
+/// an SSRF with a status code and a latency for an oracle; see nuthatch-org/lodestar#149.
 async fn probe_provider(provider: &census::Provider, kind: census::Probe) -> census::ProviderProbe {
     let mut out = census::ProviderProbe {
         address: provider.address.clone(),
@@ -4026,7 +4026,7 @@ mod schema_cid_tests {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Filing an issue in nightswatchhq/graph-support
+// Filing an issue in nuthatch-org/graph-support
 // ---------------------------------------------------------------------------------------------
 
 /// Long enough for a stack trace and a query, short enough that nobody pastes a database in.

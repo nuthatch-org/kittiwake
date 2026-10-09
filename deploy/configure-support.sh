@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Give kittiwake the token that opens an issue in nightswatchhq/graph-support.
+# Give kittiwake the token that opens an issue in nuthatch-org/graph-support.
 #
 #   bash deploy/configure-support.sh
 #
@@ -10,7 +10,7 @@
 #
 # WHAT THE TOKEN SHOULD BE
 #
-# A fine-grained personal access token, scoped to `nightswatchhq/graph-support` alone, with
+# A fine-grained personal access token, scoped to `nuthatch-org/graph-support` alone, with
 # Issues: Read and write and nothing else. Not a classic token: a classic `repo` token can push to
 # every repository the account can reach, and this one lives on a box that serves public traffic.
 #
@@ -33,7 +33,7 @@ printf '\n' >&2
 case "$TOKEN" in
   ghp_*)
     echo "that is a classic token. This wants a fine-grained one (github_pat_...) scoped to" >&2
-    echo "nightswatchhq/graph-support with Issues: Read and write. Nothing was changed." >&2
+    echo "nuthatch-org/graph-support with Issues: Read and write. Nothing was changed." >&2
     exit 1 ;;
   github_pat_*) ;;
   *)

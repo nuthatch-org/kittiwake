@@ -166,7 +166,7 @@ const SUMMARIES: &[Operation] = &[
     op("/api/curators", "The curator directory."),
     op(
         "/api/support",
-        "The nightswatchhq/graph-support archive, mirrored twice a day.",
+        "The nuthatch-org/graph-support archive, mirrored twice a day.",
     ),
     op(
         "/api/support/templates",

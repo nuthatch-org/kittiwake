@@ -26,7 +26,7 @@ service returns the same shape, ignoring the added `provenance` key.
 
 ## The route ledger
 
-Recounted on 2026-09-10 by diffing `src/app/api/**/route.ts` in `nightswatchhq/lodestar` against
+Recounted on 2026-09-10 by diffing `src/app/api/**/route.ts` in `nuthatch-org/lodestar` against
 this service's router, rather than by hand. The counts below are that diff.
 
 Lodestar has **90 API route files**, twelve of which are cron endpoints rather than API surface.
@@ -39,7 +39,7 @@ jobs in this process and are ledgered below. Four are deliberate: `health` judge
 including whether kittiwake is writing, so moving it here would make the thing being checked the
 checker; `migration` is the frontend describing itself; `horizon/debug` is cron-authed and wants
 confirming before it goes; `provider-liveness` goes with the Dispatch removal,
-nightswatchhq/lodestar#99. `disassembly/verify` is being deleted, nightswatchhq/lodestar#144. And
+nuthatch-org/lodestar#99. `disassembly/verify` is being deleted, nuthatch-org/lodestar#144. And
 `blog/search-index` stays, because it reads the blog posts out of the lodestar working directory at
 build time and porting it would put a repository this service does not own into its build; the
 reasoning is in [decisions.md](decisions.md).
@@ -84,7 +84,7 @@ run first. The rest write only their own tables or this process's memory and run
 `check-nest-health`, `check-provider-liveness` and `dispatch-notifications` all ended in
 `sendToAddress` from `lib/apns.ts`. Push was discontinued on 2026-09-06, so they detect a thing and
 post it nowhere. The nest watch is Foghorn's now; the DIPS watch is worth rehoming there
-(nightswatchhq/foghorn#2); the provider watch goes with Dispatch.
+(nuthatch-org/foghorn#2); the provider watch goes with Dispatch.
 
 **Product layer, not data plane (1).** `tap-provision` holds `TAP_SIGNER_PRIVATE_KEY` and **spends
 GRT**: porting it means putting a signing key on this box and having this service send
@@ -116,7 +116,7 @@ answer: a job with no rows under `kittiwake:` is not running here, whatever this
 Ollama-backed assistant) were discontinued on 2026-09-06. Neither is in this service and neither
 should be added.
 
-The routes and the interfaces that offered them went in `nightswatchhq/lodestar`#136 on 2026-09-09.
+The routes and the interfaces that offered them went in `nuthatch-org/lodestar`#136 on 2026-09-09.
 The tables went on 2026-09-10: `device_tokens`, `push_subscriptions` and `notification_log`, and
 the `push_notified` columns on `disputes` and `parameter_changes`. Lodie had none. This file used to
 say they could stay "until someone decides to drop them", which is how a decision becomes sediment.

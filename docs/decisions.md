@@ -16,7 +16,7 @@ module that loops for ever is stopped by the runtime rather than by a timeout wr
 Nothing in the two surviving routes executes anything. `src/lib/disassembly/index.ts` says so in its
 own header, `types.ts` repeats it, and the whole directory contains exactly one file that shells
 out or instantiates: `build-sandbox.ts`, which belongs to `verify` and goes in
-nightswatchhq/lodestar#144. Fuel bounds instructions executed; the count here is nought.
+nuthatch-org/lodestar#144. Fuel bounds instructions executed; the count here is nought.
 
 So this is `wasmparser`, and the improvement is a different one. The incumbent decodes the sections
 by hand, six hundred lines of LEB128 reader and an opcode table, and bails at the first instruction
@@ -73,8 +73,8 @@ it is a static asset with a build step, and the fact that Next spells that as `r
 business rather than an argument about where the data lives.
 
 So the nineteen are settled: sixteen answer here, `feed` went with the Intel Feed
-(nightswatchhq/lodestar#146, merged), `analytics/clickthrough` is being deleted for never having
-received a click (nightswatchhq/lodestar#150, open), and this one stays where it is.
+(nuthatch-org/lodestar#146, merged), `analytics/clickthrough` is being deleted for never having
+received a click (nuthatch-org/lodestar#150, open), and this one stays where it is.
 
 ---
 
@@ -107,7 +107,7 @@ all, and the code says so where it happens.
 
 ## 2026-09-09: this repository owns the schema
 
-`db/schema.sql` is authoritative. It moved here from `nightswatchhq/lodestar`'s
+`db/schema.sql` is authoritative. It moved here from `nuthatch-org/lodestar`'s
 `scripts/schema.sql`, and a new column is added here and nowhere else.
 
 The tables are read on nearly every route and, since the crons were ported, written by this service

@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Table names come from `schema.json` in nightswatchhq/dips-nest rather than from guesswork, and
+/// Table names come from `schema.json` in nuthatch-org/dips-nest rather than from guesswork, and
 /// the convention has a trap in it: `RCACollected` becomes `recurring_collector__r_c_a_collected`,
 /// not `..._rca_collected`, and the reasonable guess is wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

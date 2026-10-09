@@ -1,7 +1,7 @@
 //! GitHub issue forms, parsed from the YAML the repository actually ships.
 //!
 //! The templates are mirrored into Postgres verbatim by `kittiwake_ingest::graph_support`, so the
-//! compose page renders whatever `nightswatchhq/graph-support` currently declares rather than a
+//! compose page renders whatever `nuthatch-org/graph-support` currently declares rather than a
 //! copy that drifts from it. A field added there appears here on the mirror's next run and nothing
 //! is edited.
 //!
@@ -13,7 +13,7 @@
 
 use serde::Serialize;
 
-pub const REPO: &str = "nightswatchhq/graph-support";
+pub const REPO: &str = "nuthatch-org/graph-support";
 
 pub fn chooser_url() -> String {
     format!("https://github.com/{REPO}/issues/new/choose")
