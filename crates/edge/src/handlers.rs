@@ -1149,6 +1149,7 @@ pub async fn indexing_status(
         probed_at: probed_at.to_rfc3339(),
         serving_operators: servability.effective_serving_operators,
         serving_indexers: servability.serving_indexer_count,
+        unverified_indexers: servability.unverified_indexer_count,
         gateway_verdict: None,
     };
 
@@ -1217,6 +1218,7 @@ pub async fn indexing_status(
                         probed_at: r.probed_at.to_rfc3339(),
                         serving_operators: r.serving_operators.max(0) as usize,
                         serving_indexers: r.serving_indexers.max(0) as usize,
+                        unverified_indexers: r.unverified_indexers.max(0) as usize,
                         gateway_verdict: r.gateway_verdict.and_then(|v| {
                             serde_json::from_value(serde_json::Value::String(v)).ok()
                         }),

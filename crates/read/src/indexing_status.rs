@@ -191,10 +191,11 @@ impl IndexerStatus {
 
     /// RFC-006 D1: only a confirmed paid answer counts as servable.
     pub fn servable(&self) -> bool {
-        matches!(
-            self.serve_probe,
-            Some(ServeProbe::Serving) | Some(ServeProbe::AlivePaid)
-        )
+        self.serve_probe == Some(ServeProbe::Serving)
+            && self.state == SyncState::Synced
+            && self
+                .blocks_behind
+                .is_some_and(|lag| lag <= SYNC_TOLERANCE_BLOCKS)
     }
 
     /// graph-node's own `health`, passed through rather than derived.
@@ -439,6 +440,8 @@ pub struct Servability {
     /// Distinct operators with at least one servable indexer.
     pub effective_serving_operators: usize,
     pub serving_indexer_count: usize,
+    /// Payment challenges and stale answers do not establish current service.
+    pub unverified_indexer_count: usize,
     /// Nobody can serve. Queries fail whatever the sync figures say.
     pub effectively_dead: bool,
     /// Dead now, but something is catching up.
@@ -470,7 +473,14 @@ pub fn assess_servability(
 
     let serving: Vec<&IndexerStatus> = indexers.iter().filter(|i| i.servable()).collect();
     let serving_operators: HashSet<String> = serving.iter().map(|i| key(&i.indexer_id)).collect();
-    let effectively_dead = serving_operators.is_empty();
+    let unverified_indexer_count = indexers
+        .iter()
+        .filter(|i| {
+            i.serve_probe == Some(ServeProbe::AlivePaid)
+                || (i.serve_probe == Some(ServeProbe::Serving) && !i.servable())
+        })
+        .count();
+    let effectively_dead = serving_operators.is_empty() && unverified_indexer_count == 0;
 
     let mut by_operator: HashMap<String, u128> = HashMap::new();
     let mut total: u128 = 0;
@@ -490,6 +500,7 @@ pub fn assess_servability(
     Servability {
         effective_serving_operators: serving_operators.len(),
         serving_indexer_count: serving.len(),
+        unverified_indexer_count,
         effectively_dead,
         recovering: effectively_dead && indexers.iter().any(|i| i.state == SyncState::Syncing),
         dominant_operator_share,
@@ -521,6 +532,7 @@ pub struct Round {
     pub probed_at: String,
     pub serving_operators: usize,
     pub serving_indexers: usize,
+    pub unverified_indexers: usize,
     pub gateway_verdict: Option<GatewayVerdict>,
 }
 
@@ -529,6 +541,8 @@ pub struct Round {
 pub enum RenderedState {
     /// Somebody served this round.
     Ok,
+    /// No fresh answer was confirmed; payment gates or stale data answered.
+    Unverified,
     /// Dead this round, but not for long enough to say so.
     Rechecking,
     /// Dead by our probes and served by the gateway in the same round.
@@ -579,11 +593,11 @@ pub fn apply_persistence(history: &[Round], k: usize) -> RenderedServability {
             probed_at: None,
         };
     };
-    let dead = |r: &Round| r.serving_operators == 0;
+    let dead = |r: &Round| r.serving_operators == 0 && r.unverified_indexers == 0;
     let gateway_served = |r: &Round| r.gateway_verdict == Some(GatewayVerdict::Served);
 
     let at = Some(current.probed_at.clone());
-    if !dead(current) {
+    if current.serving_operators > 0 {
         return RenderedServability {
             state: RenderedState::Ok,
             effectively_dead: false,
@@ -595,6 +609,15 @@ pub fn apply_persistence(history: &[Round], k: usize) -> RenderedServability {
     if gateway_served(current) {
         return RenderedServability {
             state: RenderedState::Conflicting,
+            effectively_dead: false,
+            dead_streak: 0,
+            k: threshold,
+            probed_at: at,
+        };
+    }
+    if current.unverified_indexers > 0 {
+        return RenderedServability {
+            state: RenderedState::Unverified,
             effectively_dead: false,
             dead_streak: 0,
             k: threshold,
@@ -638,6 +661,7 @@ mod tests {
     fn at(id: &str, state: SyncState, probe: Option<ServeProbe>, stake: &str) -> IndexerStatus {
         let mut s = IndexerStatus::unreachable(id, None, "http://x", stake);
         s.state = state;
+        s.blocks_behind = (state == SyncState::Synced).then_some(0);
         s.serve_probe = probe;
         s
     }
@@ -911,6 +935,80 @@ mod tests {
     // -- 3. servability -----------------------------------------------------------------------
 
     #[test]
+    fn polygon_stall_with_payment_challenges_is_unverified_not_serving_or_dead() {
+        let indexers = vec![
+            build_indexer_status(
+                "ellipfra",
+                None,
+                "",
+                "1",
+                Some(&raw("healthy", true, 95_394_882, 95_335_908)),
+            ),
+            build_indexer_status(
+                "lunanova",
+                None,
+                "",
+                "1",
+                Some(&raw("healthy", true, 95_394_882, 95_375_191)),
+            ),
+            IndexerStatus::unreachable("upgrade", None, "", "1"),
+        ]
+        .into_iter()
+        .map(|mut i| {
+            i.serve_probe = Some(probe_from_paid(classify_paid_response(
+                402,
+                "application/json",
+                r#"{"error":"payment required"}"#,
+            )));
+            i
+        })
+        .collect::<Vec<_>>();
+        let verdict = assess_servability(&indexers, None);
+        assert_eq!(verdict.serving_indexer_count, 0);
+        assert_eq!(verdict.effective_serving_operators, 0);
+        assert_eq!(verdict.unverified_indexer_count, 3);
+        assert!(!verdict.effectively_dead);
+        assert!(indexers.iter().all(|i| !i.servable()));
+        let mut inconclusive = round(0, None);
+        inconclusive.unverified_indexers = 3;
+        let rendered = apply_persistence(
+            &[inconclusive.clone(), inconclusive.clone(), inconclusive],
+            3,
+        );
+        assert_eq!(rendered.state, RenderedState::Unverified);
+        assert!(!rendered.effectively_dead);
+        assert_eq!(rendered.dead_streak, 0);
+    }
+
+    #[test]
+    fn stale_data_is_not_confirmed_current_service() {
+        let v = assess_servability(
+            &[
+                at("stale", SyncState::Syncing, Some(ServeProbe::Serving), "1"),
+                at(
+                    "unknown",
+                    SyncState::Unreachable,
+                    Some(ServeProbe::Serving),
+                    "1",
+                ),
+            ],
+            None,
+        );
+        assert_eq!(v.serving_indexer_count, 0);
+        assert_eq!(v.unverified_indexer_count, 2);
+        assert!(!v.effectively_dead);
+    }
+
+    #[test]
+    fn inconclusive_payment_round_breaks_a_dead_streak() {
+        let mut unknown = round(0, None);
+        unknown.unverified_indexers = 1;
+        let rendered = apply_persistence(&[round(0, None), unknown, round(0, None)], 3);
+        assert_eq!(rendered.state, RenderedState::Rechecking);
+        assert_eq!(rendered.dead_streak, 1);
+    }
+
+    #[test]
     fn one_serving_indexer_is_enough_for_the_deployment_not_to_be_dead() {
         let v = assess_servability(
             &[
@@ -987,6 +1085,7 @@ mod tests {
             probed_at: "2026-09-09T00:00:00Z".into(),
             serving_operators: serving,
             serving_indexers: serving,
+            unverified_indexers: 0,
             gateway_verdict: gateway,
         }
     }
@@ -1603,6 +1702,7 @@ mod shape_tests {
     fn one(id: &str, state: SyncState, probe: Option<ServeProbe>) -> IndexerStatus {
         let mut s = IndexerStatus::unreachable(id, None, "http://x", "100");
         s.state = state;
+        s.blocks_behind = (state == SyncState::Synced).then_some(0);
         s.serve_probe = probe;
         s.answered = true;
         s
@@ -1849,7 +1949,8 @@ mod shape_tests {
                 "effectiveServingOperators",
                 "effectivelyDead",
                 "recovering",
-                "servingIndexerCount"
+                "servingIndexerCount",
+                "unverifiedIndexerCount"
             ]
         );
 
@@ -1879,6 +1980,7 @@ mod shape_tests {
             probed_at: "2026-09-09T00:00:00Z".into(),
             serving_operators: v.effective_serving_operators,
             serving_indexers: v.serving_indexer_count,
+            unverified_indexers: v.unverified_indexer_count,
             gateway_verdict: None,
         };
         let r = apply_persistence(&[now], 3);

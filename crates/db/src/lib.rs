@@ -2151,6 +2151,7 @@ pub struct RoundSummary {
     pub probed_at: chrono::DateTime<chrono::Utc>,
     pub serving_operators: i64,
     pub serving_indexers: i64,
+    pub unverified_indexers: i64,
     pub gateway_verdict: Option<String>,
 }
 
@@ -2190,8 +2191,9 @@ pub async fn recent_servability_rounds(
     deployment_hash: &str,
     limit: i64,
 ) -> Result<Vec<RoundSummary>, DbError> {
-    let rows = sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, i32, i32, Option<String>)>(
-        "SELECT probed_at, serving_operator_count, serving_indexer_count, gateway_verdict \
+    let rows = sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, i32, i32, Option<String>, i64)>(
+        "SELECT probed_at, serving_operator_count, serving_indexer_count, gateway_verdict, \
+                COALESCE((verdict_json->>'unverifiedIndexerCount')::bigint, 0) \
            FROM servability_rounds \
           WHERE deployment_hash = $1 \
           ORDER BY probed_at DESC \
@@ -2206,10 +2208,11 @@ pub async fn recent_servability_rounds(
         .into_iter()
         .rev()
         .map(
-            |(probed_at, operators, indexers, gateway_verdict)| RoundSummary {
+            |(probed_at, operators, indexers, gateway_verdict, unverified_indexers)| RoundSummary {
                 probed_at,
                 serving_operators: operators as i64,
                 serving_indexers: indexers as i64,
+                unverified_indexers,
                 gateway_verdict,
             },
         )
