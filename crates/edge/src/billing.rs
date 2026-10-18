@@ -22,6 +22,20 @@ const FIRST_PERIOD_SECS: i64 = 32 * 86_400;
 /// A renewal that fails and is retried by Stripe should not lock a subscriber out meanwhile.
 const GRACE_SECS: i64 = 86_400;
 
+/// A wallet paying for the first time, and not one of ours.
+pub(crate) fn is_news(inserted: bool, address: &str, ignore: &[String]) -> bool {
+    inserted && !ignore.iter().any(|a| a.eq_ignore_ascii_case(address))
+}
+
+pub(crate) fn new_subscriber_message(address: &str, paid_until: i64) -> String {
+    let until = chrono::DateTime::from_timestamp(paid_until, 0)
+        .map(|d| d.format("%-d %B %Y").to_string())
+        .unwrap_or_default();
+    format!(
+        "New Lodestar subscriber: {address}, paid until {until}.\nhttps://arbiscan.io/address/{address}"
+    )
+}
+
 /// `Stripe-Signature: t=<unix>,v1=<hex hmac>[,v1=...]` over `"{t}.{body}"`.
 pub(crate) fn verify_signature(secret: &str, header: &str, body: &[u8], now: i64) -> bool {
     let mut ts = None;
@@ -144,7 +158,7 @@ pub(crate) async fn stripe_webhook(
         tracing::warn!(event = ?event["id"], "stripe payment for an unknown subscription");
         return Ok(ok());
     };
-    kittiwake_db::extend_subscription(
+    let inserted = kittiwake_db::extend_subscription(
         pool,
         &address,
         credit.paid_until,
@@ -156,6 +170,24 @@ pub(crate) async fn stripe_webhook(
     .map_err(db)?;
     if let Some(p) = &st.paywall {
         p.forget(&address);
+    }
+    if let Some(t) = st.telegram.clone()
+        && is_news(inserted, &address, &t.ignore_addresses)
+    {
+        let text = new_subscriber_message(&address, credit.paid_until);
+        // Off the webhook's path: Stripe should not retry a payment because Telegram was slow.
+        tokio::spawn(async move {
+            let url = format!("https://api.telegram.org/bot{}/sendMessage", t.bot_token);
+            let sent = reqwest::Client::new()
+                .post(url)
+                .json(&serde_json::json!({ "chat_id": t.chat_id, "text": text }))
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await;
+            if !sent.is_ok_and(|r| r.status().is_success()) {
+                tracing::warn!("could not announce a new subscriber on Telegram");
+            }
+        });
     }
     metrics::counter!("stripe_credits_total").increment(1);
     Ok(ok())
@@ -264,6 +296,28 @@ mod tests {
             assert_eq!(c.external_ref.as_deref(), Some("sub_1"));
             assert_eq!(c.paid_until, NOW + 200 + GRACE_SECS);
         }
+    }
+
+    #[test]
+    fn only_a_first_payment_from_somebody_else_is_news() {
+        let me = vec!["0x7dfb2175a77e922f060bc0a59f83be6d2f4b85d4".to_string()];
+        assert!(is_news(true, "0xabc", &me));
+        assert!(
+            !is_news(false, "0xabc", &me),
+            "a renewal is not a new subscriber"
+        );
+        assert!(!is_news(
+            true,
+            "0x7DFB2175A77E922F060BC0A59F83BE6D2F4B85D4",
+            &me
+        ));
+    }
+
+    #[test]
+    fn the_announcement_names_the_wallet_and_the_date() {
+        let m = new_subscriber_message("0xabc", 1_795_111_382);
+        assert!(m.starts_with("New Lodestar subscriber: 0xabc, paid until 19 November 2026."));
+        assert!(m.ends_with("https://arbiscan.io/address/0xabc"));
     }
 
     #[test]

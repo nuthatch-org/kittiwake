@@ -2689,7 +2689,7 @@ pub async fn subscription_paid_until(pool: &Pool, address: &str) -> Result<Optio
 }
 
 /// Extend a wallet's access to `paid_until` (unix seconds), never shortening it, so a replayed or
-/// out-of-order event cannot take away time already paid for.
+/// out-of-order event cannot take away time already paid for. True when the wallet had no row.
 pub async fn extend_subscription(
     pool: &Pool,
     address: &str,
@@ -2697,8 +2697,8 @@ pub async fn extend_subscription(
     source: &str,
     external_ref: Option<&str>,
     email: Option<&str>,
-) -> Result<(), DbError> {
-    sqlx::query(
+) -> Result<bool, DbError> {
+    let (inserted,): (bool,) = sqlx::query_as(
         "INSERT INTO subscriptions (address, paid_until, source, external_ref, email) \
          VALUES ($1, to_timestamp($2), $3, $4, $5) \
          ON CONFLICT (address) DO UPDATE SET \
@@ -2706,16 +2706,17 @@ pub async fn extend_subscription(
            source = EXCLUDED.source, \
            external_ref = COALESCE(EXCLUDED.external_ref, subscriptions.external_ref), \
            email = COALESCE(EXCLUDED.email, subscriptions.email), \
-           updated_at = NOW()",
+           updated_at = NOW() \
+         RETURNING (xmax = 0)",
     )
     .bind(address.to_lowercase())
     .bind(paid_until as f64)
     .bind(source)
     .bind(external_ref)
     .bind(email)
-    .execute(pool)
+    .fetch_one(pool)
     .await?;
-    Ok(())
+    Ok(inserted)
 }
 
 /// The wallet a payment rail's id belongs to, such as a Stripe subscription.

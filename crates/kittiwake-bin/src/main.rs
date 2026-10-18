@@ -236,7 +236,8 @@ async fn main() -> anyhow::Result<()> {
         cfg.cors.as_ref().map(|c| c.allowed_origin_patterns.clone()),
     )
     .with_paywall(cfg.paywall_enabled, cfg.paywall_service_tokens.clone())
-    .with_stripe(cfg.stripe.as_ref().map(|s| s.webhook_secret.clone()));
+    .with_stripe(cfg.stripe.as_ref().map(|s| s.webhook_secret.clone()))
+    .with_telegram(cfg.telegram.clone());
     let limits_handle = state.limits.clone();
 
     // Keyed rate-limit state grows with distinct callers; sweep the idle ones periodically so a
