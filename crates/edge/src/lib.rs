@@ -1082,14 +1082,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/poi", get(handlers::poi))
         // Activity
         .route("/api/delegation-events", get(handlers::delegation_events))
-        .route("/api/delegation-flows", get(handlers::delegation_flows))
-        .route("/api/developer-activity", get(handlers::developer_activity))
         // Subgraphs
         .route(
             "/api/subgraph-deployments",
             get(handlers::subgraph_deployments),
         )
-        .route("/api/subgraph-fees-30d", get(handlers::subgraph_fees_30d))
         .route(
             "/api/subgraph-curation/{hash}",
             get(handlers::subgraph_curation),
@@ -1106,7 +1103,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dips", get(handlers::dips))
         // The public SQL surface
         .route("/api/indexers-enriched", get(handlers::indexers_enriched))
-        .route("/api/horizon/activity", get(handlers::horizon_activity))
         .route(
             "/api/subgraph-deployment/{hash}",
             get(handlers::subgraph_deployment),
@@ -1159,7 +1155,6 @@ pub fn router(state: AppState) -> Router {
             "/api/subgraph-schema/{hash}",
             get(handlers::subgraph_schema),
         )
-        .route("/api/dips/agreements", get(handlers::dips_agreements))
         .route("/api/manifest", get(handlers::manifest))
         .route("/api/service-census", get(handlers::service_census))
         .route("/api/operator-preflight", get(handlers::operator_preflight))
@@ -1266,6 +1261,12 @@ pub fn router(state: AppState) -> Router {
             axum::routing::patch(handlers::studio_bounty_patch),
         )
         .route("/api/ens", get(handlers::ens))
+        // Network-wide totals on the free overview.
+        .route("/api/dips/agreements", get(handlers::dips_agreements))
+        .route("/api/horizon/activity", get(handlers::horizon_activity))
+        .route("/api/subgraph-fees-30d", get(handlers::subgraph_fees_30d))
+        .route("/api/delegation-flows", get(handlers::delegation_flows))
+        .route("/api/developer-activity", get(handlers::developer_activity))
         .route("/api/account", get(handlers::account))
         .route("/api/billing/stripe", post(billing::stripe_webhook))
         .merge(paid)
