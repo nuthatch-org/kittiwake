@@ -234,7 +234,9 @@ async fn main() -> anyhow::Result<()> {
     .with_cors(
         cfg.cors.as_ref().map(|c| c.allowed_origins.clone()),
         cfg.cors.as_ref().map(|c| c.allowed_origin_patterns.clone()),
-    );
+    )
+    .with_paywall(cfg.paywall_enabled)
+    .with_stripe(cfg.stripe.as_ref().map(|s| s.webhook_secret.clone()));
     let limits_handle = state.limits.clone();
 
     // Keyed rate-limit state grows with distinct callers; sweep the idle ones periodically so a
@@ -279,6 +281,9 @@ async fn main() -> anyhow::Result<()> {
             kittiwake_db::ensure_graph_support_table(p)
                 .await
                 .context("creating the graph-support mirror table")?;
+            kittiwake_db::ensure_subscriptions_table(p)
+                .await
+                .context("creating the subscriptions table")?;
         }
         jobs.extend(jobs::live_jobs(
             store.clone(),

@@ -50,6 +50,15 @@ pub const WITHHELD: &[(&str, &str)] = &[
          rather than the protocol",
     ),
     (
+        "/api/billing/stripe",
+        "Stripe's webhook, signed with a secret only Stripe holds; a POST that extends a \
+         subscription, not a read",
+    ),
+    (
+        "/api/account",
+        "the signed-in wallet's own subscription; a session-scoped product route, not a protocol read",
+    ),
+    (
         "/api/studio/auth",
         "a session- and wallet-signature-scoped product route, not a public protocol read",
     ),

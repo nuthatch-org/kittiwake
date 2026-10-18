@@ -2658,3 +2658,75 @@ mod gaps_are_about_us {
         );
     }
 }
+
+/// One row per wallet that has paid. `paid_until` is the whole entitlement; `source` says which
+/// rail extended it last (`stripe`, `chain`, `manual`) and `external_ref` is that rail's id.
+pub async fn ensure_subscriptions_table(pool: &Pool) -> Result<(), DbError> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS subscriptions ( \
+           address      TEXT PRIMARY KEY, \
+           paid_until   TIMESTAMPTZ NOT NULL, \
+           source       TEXT NOT NULL, \
+           external_ref TEXT, \
+           email        TEXT, \
+           created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
+           updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW() \
+         )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// When this wallet's access ends, in unix seconds, or `None` if it has never paid.
+pub async fn subscription_paid_until(pool: &Pool, address: &str) -> Result<Option<i64>, DbError> {
+    let row: Option<(chrono::DateTime<chrono::Utc>,)> =
+        sqlx::query_as("SELECT paid_until FROM subscriptions WHERE address = $1")
+            .bind(address.to_lowercase())
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(t,)| t.timestamp()))
+}
+
+/// Extend a wallet's access to `paid_until` (unix seconds), never shortening it, so a replayed or
+/// out-of-order event cannot take away time already paid for.
+pub async fn extend_subscription(
+    pool: &Pool,
+    address: &str,
+    paid_until: i64,
+    source: &str,
+    external_ref: Option<&str>,
+    email: Option<&str>,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "INSERT INTO subscriptions (address, paid_until, source, external_ref, email) \
+         VALUES ($1, to_timestamp($2), $3, $4, $5) \
+         ON CONFLICT (address) DO UPDATE SET \
+           paid_until = GREATEST(subscriptions.paid_until, EXCLUDED.paid_until), \
+           source = EXCLUDED.source, \
+           external_ref = COALESCE(EXCLUDED.external_ref, subscriptions.external_ref), \
+           email = COALESCE(EXCLUDED.email, subscriptions.email), \
+           updated_at = NOW()",
+    )
+    .bind(address.to_lowercase())
+    .bind(paid_until as f64)
+    .bind(source)
+    .bind(external_ref)
+    .bind(email)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The wallet a payment rail's id belongs to, such as a Stripe subscription.
+pub async fn subscription_address_for_ref(
+    pool: &Pool,
+    external_ref: &str,
+) -> Result<Option<String>, DbError> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT address FROM subscriptions WHERE external_ref = $1")
+            .bind(external_ref)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(a,)| a))
+}
