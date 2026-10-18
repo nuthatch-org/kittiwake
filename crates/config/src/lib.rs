@@ -200,6 +200,20 @@ impl std::fmt::Debug for ReceiptSettings {
 /// the token has never been minted, so the incumbent's filing route has answered "not configured"
 /// to every request it has ever had. The compose page is told so through `canFile` and sends people
 /// to GitHub's own chooser rather than accepting typing it cannot deliver.
+/// Stripe's webhook signing secret (`whsec_...`), from the endpoint's page in the dashboard.
+#[derive(Clone, Deserialize)]
+pub struct StripeSettings {
+    pub webhook_secret: String,
+}
+
+impl std::fmt::Debug for StripeSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StripeSettings")
+            .field("webhook_secret", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Clone, Deserialize)]
 pub struct SupportSettings {
     /// A fine-grained token with `issues:write` on that repository and nothing else.
@@ -291,6 +305,8 @@ pub struct Config {
     pub receipt: Option<ReceiptSettings>,
     pub tap: Option<TapSettings>,
     pub support: Option<SupportSettings>,
+    /// Absent means `/api/billing/stripe` refuses every event, so card payments extend nothing.
+    pub stripe: Option<StripeSettings>,
     /// Turns the in-process scheduler on. Off by default so a second instance, or a staging box,
     /// cannot start writing to the same Postgres behind your back.
     #[serde(default)]
@@ -298,6 +314,10 @@ pub struct Config {
     /// Turns the warmer on. Off by default for the same reason.
     #[serde(default)]
     pub warmer_enabled: bool,
+    /// Puts the paid routes behind a signed-in wallet with a current subscription. Off by default,
+    /// so a deploy cannot lock every visitor out before there is a way to pay.
+    #[serde(default)]
+    pub paywall_enabled: bool,
 }
 
 fn default_bind() -> String {
@@ -320,6 +340,13 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.paywall_enabled && (self.studio.is_none() || self.database_url.is_none()) {
+            return Err(ConfigError::Invalid(
+                "paywall_enabled needs [studio] for sign-in and database_url for subscriptions; \
+                 without either every paid route would refuse everyone"
+                    .into(),
+            ));
+        }
         if self.nest.origin.trim().is_empty() {
             return Err(ConfigError::Invalid(
                 "nest.origin is required: every protocol route reads a nest and there is no fallback".into(),
@@ -614,9 +641,20 @@ mod tests {
             database_max_connections: 16,
             cache: None,
             limits: None,
+            stripe: None,
             scheduler_enabled: false,
             warmer_enabled: false,
+            paywall_enabled: false,
         }
+    }
+
+    #[test]
+    fn a_paywall_with_no_way_to_sign_in_is_a_startup_failure() {
+        let mut c = settings("https://nest.example");
+        c.paywall_enabled = true;
+        assert!(c.validate().is_err());
+        c.database_url = Some("postgresql://x".into());
+        assert!(c.validate().is_err(), "still no [studio]");
     }
 
     #[test]

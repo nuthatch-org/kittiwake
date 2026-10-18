@@ -44,6 +44,8 @@ tower = "0.5.3"
 tower-http = { version = "0.7.1", features = ["trace", "cors", "request-id", "util", "catch-panic", "timeout"] }
 futures = "0.3.34"
 subtle = "2.6.1"
+hmac = "0.12.1"
+sha2 = "0.10.9"
 tracing = "0.1.44"
 base64 = "0.23.1"
 

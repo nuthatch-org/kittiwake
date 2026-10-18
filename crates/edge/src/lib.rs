@@ -10,8 +10,10 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod billing;
 pub mod handlers;
 pub mod openapi;
+pub mod paywall;
 
 use axum::Router;
 use axum::extract::{ConnectInfo, State};
@@ -119,6 +121,10 @@ pub struct AppState {
     pub limits: Arc<Limits>,
     pub metrics: Option<kittiwake_obs::PrometheusHandle>,
     pub started: std::time::Instant,
+    /// Present when the paywall is on. Absent means every route is free, as it always was.
+    pub paywall: Option<paywall::Paywall>,
+    /// Stripe's webhook signing secret. Absent means card payments are refused, not guessed at.
+    pub stripe_webhook_secret: Option<Arc<str>>,
 }
 
 #[derive(Clone)]
@@ -136,6 +142,16 @@ impl AppState {
     ) -> Self {
         self.cors_origins = origins.filter(|o| !o.is_empty()).map(Arc::new);
         self.cors_patterns = patterns.filter(|p| !p.is_empty()).map(Arc::new);
+        self
+    }
+
+    pub fn with_stripe(mut self, webhook_secret: Option<String>) -> Self {
+        self.stripe_webhook_secret = webhook_secret.map(|s| Arc::from(s.as_str()));
+        self
+    }
+
+    pub fn with_paywall(mut self, enabled: bool) -> Self {
+        self.paywall = enabled.then(paywall::Paywall::default);
         self
     }
 }
@@ -1036,6 +1052,7 @@ fn cors_layer(origins: &[String], patterns: &[String]) -> Option<tower_http::cor
             .expose_headers([
                 axum::http::HeaderName::from_static("x-kittiwake-source"),
                 axum::http::HeaderName::from_static("x-kittiwake-age"),
+                axum::http::HeaderName::from_static(paywall::REFUSAL_HEADER),
             ])
             .max_age(std::time::Duration::from_secs(600)),
     )
@@ -1043,25 +1060,10 @@ fn cors_layer(origins: &[String], patterns: &[String]) -> Option<tower_http::cor
 
 pub fn router(state: AppState) -> Router {
     use axum::routing::post;
-    let routes = Router::new()
-        .route("/whoami", get(get_whoami))
-        // Also under /api, so it can be reached through the edge rewrite and the whole chain can be
-        // checked from a browser rather than only from the box.
-        .route("/api/whoami", get(get_whoami))
-        .route("/health", get(get_health))
-        // The URL anything watching this deployment already points at, answering in the shape it
-        // has always answered in. See `get_api_health`.
-        .route("/api/health", get(get_api_health))
-        .route("/ready", get(get_ready))
-        .route("/metrics", get(get_metrics))
-        .route("/openapi.json", get(get_openapi))
-        // The directory and the network
-        .route("/api/indexers", get(handlers::indexers))
-        .route("/api/indexer/{address}", get(handlers::indexer))
-        .route(
-            "/api/indexer-status/{address}",
-            get(handlers::indexer_status),
-        )
+    // Everything below answers only a signed-in wallet with a current subscription, once
+    // `paywall_enabled` is set. Anything not listed here is free, so a new route is free until
+    // somebody decides otherwise.
+    let paid = Router::new()
         .route(
             "/api/apr-provenance/{address}",
             get(handlers::apr_provenance),
@@ -1071,16 +1073,6 @@ pub fn router(state: AppState) -> Router {
             get(handlers::indexer_stake_history),
         )
         .route("/api/curators", get(handlers::curators))
-        .route("/api/support", get(handlers::support))
-        .route("/api/support/templates", get(handlers::support_templates))
-        .route("/api/issue-forms", get(handlers::issue_forms))
-        .route("/api/file-issue", post(handlers::file_issue))
-        .route("/api/support/{number}", get(handlers::support_issue))
-        .route("/api/epochs", get(handlers::epochs))
-        .route("/api/network-stats", get(handlers::network_stats))
-        // Same fold, different panel: one cache entry serves both.
-        .route("/api/grt-flow", get(handlers::grt_flow))
-        .route("/api/token-metrics", get(handlers::token_metrics))
         // Positions
         .route("/api/portfolio", get(handlers::portfolio))
         .route("/api/rewards-history", get(handlers::rewards_history))
@@ -1098,7 +1090,6 @@ pub fn router(state: AppState) -> Router {
             get(handlers::subgraph_deployments),
         )
         .route("/api/subgraph-fees-30d", get(handlers::subgraph_fees_30d))
-        .route("/api/subgraph-directory", get(handlers::subgraph_directory))
         .route(
             "/api/subgraph-curation/{hash}",
             get(handlers::subgraph_curation),
@@ -1120,55 +1111,9 @@ pub fn router(state: AppState) -> Router {
             "/api/subgraph-deployment/{hash}",
             get(handlers::subgraph_deployment),
         )
-        .route("/api/subgraph-search", get(handlers::subgraph_search))
-        .route("/api/subgraph-names", post(handlers::subgraph_names))
-        .route(
-            "/api/analytics/clickthrough",
-            post(handlers::analytics_clickthrough),
-        )
-        .route("/api/chain-lag", get(handlers::chain_lag))
-        .route("/api/dropped-chains", get(handlers::dropped_chains))
-        .route("/api/reo", get(handlers::reo))
         .route(
             "/api/indexer-node-health",
             get(handlers::indexer_node_health),
-        )
-        .route("/api/price", get(handlers::price))
-        .route("/api/tvl", get(handlers::tvl))
-        // The Dock. These are deliberately individual registrations: the parity extractor sees
-        // the real public surface, and a new route cannot wander into a rewrite unchecked.
-        .route(
-            "/api/studio/auth",
-            get(handlers::studio_auth_get)
-                .post(handlers::studio_auth_post)
-                .delete(handlers::studio_auth_delete),
-        )
-        .route(
-            "/api/studio/subgraphs",
-            get(handlers::studio_subgraphs_get).post(handlers::studio_subgraphs_post),
-        )
-        .route(
-            "/api/studio/subgraphs/{id}",
-            axum::routing::patch(handlers::studio_subgraph_patch)
-                .delete(handlers::studio_subgraph_delete),
-        )
-        .route(
-            "/api/studio/deploy-key",
-            get(handlers::studio_deploy_key_get).post(handlers::studio_deploy_key_post),
-        )
-        .route("/api/studio/metadata", post(handlers::studio_metadata_post))
-        .route("/api/studio/node", post(handlers::studio_node_post))
-        .route(
-            "/api/studio/ipfs/{*path}",
-            get(handlers::studio_ipfs_proxy).post(handlers::studio_ipfs_proxy),
-        )
-        .route(
-            "/api/studio/bounties",
-            get(handlers::studio_bounties_get).post(handlers::studio_bounties_post),
-        )
-        .route(
-            "/api/studio/bounties/{id}",
-            axum::routing::patch(handlers::studio_bounty_patch),
         )
         // The public SQL surface
         .route("/api/sql/catalog", get(get_sql_catalog))
@@ -1215,7 +1160,6 @@ pub fn router(state: AppState) -> Router {
             get(handlers::subgraph_schema),
         )
         .route("/api/dips/agreements", get(handlers::dips_agreements))
-        .route("/api/ens", get(handlers::ens))
         .route("/api/manifest", get(handlers::manifest))
         .route("/api/service-census", get(handlers::service_census))
         .route("/api/operator-preflight", get(handlers::operator_preflight))
@@ -1240,6 +1184,91 @@ pub fn router(state: AppState) -> Router {
             "/api/subgraph-deployment/{hash}/graft-children",
             get(handlers::graft_children),
         )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            paywall::require_subscription,
+        ));
+
+    let routes = Router::new()
+        .route("/whoami", get(get_whoami))
+        // Also under /api, so it can be reached through the edge rewrite and the whole chain can be
+        // checked from a browser rather than only from the box.
+        .route("/api/whoami", get(get_whoami))
+        .route("/health", get(get_health))
+        // The URL anything watching this deployment already points at, answering in the shape it
+        // has always answered in. See `get_api_health`.
+        .route("/api/health", get(get_api_health))
+        .route("/ready", get(get_ready))
+        .route("/metrics", get(get_metrics))
+        .route("/openapi.json", get(get_openapi))
+        // The directory and the network
+        .route("/api/indexers", get(handlers::indexers))
+        .route("/api/indexer/{address}", get(handlers::indexer))
+        .route(
+            "/api/indexer-status/{address}",
+            get(handlers::indexer_status),
+        )
+        .route("/api/support", get(handlers::support))
+        .route("/api/support/templates", get(handlers::support_templates))
+        .route("/api/issue-forms", get(handlers::issue_forms))
+        .route("/api/file-issue", post(handlers::file_issue))
+        .route("/api/support/{number}", get(handlers::support_issue))
+        .route("/api/epochs", get(handlers::epochs))
+        .route("/api/network-stats", get(handlers::network_stats))
+        // Same fold, different panel: one cache entry serves both.
+        .route("/api/grt-flow", get(handlers::grt_flow))
+        .route("/api/token-metrics", get(handlers::token_metrics))
+        .route("/api/subgraph-directory", get(handlers::subgraph_directory))
+        .route("/api/subgraph-search", get(handlers::subgraph_search))
+        .route("/api/subgraph-names", post(handlers::subgraph_names))
+        .route(
+            "/api/analytics/clickthrough",
+            post(handlers::analytics_clickthrough),
+        )
+        .route("/api/chain-lag", get(handlers::chain_lag))
+        .route("/api/dropped-chains", get(handlers::dropped_chains))
+        .route("/api/reo", get(handlers::reo))
+        .route("/api/price", get(handlers::price))
+        .route("/api/tvl", get(handlers::tvl))
+        // The Dock. These are deliberately individual registrations: the parity extractor sees
+        // the real public surface, and a new route cannot wander into a rewrite unchecked.
+        .route(
+            "/api/studio/auth",
+            get(handlers::studio_auth_get)
+                .post(handlers::studio_auth_post)
+                .delete(handlers::studio_auth_delete),
+        )
+        .route(
+            "/api/studio/subgraphs",
+            get(handlers::studio_subgraphs_get).post(handlers::studio_subgraphs_post),
+        )
+        .route(
+            "/api/studio/subgraphs/{id}",
+            axum::routing::patch(handlers::studio_subgraph_patch)
+                .delete(handlers::studio_subgraph_delete),
+        )
+        .route(
+            "/api/studio/deploy-key",
+            get(handlers::studio_deploy_key_get).post(handlers::studio_deploy_key_post),
+        )
+        .route("/api/studio/metadata", post(handlers::studio_metadata_post))
+        .route("/api/studio/node", post(handlers::studio_node_post))
+        .route(
+            "/api/studio/ipfs/{*path}",
+            get(handlers::studio_ipfs_proxy).post(handlers::studio_ipfs_proxy),
+        )
+        .route(
+            "/api/studio/bounties",
+            get(handlers::studio_bounties_get).post(handlers::studio_bounties_post),
+        )
+        .route(
+            "/api/studio/bounties/{id}",
+            axum::routing::patch(handlers::studio_bounty_patch),
+        )
+        .route("/api/ens", get(handlers::ens))
+        .route("/api/account", get(handlers::account))
+        .route("/api/billing/stripe", post(billing::stripe_webhook))
+        .merge(paid)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(tower_http::catch_panic::CatchPanicLayer::new());
 
@@ -1302,6 +1331,8 @@ pub fn state(
         limits: Arc::new(limits),
         metrics,
         started: std::time::Instant::now(),
+        paywall: None,
+        stripe_webhook_secret: None,
     }
 }
 
