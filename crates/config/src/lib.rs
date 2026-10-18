@@ -200,6 +200,25 @@ impl std::fmt::Debug for ReceiptSettings {
 /// the token has never been minted, so the incumbent's filing route has answered "not configured"
 /// to every request it has ever had. The compose page is told so through `canFile` and sends people
 /// to GitHub's own chooser rather than accepting typing it cannot deliver.
+/// Where a new subscriber is announced: a Telegram bot and the chat it writes to.
+#[derive(Clone, Deserialize)]
+pub struct TelegramSettings {
+    pub bot_token: String,
+    pub chat_id: String,
+    /// Wallets whose subscriptions are not news, such as the owner's own test purchase.
+    #[serde(default)]
+    pub ignore_addresses: Vec<String>,
+}
+
+impl std::fmt::Debug for TelegramSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelegramSettings")
+            .field("bot_token", &"<redacted>")
+            .field("chat_id", &self.chat_id)
+            .finish()
+    }
+}
+
 /// Stripe's webhook signing secret (`whsec_...`), from the endpoint's page in the dashboard.
 #[derive(Clone, Deserialize)]
 pub struct StripeSettings {
@@ -307,6 +326,8 @@ pub struct Config {
     pub support: Option<SupportSettings>,
     /// Absent means `/api/billing/stripe` refuses every event, so card payments extend nothing.
     pub stripe: Option<StripeSettings>,
+    /// Absent means new subscribers are recorded and nobody is told.
+    pub telegram: Option<TelegramSettings>,
     /// Turns the in-process scheduler on. Off by default so a second instance, or a staging box,
     /// cannot start writing to the same Postgres behind your back.
     #[serde(default)]
@@ -646,6 +667,7 @@ mod tests {
             cache: None,
             limits: None,
             stripe: None,
+            telegram: None,
             scheduler_enabled: false,
             warmer_enabled: false,
             paywall_enabled: false,

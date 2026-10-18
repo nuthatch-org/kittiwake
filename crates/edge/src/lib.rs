@@ -125,6 +125,7 @@ pub struct AppState {
     pub paywall: Option<paywall::Paywall>,
     /// Stripe's webhook signing secret. Absent means card payments are refused, not guessed at.
     pub stripe_webhook_secret: Option<Arc<str>>,
+    pub telegram: Option<Arc<kittiwake_config::TelegramSettings>>,
 }
 
 #[derive(Clone)]
@@ -142,6 +143,11 @@ impl AppState {
     ) -> Self {
         self.cors_origins = origins.filter(|o| !o.is_empty()).map(Arc::new);
         self.cors_patterns = patterns.filter(|p| !p.is_empty()).map(Arc::new);
+        self
+    }
+
+    pub fn with_telegram(mut self, t: Option<kittiwake_config::TelegramSettings>) -> Self {
+        self.telegram = t.map(Arc::new);
         self
     }
 
@@ -1334,6 +1340,7 @@ pub fn state(
         started: std::time::Instant::now(),
         paywall: None,
         stripe_webhook_secret: None,
+        telegram: None,
     }
 }
 
