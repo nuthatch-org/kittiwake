@@ -150,8 +150,8 @@ impl AppState {
         self
     }
 
-    pub fn with_paywall(mut self, enabled: bool) -> Self {
-        self.paywall = enabled.then(paywall::Paywall::default);
+    pub fn with_paywall(mut self, enabled: bool, service_tokens: Vec<String>) -> Self {
+        self.paywall = enabled.then(|| paywall::Paywall::with_service_tokens(service_tokens));
         self
     }
 }

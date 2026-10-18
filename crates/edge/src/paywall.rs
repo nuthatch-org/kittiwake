@@ -28,9 +28,17 @@ type Entitlements = HashMap<String, (Option<i64>, Instant)>;
 #[derive(Clone, Default)]
 pub struct Paywall {
     cache: Arc<Mutex<Entitlements>>,
+    service_tokens: Arc<Vec<String>>,
 }
 
 impl Paywall {
+    pub fn with_service_tokens(tokens: Vec<String>) -> Self {
+        Self {
+            service_tokens: Arc::new(tokens.into_iter().filter(|t| !t.is_empty()).collect()),
+            ..Self::default()
+        }
+    }
+
     fn cached(&self, address: &str) -> Option<Option<i64>> {
         let cache = self.cache.lock().unwrap();
         cache
@@ -90,6 +98,22 @@ fn edge_trusted(headers: &HeaderMap, secret: Option<&str>) -> bool {
         })
 }
 
+fn service_trusted(headers: &HeaderMap, tokens: &[String]) -> bool {
+    let Some(presented) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    tokens.iter().any(|t| {
+        bool::from(subtle::ConstantTimeEq::ct_eq(
+            presented.as_bytes(),
+            t.as_bytes(),
+        ))
+    })
+}
+
 pub(crate) async fn require_subscription(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -128,6 +152,7 @@ async fn decide(
 ) -> Result<(), ApiError> {
     let secret = st.edge_secret.as_deref();
     let trusted = edge_trusted(headers, secret)
+        || service_trusted(headers, &paywall.service_tokens)
         || st.limits.exempt.contains(&client_ip(peer, headers, secret));
     if trusted {
         return Ok(());
@@ -210,6 +235,39 @@ mod tests {
         assert!(edge_trusted(&h, Some("s3cret")));
         // No secret configured means nobody is trusted, whatever they send.
         assert!(!edge_trusted(&h, None));
+    }
+
+    #[test]
+    fn only_a_configured_service_token_is_trusted() {
+        let tokens = vec!["svc-token-foghorn".to_string()];
+        let mut h = HeaderMap::new();
+        assert!(!service_trusted(&h, &tokens));
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer svc-token-foghor".parse().unwrap(),
+        );
+        assert!(!service_trusted(&h, &tokens));
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "svc-token-foghorn".parse().unwrap(),
+        );
+        assert!(!service_trusted(&h, &tokens), "the scheme is required");
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer svc-token-foghorn".parse().unwrap(),
+        );
+        assert!(service_trusted(&h, &tokens));
+        assert!(
+            !service_trusted(&h, &[]),
+            "no tokens configured trusts nobody"
+        );
+        // An empty token in the config must not admit an empty bearer.
+        let p = Paywall::with_service_tokens(vec![String::new()]);
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer ".parse().unwrap(),
+        );
+        assert!(!service_trusted(&h, &p.service_tokens));
     }
 
     #[test]

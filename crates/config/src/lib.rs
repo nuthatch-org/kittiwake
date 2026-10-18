@@ -318,6 +318,10 @@ pub struct Config {
     /// so a deploy cannot lock every visitor out before there is a way to pay.
     #[serde(default)]
     pub paywall_enabled: bool,
+    /// Bearer tokens our own services send to read paid routes, such as Foghorn's hourly roster
+    /// read. A token rather than an address: a container's bridge address changes on restart.
+    #[serde(default)]
+    pub paywall_service_tokens: Vec<String>,
 }
 
 fn default_bind() -> String {
@@ -645,6 +649,7 @@ mod tests {
             scheduler_enabled: false,
             warmer_enabled: false,
             paywall_enabled: false,
+            paywall_service_tokens: Vec::new(),
         }
     }
 
