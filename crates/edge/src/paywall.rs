@@ -175,7 +175,7 @@ async fn decide(
                 .ok_or_else(|| ApiError::Unavailable("no database is configured".into()))?;
             let p = kittiwake_db::subscription_paid_until(pool, &address)
                 .await
-                .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+                .map_err(kittiwake_db::unavailable)?;
             paywall.remember(&address, p);
             p
         }

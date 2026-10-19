@@ -477,7 +477,7 @@ pub async fn by_name(
     .bind(format!("%{q}%"))
     .fetch_all(pool)
     .await
-    .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+    .map_err(kittiwake_db::unavailable)?;
 
     let hashes: Vec<String> = cids
         .iter()
@@ -517,7 +517,7 @@ pub async fn by_manifest_address(
             .bind(format!("%{address}%"))
             .fetch_all(pool)
             .await
-            .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+            .map_err(kittiwake_db::unavailable)?;
     let ids: Vec<String> = cids
         .iter()
         .filter_map(|(c,)| ipfs_hash_to_bytes32(c))
@@ -774,7 +774,7 @@ pub async fn warm(
     let now = chrono::Utc::now();
     let have = kittiwake_ext::cached_docs(pool, &all)
         .await
-        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+        .map_err(kittiwake_db::unavailable)?;
 
     // A CID is wanted as JSON or as text, never both, so the two "already have it" sets are built
     // against different columns. Sharing one set would let a cached manifest satisfy a request for

@@ -30,7 +30,7 @@ pub async fn children(
             .bind(format!("%{base}%"))
             .fetch_all(pool)
             .await
-            .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+            .map_err(kittiwake_db::unavailable)?;
     let mut grafts = matching_grafts(base, docs);
     grafts.sort_by(|a, b| a.0.cmp(&b.0));
     let ids: Vec<String> = grafts

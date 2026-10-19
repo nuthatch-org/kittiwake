@@ -52,7 +52,7 @@ fn pool(st: &AppState) -> Result<&kittiwake_db::Pool, ErrorResponse> {
 }
 
 fn db_err(e: kittiwake_db::DbError) -> ErrorResponse {
-    ApiError::Unavailable(format!("database: {e}")).into()
+    kittiwake_db::unavailable(e).into()
 }
 
 pub(crate) fn unix_now() -> i64 {
@@ -802,7 +802,7 @@ pub async fn rewards_history(
     let indexers: Vec<String> = positions.iter().map(|(i, _, _)| i.clone()).collect();
     let rates = kittiwake_db::delegation_exchange_rates(pool, &indexers, since)
         .await
-        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?
+        .map_err(kittiwake_db::unavailable)?
         .into_iter()
         .map(|(i, d, r)| (i, d.to_string(), r))
         .collect::<Vec<_>>();
@@ -1939,7 +1939,7 @@ pub async fn indexers_enriched(
 
     let rows = kittiwake_db::enriched_indexers(pool, q.first.clamp(1, 1000))
         .await
-        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+        .map_err(kittiwake_db::unavailable)?;
 
     let mut resp = axum::Json(serde_json::json!({
         "data": rows,
@@ -2257,7 +2257,7 @@ pub async fn support(
 
     let issues = kittiwake_db::graph_support_issues(pool)
         .await
-        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+        .map_err(kittiwake_db::unavailable)?;
 
     if issues.is_empty() {
         return Err(
@@ -2269,7 +2269,7 @@ pub async fn support(
     // data being served rather than a cursor that may have moved while the write failed.
     let fetched_at = kittiwake_db::graph_support_ingested_at(pool)
         .await
-        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+        .map_err(kittiwake_db::unavailable)?;
 
     let mut resp = axum::Json(serde_json::json!({
         "issues": issues,
@@ -2307,16 +2307,16 @@ pub async fn support_issue(
 
     let issue = kittiwake_db::graph_support_issue(pool, number)
         .await
-        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?
+        .map_err(kittiwake_db::unavailable)?
         .ok_or(ApiError::NotFound)?;
 
     let comments = kittiwake_db::graph_support_thread(pool, number)
         .await
-        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+        .map_err(kittiwake_db::unavailable)?;
 
     let fetched_at = kittiwake_db::graph_support_ingested_at(pool)
         .await
-        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+        .map_err(kittiwake_db::unavailable)?;
 
     let mut resp = axum::Json(serde_json::json!({
         "issue": issue,
@@ -2908,7 +2908,7 @@ pub async fn support_templates(
 
     let templates = kittiwake_db::graph_support_templates(pool)
         .await
-        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+        .map_err(kittiwake_db::unavailable)?;
 
     // Empty means the mirror has not run rather than that the repository has no templates, and a
     // compose page rendering no options would look like a decision instead of a fault.
@@ -3788,7 +3788,7 @@ pub async fn delegate_recommend(
     // page it came from never showed.
     let rows = kittiwake_db::enriched_indexers(pool, 100)
         .await
-        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+        .map_err(kittiwake_db::unavailable)?;
 
     // The incumbent's own sentences, kept verbatim: they are what a delegator sees in the console
     // when the page says it could not load a recommendation.
@@ -4019,7 +4019,7 @@ pub async fn analytics_clickthrough(
 
     kittiwake_db::record_clickthrough(pool, &body)
         .await
-        .map_err(|e| ApiError::Unavailable(format!("database: {e}")))?;
+        .map_err(kittiwake_db::unavailable)?;
 
     Ok(axum::Json(serde_json::json!({ "ok": true })).into_response())
 }
