@@ -776,25 +776,11 @@ pub async fn rewards_history(
         .as_ref()
         .ok_or_else(|| ApiError::Unavailable("no database is configured".into()))?;
 
-    let positions: Vec<(String, f64, f64)> = read
+    let positions = read
         .entry
         .value
         .as_array()
-        .map(|rows| {
-            rows.iter()
-                .filter_map(|r| {
-                    let indexer = r.get("indexer")?.as_str()?.to_lowercase();
-                    let wei = |k: &str| {
-                        r.get(k)
-                            .and_then(|v| v.as_str())
-                            .and_then(|x| x.parse::<f64>().ok())
-                            .unwrap_or(0.0)
-                            / 1e18
-                    };
-                    Some((indexer, wei("staked_tokens"), wei("share_amount")))
-                })
-                .collect()
-        })
+        .map(|rows| kittiwake_read::shape::rewards_history_positions(rows))
         .unwrap_or_default();
 
     // Ninety days, as the handler this replaces defaults to.

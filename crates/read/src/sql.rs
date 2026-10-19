@@ -267,22 +267,28 @@ pub fn delegator_stakes_sql(addr: &str, first: i64, active_only: bool) -> Option
     // `lodestar_delegator_positions` rather than `lodestar_delegator_stakes`: the stakes view joins
     // the whole delegation pool for `staked_tokens`, and DuckDB pushes no filter into the right side
     // of a LEFT JOIN, so one delegator paid the pool fold and the indexers fold both (21 s on
-    // 2026-09-26). The indexers row carries the same two pool figures, so the worth of the shares is
-    // computed here with the view's own formula, and only the indexers fold remains (8.6 s).
+    // 2026-09-26). The indexers row carries the pool figures, so the worth of the shares is
+    // computed here, and only the indexers fold remains (8.6 s).
+    //
+    // `staked_tokens` is what the shares are worth now, at HorizonStaking's
+    // `(tokens - tokensThawing) / shares`; it was lifetime GRT delegated until #224. `cost_basis` is
+    // what the remaining shares cost.
     Some(format!(
         "WITH s AS (SELECT p.id, p.indexer, p.total_delegated_tokens, p.share_amount, p.locked_tokens, p.locked_until, \
          p.realized_rewards, p.total_undelegated_tokens, p.created_at, p.last_undelegated_at, p.active, \
          CASE WHEN i.delegator_shares > 0 \
-              THEN (p.share_amount // i.delegator_shares) * i.delegated_tokens \
-                   + CAST(CAST(p.share_amount % i.delegator_shares AS DOUBLE) * CAST(i.delegated_tokens AS DOUBLE) / CAST(i.delegator_shares AS DOUBLE) AS HUGEINT) \
+              THEN (p.share_amount // i.delegator_shares) * (i.delegated_tokens - i.delegated_thawing_tokens) \
+                   + CAST(CAST(p.share_amount % i.delegator_shares AS DOUBLE) * CAST(i.delegated_tokens - i.delegated_thawing_tokens AS DOUBLE) / CAST(i.delegator_shares AS DOUBLE) AS HUGEINT) \
               ELSE 0 END AS staked_tokens, \
+         CAST(CAST(p.share_amount AS DOUBLE) * p.personal_exchange_rate AS HUGEINT) AS cost_basis, \
          i.staked_tokens AS indexer_staked_tokens, i.delegated_tokens AS indexer_delegated_tokens, \
          i.delegated_thawing_tokens AS indexer_delegated_thawing_tokens, i.delegator_shares AS indexer_delegator_shares, \
          i.indexing_reward_cut, i.query_fee_cut, i.allocation_count, i.url, i.geohash \
          FROM lodestar_delegator_positions p LEFT JOIN lodestar_indexers i ON i.id = p.indexer \
          WHERE p.delegator = '{addr}'{active}) \
-         SELECT id, indexer, CAST(total_delegated_tokens AS VARCHAR) AS staked_tokens, \
-         CAST(staked_tokens AS VARCHAR) AS current_tokens, CAST(share_amount AS VARCHAR) AS share_amount, \
+         SELECT id, indexer, CAST(staked_tokens AS VARCHAR) AS staked_tokens, \
+         CAST(staked_tokens AS VARCHAR) AS current_tokens, CAST(cost_basis AS VARCHAR) AS cost_basis, \
+         CAST(total_delegated_tokens AS VARCHAR) AS total_delegated_tokens, CAST(share_amount AS VARCHAR) AS share_amount, \
          CAST(locked_tokens AS VARCHAR) AS locked_tokens, locked_until, \
          CAST(realized_rewards AS VARCHAR) AS realized_rewards, \
          CAST(total_undelegated_tokens AS VARCHAR) AS unstaked_tokens, created_at, last_undelegated_at, active, \
@@ -371,8 +377,8 @@ pub fn indexer_delegators_order_column(order_by: &str) -> &'static str {
 ///
 /// A position is listed while it holds shares or has Horizon tokens still thawing. A legacy lock
 /// never withdrawn is carried as `locked_tokens` but does not keep a position listed: those sit
-/// there forever, 1.2M GRT on one indexer. The pool is `lodestar_indexer_pool`, so a position is
-/// valued as the delegator page values it.
+/// there forever, 1.2M GRT on one indexer. A share is worth the pool's tokens less its thawing over
+/// its shares, as HorizonStaking prices it; the view's `delegated_tokens` still holds the thawing.
 pub fn indexer_delegators_page_sql(
     addr: &str,
     first: i64,
@@ -409,10 +415,12 @@ pub fn indexer_delegators_page_sql(
          MIN(ts) FILTER (WHERE kind = 'in') AS delegated_at, MAX(ts) AS last_change_at FROM events GROUP BY 1), \
          thaw AS (SELECT LOWER(owner) AS delegator, MAX(CAST(\"thawingUntil\" AS BIGINT)) AS thawing_until FROM staking__thaw_request_created \
          WHERE LOWER(\"serviceProvider\") = '{addr}' AND CAST(\"requestType\" AS INTEGER) IN (1, 2) GROUP BY 1), \
-         pool AS (SELECT delegator_shares, delegated_tokens FROM lodestar_indexer_pool WHERE id = '{addr}') \
+         pool AS (SELECT delegator_shares, delegated_tokens, \
+         delegated_tokens - (SELECT GREATEST(COALESCE(SUM(CASE WHEN kind = 'thaw' THEN tok WHEN kind = 'release' THEN -tok END), 0), 0) FROM events) AS active_tokens \
+         FROM lodestar_indexer_pool WHERE id = '{addr}') \
          SELECT p.delegator || '-' || '{addr}' AS id, p.delegator, CAST(p.share_amount AS VARCHAR) AS share_amount, \
-         CAST(CASE WHEN pool.delegator_shares > 0 THEN (p.share_amount // pool.delegator_shares) * pool.delegated_tokens \
-         + CAST(CAST(p.share_amount % pool.delegator_shares AS DOUBLE) * CAST(pool.delegated_tokens AS DOUBLE) / CAST(pool.delegator_shares AS DOUBLE) AS HUGEINT) \
+         CAST(CASE WHEN pool.delegator_shares > 0 THEN (p.share_amount // pool.delegator_shares) * pool.active_tokens \
+         + CAST(CAST(p.share_amount % pool.delegator_shares AS DOUBLE) * CAST(pool.active_tokens AS DOUBLE) / CAST(pool.delegator_shares AS DOUBLE) AS HUGEINT) \
          ELSE 0 END AS VARCHAR) AS current_tokens, \
          CAST(p.total_delegated_tokens AS VARCHAR) AS total_delegated_tokens, CAST(p.thawing_tokens AS VARCHAR) AS thawing_tokens, \
          CASE WHEN p.thawing_tokens > 0 THEN t.thawing_until END AS thawing_until, CAST(p.locked_tokens AS VARCHAR) AS locked_tokens, \
@@ -1304,6 +1312,33 @@ mod tests {
         }
         assert!(sql.contains("WHERE share_amount > 0"));
         assert!(sql.ends_with("LIMIT 100"));
+    }
+
+    /// HorizonStaking prices a share at `(tokens - tokensThawing) / shares`, and the pool's `tokens`
+    /// holds the thawing until it is withdrawn: 3.3% on 0xf92f...a6d4 on 2026-10-19. #225
+    #[test]
+    fn a_share_is_priced_without_the_pools_thawing_tokens() {
+        let addr = "0xf92f430dd8567b0d466358c79594ab58d919a6d4";
+        let stakes = delegator_stakes_sql(addr, 10, false).unwrap();
+        assert!(
+            stakes.contains("* (i.delegated_tokens - i.delegated_thawing_tokens)"),
+            "{stakes}"
+        );
+        let page = indexer_delegators_page_sql(addr, 10, 0, "stake", true).unwrap();
+        assert!(page.contains("* pool.active_tokens"), "{page}");
+        assert!(!page.contains("* pool.delegated_tokens"), "{page}");
+    }
+
+    /// `staked_tokens` was lifetime GRT delegated, so a position half undelegated still read as
+    /// the whole of it. #358
+    #[test]
+    fn a_position_is_sent_at_its_worth_and_its_cost() {
+        let sql =
+            delegator_stakes_sql("0xf92f430dd8567b0d466358c79594ab58d919a6d4", 10, false).unwrap();
+        assert!(sql.contains("CAST(staked_tokens AS VARCHAR) AS staked_tokens"));
+        assert!(sql.contains("CAST(cost_basis AS VARCHAR) AS cost_basis"));
+        assert!(sql.contains("p.personal_exchange_rate AS HUGEINT) AS cost_basis"));
+        assert!(!sql.contains("CAST(total_delegated_tokens AS VARCHAR) AS staked_tokens"));
     }
 
     /// 106,652 positions on the largest indexer (2026-09-23). The page is cut by the nest and the
