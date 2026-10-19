@@ -767,7 +767,7 @@ pub async fn rewards_history(
     let read = routes::rewards_history(&st.read, &addr(&address)).await?;
 
     // The positions come from the nest; the daily exchange rates that turn them into a value over
-    // time live in Lodestar's own Postgres, written by the snapshot cron. Neither half is the
+    // time live in Lodestar's own Postgres, written by `snapshot-indexers`. Neither half is the
     // series on its own, which is why this is composed here rather than in `routes`: `ReadCtx` has
     // no database, deliberately, and giving it one so this route could reach it would hand every
     // nest read a dependency only this one needs.
