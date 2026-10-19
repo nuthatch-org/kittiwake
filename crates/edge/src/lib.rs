@@ -136,6 +136,7 @@ pub struct AppState {
 pub struct Studio {
     pub secret: kittiwake_dock::Secret,
     pub bounty_board_address: Option<String>,
+    pub spent_nonces: kittiwake_dock::SpentNonces,
 }
 
 impl AppState {

@@ -1271,7 +1271,13 @@ pub async fn indexing_status(
 
 pub async fn studio_auth_get(State(st): State<AppState>, headers: HeaderMap) -> Response {
     let address = session(&st, &headers).ok();
-    let mut r = axum::Json(serde_json::json!({"address": address})).into_response();
+    let mut body = serde_json::json!({"address": address});
+    if let Some(studio) = &st.studio {
+        let issued_at = now();
+        body["nonce"] = kittiwake_dock::issue_sign_in_nonce(&studio.secret, issued_at).into();
+        body["issuedAt"] = issued_at.into();
+    }
+    let mut r = axum::Json(body).into_response();
     crate::no_store(r.headers_mut());
     r
 }
@@ -1319,9 +1325,13 @@ pub async fn studio_auth_post(
         .get("signature")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ApiError::BadRequest("Missing address, message, or signature".into()))?;
-    kittiwake_dock::verify_sign_in(address, message, signature, now())
+    let studio = dock(&st)?;
+    let signed = kittiwake_dock::verify_sign_in(&studio.secret, address, message, signature, now())
         .map_err(|_| ApiError::Unauthorized)?;
-    let token = kittiwake_dock::create_session(&dock(&st)?.secret, address, now());
+    if !studio.spent_nonces.spend(&signed, now()) {
+        return Err(ApiError::Unauthorized.into());
+    }
+    let token = kittiwake_dock::create_session(&studio.secret, address, now());
     let mut r = axum::Json(serde_json::json!({"address": address.to_lowercase()})).into_response();
     r.headers_mut().insert(
         header::SET_COOKIE,
