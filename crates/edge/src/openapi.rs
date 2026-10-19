@@ -372,9 +372,24 @@ const fn op(path: &'static str, summary: &'static str) -> Operation {
 
 /// Every `/api/...` path the router registers.
 pub fn served_paths() -> Vec<String> {
+    routes_in(ROUTER)
+}
+
+/// The paths behind the paywall: those registered on the `paid` router, read the same way.
+pub fn paid_paths() -> Vec<String> {
+    let start = ROUTER
+        .find("let paid = Router::new()")
+        .expect("the router has a paid section");
+    let len = ROUTER[start..]
+        .find("paywall::require_subscription")
+        .expect("the paid section ends at the paywall");
+    routes_in(&ROUTER[start..start + len])
+}
+
+fn routes_in(src: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for (i, _) in ROUTER.match_indices(".route(") {
-        let rest = ROUTER[i + ".route(".len()..].trim_start();
+    for (i, _) in src.match_indices(".route(") {
+        let rest = src[i + ".route(".len()..].trim_start();
         let Some(rest) = rest.strip_prefix('"') else {
             continue;
         };
@@ -412,6 +427,7 @@ fn parameters(path: &str) -> Vec<serde_json::Value> {
 /// changed. What is described is what a caller cannot discover by trying: which paths exist, what
 /// each one is for, and which parameters are part of the path.
 pub fn document(version: &str) -> serde_json::Value {
+    let paid = paid_paths();
     let mut paths = serde_json::Map::new();
     for path in served_paths() {
         if WITHHELD.iter().any(|(p, _)| *p == path) {
@@ -420,20 +436,26 @@ pub fn document(version: &str) -> serde_json::Value {
         let Some(o) = SUMMARIES.iter().find(|o| o.path == path) else {
             continue; // The test below is what stops this being silent.
         };
+        let mut op = serde_json::json!({
+            "summary": o.summary,
+            "parameters": parameters(&path),
+            "responses": {
+                "200": { "description": "The answer, with a provenance envelope." },
+                "400": { "description": "The request was not understood; the message says why." },
+                "429": { "description": "Rate limited." },
+                "503": { "description": "A source this route depends on is not answering." },
+            },
+        });
+        if paid.contains(&path) {
+            op["security"] = serde_json::json!([{ "subscriberSession": [] }]);
+            op["responses"]["401"] =
+                serde_json::json!({ "description": "No signed-in wallet session." });
+            op["responses"]["402"] = serde_json::json!({
+                "description": "The signed-in wallet has no current subscription."
+            });
+        }
         let mut item = serde_json::Map::new();
-        item.insert(
-            "get".into(),
-            serde_json::json!({
-                "summary": o.summary,
-                "parameters": parameters(&path),
-                "responses": {
-                    "200": { "description": "The answer, with a provenance envelope." },
-                    "400": { "description": "The request was not understood; the message says why." },
-                    "429": { "description": "Rate limited." },
-                    "503": { "description": "A source this route depends on is not answering." },
-                },
-            }),
-        );
+        item.insert("get".into(), op);
         paths.insert(path, serde_json::Value::Object(item));
     }
 
@@ -450,7 +472,20 @@ pub fn document(version: &str) -> serde_json::Value {
                  that does not exist or omit one that does. A few routes are served but not \
                  described, because documenting them would advertise something that is not a \
                  public protocol read; those are listed under `x-withheld` with the reason, so \
-                 this document is still a complete inventory of what is served.",
+                 this document is still a complete inventory of what is served.\n\n\
+                 Routes with a `subscriberSession` security requirement answer only a wallet \
+                 signed in at https://www.lodestar-dashboard.com/account with a current \
+                 subscription: 401 without a session, 402 without a subscription.",
+        },
+        "components": {
+            "securitySchemes": {
+                "subscriberSession": {
+                    "type": "apiKey",
+                    "in": "cookie",
+                    "name": kittiwake_dock::COOKIE_NAME,
+                    "description": "The session cookie set by signing in with a subscribed wallet.",
+                },
+            },
         },
         "servers": [{ "url": "https://api.lodestar-dashboard.com" }],
         "paths": paths,
@@ -611,6 +646,47 @@ mod tests {
                 .map(|a| a.len()),
             Some(0)
         );
+    }
+
+    /// kittiwake#213: the paywall's routes were documented as open to anyone.
+    #[test]
+    fn a_paid_route_says_it_needs_a_subscription_and_a_free_one_does_not() {
+        let doc = document("test");
+        let paid = paid_paths();
+        assert!(paid.len() > 40, "only {} paid routes found", paid.len());
+        for (path, item) in doc["paths"].as_object().unwrap() {
+            let op = &item["get"];
+            if paid.contains(path) {
+                assert_eq!(
+                    op["security"],
+                    serde_json::json!([{ "subscriberSession": [] }])
+                );
+                assert!(op["responses"]["401"].is_object(), "{path}");
+            } else {
+                assert!(op.get("security").is_none(), "{path}");
+                assert!(op["responses"].get("401").is_none(), "{path}");
+            }
+        }
+        assert_eq!(
+            doc["components"]["securitySchemes"]["subscriberSession"]["name"],
+            "studio_session"
+        );
+        assert!(!paid.contains(&"/api/network-stats".to_string()));
+        assert!(!paid.contains(&"/api/subgraph-search".to_string()));
+    }
+
+    /// kittiwake#212: the directory and indexer pages are sold as paid, and their reads were free.
+    #[test]
+    fn the_directory_reads_are_paid() {
+        let paid = paid_paths();
+        for path in [
+            "/api/indexers",
+            "/api/indexer/{address}",
+            "/api/indexer-status/{address}",
+            "/api/subgraph-directory",
+        ] {
+            assert!(paid.contains(&path.to_string()), "{path} is free");
+        }
     }
 
     /// The one thing a reader must not be able to find here.

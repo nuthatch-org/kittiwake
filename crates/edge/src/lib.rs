@@ -1078,6 +1078,14 @@ pub fn router(state: AppState) -> Router {
     // `paywall_enabled` is set. Anything not listed here is free, so a new route is free until
     // somebody decides otherwise.
     let paid = Router::new()
+        // The directory
+        .route("/api/indexers", get(handlers::indexers))
+        .route("/api/indexer/{address}", get(handlers::indexer))
+        .route(
+            "/api/indexer-status/{address}",
+            get(handlers::indexer_status),
+        )
+        .route("/api/subgraph-directory", get(handlers::subgraph_directory))
         .route(
             "/api/apr-provenance/{address}",
             get(handlers::apr_provenance),
@@ -1209,13 +1217,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(get_api_health))
         .route("/ready", get(get_ready))
         .route("/openapi.json", get(get_openapi))
-        // The directory and the network
-        .route("/api/indexers", get(handlers::indexers))
-        .route("/api/indexer/{address}", get(handlers::indexer))
-        .route(
-            "/api/indexer-status/{address}",
-            get(handlers::indexer_status),
-        )
+        // The network
         .route("/api/support", get(handlers::support))
         .route("/api/support/templates", get(handlers::support_templates))
         .route("/api/issue-forms", get(handlers::issue_forms))
@@ -1226,7 +1228,6 @@ pub fn router(state: AppState) -> Router {
         // Same fold, different panel: one cache entry serves both.
         .route("/api/grt-flow", get(handlers::grt_flow))
         .route("/api/token-metrics", get(handlers::token_metrics))
-        .route("/api/subgraph-directory", get(handlers::subgraph_directory))
         .route("/api/subgraph-search", get(handlers::subgraph_search))
         .route("/api/subgraph-names", post(handlers::subgraph_names))
         .route(
