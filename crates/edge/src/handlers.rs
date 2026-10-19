@@ -4463,7 +4463,6 @@ mod indexer_page_tests {
                 )));
         let mut st = crate::state(
             crate::Limits::new(1000, 1000, 1000, Vec::new()),
-            None,
             Some(pool),
             read,
             None,

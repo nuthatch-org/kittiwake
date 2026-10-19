@@ -124,7 +124,6 @@ pub struct AppState {
     /// `prefix|suffix` shapes, for hosts that cannot be named in advance. See `matches_pattern`.
     pub cors_patterns: Option<Arc<Vec<String>>>,
     pub limits: Arc<Limits>,
-    pub metrics: Option<kittiwake_obs::PrometheusHandle>,
     pub started: std::time::Instant,
     /// Present when the paywall is on. Absent means every route is free, as it always was.
     pub paywall: Option<paywall::Paywall>,
@@ -967,11 +966,10 @@ async fn get_ready(State(st): State<AppState>) -> Response {
         .into_response()
 }
 
-async fn get_metrics(State(st): State<AppState>) -> Response {
-    match st.metrics {
-        Some(handle) => handle.render().into_response(),
-        None => (StatusCode::NOT_FOUND, "metrics recorder not installed").into_response(),
-    }
+/// `/metrics`, on its own listener. Caddy proxies every path of the public one, and these counters
+/// are revenue and capacity figures, so they are kept off it rather than filtered at the proxy.
+pub fn metrics_router(handle: kittiwake_obs::PrometheusHandle) -> Router {
+    Router::new().route("/metrics", get(move || async move { handle.render() }))
 }
 
 /// The CORS layer, when browser origins are configured.
@@ -1205,7 +1203,6 @@ pub fn router(state: AppState) -> Router {
         // has always answered in. See `get_api_health`.
         .route("/api/health", get(get_api_health))
         .route("/ready", get(get_ready))
-        .route("/metrics", get(get_metrics))
         .route("/openapi.json", get(get_openapi))
         // The directory and the network
         .route("/api/indexers", get(handlers::indexers))
@@ -1308,7 +1305,6 @@ pub fn router(state: AppState) -> Router {
 #[allow(clippy::too_many_arguments)]
 pub fn state(
     limits: Limits,
-    metrics: Option<kittiwake_obs::PrometheusHandle>,
     pool: Option<kittiwake_db::Pool>,
     read: ReadCtx,
     edge_secret: Option<String>,
@@ -1339,7 +1335,6 @@ pub fn state(
         edge_secret: edge_secret.map(|s| Arc::from(s.as_str())),
         pool,
         limits: Arc::new(limits),
-        metrics,
         started: std::time::Instant::now(),
         paywall: None,
         stripe_webhook_secret: None,
@@ -1395,6 +1390,48 @@ async fn get_whoami(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn metrics_are_served_only_on_their_own_listener() {
+        use tower::ServiceExt;
+        let get = |path: &str| {
+            axum::http::Request::get(path)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        let gate =
+            kittiwake_nest::NestGate::new(kittiwake_nest::NestConfig::new("http://127.0.0.1:9"))
+                .unwrap();
+        let read = kittiwake_read::ReadCtx::new(gate, kittiwake_cache::Store::new(64), 1);
+        let st = state(
+            Limits::new(1000, 1000, 1000, Vec::new()),
+            None,
+            read,
+            None,
+            None,
+            kittiwake_ext::Ipfs::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let public = router(st).oneshot(get("/metrics")).await.unwrap();
+        assert_eq!(public.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(public.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty(), "{body:?}");
+
+        let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+            .build_recorder()
+            .handle();
+        let private = metrics_router(handle)
+            .oneshot(get("/metrics"))
+            .await
+            .unwrap();
+        assert_eq!(private.status(), StatusCode::OK);
+    }
 
     #[test]
     fn support_reports_get_a_few_and_then_wait() {

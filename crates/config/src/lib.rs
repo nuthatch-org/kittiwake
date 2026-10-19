@@ -261,6 +261,9 @@ fn default_mutation_per_min() -> u32 {
 pub struct Config {
     #[serde(default = "default_bind")]
     pub bind: String,
+    /// Where `/metrics` is served. Its own listener, so it is never behind the public proxy.
+    #[serde(default = "default_metrics_bind")]
+    pub metrics_bind: String,
     pub nest: NestSettings,
     /// Absent means the Postgres-backed routes report unavailable rather than pretending.
     pub database_url: Option<String>,
@@ -328,6 +331,9 @@ pub struct Config {
 
 fn default_bind() -> String {
     "127.0.0.1:8080".to_string()
+}
+fn default_metrics_bind() -> String {
+    "127.0.0.1:9184".to_string()
 }
 fn default_db_max_conns() -> u32 {
     16
@@ -622,6 +628,7 @@ mod tests {
     fn settings(origin: &str) -> Config {
         Config {
             bind: default_bind(),
+            metrics_bind: default_metrics_bind(),
             cors: None,
             nest: NestSettings {
                 origin: origin.into(),
