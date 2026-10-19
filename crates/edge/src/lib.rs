@@ -14,6 +14,7 @@ pub mod billing;
 pub mod handlers;
 pub mod openapi;
 pub mod paywall;
+mod telegram;
 
 use axum::Router;
 use axum::extract::{ConnectInfo, State};
@@ -34,6 +35,8 @@ pub struct Limits {
     pub sql: Limiter,
     pub read: Limiter,
     pub mutation: Limiter,
+    /// Support reports land in a chat a person reads, so the read budget is far too generous.
+    pub report: Limiter,
     pub exempt: Vec<IpAddr>,
 }
 
@@ -56,6 +59,10 @@ impl Limits {
             sql: RateLimiter::keyed(q(sql_per_min, 5)),
             read: RateLimiter::keyed(q(read_per_min, 40)),
             mutation: RateLimiter::keyed(q(mutation_per_min, 10)),
+            report: RateLimiter::keyed(
+                Quota::per_hour(NonZeroU32::new(6).unwrap())
+                    .allow_burst(NonZeroU32::new(3).unwrap()),
+            ),
             exempt,
         }
     }
@@ -81,6 +88,7 @@ impl Limits {
         self.sql.retain_recent();
         self.read.retain_recent();
         self.mutation.retain_recent();
+        self.report.retain_recent();
     }
 }
 
@@ -103,9 +111,6 @@ pub struct AppState {
     /// The escrow-funded payer a serving probe signs with. Absent means probes go out unpaid and
     /// an indexer that wants a receipt is reported as unverified rather than as broken.
     pub tap_payer: Option<Arc<kittiwake_chain::tap::Payer>>,
-    /// The credential that opens a graph-support issue. Absent means this deployment reads the
-    /// forms and refuses to file, and says so through `canFile`.
-    pub support_token: Option<Arc<str>>,
     /// The secret the edge proxy presents. Absent means no request is ever trusted to name a client
     /// other than the one that connected - safe, and wrong once traffic arrives through Vercel.
     pub edge_secret: Option<Arc<str>>,
@@ -1313,7 +1318,6 @@ pub fn state(
     indexer_agent: Option<kittiwake_config::IndexerAgentSettings>,
     receipt_key: Option<Arc<ed25519_dalek::SigningKey>>,
     tap_payer: Option<Arc<kittiwake_chain::tap::Payer>>,
-    support_token: Option<String>,
 ) -> AppState {
     let ext = kittiwake_ext::Ext::default();
     AppState {
@@ -1332,7 +1336,6 @@ pub fn state(
         indexer_agent,
         receipt_key,
         tap_payer,
-        support_token: support_token.map(|t| Arc::from(t.as_str())),
         edge_secret: edge_secret.map(|s| Arc::from(s.as_str())),
         pool,
         limits: Arc::new(limits),
@@ -1392,6 +1395,18 @@ async fn get_whoami(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn support_reports_get_a_few_and_then_wait() {
+        let limits = Limits::new(1000, 1000, 1000, Vec::new());
+        let ip: IpAddr = [203, 0, 113, 7].into();
+        for _ in 0..3 {
+            assert!(limits.check(&limits.report, ip).is_ok());
+        }
+        assert!(limits.check(&limits.report, ip).is_err());
+        let other: IpAddr = [203, 0, 113, 8].into();
+        assert!(limits.check(&limits.report, other).is_ok());
+    }
 
     // ── Presenting a proof of indexing ───────────────────────────────────────
 

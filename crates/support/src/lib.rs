@@ -7,17 +7,12 @@
 //!
 //! [`render_issue_body`] reproduces the markdown GitHub itself composes on submit - `### label`,
 //! the value, `_No response_` for an unanswered optional - so a thread filed from here is
-//! indistinguishable in the archive from one filed on GitHub.
+//! indistinguishable from one filed on GitHub. Reports now go to Telegram rather than to the
+//! repository, which is private, and keep that shape so one can be pasted into an issue as is.
 //!
 //! Ported from lodestar's `src/lib/issue-form.ts`.
 
 use serde::Serialize;
-
-pub const REPO: &str = "nuthatch-org/graph-support";
-
-pub fn chooser_url() -> String {
-    format!("https://github.com/{REPO}/issues/new/choose")
-}
 
 const NO_RESPONSE: &str = "_No response_";
 
@@ -345,22 +340,4 @@ pub fn render_issue_body(form: &IssueForm, values: &Values) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n\n")
-}
-
-/// The provenance line every issue filed from here carries.
-///
-/// It exists because the credential is one account: without this the archive would show every
-/// report as opened by the maintainer, and that repository credits reporters by name and answers
-/// them in the thread. A handle is optional, and saying nobody left one is better than implying
-/// the account is the reporter.
-pub fn provenance_footer(handle: Option<&str>) -> String {
-    match handle.map(str::trim).filter(|h| !h.is_empty()) {
-        Some(who) => format!(
-            "---\n\nFiled through [Lodestar](https://www.lodestar-dashboard.com/support) on behalf \
-             of {who}, who is not the account that opened this thread."
-        ),
-        None => "---\n\nFiled through [Lodestar](https://www.lodestar-dashboard.com/support). The \
-                 reporter left no handle, so the account that opened this thread is not theirs."
-            .to_string(),
-    }
 }

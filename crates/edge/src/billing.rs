@@ -177,15 +177,8 @@ pub(crate) async fn stripe_webhook(
         let text = new_subscriber_message(&address, credit.paid_until);
         // Off the webhook's path: Stripe should not retry a payment because Telegram was slow.
         tokio::spawn(async move {
-            let url = format!("https://api.telegram.org/bot{}/sendMessage", t.bot_token);
-            let sent = reqwest::Client::new()
-                .post(url)
-                .json(&serde_json::json!({ "chat_id": t.chat_id, "text": text }))
-                .timeout(std::time::Duration::from_secs(10))
-                .send()
-                .await;
-            if !sent.is_ok_and(|r| r.status().is_success()) {
-                tracing::warn!("could not announce a new subscriber on Telegram");
+            if let Err(e) = crate::telegram::send(&t, &text).await {
+                tracing::warn!(error = %e, "could not announce a new subscriber on Telegram");
             }
         });
     }

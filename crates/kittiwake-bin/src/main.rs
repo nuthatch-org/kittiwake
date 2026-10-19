@@ -229,7 +229,6 @@ async fn main() -> anyhow::Result<()> {
                     .expect("tap.signer_private_key was accepted by configuration"),
             )
         }),
-        cfg.support.as_ref().map(|s| s.issue_token.clone()),
     )
     .with_cors(
         cfg.cors.as_ref().map(|c| c.allowed_origins.clone()),
