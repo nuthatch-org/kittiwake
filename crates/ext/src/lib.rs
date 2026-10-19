@@ -57,6 +57,9 @@ pub struct Ext {
     graph_support_url: String,
     graph_support_comments_url: String,
     graph_support_templates_url: String,
+    /// Read access to nuthatch-org/graph-support, which is private. Without it every mirror read
+    /// is a 404.
+    github_token: Option<String>,
 }
 
 impl Default for Ext {
@@ -85,6 +88,40 @@ impl Ext {
             graph_support_url: GRAPH_SUPPORT.to_string(),
             graph_support_comments_url: GRAPH_SUPPORT_COMMENTS.to_string(),
             graph_support_templates_url: GRAPH_SUPPORT_TEMPLATES.to_string(),
+            github_token: None,
+        }
+    }
+
+    pub fn with_github_token(mut self, token: Option<String>) -> Self {
+        self.github_token = token.filter(|t| !t.trim().is_empty());
+        self
+    }
+
+    /// A GET to one of the configured graph-support URLs, carrying the token.
+    fn github_get(&self, url: &str) -> reqwest::RequestBuilder {
+        match &self.github_token {
+            Some(token) => self.http.get(url).bearer_auth(token),
+            None => self.http.get(url),
+        }
+    }
+
+    /// A GET to a URL GitHub handed back, which gets the token only if it points at GitHub or at
+    /// the host the listing came from.
+    fn github_get_returned(&self, url: &str) -> reqwest::RequestBuilder {
+        let host = |u: &str| {
+            reqwest::Url::parse(u)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_owned))
+        };
+        let ours = host(url).is_some_and(|h| {
+            h == "api.github.com"
+                || h == "raw.githubusercontent.com"
+                || Some(&h) == host(&self.graph_support_templates_url).as_ref()
+        });
+        if ours {
+            self.github_get(url)
+        } else {
+            self.http.get(url)
         }
     }
 
@@ -183,8 +220,7 @@ impl Ext {
     /// seventh template for ever, which is the more expensive mistake.
     pub async fn graph_support_templates(&self) -> Result<Vec<GraphSupportTemplate>, ApiError> {
         let listing: Vec<GhContent> = self
-            .http
-            .get(&self.graph_support_templates_url)
+            .github_get(&self.graph_support_templates_url)
             .send()
             .await
             .map_err(|e| ApiError::Unavailable(format!("graph-support templates: {e}")))?
@@ -203,8 +239,7 @@ impl Ext {
                 continue;
             };
             let yaml = self
-                .http
-                .get(&url)
+                .github_get_returned(&url)
                 .send()
                 .await
                 .map_err(|e| ApiError::Unavailable(format!("graph-support template: {e}")))?
@@ -238,8 +273,7 @@ impl Ext {
 
         for page in 1..=20u32 {
             let batch: Vec<GhComment> = self
-                .http
-                .get(&self.graph_support_comments_url)
+                .github_get(&self.graph_support_comments_url)
                 .query(&[("page", page.to_string())])
                 .send()
                 .await
@@ -291,8 +325,7 @@ impl Ext {
         // Enough for the repository to grow thirty-fold before the cap is what truncates it.
         for page in 1..=10u32 {
             let batch: Vec<GhIssue> = self
-                .http
-                .get(&self.graph_support_url)
+                .github_get(&self.graph_support_url)
                 .query(&[("page", page.to_string())])
                 .send()
                 .await
@@ -1406,6 +1439,26 @@ mod ipfs_tests {
             issues[0].labels,
             vec!["area/gateway", "owner/edge-and-node"]
         );
+    }
+
+    #[tokio::test]
+    async fn the_private_archive_is_read_with_the_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/issues"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer gh-secret",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![gh(31, "open")]))
+            .mount(&server)
+            .await;
+
+        let without = Ext::default().with_graph_support_url(format!("{}/issues", server.uri()));
+        assert!(without.graph_support_issues().await.is_err());
+
+        let with = without.with_github_token(Some("gh-secret".into()));
+        assert_eq!(with.graph_support_issues().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
