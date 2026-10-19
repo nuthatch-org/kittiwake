@@ -3119,21 +3119,29 @@ pub async fn present_poi(
     };
 
     let agent = st.indexer_agent.as_ref();
-    let target = match body.agent_url.as_deref() {
+    let (target, client) = match body.agent_url.as_deref() {
         Some(url) => {
             kittiwake_ssrf::check_resolved(url).await.map_err(|_| {
                 ErrorResponse::from(ApiError::BadRequest(
                     "agentUrl must be a public http or https URL".into(),
                 ))
             })?;
-            url.to_string()
+            (url.to_string(), kittiwake_ssrf::client_builder())
         }
-        None => agent.map(|a| a.url.to_string()).ok_or_else(|| {
-            ErrorResponse::from(ApiError::Unavailable(
-                "no indexer agent is configured here and none was given".into(),
-            ))
-        })?,
+        None => (
+            agent.map(|a| a.url.to_string()).ok_or_else(|| {
+                ErrorResponse::from(ApiError::Unavailable(
+                    "no indexer agent is configured here and none was given".into(),
+                ))
+            })?,
+            reqwest::Client::builder(),
+        ),
     };
+    let client = client.build().map_err(|e| {
+        ErrorResponse::from(ApiError::Unavailable(format!(
+            "could not build an HTTP client: {e}"
+        )))
+    })?;
     let token = agent_token(
         body.agent_url.as_deref(),
         body.agent_token.as_deref(),
@@ -3156,7 +3164,6 @@ pub async fn present_poi(
   }}"#
     );
 
-    let client = reqwest::Client::new();
     let mut request = client
         .post(&target)
         .timeout(std::time::Duration::from_secs(10))
@@ -3508,7 +3515,11 @@ async fn probe_provider(provider: &census::Provider, kind: census::Probe) -> cen
     }
 
     let started = std::time::Instant::now();
-    let answer = reqwest::Client::new()
+    let Ok(client) = kittiwake_ssrf::client_builder().build() else {
+        out.verdict = census::Verdict::Unreachable;
+        return out;
+    };
+    let answer = client
         .get(&provider.endpoint)
         .timeout(std::time::Duration::from_secs(8))
         .send()

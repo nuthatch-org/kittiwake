@@ -48,6 +48,8 @@ const GRAPH_SUPPORT_TEMPLATES: &str =
 #[derive(Clone)]
 pub struct Ext {
     pub(crate) http: reqwest::Client,
+    /// For indexer endpoints, which anyone may register on chain.
+    probe: reqwest::Client,
     /// Base of the coins API. Overridable so the tests can point at a stand-in rather than the
     /// live API.
     price_url: String,
@@ -73,6 +75,11 @@ impl Ext {
                 .timeout(Duration::from_secs(8))
                 .build()
                 .unwrap_or_default(),
+            probe: kittiwake_ssrf::client_builder()
+                .user_agent(concat!("kittiwake/", env!("CARGO_PKG_VERSION")))
+                .timeout(Duration::from_secs(8))
+                .build()
+                .expect("the probe client is built from fixed settings"),
             price_url: price_url.into(),
             tvl_url: tvl_url.into(),
             graph_support_url: GRAPH_SUPPORT.to_string(),
@@ -643,7 +650,7 @@ impl Ext {
         };
 
         let sent = self
-            .http
+            .probe
             .post(checked)
             .header("content-type", "application/json")
             // Explicit rather than inherited. The client's own eight seconds is set for the price
@@ -742,7 +749,7 @@ impl Ext {
         }
         let body = deployment_status_query(ipfs_hash);
         let res = self
-            .http
+            .probe
             .post(checked)
             .header("content-type", "application/json")
             .body(body)
@@ -800,7 +807,7 @@ impl Ext {
             }
             attempts += 1;
             let mut req = self
-                .http
+                .probe
                 .post(checked.clone())
                 .header("content-type", "application/json")
                 .timeout(timeout)
