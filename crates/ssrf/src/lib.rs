@@ -9,7 +9,7 @@
 //! name is resolved and **every** address it resolves to is checked, because a name that resolves
 //! to a private address is the whole DNS-rebinding trick and passes the first check happily.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// Is this address one we must never fetch from?
 ///
@@ -19,17 +19,34 @@ pub fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_private_v4(v4),
         IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                // An IPv4-mapped v6 address is an IPv4 address wearing a hat; judge it as one.
-                return is_private_v4(mapped);
+            if let Some(v4) = embedded_v4(v6) {
+                return is_private_v4(v4);
             }
             v6.is_loopback()
                 || v6.is_unspecified()
+                || v6.is_multicast()
+                // 64:ff9b:1::/48, local-use NAT64, where the embedded address may sit anywhere.
+                || (v6.segments()[..3] == [0x64, 0xff9b, 1])
                 // fe80::/10, link-local.
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
                 // fc00::/7, unique local.
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
         }
+    }
+}
+
+/// The IPv4 address an IPv6 one carries: mapped (`::ffff:a.b.c.d`), compatible (`::a.b.c.d`) or
+/// well-known NAT64 (`64:ff9b::a.b.c.d`). Each is an IPv4 address wearing a hat; judge it as one.
+fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(mapped) = v6.to_ipv4_mapped() {
+        return Some(mapped);
+    }
+    let s = v6.segments();
+    let tail = Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8);
+    match s[..6] {
+        [0, 0, 0, 0, 0, 0] if !v6.is_loopback() && !v6.is_unspecified() => Some(tail),
+        [0x64, 0xff9b, 0, 0, 0, 0] => Some(tail),
+        _ => None,
     }
 }
 
@@ -43,6 +60,7 @@ fn is_private_v4(ip: Ipv4Addr) -> bool {
         || ip.is_unspecified()
         || a == 0                   // 0.0.0.0/8, "this network"
         || (a == 100 && (64..=127).contains(&b)) // 100.64/10, carrier-grade NAT
+        || (a == 198 && (b & 0xfe) == 18) // 198.18/15, benchmarking
         || a >= 224 // multicast and reserved
 }
 
@@ -70,6 +88,8 @@ impl std::fmt::Display for Refusal {
         }
     }
 }
+
+impl std::error::Error for Refusal {}
 
 /// The cheap check: scheme, and the host as written.
 ///
@@ -139,8 +159,8 @@ pub fn is_never_a_service(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_never_a_service_v4(v4),
         IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return is_never_a_service_v4(mapped);
+            if let Some(v4) = embedded_v4(v6) {
+                return is_never_a_service_v4(v4);
             }
             v6.is_unspecified() || v6.is_multicast() || (v6.segments()[0] & 0xffc0) == 0xfe80
         }
@@ -187,6 +207,45 @@ pub async fn check_configured(raw: &str) -> Result<(url::Url, Vec<std::net::Sock
     Ok((u, addrs))
 }
 
+/// A client for URLs a stranger supplied. Every name is judged again at connect time, so neither a
+/// DNS answer that changes after [`check_resolved`] nor a redirect to a name can reach inward; a
+/// literal address skips the resolver, so each redirect hop is checked as written.
+pub fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                attempt.error("too many redirects")
+            } else if let Err(refusal) = check_literal(attempt.url().as_str()) {
+                attempt.error(refusal)
+            } else {
+                attempt.follow()
+            }
+        }))
+        .no_proxy()
+        .dns_resolver(Guarded)
+}
+
+struct Guarded;
+
+impl reqwest::dns::Resolve for Guarded {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|_| Refusal::Unresolvable(host.clone()))?
+                .collect();
+            if addrs.is_empty() {
+                return Err(Refusal::Unresolvable(host).into());
+            }
+            if addrs.iter().any(|a| is_private_ip(a.ip())) {
+                return Err(Refusal::ResolvesToPrivate(host).into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +284,15 @@ mod tests {
             "fc00::1",
             "fd00::1",
             "::ffff:127.0.0.1",
+            "::127.0.0.1",
+            "::a9fe:a9fe",
+            "64:ff9b::7f00:1",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b:1::1",
+            "ff02::1",
+            "ff05::2",
+            "198.18.0.1",
+            "198.19.255.255",
         ] {
             assert!(is_private_ip(ip(a)), "{a} should be refused");
         }
@@ -244,6 +312,8 @@ mod tests {
         // 172.32 is outside the 172.16/12 private block; an off-by-one here would block real hosts.
         assert!(!is_private_ip(ip("172.32.0.1")));
         assert!(!is_private_ip(ip("100.128.0.1")));
+        assert!(!is_private_ip(ip("198.20.0.1")));
+        assert!(!is_private_ip(ip("64:ff9b::808:808")));
     }
 
     #[test]
@@ -297,6 +367,8 @@ mod tests {
             "http://0.0.0.0:18000/",
             "http://[::ffff:169.254.169.254]/",
             "http://224.0.0.1/",
+            "http://[64:ff9b::a9fe:a9fe]/",
+            "http://[::169.254.169.254]/",
             "file:///etc/passwd",
             "gopher://10.0.0.5/",
             "not a url",
@@ -320,5 +392,46 @@ mod tests {
     async fn a_name_that_does_not_resolve_fails_closed() {
         let r = check_resolved("http://this-name-does-not-exist.invalid/").await;
         assert!(matches!(r, Err(Refusal::Unresolvable(_))), "got {r:?}");
+    }
+
+    async fn serve_once(answer: &'static str) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(answer.as_bytes()).await;
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn a_redirect_inward_is_refused() {
+        let inner = serve_once("HTTP/1.1 200 OK\r\ncontent-length: 6\r\n\r\nsecret").await;
+        let redirect: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:{inner}/\r\ncontent-length: 0\r\n\r\n"
+            )
+            .into_boxed_str(),
+        );
+        let outer = serve_once(redirect).await;
+        let client = client_builder().build().unwrap();
+        let res = client
+            .get(format!("http://127.0.0.1:{outer}/"))
+            .send()
+            .await;
+        assert!(res.unwrap_err().is_redirect());
+    }
+
+    /// The name was public when it was checked; by the time the client connects it says loopback.
+    #[tokio::test]
+    async fn a_name_that_resolves_inward_at_connect_time_is_refused() {
+        let port = serve_once("HTTP/1.1 200 OK\r\ncontent-length: 6\r\n\r\nsecret").await;
+        let client = client_builder().build().unwrap();
+        let res = client.get(format!("http://localhost:{port}/")).send().await;
+        assert!(res.is_err(), "reached loopback through a name: {res:?}");
     }
 }
