@@ -1003,6 +1003,20 @@ const FAILURE_TTL: Duration = Duration::from_secs(3600);
 /// A manifest or metadata document. The largest real manifests are a few hundred kilobytes.
 const MAX_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
 
+/// Takes `n` from `budget` if that much is left. Not `fetch_update`, deprecated on current stable,
+/// nor `try_update`, which older toolchains lack.
+fn take_from(budget: &AtomicUsize, n: usize) -> bool {
+    let mut left = budget.load(Ordering::SeqCst);
+    loop {
+        let Some(next) = left.checked_sub(n) else {
+            return false;
+        };
+        match budget.compare_exchange_weak(left, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(now) => left = now,
+        }
+    }
+}
 /// Reads a body chunk by chunk and refuses it as soon as it passes `cap` or exhausts `budget`, so
 /// an oversized artefact is never held whole. `Content-Length` is optional and a gateway may omit it.
 async fn read_capped(
@@ -1022,11 +1036,7 @@ async fn read_capped(
             return Err(format!("Artifact {cid} is over the {cap}-byte cap"));
         }
         if let Some(budget) = budget
-            && budget
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                    left.checked_sub(chunk.len())
-                })
-                .is_err()
+            && !take_from(budget, chunk.len())
         {
             return Err(format!(
                 "Artifact {cid} does not fit in what is left of the request's byte budget"
