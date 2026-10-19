@@ -194,13 +194,8 @@ impl std::fmt::Debug for ReceiptSettings {
     }
 }
 
-/// The credential that opens an issue in `nuthatch-org/graph-support`.
-///
-/// Absent means this deployment reads the forms and refuses to file, which is what it does today:
-/// the token has never been minted, so the incumbent's filing route has answered "not configured"
-/// to every request it has ever had. The compose page is told so through `canFile` and sends people
-/// to GitHub's own chooser rather than accepting typing it cannot deliver.
-/// Where a new subscriber is announced: a Telegram bot and the chat it writes to.
+/// The Telegram bot and the chat it writes to: new subscribers, and reports sent from the support
+/// page.
 #[derive(Clone, Deserialize)]
 pub struct TelegramSettings {
     pub bot_token: String,
@@ -229,20 +224,6 @@ impl std::fmt::Debug for StripeSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StripeSettings")
             .field("webhook_secret", &"<redacted>")
-            .finish()
-    }
-}
-
-#[derive(Clone, Deserialize)]
-pub struct SupportSettings {
-    /// A fine-grained token with `issues:write` on that repository and nothing else.
-    pub issue_token: String,
-}
-
-impl std::fmt::Debug for SupportSettings {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SupportSettings")
-            .field("issue_token", &"<redacted>")
             .finish()
     }
 }
@@ -323,10 +304,10 @@ pub struct Config {
     #[serde(default)]
     pub receipt: Option<ReceiptSettings>,
     pub tap: Option<TapSettings>,
-    pub support: Option<SupportSettings>,
     /// Absent means `/api/billing/stripe` refuses every event, so card payments extend nothing.
     pub stripe: Option<StripeSettings>,
-    /// Absent means new subscribers are recorded and nobody is told.
+    /// Absent means new subscribers are recorded and nobody is told, and the support page cannot
+    /// send a report.
     pub telegram: Option<TelegramSettings>,
     /// Turns the in-process scheduler on. Off by default so a second instance, or a staging box,
     /// cannot start writing to the same Postgres behind your back.
@@ -658,7 +639,6 @@ mod tests {
             indexer_agent: None,
             receipt: None,
             tap: None,
-            support: None,
             arbitrum_rpc_url: None,
             mainnet_rpc_url: None,
             mainnet_rpc_fallback_url: None,

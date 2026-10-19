@@ -35,9 +35,8 @@ pub const WITHHELD: &[(&str, &str)] = &[
     ),
     (
         "/api/file-issue",
-        "opens an issue in a public repository on a reporter's behalf, authored by one credential. \
-         Documenting it as an anonymous endpoint would be an invitation to write into somebody \
-         else's issue tracker through us",
+        "sends a support report to the maintainers' Telegram chat. Documenting it as an anonymous \
+         endpoint would be an invitation to write into our chat through us",
     ),
     (
         "/api/health",

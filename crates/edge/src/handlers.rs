@@ -4108,8 +4108,7 @@ pub async fn issue_forms(
 
     let mut response = axum::Json(serde_json::json!({
         "templates": templates,
-        "canFile": st.support_token.is_some(),
-        "chooserUrl": kittiwake_support::chooser_url(),
+        "canFile": st.telegram.is_some(),
     }))
     .into_response();
     crate::no_store(response.headers_mut());
@@ -4155,23 +4154,15 @@ fn clamp(s: &str) -> String {
 }
 
 fn filing_error(message: &str, status: axum::http::StatusCode) -> Response {
-    let mut r = (
-        status,
-        axum::Json(serde_json::json!({
-            "error": message,
-            "chooserUrl": kittiwake_support::chooser_url(),
-        })),
-    )
-        .into_response();
+    let mut r = (status, axum::Json(serde_json::json!({ "error": message }))).into_response();
     crate::no_store(r.headers_mut());
     r
 }
 
-/// Open an issue on a reporter's behalf.
+/// Send a report from the support page to the Telegram chat, where someone will answer it.
 ///
-/// The credential is one account, so every thread filed here is authored by it.
-/// `provenance_footer` says so in the body rather than letting the archive imply the maintainer
-/// reported it themselves.
+/// The body is the markdown GitHub would compose from the same form, so a report that deserves an
+/// issue can be pasted into one as it stands.
 pub async fn file_issue(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -4203,11 +4194,11 @@ pub async fn file_issue(
         ));
     }
 
-    let Some(token) = st.support_token.as_deref() else {
-        // Not a failure the reporter caused, and their typing is still in the form, so the answer
-        // says where else to put it rather than pretending the send worked.
+    let Some(telegram) = st.telegram.clone() else {
+        // Their typing is still in the form, so the answer says where else to take it rather than
+        // pretending the send worked.
         return Ok(filing_error(
-            "Filing from Lodestar is not configured. The issue can still be opened on GitHub.",
+            "Sending reports from Lodestar is not configured. Bring it to the Nuthatch Discord instead.",
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
         ));
     };
@@ -4221,7 +4212,7 @@ pub async fn file_issue(
         Err(e) => {
             tracing::warn!(error = %e, "the issue forms could not be read");
             return Ok(filing_error(
-                "The issue forms could not be read, so nothing was filed.",
+                "The forms could not be read, so nothing was sent.",
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
             ));
         }
@@ -4233,7 +4224,7 @@ pub async fn file_issue(
         .and_then(|r| kittiwake_support::parse_issue_form(&r.file, &r.yaml).ok())
     else {
         return Ok(filing_error(
-            "That is not one of the issue forms.",
+            "That is not one of the forms.",
             axum::http::StatusCode::BAD_REQUEST,
         ));
     };
@@ -4257,11 +4248,7 @@ pub async fn file_issue(
     if let Some(first) = errors.first() {
         let mut r = (
             axum::http::StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({
-                "error": first,
-                "errors": errors,
-                "chooserUrl": kittiwake_support::chooser_url(),
-            })),
+            axum::Json(serde_json::json!({ "error": first, "errors": errors })),
         )
             .into_response();
         crate::no_store(r.headers_mut());
@@ -4271,75 +4258,41 @@ pub async fn file_issue(
     let handle = payload
         .handle
         .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
         .map(|h| h.chars().take(120).collect::<String>());
-    let body_md = format!(
-        "{}\n\n{}",
-        kittiwake_support::render_issue_body(&form, &values),
-        kittiwake_support::provenance_footer(handle.as_deref())
+    let text = support_report_message(
+        title,
+        &form,
+        handle.as_deref(),
+        &kittiwake_support::render_issue_body(&form, &values),
     );
 
-    let client = reqwest::Client::new();
-    let res = match client
-        .post(format!(
-            "https://api.github.com/repos/{}/issues",
-            kittiwake_support::REPO
-        ))
-        .header(axum::http::header::ACCEPT, "application/vnd.github.v3+json")
-        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
-        // GitHub refuses a request with no user agent, and a named one is what appears in their
-        // rate-limit accounting rather than an anonymous bucket shared with everything else.
-        .header(axum::http::header::USER_AGENT, "kittiwake")
-        .json(&serde_json::json!({
-            "title": title,
-            "body": body_md,
-            "labels": form.labels,
-        }))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, file = %form.file, "GitHub could not be reached to open an issue");
-            return Ok(filing_error(
-                "GitHub could not be reached, so nothing was filed.",
-                axum::http::StatusCode::BAD_GATEWAY,
-            ));
-        }
-    };
-
-    if !res.status().is_success() {
-        tracing::warn!(
-            status = res.status().as_u16(),
-            file = %form.file,
-            rate_limit_remaining = ?res.headers().get("x-ratelimit-remaining"),
-            "GitHub refused to open a graph-support issue"
-        );
+    if let Err(e) = crate::telegram::send(&telegram, &text).await {
+        tracing::warn!(error = %e, file = %form.file, "a support report could not be sent to Telegram");
         return Ok(filing_error(
-            "GitHub refused the issue, so nothing was filed.",
+            "The report could not be sent. Your answers are still here; try again, or bring it to the Nuthatch Discord.",
             axum::http::StatusCode::BAD_GATEWAY,
         ));
     }
+    metrics::counter!("support_reports_total").increment(1);
 
-    let created: serde_json::Value = res.json().await.unwrap_or(serde_json::Value::Null);
-    let Some(number) = created.get("number").and_then(|n| n.as_u64()) else {
-        // The issue may well exist; what is missing is the number to send anyone to.
-        return Ok(filing_error(
-            "The issue was accepted but GitHub did not say which number it got.",
-            axum::http::StatusCode::BAD_GATEWAY,
-        ));
-    };
-
-    let mut response = axum::Json(serde_json::json!({
-        "number": number,
-        "url": created
-            .get("html_url")
-            .and_then(|u| u.as_str())
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("https://github.com/{}/issues/{number}", kittiwake_support::REPO)),
-    }))
-    .into_response();
+    let mut response = axum::Json(serde_json::json!({ "sent": true })).into_response();
     crate::no_store(response.headers_mut());
     Ok(response)
+}
+
+fn support_report_message(
+    title: &str,
+    form: &kittiwake_support::IssueForm,
+    handle: Option<&str>,
+    body: &str,
+) -> String {
+    format!(
+        "Support report: {title}\nForm: {}\nFrom: {}\n\n{body}",
+        form.name,
+        handle.unwrap_or("no handle left, so there is no way to reply"),
+    )
 }
 
 #[cfg(test)]
@@ -4515,7 +4468,6 @@ mod indexer_page_tests {
             None,
             None,
             ipfs,
-            None,
             None,
             None,
             None,
