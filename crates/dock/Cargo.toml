@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 alloy = { version = "2.4.1", default-features = false, features = ["std", "signers"] }
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 hex = "0.4.3"
 hmac = "0.12.1"
 kittiwake-types = { version = "0.1.0", path = "../types" }

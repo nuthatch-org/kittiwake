@@ -202,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
                 .map(|secret| kittiwake_edge::Studio {
                     secret,
                     bounty_board_address: cfg.bounty_board_address.clone(),
+                    spent_nonces: Default::default(),
                 })
                 .map_err(|e| anyhow::anyhow!("invalid studio session secret: {e}"))
         })

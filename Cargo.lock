@@ -3248,6 +3248,7 @@ name = "kittiwake-dock"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "chrono",
  "getrandom 0.4.3",
  "hex",
  "hmac 0.12.1",

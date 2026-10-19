@@ -20,9 +20,15 @@ type HmacSha256 = Hmac<Sha256>;
 /// whatever the user was doing.
 pub const SESSION_TTL_SECS: i64 = 60 * 60 * 24 * 7;
 
-/// Five minutes, matching `AUTH_WINDOW`. How old a sign-in message may be, which is what stops a
-/// captured signature being replayed tomorrow.
+/// How old a sign-in challenge may be, which is what stops a captured signature being replayed
+/// tomorrow.
 pub const AUTH_WINDOW_SECS: i64 = 300;
+
+/// Arbitrum One, where the wallets this signs in hold their stake.
+pub const SIGN_IN_CHAIN_ID: u64 = 42161;
+
+const SIGN_IN_STATEMENT: &str =
+    "Sign in to Lodestar. This proves you own this wallet. It is free and sends no transaction.";
 
 pub const COOKIE_NAME: &str = "studio_session";
 
@@ -115,16 +121,51 @@ pub fn parse_session(secret: &Secret, token: &str, now: i64) -> Result<String, S
     Ok(address.to_string())
 }
 
-/// The message a wallet is asked to sign. Byte-identical to `buildSignInMessage`, newlines and all,
-/// because the signature is over these exact bytes and a stray space invalidates every one.
-pub fn sign_in_message(address: &str, timestamp: i64) -> String {
-    format!("Sign in to Lodestar Studio\n\nAddress: {address}\nTimestamp: {timestamp}")
+/// The origin a sign-in message may name, as its URI, or `None` for any other host. Local
+/// development signs in against the production API, so `localhost` is accepted on any port.
+fn sign_in_uri(domain: &str) -> Option<String> {
+    if domain == "www.lodestar-dashboard.com" {
+        return Some(format!("https://{domain}"));
+    }
+    let port = domain.strip_prefix("localhost")?;
+    let local = port.is_empty()
+        || port
+            .strip_prefix(':')
+            .is_some_and(|p| (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()));
+    local.then(|| format!("http://{domain}"))
+}
+
+/// A nonce this service can recognise as its own without remembering it: eight random bytes and
+/// an HMAC over them and the issue time.
+pub fn issue_sign_in_nonce(secret: &Secret, issued_at: i64) -> String {
+    let mut r = [0u8; 8];
+    getrandom::fill(&mut r).expect("the OS must be able to produce randomness");
+    nonce_from(secret, &hex::encode(r), issued_at)
+}
+
+fn nonce_from(secret: &Secret, random: &str, issued_at: i64) -> String {
+    let mac = sign(secret, &format!("sign-in-nonce:{random}:{issued_at}"));
+    format!("{random}{}", &mac[..32])
+}
+
+/// The EIP-4361 message a wallet is asked to sign, byte for byte what viem's `createSiweMessage`
+/// builds from the same fields, so a wallet can check the domain against the page asking.
+pub fn sign_in_message(domain: &str, address: &str, nonce: &str, issued_at: i64) -> Option<String> {
+    let uri = sign_in_uri(domain)?;
+    let issued = chrono::DateTime::from_timestamp(issued_at, 0)?.format("%Y-%m-%dT%H:%M:%S%.3fZ");
+    Some(format!(
+        "{domain} wants you to sign in with your Ethereum account:\n{address}\n\n\
+         {SIGN_IN_STATEMENT}\n\nURI: {uri}\nVersion: 1\nChain ID: {SIGN_IN_CHAIN_ID}\n\
+         Nonce: {nonce}\nIssued At: {issued}"
+    ))
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SignInError {
-    #[error("the message carries no timestamp")]
-    NoTimestamp,
+    #[error("the message is not a sign-in message this service issued")]
+    NotOurMessage,
+    #[error("the nonce was not issued here")]
+    BadNonce,
     #[error("the message is outside the five-minute window")]
     StaleMessage,
     #[error("the signature is not readable")]
@@ -135,29 +176,58 @@ pub enum SignInError {
     BadAddress,
 }
 
-/// Verify that `address` signed `message`, and that the message is recent.
+/// A verified sign-in's nonce, for the caller to spend.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SignedIn {
+    pub nonce: String,
+    pub issued_at: i64,
+}
+
+/// Verify that `address` signed exactly the message this service would have asked it to sign:
+/// an allowed domain, a nonce issued here, and fresh.
 ///
-/// The window is checked **before** the signature, as the incumbent checks it: recovering a public
-/// key is the expensive half, and an old message is refused whether or not it was signed properly.
+/// The signature is recovered last: recovering a public key is the expensive half, and a message
+/// that is not ours is refused whether or not it was signed properly.
 pub fn verify_sign_in(
+    secret: &Secret,
     address: &str,
     message: &str,
     signature: &str,
     now: i64,
-) -> Result<(), SignInError> {
-    let ts = message
-        .split("Timestamp: ")
-        .nth(1)
-        .and_then(|rest| {
-            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            digits.parse::<i64>().ok()
-        })
-        .ok_or(SignInError::NoTimestamp)?;
-    if (now - ts).abs() > AUTH_WINDOW_SECS {
+) -> Result<SignedIn, SignInError> {
+    let want: alloy::primitives::Address = address.parse().map_err(|_| SignInError::BadAddress)?;
+    let (domain, _) = message
+        .split_once(" wants you to sign in with your Ethereum account:\n")
+        .ok_or(SignInError::NotOurMessage)?;
+    let field = |name: &str| {
+        message
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .ok_or(SignInError::NotOurMessage)
+    };
+    let nonce = field("Nonce: ")?;
+    let issued_at = chrono::DateTime::parse_from_rfc3339(field("Issued At: ")?)
+        .map_err(|_| SignInError::NotOurMessage)?
+        .timestamp();
+    if (now - issued_at).abs() > AUTH_WINDOW_SECS {
         return Err(SignInError::StaleMessage);
     }
+    let random = nonce.get(..16).ok_or(SignInError::BadNonce)?;
+    let expected = nonce_from(secret, random, issued_at);
+    if expected.len() != nonce.len()
+        || !bool::from(subtle::ConstantTimeEq::ct_eq(
+            expected.as_bytes(),
+            nonce.as_bytes(),
+        ))
+    {
+        return Err(SignInError::BadNonce);
+    }
+    if sign_in_message(domain, &want.to_checksum(None), nonce, issued_at).as_deref()
+        != Some(message)
+    {
+        return Err(SignInError::NotOurMessage);
+    }
 
-    let want: alloy::primitives::Address = address.parse().map_err(|_| SignInError::BadAddress)?;
     let bytes =
         hex::decode(signature.trim_start_matches("0x")).map_err(|_| SignInError::BadSignature)?;
     let sig = alloy::primitives::Signature::try_from(bytes.as_slice())
@@ -168,7 +238,25 @@ pub fn verify_sign_in(
     if recovered != want {
         return Err(SignInError::WrongSigner);
     }
-    Ok(())
+    Ok(SignedIn {
+        nonce: nonce.to_string(),
+        issued_at,
+    })
+}
+
+/// Nonces already exchanged for a session, kept only while they could still verify.
+#[derive(Clone, Default)]
+pub struct SpentNonces(std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>);
+
+impl SpentNonces {
+    /// True the first time a sign-in is spent; false for a replay of it.
+    pub fn spend(&self, signed: &SignedIn, now: i64) -> bool {
+        let mut spent = self.0.lock().expect("spent nonces lock");
+        spent.retain(|_, issued_at| now - *issued_at <= AUTH_WINDOW_SECS);
+        spent
+            .insert(signed.nonce.clone(), signed.issued_at)
+            .is_none()
+    }
 }
 
 /// A new deploy key, and the hash we store instead of it.
@@ -346,14 +434,6 @@ mod session_tests {
     }
 
     #[test]
-    fn the_sign_in_message_is_byte_identical() {
-        assert_eq!(
-            sign_in_message("0xAbC", 1_757_000_000),
-            "Sign in to Lodestar Studio\n\nAddress: 0xAbC\nTimestamp: 1757000000"
-        );
-    }
-
-    #[test]
     fn a_deploy_key_is_stored_as_its_hash_and_not_as_itself() {
         let key = generate_deploy_key();
         assert_eq!(key.len(), 64);
@@ -372,74 +452,163 @@ mod session_tests {
 mod sign_in_tests {
     use super::*;
 
-    /// A real EIP-191 signature over the incumbent's own sign-in message, produced by viem - the
-    /// same library the live service verifies with. The key is a well-known throwaway (Hardhat's
-    /// second account); it holds nothing and never will.
+    /// Real EIP-191 signatures by viem over the message lodestar's `buildSignInMessage` builds. The
+    /// key is a well-known throwaway (Hardhat's second account); it holds nothing and never will.
     const ADDRESS: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
     const TS: i64 = 1_757_000_000;
-    const SIGNATURE: &str = "0x875cfb39b4182be71e295ed0377180113046213647e43c8af9838274054169d26b12488eb948f310054c052470c07679e5c2cf755abf76faf59989ffee7853471c";
+    const NONCE: &str = "0123456789abcdef2716f2a93b5b752b1e1fbccb1bb1de1b";
+    const MESSAGE: &str = "www.lodestar-dashboard.com wants you to sign in with your Ethereum account:\n0x70997970C51812dc3A010C7d01b50e0d17dc79C8\n\nSign in to Lodestar. This proves you own this wallet. It is free and sends no transaction.\n\nURI: https://www.lodestar-dashboard.com\nVersion: 1\nChain ID: 42161\nNonce: 0123456789abcdef2716f2a93b5b752b1e1fbccb1bb1de1b\nIssued At: 2025-09-04T15:33:20.000Z";
+    const SIGNATURE: &str = "0x70e06b0ab32292442fe2deefa2f644112d9653aa71597adc5597028c03af16b04287a99a77a0ed3fe0deb43e8b2ea0c72f1750c0d889ff16df8419de035c37931c";
+    const LOCAL_MESSAGE: &str = "localhost:3019 wants you to sign in with your Ethereum account:\n0x70997970C51812dc3A010C7d01b50e0d17dc79C8\n\nSign in to Lodestar. This proves you own this wallet. It is free and sends no transaction.\n\nURI: http://localhost:3019\nVersion: 1\nChain ID: 42161\nNonce: 0123456789abcdef2716f2a93b5b752b1e1fbccb1bb1de1b\nIssued At: 2025-09-04T15:33:20.000Z";
+    const LOCAL_SIGNATURE: &str = "0xb433a07e5d996fc45659509f962e32f4b17fb6575a51e55f3d71406a66b022b96254889f8ed8219eab82c99dc179829378467bf581b4fff17db00567c40fc3781b";
 
-    fn message() -> String {
-        sign_in_message(ADDRESS, TS)
+    fn secret() -> Secret {
+        Secret::new("test-secret-that-is-at-least-32-characters-long").unwrap()
     }
 
-    /// If this passes, our `sign_in_message` produces the exact bytes viem signed - the signature
-    /// is over those bytes, so a stray space anywhere would fail here rather than in production.
+    fn verify(address: &str, message: &str, signature: &str, now: i64) -> Result<(), SignInError> {
+        verify_sign_in(&secret(), address, message, signature, now).map(|_| ())
+    }
+
+    #[test]
+    fn we_build_the_bytes_viem_signed() {
+        assert_eq!(nonce_from(&secret(), "0123456789abcdef", TS), NONCE);
+        assert_eq!(
+            sign_in_message("www.lodestar-dashboard.com", ADDRESS, NONCE, TS).as_deref(),
+            Some(MESSAGE)
+        );
+        assert_eq!(
+            sign_in_message("localhost:3019", ADDRESS, NONCE, TS).as_deref(),
+            Some(LOCAL_MESSAGE)
+        );
+    }
+
     #[test]
     fn a_signature_a_wallet_really_produced_is_accepted() {
         assert_eq!(
-            verify_sign_in(ADDRESS, &message(), SIGNATURE, TS + 10),
+            verify_sign_in(&secret(), ADDRESS, MESSAGE, SIGNATURE, TS + 10),
+            Ok(SignedIn {
+                nonce: NONCE.into(),
+                issued_at: TS
+            })
+        );
+        assert_eq!(
+            verify(ADDRESS, LOCAL_MESSAGE, LOCAL_SIGNATURE, TS + 10),
+            Ok(())
+        );
+        // The body may carry the address in any case; the message is rebuilt checksummed.
+        assert_eq!(
+            verify(&ADDRESS.to_lowercase(), MESSAGE, SIGNATURE, TS + 10),
             Ok(())
         );
     }
 
-    /// The check that matters: proving you signed *something* is not proving you are that address.
+    /// kittiwake#210: any message the wallet signed that mentioned a recent timestamp used to
+    /// open a session. This one is a real signature over the old, unbound text.
+    #[test]
+    fn a_signature_over_any_other_message_with_a_timestamp_is_refused() {
+        let other = "Sign in to Lodestar Studio\n\nAddress: 0x70997970C51812dc3A010C7d01b50e0d17dc79C8\nTimestamp: 1757000000";
+        let sig = "0x875cfb39b4182be71e295ed0377180113046213647e43c8af9838274054169d26b12488eb948f310054c052470c07679e5c2cf755abf76faf59989ffee7853471c";
+        assert_eq!(
+            verify(ADDRESS, other, sig, TS + 10),
+            Err(SignInError::NotOurMessage)
+        );
+    }
+
+    #[test]
+    fn another_domain_is_refused() {
+        let elsewhere = MESSAGE.replace("www.lodestar-dashboard.com", "lodestar-dashboard.evil");
+        assert_eq!(
+            verify(ADDRESS, &elsewhere, SIGNATURE, TS + 10),
+            Err(SignInError::NotOurMessage)
+        );
+        assert_eq!(sign_in_uri("localhost.evil"), None);
+        assert_eq!(sign_in_uri("localhost:123456"), None);
+        assert_eq!(sign_in_uri("lodestar-dashboard.com"), None);
+    }
+
+    #[test]
+    fn a_nonce_this_service_did_not_issue_is_refused() {
+        let other = Secret::new("another-secret-that-is-also-at-least-32-chars").unwrap();
+        assert_eq!(
+            verify_sign_in(&other, ADDRESS, MESSAGE, SIGNATURE, TS + 10),
+            Err(SignInError::BadNonce)
+        );
+        let forged = MESSAGE.replace(NONCE, "0123456789abcdef00000000000000000000000000000000");
+        assert_eq!(
+            verify(ADDRESS, &forged, SIGNATURE, TS + 10),
+            Err(SignInError::BadNonce)
+        );
+    }
+
     #[test]
     fn a_signature_by_someone_else_is_refused() {
         let other = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+        let message = sign_in_message("www.lodestar-dashboard.com", other, NONCE, TS).unwrap();
         assert_eq!(
-            verify_sign_in(other, &message(), SIGNATURE, TS + 10),
+            verify(other, &message, SIGNATURE, TS + 10),
             Err(SignInError::WrongSigner)
+        );
+        // Nor can the address be swapped under somebody else's message.
+        assert_eq!(
+            verify(other, MESSAGE, SIGNATURE, TS + 10),
+            Err(SignInError::NotOurMessage)
         );
     }
 
-    /// The replay guard. A captured signature is valid for ever cryptographically; only the window
-    /// stops it being reused tomorrow.
     #[test]
     fn a_signature_outside_the_five_minute_window_is_refused() {
         assert_eq!(
-            verify_sign_in(ADDRESS, &message(), SIGNATURE, TS + AUTH_WINDOW_SECS + 1),
+            verify(ADDRESS, MESSAGE, SIGNATURE, TS + AUTH_WINDOW_SECS + 1),
             Err(SignInError::StaleMessage)
         );
-        // Symmetric, as the incumbent's `Math.abs` is: a message from the future is refused too.
         assert_eq!(
-            verify_sign_in(ADDRESS, &message(), SIGNATURE, TS - AUTH_WINDOW_SECS - 1),
+            verify(ADDRESS, MESSAGE, SIGNATURE, TS - AUTH_WINDOW_SECS - 1),
             Err(SignInError::StaleMessage)
         );
-        assert!(verify_sign_in(ADDRESS, &message(), SIGNATURE, TS + AUTH_WINDOW_SECS).is_ok());
+        assert!(verify(ADDRESS, MESSAGE, SIGNATURE, TS + AUTH_WINDOW_SECS).is_ok());
     }
 
     #[test]
-    fn a_tampered_message_no_longer_verifies() {
-        let tampered = message().replace("Lodestar", "Lodesbar");
-        assert_eq!(
-            verify_sign_in(ADDRESS, &tampered, SIGNATURE, TS + 10),
-            Err(SignInError::WrongSigner)
-        );
+    fn a_sign_in_is_spent_once() {
+        let spent = SpentNonces::default();
+        let signed = verify_sign_in(&secret(), ADDRESS, MESSAGE, SIGNATURE, TS + 10).unwrap();
+        assert!(spent.spend(&signed, TS + 10));
+        assert!(!spent.spend(&signed, TS + 20), "a replay inside the window");
+    }
+
+    #[test]
+    fn a_fresh_nonce_verifies_and_is_different_each_time() {
+        let a = issue_sign_in_nonce(&secret(), TS);
+        assert_ne!(a, issue_sign_in_nonce(&secret(), TS));
+        assert_eq!(a.len(), 48);
+        assert_eq!(nonce_from(&secret(), &a[..16], TS), a);
     }
 
     #[test]
     fn rubbish_is_refused_rather_than_panicking() {
+        for m in [
+            "",
+            "no timestamp here",
+            "x wants you to sign in with your Ethereum account:\n",
+        ] {
+            assert_eq!(
+                verify(ADDRESS, m, SIGNATURE, TS),
+                Err(SignInError::NotOurMessage),
+                "{m}"
+            );
+        }
+        let short = MESSAGE.replace(NONCE, "abc");
         assert_eq!(
-            verify_sign_in(ADDRESS, "no timestamp here", SIGNATURE, TS),
-            Err(SignInError::NoTimestamp)
+            verify(ADDRESS, &short, SIGNATURE, TS + 10),
+            Err(SignInError::BadNonce)
         );
         assert_eq!(
-            verify_sign_in(ADDRESS, &message(), "0xnothex", TS + 10),
+            verify(ADDRESS, MESSAGE, "0xnothex", TS + 10),
             Err(SignInError::BadSignature)
         );
         assert_eq!(
-            verify_sign_in("not-an-address", &message(), SIGNATURE, TS + 10),
+            verify("not-an-address", MESSAGE, SIGNATURE, TS + 10),
             Err(SignInError::BadAddress)
         );
     }
