@@ -143,7 +143,7 @@ pub(crate) async fn stripe_webhook(
         .pool
         .as_ref()
         .ok_or_else(|| ApiError::Unavailable("no database is configured".into()))?;
-    let db = |e: kittiwake_db::DbError| ApiError::Unavailable(format!("database: {e}"));
+    let db = kittiwake_db::unavailable::<kittiwake_db::DbError>;
 
     let address = match (&credit.address, &credit.external_ref) {
         (Some(a), _) => Some(a.clone()),

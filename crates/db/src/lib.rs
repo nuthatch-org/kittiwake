@@ -13,6 +13,13 @@ pub enum DbError {
     Sqlx(#[from] sqlx::Error),
 }
 
+/// What a caller is told when the database fails. The detail goes to the log only, because sqlx's
+/// text names tables, columns and constraints.
+pub fn unavailable<E: std::fmt::Display>(e: E) -> kittiwake_types::ApiError {
+    tracing::error!(error = %e, "database");
+    kittiwake_types::ApiError::Unavailable("the database could not answer".into())
+}
+
 pub type Pool = PgPool;
 
 /// Open the pool. Conservative by default: this box also runs Postgres itself and Grafana reads it
@@ -1392,6 +1399,14 @@ mod tests {
             format!("{CRON_RUN_PREFIX}refresh-chain-health"),
             "kittiwake:refresh-chain-health"
         );
+    }
+
+    #[test]
+    fn a_caller_is_not_told_what_the_database_said() {
+        let e = DbError::from(sqlx::Error::Protocol(
+            "relation \"stripe_credits\" does not exist".into(),
+        ));
+        assert!(!unavailable(e).to_string().contains("stripe_credits"));
     }
 }
 

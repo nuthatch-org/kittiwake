@@ -65,7 +65,7 @@ pub trait QosStore: Send + Sync {
 }
 
 fn database(e: kittiwake_db::DbError) -> ApiError {
-    ApiError::Unavailable(format!("database: {e}"))
+    kittiwake_db::unavailable(e)
 }
 
 impl QosStore for kittiwake_db::Pool {
