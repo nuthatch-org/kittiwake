@@ -293,13 +293,13 @@ pub async fn refresh(
 
         let empty: Vec<rw::Allocation> = Vec::new();
         let allocs = allocs_by_indexer.get(&id).unwrap_or(&empty);
-        let apr = rw::delegator_apr_breakdown(
+        let apr = instant_apr(
             allocs,
             reward_cut_ppm,
             delegated,
+            thawing,
             total_signal,
             annual_issuance,
-            None,
             delegated_ratio,
         );
 
@@ -315,7 +315,7 @@ pub async fn refresh(
                 .or_else(|| {
                     closed_by_indexer
                         .get(&id)
-                        .map(|c| rw::rolling_apy(c, delegated, window, now))
+                        .map(|c| rw::rolling_apy(c, delegated - thawing, window, now))
                         .filter(|v| *v > 0.0)
                 })
         };
@@ -448,6 +448,28 @@ struct ParamChange {
 /// Empty until `ingest-names` has run once, so a name the platform left behind is never scored.
 const KNOWN_NAMES_SQL: &str = "SELECT address, name, ens_name FROM indexers \
      WHERE EXISTS (SELECT 1 FROM ingestion_state WHERE key = 'kittiwake:names')";
+
+/// Thawing tokens stay in the pool's `tokens` until withdrawn but earn nothing, so the APR is
+/// over the rest: the base docs/apr-methodology.md and the browser's provenance panel use. #223
+fn instant_apr(
+    allocs: &[rw::Allocation],
+    reward_cut_ppm: f64,
+    delegated: f64,
+    thawing: f64,
+    total_signal: f64,
+    annual_issuance: f64,
+    delegated_ratio: Option<f64>,
+) -> rw::AprBreakdown {
+    rw::delegator_apr_breakdown(
+        allocs,
+        reward_cut_ppm,
+        delegated - thawing,
+        total_signal,
+        annual_issuance,
+        None,
+        delegated_ratio,
+    )
+}
 
 /// `(name, ens_name)` as `ingest-names` last verified them. Read, not looked up: refresh runs every
 /// five minutes and the lookups are mainnet round trips, so they live in the hourly job.
@@ -846,5 +868,19 @@ mod tests {
         // Unified with the figure the displayed issuance percentage uses; see
         // `kittiwake_rewards::L1_BLOCKS_PER_YEAR` for why this moved and why no ranking did.
         assert_eq!(super::L1_BLOCKS_PER_YEAR, 2_610_223.0);
+    }
+
+    /// ellipfra's pool on 2026-10-19: tokens 156,308,737, tokensThawing 4,929,832.
+    #[test]
+    fn instant_apr_divides_by_the_stake_that_is_not_thawing() {
+        let allocs = [rw::Allocation {
+            allocated_grt: 1e8,
+            deployment_signal_grt: 1e4,
+            deployment_stake_grt: 1e8,
+        }];
+        let (delegated, thawing) = (156_308_737.0, 4_929_832.0);
+        let b = instant_apr(&allocs, 430_000.0, delegated, thawing, 1e6, 3e8, None);
+        assert_eq!(b.active_base, delegated - thawing);
+        assert!((b.apr - b.annual_delegator_rewards / (delegated - thawing) * 100.0).abs() < 1e-9);
     }
 }

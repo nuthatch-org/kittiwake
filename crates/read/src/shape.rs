@@ -3032,6 +3032,18 @@ mod subgraph_curation_tests {
     }
 }
 
+/// `(indexer, principal, shares)` for each position, in GRT. The principal is what the shares still
+/// held cost, not everything ever delegated: one partial undelegation made the latter overstate it
+/// by all that was taken out, and the rewards line sat at zero. #224
+pub fn rewards_history_positions(rows: &[Value]) -> Vec<(String, f64, f64)> {
+    rows.iter()
+        .filter_map(|r| {
+            let indexer = r.get("indexer")?.as_str()?.to_lowercase();
+            Some((indexer, grt(r, "cost_basis"), grt(r, "share_amount")))
+        })
+        .collect()
+}
+
 /// A delegator's portfolio value over time, folded from their positions and each indexer's daily
 /// delegation exchange rate.
 ///
@@ -3144,6 +3156,17 @@ mod rewards_history_tests {
     }
     fn rate(indexer: &str, date: &str, r: f64) -> (String, String, f64) {
         (indexer.to_string(), date.to_string(), r)
+    }
+
+    /// 100 delegated at a rate of 1, half the shares undelegated at 1.2: 50 shares that cost 50.
+    #[test]
+    fn the_principal_is_what_the_remaining_shares_cost() {
+        let row = json!({
+            "indexer": "0xA", "share_amount": "50000000000000000000",
+            "cost_basis": "50000000000000000000", "total_delegated_tokens": "100000000000000000000",
+            "staked_tokens": "60000000000000000000",
+        });
+        assert_eq!(rewards_history_positions(&[row]), [pos("0xa", 50.0, 50.0)]);
     }
 
     #[test]
