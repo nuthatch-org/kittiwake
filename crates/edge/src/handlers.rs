@@ -4059,7 +4059,7 @@ mod schema_cid_tests {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Filing an issue in nuthatch-org/graph-support
+// Support reports, sent to Telegram
 // ---------------------------------------------------------------------------------------------
 
 /// Long enough for a stack trace and a query, short enough that nobody pastes a database in.
@@ -4069,9 +4069,6 @@ const MIN_TITLE_CHARS: usize = 8;
 
 /// The forms, parsed, for the compose page to render.
 ///
-/// On its own path rather than sharing one with `file_issue`, because the rate limiter buckets by
-/// path and not by method: three writes a minute is right for opening issues in a public repository
-/// and would lock a reader out of the form on their third page load.
 pub async fn issue_forms(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -4170,6 +4167,10 @@ pub async fn file_issue(
     body: Option<axum::Json<FileIssueBody>>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
+    st.limits.check(
+        &st.limits.report,
+        client_ip(peer, &headers, st.edge_secret.as_deref()),
+    )?;
 
     // `Option<Json<..>>` rather than `Json<..>`: a mandatory body makes axum answer 400 before the
     // handler runs, so a client that sends none gets a bare rejection with no explanation. That

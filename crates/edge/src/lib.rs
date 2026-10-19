@@ -35,6 +35,8 @@ pub struct Limits {
     pub sql: Limiter,
     pub read: Limiter,
     pub mutation: Limiter,
+    /// Support reports land in a chat a person reads, so the read budget is far too generous.
+    pub report: Limiter,
     pub exempt: Vec<IpAddr>,
 }
 
@@ -57,6 +59,10 @@ impl Limits {
             sql: RateLimiter::keyed(q(sql_per_min, 5)),
             read: RateLimiter::keyed(q(read_per_min, 40)),
             mutation: RateLimiter::keyed(q(mutation_per_min, 10)),
+            report: RateLimiter::keyed(
+                Quota::per_hour(NonZeroU32::new(6).unwrap())
+                    .allow_burst(NonZeroU32::new(3).unwrap()),
+            ),
             exempt,
         }
     }
@@ -82,6 +88,7 @@ impl Limits {
         self.sql.retain_recent();
         self.read.retain_recent();
         self.mutation.retain_recent();
+        self.report.retain_recent();
     }
 }
 
@@ -1388,6 +1395,18 @@ async fn get_whoami(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn support_reports_get_a_few_and_then_wait() {
+        let limits = Limits::new(1000, 1000, 1000, Vec::new());
+        let ip: IpAddr = [203, 0, 113, 7].into();
+        for _ in 0..3 {
+            assert!(limits.check(&limits.report, ip).is_ok());
+        }
+        assert!(limits.check(&limits.report, ip).is_err());
+        let other: IpAddr = [203, 0, 113, 8].into();
+        assert!(limits.check(&limits.report, other).is_ok());
+    }
 
     // ── Presenting a proof of indexing ───────────────────────────────────────
 
