@@ -12,6 +12,10 @@ warmer_enabled = true
 # database_url = "postgresql://lodestar:...@127.0.0.1:5433/lodestar?sslmode=require"
 database_max_connections = 16
 
+# Read access to nuthatch-org/graph-support, which is private. Without it the support archive is
+# never refreshed. A top-level key, so it must sit above the first [table].
+# github_token = "github_pat_..."
+
 # Arbitrum One JSON-RPC. Required for the eligibility oracle, the supply reads and the bounty
 # reconciliation; the routes that need it report unavailable without it rather than reaching for a
 # public endpoint that would throttle under the directory's fan-out.

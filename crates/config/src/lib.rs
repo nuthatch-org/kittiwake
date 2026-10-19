@@ -309,6 +309,10 @@ pub struct Config {
     /// Absent means new subscribers are recorded and nobody is told, and the support page cannot
     /// send a report.
     pub telegram: Option<TelegramSettings>,
+    /// A fine-grained token with read access to nuthatch-org/graph-support's issues and contents.
+    /// Absent means the support archive is not refreshed, because the repository is private.
+    #[serde(default)]
+    pub github_token: Option<String>,
     /// Turns the in-process scheduler on. Off by default so a second instance, or a staging box,
     /// cannot start writing to the same Postgres behind your back.
     #[serde(default)]
@@ -648,6 +652,7 @@ mod tests {
             limits: None,
             stripe: None,
             telegram: None,
+            github_token: None,
             scheduler_enabled: false,
             warmer_enabled: false,
             paywall_enabled: false,

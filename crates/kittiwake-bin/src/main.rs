@@ -236,7 +236,8 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_paywall(cfg.paywall_enabled, cfg.paywall_service_tokens.clone())
     .with_stripe(cfg.stripe.as_ref().map(|s| s.webhook_secret.clone()))
-    .with_telegram(cfg.telegram.clone());
+    .with_telegram(cfg.telegram.clone())
+    .with_github_token(cfg.github_token.clone());
     let limits_handle = state.limits.clone();
 
     // Keyed rate-limit state grows with distinct callers; sweep the idle ones periodically so a
@@ -288,7 +289,7 @@ async fn main() -> anyhow::Result<()> {
         jobs.extend(jobs::live_jobs(
             store.clone(),
             pool.clone(),
-            kittiwake_ext::Ext::default(),
+            kittiwake_ext::Ext::default().with_github_token(cfg.github_token.clone()),
         ));
 
         if cfg.warmer_enabled {
@@ -351,7 +352,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(p) => {
                     let ingest = jobs::ingest_jobs(
                         p.clone(),
-                        kittiwake_ext::Ext::default(),
+                        kittiwake_ext::Ext::default().with_github_token(cfg.github_token.clone()),
                         chain.clone(),
                         cfg.bounty_board_address.clone(),
                     );

@@ -151,6 +151,11 @@ impl AppState {
         self
     }
 
+    pub fn with_github_token(mut self, token: Option<String>) -> Self {
+        self.ext = self.ext.with_github_token(token);
+        self
+    }
+
     pub fn with_telegram(mut self, t: Option<kittiwake_config::TelegramSettings>) -> Self {
         self.telegram = t.map(Arc::new);
         self
