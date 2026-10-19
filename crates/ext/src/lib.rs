@@ -5,6 +5,7 @@
 //! must not, on failure, quietly serve yesterday's price as today's. It reports the failure and the
 //! panel shows a gap, exactly as a nest route would.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use kittiwake_types::ApiError;
@@ -1039,6 +1040,53 @@ pub struct Ipfs {
 /// poison a document.
 const FAILURE_TTL: Duration = Duration::from_secs(3600);
 
+/// A manifest or metadata document. The largest real manifests are a few hundred kilobytes.
+const MAX_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Takes `n` from `budget` if that much is left. Not `fetch_update`, deprecated on current stable,
+/// nor `try_update`, which older toolchains lack.
+fn take_from(budget: &AtomicUsize, n: usize) -> bool {
+    let mut left = budget.load(Ordering::SeqCst);
+    loop {
+        let Some(next) = left.checked_sub(n) else {
+            return false;
+        };
+        match budget.compare_exchange_weak(left, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(now) => left = now,
+        }
+    }
+}
+/// Reads a body chunk by chunk and refuses it as soon as it passes `cap` or exhausts `budget`, so
+/// an oversized artefact is never held whole. `Content-Length` is optional and a gateway may omit it.
+async fn read_capped(
+    mut res: reqwest::Response,
+    cid: &str,
+    cap: usize,
+    budget: Option<&AtomicUsize>,
+) -> Result<Vec<u8>, String> {
+    if let Some(len) = res.content_length()
+        && len > cap as u64
+    {
+        return Err(format!("Artifact {cid} is {len} bytes (>{cap} cap)"));
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = res.chunk().await.map_err(|e| e.to_string())? {
+        if out.len() + chunk.len() > cap {
+            return Err(format!("Artifact {cid} is over the {cap}-byte cap"));
+        }
+        if let Some(budget) = budget
+            && !take_from(budget, chunk.len())
+        {
+            return Err(format!(
+                "Artifact {cid} does not fit in what is left of the request's byte budget"
+            ));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
 impl Default for Ipfs {
     fn default() -> Self {
         Self::new(THEGRAPH_IPFS)
@@ -1078,16 +1126,22 @@ impl Ipfs {
         if !res.status().is_success() {
             return Err(format!("ipfs cat {cid}: HTTP {}", res.status().as_u16()));
         }
-        res.text().await.map_err(|e| e.to_string())
+        let bytes = read_capped(res, cid, MAX_DOCUMENT_BYTES, None).await?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// The same `cat`, for an artefact that is not text.
     ///
     /// A compiled mapping module is binary and can be tens of megabytes, so this takes its own
-    /// longer timeout and refuses anything over the cap rather than holding it in memory to find
-    /// out how big it was. The client's eight seconds is right for a manifest and short for a
-    /// module on a cold gateway block.
-    pub async fn cat_bytes(&self, cid: &str, cap: usize) -> Result<Vec<u8>, String> {
+    /// longer timeout, and draws on `budget`, shared by every fetch for one request, as well as
+    /// its own `cap`. The client's eight seconds is right for a manifest and short for a module on
+    /// a cold gateway block.
+    pub async fn cat_bytes(
+        &self,
+        cid: &str,
+        cap: usize,
+        budget: &AtomicUsize,
+    ) -> Result<Vec<u8>, String> {
         let url = format!("{}/api/v0/cat", self.endpoint);
         let res = self
             .http
@@ -1106,20 +1160,7 @@ impl Ipfs {
         if !res.status().is_success() {
             return Err(format!("ipfs cat {cid}: HTTP {}", res.status().as_u16()));
         }
-        // The declared length first, so an oversized artefact is refused before it is downloaded.
-        if let Some(len) = res.content_length()
-            && len > cap as u64
-        {
-            return Err(format!("Artifact {cid} is {len} bytes (>{cap} cap)"));
-        }
-        let bytes = res.bytes().await.map_err(|e| e.to_string())?;
-        if bytes.len() > cap {
-            return Err(format!(
-                "Artifact {cid} is {} bytes (>{cap} cap)",
-                bytes.len()
-            ));
-        }
-        Ok(bytes.to_vec())
+        read_capped(res, cid, cap, Some(budget)).await
     }
 
     /// Put one JSON document through the IPFS API and return the CID it actually assigned.
@@ -1366,6 +1407,66 @@ mod ipfs_tests {
 
         let err = Ipfs::new(&server.uri()).cat("QmAbc").await.unwrap_err();
         assert!(err.contains("404"), "{err}");
+    }
+
+    /// Answers with a chunked body and no length: `head`, then holds the connection open.
+    async fn chunked_then_stall(head: usize) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n")
+                .await
+                .unwrap();
+            sock.write_all(format!("{head:x}\r\n").as_bytes())
+                .await
+                .unwrap();
+            sock.write_all(&vec![b'a'; head]).await.unwrap();
+            sock.write_all(b"\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn an_oversized_module_without_a_length_is_refused_while_it_streams() {
+        let ipfs = Ipfs::new(&chunked_then_stall(2048).await);
+        let budget = AtomicUsize::new(usize::MAX);
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            ipfs.cat_bytes("QmAbc", 1024, &budget),
+        )
+        .await
+        .expect("refused before the body ended")
+        .unwrap_err();
+        assert!(err.contains("cap"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn modules_share_one_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v0/cat"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 600]))
+            .mount(&server)
+            .await;
+        let ipfs = Ipfs::new(&server.uri());
+        let budget = AtomicUsize::new(1000);
+        assert!(ipfs.cat_bytes("QmA", 1024, &budget).await.is_ok());
+        let err = ipfs.cat_bytes("QmB", 1024, &budget).await.unwrap_err();
+        assert!(err.contains("budget"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_oversized_manifest_is_refused() {
+        let ipfs = Ipfs::new(&chunked_then_stall(MAX_DOCUMENT_BYTES + 1).await);
+        let r = tokio::time::timeout(Duration::from_secs(5), ipfs.cat("QmAbc"))
+            .await
+            .expect("refused before the body ended");
+        assert!(r.unwrap_err().contains("cap"));
     }
 
     /// The bug that leaves every subgraph on the dashboard nameless.

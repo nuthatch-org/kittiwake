@@ -15,7 +15,7 @@ use crate::{decode_audit, scorecard, wasm};
 
 /// Caps so a hostile manifest cannot fan out an unbounded number of fetches.
 const MAX_DATA_SOURCES: usize = 60;
-const MAX_UNIQUE_WASM: usize = 40;
+const MAX_UNIQUE_WASM: usize = 16;
 
 #[derive(Debug)]
 pub struct Plan {
@@ -59,12 +59,18 @@ pub fn plan(yaml: &str) -> Result<Plan, NotAManifest> {
     }
 
     let mut seen = BTreeSet::new();
-    let modules: Vec<String> = parsed.data_sources[..sources]
+    let mut modules: Vec<String> = parsed.data_sources[..sources]
         .iter()
         .filter_map(|d| d.wasm_hash.clone())
         .filter(|hash| seen.insert(hash.clone()))
-        .take(MAX_UNIQUE_WASM)
         .collect();
+    if modules.len() > MAX_UNIQUE_WASM {
+        caveats.push(format!(
+            "Manifest names {} distinct mapping modules; analysis capped at {MAX_UNIQUE_WASM}.",
+            modules.len()
+        ));
+        modules.truncate(MAX_UNIQUE_WASM);
+    }
 
     Ok(Plan {
         manifest: parsed,
