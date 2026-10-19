@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod backup_watch;
 mod jobs;
 
 use anyhow::Context;
@@ -285,6 +286,9 @@ async fn main() -> anyhow::Result<()> {
             kittiwake_db::ensure_subscriptions_table(p)
                 .await
                 .context("creating the subscriptions table")?;
+        }
+        if let Some(path) = &cfg.backup_mark_path {
+            jobs.push(backup_watch::job(path.clone(), cfg.telegram.clone()));
         }
         jobs.extend(jobs::live_jobs(
             store.clone(),

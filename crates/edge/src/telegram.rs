@@ -34,7 +34,7 @@ pub(crate) fn parts(text: &str) -> Vec<String> {
 
 /// Send `text`, in as many messages as it takes. Plain text, so nothing a reporter types is
 /// read as markup.
-pub(crate) async fn send(t: &TelegramSettings, text: &str) -> Result<(), String> {
+pub async fn send(t: &TelegramSettings, text: &str) -> Result<(), String> {
     let client = reqwest::Client::new();
     let url = format!("https://api.telegram.org/bot{}/sendMessage", t.bot_token);
     for part in parts(text) {

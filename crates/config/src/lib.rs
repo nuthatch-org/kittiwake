@@ -313,6 +313,10 @@ pub struct Config {
     /// Absent means the support archive is not refreshed, because the repository is private.
     #[serde(default)]
     pub github_token: Option<String>,
+    /// The file the backup box's verification writes its time into. Absent means nobody watches
+    /// whether the nightly backup of this database still arrives.
+    #[serde(default)]
+    pub backup_mark_path: Option<String>,
     /// Turns the in-process scheduler on. Off by default so a second instance, or a staging box,
     /// cannot start writing to the same Postgres behind your back.
     #[serde(default)]
@@ -653,6 +657,7 @@ mod tests {
             stripe: None,
             telegram: None,
             github_token: None,
+            backup_mark_path: None,
             scheduler_enabled: false,
             warmer_enabled: false,
             paywall_enabled: false,
