@@ -16,6 +16,11 @@ database_max_connections = 16
 # never refreshed. A top-level key, so it must sit above the first [table].
 # github_token = "github_pat_..."
 
+# Where the backup box records each verified dump of this database (lodestar's
+# scripts/lodestar-dump-stdout.sh). Set it on the box that holds the database, and the watch-backup
+# job fails, and tells the Telegram chat, when the last one is over a day old.
+# backup_mark_path = "/var/lib/lodestar-backup/verified"
+
 # Arbitrum One JSON-RPC. Required for the eligibility oracle, the supply reads and the bounty
 # reconciliation; the routes that need it report unavailable without it rather than reaching for a
 # public endpoint that would throttle under the directory's fan-out.

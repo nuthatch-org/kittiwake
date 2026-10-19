@@ -14,7 +14,7 @@ pub mod billing;
 pub mod handlers;
 pub mod openapi;
 pub mod paywall;
-mod telegram;
+pub mod telegram;
 
 use axum::Router;
 use axum::extract::{ConnectInfo, State};
