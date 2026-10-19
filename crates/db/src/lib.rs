@@ -2690,6 +2690,34 @@ pub async fn ensure_subscriptions_table(pool: &Pool) -> Result<(), DbError> {
     )
     .execute(pool)
     .await?;
+    // Every Stripe subscription a wallet has paid through, so a second checkout does not orphan
+    // the first one's renewals. `last_paid_at` is when its latest payment landed.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS stripe_subscriptions ( \
+           subscription TEXT PRIMARY KEY, \
+           address      TEXT NOT NULL, \
+           customer     TEXT, \
+           paid_until   TIMESTAMPTZ NOT NULL, \
+           last_paid_at TIMESTAMPTZ, \
+           created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW() \
+         )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS stripe_subscriptions_customer \
+         ON stripe_subscriptions (customer)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO stripe_subscriptions (subscription, address, paid_until) \
+         SELECT external_ref, address, paid_until FROM subscriptions \
+         WHERE external_ref LIKE 'sub\\_%' \
+         ON CONFLICT (subscription) DO NOTHING",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -2734,15 +2762,101 @@ pub async fn extend_subscription(
     Ok(inserted)
 }
 
-/// The wallet a payment rail's id belongs to, such as a Stripe subscription.
-pub async fn subscription_address_for_ref(
+/// The wallet a Stripe subscription pays for, or failing that the wallet its customer paid for.
+pub async fn stripe_subscription_address(
     pool: &Pool,
-    external_ref: &str,
+    subscription: Option<&str>,
+    customer: Option<&str>,
 ) -> Result<Option<String>, DbError> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT address FROM subscriptions WHERE external_ref = $1")
-            .bind(external_ref)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT address FROM stripe_subscriptions \
+         WHERE subscription = $1 OR customer = $2 \
+         ORDER BY (subscription = $1) IS TRUE DESC, created_at DESC LIMIT 1",
+    )
+    .bind(subscription)
+    .bind(customer)
+    .fetch_optional(pool)
+    .await?;
     Ok(row.map(|(a,)| a))
+}
+
+/// Remember that `subscription` pays for `address`, extending its own `paid_until` the way
+/// [`extend_subscription`] extends the wallet's. `paid_at` is set for a payment, not a retry.
+pub async fn record_stripe_subscription(
+    pool: &Pool,
+    subscription: &str,
+    address: &str,
+    customer: Option<&str>,
+    paid_until: i64,
+    paid_at: Option<i64>,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "INSERT INTO stripe_subscriptions \
+           (subscription, address, customer, paid_until, last_paid_at) \
+         VALUES ($1, $2, $3, to_timestamp($4), to_timestamp($5)) \
+         ON CONFLICT (subscription) DO UPDATE SET \
+           customer = COALESCE(EXCLUDED.customer, stripe_subscriptions.customer), \
+           paid_until = GREATEST(stripe_subscriptions.paid_until, EXCLUDED.paid_until), \
+           last_paid_at = GREATEST(stripe_subscriptions.last_paid_at, EXCLUDED.last_paid_at)",
+    )
+    .bind(subscription)
+    .bind(address.to_lowercase())
+    .bind(customer)
+    .bind(paid_until as f64)
+    .bind(paid_at.map(|t| t as f64))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// End, at `at`, the Stripe subscriptions named by id or by customer, and cut each wallet they
+/// paid for back to whatever its other Stripe subscriptions still cover. With `paid_near`, only a
+/// subscription whose latest payment landed within a day of it: a refund of an older charge
+/// leaves the current period alone. A wallet last extended by another rail is not touched.
+///
+/// Returns each wallet affected and when its access now ends.
+pub async fn end_stripe_access(
+    pool: &Pool,
+    subscription: Option<&str>,
+    customer: Option<&str>,
+    paid_near: Option<i64>,
+    at: i64,
+) -> Result<Vec<(String, i64)>, DbError> {
+    let mut tx = pool.begin().await?;
+    let addresses: Vec<(String,)> = sqlx::query_as(
+        "UPDATE stripe_subscriptions SET paid_until = LEAST(paid_until, to_timestamp($4)) \
+         WHERE (subscription = $1 OR customer = $2) \
+           AND ($3::float8 IS NULL \
+                OR abs(extract(epoch FROM last_paid_at) - $3::float8) <= 86400) \
+         RETURNING address",
+    )
+    .bind(subscription)
+    .bind(customer)
+    .bind(paid_near.map(|t| t as f64))
+    .bind(at as f64)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut ended = Vec::new();
+    for (address,) in addresses {
+        if ended.iter().any(|(a, _)| *a == address) {
+            continue;
+        }
+        let row: Option<(f64,)> = sqlx::query_as(
+            "UPDATE subscriptions SET paid_until = LEAST(paid_until, \
+               (SELECT GREATEST(to_timestamp($2), MAX(paid_until)) \
+                FROM stripe_subscriptions WHERE address = $1)), \
+               updated_at = NOW() \
+             WHERE address = $1 AND source = 'stripe' \
+             RETURNING extract(epoch FROM paid_until)::float8",
+        )
+        .bind(&address)
+        .bind(at as f64)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((until,)) = row {
+            ended.push((address, until as i64));
+        }
+    }
+    tx.commit().await?;
+    Ok(ended)
 }
