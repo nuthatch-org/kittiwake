@@ -4,6 +4,9 @@
 //! The analysis itself is `kittiwake_disasm` and is pure. This is the part that talks to IPFS and
 //! to the nest.
 
+use std::sync::atomic::AtomicUsize;
+
+use futures::StreamExt;
 use kittiwake_db::Pool;
 use kittiwake_disasm::report::{self as build, Fetched};
 use kittiwake_disasm::types::DisassemblyReport;
@@ -21,6 +24,11 @@ pub const ANALYSIS_VERSION: u32 = 1;
 
 /// Matches the incumbent's cap. A module larger than this is not a mapping.
 const MAX_WASM_BYTES: usize = 32 * 1024 * 1024;
+
+/// All of one report's modules together, since they are held in memory at once.
+const MAX_TOTAL_WASM_BYTES: usize = 64 * 1024 * 1024;
+
+const FETCH_CONCURRENCY: usize = 4;
 
 fn cache_key(deployment_id: &str) -> String {
     format!("disasm:v{ANALYSIS_VERSION}:{deployment_id}")
@@ -50,14 +58,16 @@ pub async fn report(
 
     // Concurrently, because a subgraph with a dozen mappings would otherwise pay a dozen round
     // trips in series and the caller would give up first.
-    let fetches = plan
-        .modules
-        .iter()
-        .map(|hash| async move { (hash.clone(), ipfs.cat_bytes(hash, MAX_WASM_BYTES).await) });
-    let fetched: Fetched = futures::future::join_all(fetches)
-        .await
-        .into_iter()
-        .collect();
+    let budget = AtomicUsize::new(MAX_TOTAL_WASM_BYTES);
+    let budget = &budget;
+    let fetched: Fetched = futures::stream::iter(plan.modules.clone())
+        .map(|hash| async move {
+            let bytes = ipfs.cat_bytes(&hash, MAX_WASM_BYTES, budget).await;
+            (hash, bytes)
+        })
+        .buffer_unordered(FETCH_CONCURRENCY)
+        .collect()
+        .await;
 
     // Whether every module the manifest names actually arrived. A report assembled during a
     // gateway outage is a real answer to serve and a terrible one to keep for ever.

@@ -226,3 +226,40 @@ fn a_changed_module_shows_up_in_the_recovered_strings() {
     // The handler surface did not move, so this is not a change in what it can do.
     assert_eq!(d.summary.handlers_changed, 0);
 }
+
+#[test]
+fn a_manifest_naming_too_many_modules_is_capped_and_says_so() {
+    let b58 = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'J', 'K'];
+    let sources: String = (0..20)
+        .map(|i| {
+            format!(
+                r#"  - kind: ethereum/contract
+    name: Source{i}
+    network: mainnet
+    source:
+      address: "0xdEaDbeef"
+    mapping:
+      apiVersion: 0.0.7
+      file: /ipfs/QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPb{}{}
+      eventHandlers:
+        - event: Transfer(address,address,uint256)
+          handler: handleTransfer
+"#,
+                b58[i / 10],
+                b58[i % 10]
+            )
+        })
+        .collect();
+    let yaml =
+        format!("specVersion: 0.0.5\nschema:\n  file: /ipfs/{WASM_B}\ndataSources:\n{sources}");
+    let plan = report::plan(&yaml).unwrap();
+    assert_eq!(plan.modules.len(), 16);
+    let r = report::assemble("QmDeployment", plan, &HashMap::new());
+    assert!(
+        r.caveats
+            .iter()
+            .any(|c| c.contains("20 distinct mapping modules")),
+        "{:?}",
+        r.caveats
+    );
+}
