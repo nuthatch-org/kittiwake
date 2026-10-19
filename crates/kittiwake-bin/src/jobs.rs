@@ -245,6 +245,34 @@ pub fn ingest_jobs(
         jobs.push(job);
     }
 
+    // Hourly, for the rewards-history chart, which keeps each day's last. The first run after a gap
+    // fills it a nest statement per day, so it gets the longer timeout. #236
+    {
+        let pool = pool.clone();
+        let mut job = JobDef::every(
+            "snapshot-indexers",
+            mins(60),
+            Arc::new(move |ctx| {
+                let pool = pool.clone();
+                Box::pin(async move {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    kittiwake_ingest::snapshots::snapshot_indexers(&pool, &ctx.gate, ctx.lane, now)
+                        .await
+                        .map(|i| JobOutcome {
+                            rows_written: i.rows,
+                        })
+                        .map_err(|e| e.to_string())
+                })
+            }),
+        )
+        .staggered(mins(56));
+        job.timeout = mins(25);
+        jobs.push(job);
+    }
+
     // Hourly: the oracle's documents resolve half an hour behind the chain, and a thirty-day score
     // moves by a day's weight at most.
     {
@@ -505,6 +533,7 @@ mod tests {
             ("ingest-rav", 60, 28),
             ("ingest-disputes", 60, 48),
             ("score-qos", 60, 38),
+            ("snapshot-indexers", 60, 56),
             ("ingest-qos-days", 30, 21),
             ("refresh", 5, 0),
             ("snapshot-network", 5, 2),
@@ -545,6 +574,7 @@ mod tests {
             ("ingest-rav", mins(60), mins(28)),
             ("ingest-disputes", mins(360), mins(48)),
             ("score-qos", mins(60), mins(38)),
+            ("snapshot-indexers", mins(60), mins(56)),
             ("ingest-qos-days", mins(30), mins(21)),
             ("refresh", mins(5), Duration::ZERO),
             ("snapshot-network", mins(5), mins(2)),
