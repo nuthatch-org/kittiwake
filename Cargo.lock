@@ -3290,6 +3290,7 @@ dependencies = [
  "kittiwake-support",
  "kittiwake-types",
  "metrics",
+ "metrics-exporter-prometheus",
  "reqwest",
  "serde",
  "serde_json",

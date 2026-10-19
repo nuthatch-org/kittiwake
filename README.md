@@ -123,7 +123,7 @@ cargo clippy --all-targets -- -D warnings
 |---|---|
 | `GET /health` | is this process answering |
 | `GET /ready` | what every nest says about itself; the frozen archive is reported without judgement |
-| `GET /metrics` | Prometheus |
+| `GET /metrics` | Prometheus, on `metrics_bind` (127.0.0.1:9184) rather than the public listener |
 | `GET /api/network-stats`, `/api/indexers`, `/api/epochs` | nest-backed reads |
 | `GET /api/sql/catalog`, `POST /api/sql/query` | the public SQL surface over five allowlisted datasets |
 | `GET /openapi.json` | the published API, generated from the router |

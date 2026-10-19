@@ -209,7 +209,6 @@ async fn main() -> anyhow::Result<()> {
         .transpose()?;
     let state = kittiwake_edge::state(
         limits,
-        metrics,
         pool.clone(),
         read.clone(),
         cfg.edge_secret.clone(),
@@ -383,6 +382,22 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("binding {addr}"))?;
     tracing::info!(%addr, "listening");
+
+    if let Some(handle) = metrics {
+        let addr: SocketAddr = cfg
+            .metrics_bind
+            .parse()
+            .with_context(|| format!("metrics bind address {}", cfg.metrics_bind))?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("binding {addr}"))?;
+        tracing::info!(%addr, "serving metrics");
+        handles.push(tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, kittiwake_edge::metrics_router(handle)).await {
+                tracing::error!(error = %e, "metrics listener stopped");
+            }
+        }));
+    }
 
     axum::serve(
         listener,

@@ -2,6 +2,8 @@
 # with __ for nesting: KITTIWAKE_NEST__ORIGIN, KITTIWAKE_DATABASE_URL, and so on.
 
 bind = "127.0.0.1:8080"
+# Prometheus /metrics, on its own listener and never behind Caddy.
+metrics_bind = "127.0.0.1:9184"
 
 # Off by default. Two instances both scheduling against one Postgres is a data problem, so turning
 # these on is a deliberate act on exactly one box.
