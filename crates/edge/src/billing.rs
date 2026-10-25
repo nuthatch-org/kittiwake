@@ -114,7 +114,12 @@ pub(crate) fn action_for(event: &Value) -> Option<Action> {
     let s = |v: &Value| v.as_str().map(String::from);
     match event["type"].as_str()? {
         "checkout.session.completed" => {
-            if obj["mode"] != "subscription" || obj["payment_status"] != "paid" {
+            // A 100%-off promotion code completes as `no_payment_required`, not `paid`.
+            let settled = matches!(
+                obj["payment_status"].as_str(),
+                Some("paid" | "no_payment_required")
+            );
+            if obj["mode"] != "subscription" || !settled {
                 return None;
             }
             let Some(address) = obj["client_reference_id"]
@@ -473,6 +478,10 @@ mod tests {
             assert!(text.contains("cs_1") && text.contains("sub_9") && text.contains("a@b.c"));
         }
         assert_eq!(received(base(json!(WALLET), "unpaid")), None);
+        let Some(Action::Credit(c)) = received(base(json!(WALLET), "no_payment_required")) else {
+            panic!("a free checkout credited nobody")
+        };
+        assert_eq!(c.address.as_deref(), Some(WALLET));
     }
 
     #[test]
