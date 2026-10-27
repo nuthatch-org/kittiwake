@@ -1,4 +1,4 @@
-//! Messages to the chat the Telegram bot writes to: new subscribers and support reports.
+//! Messages to the chat the Telegram bot writes to: support reports and alerts.
 
 use kittiwake_config::TelegramSettings;
 

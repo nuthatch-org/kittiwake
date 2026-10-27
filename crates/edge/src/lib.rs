@@ -10,10 +10,8 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub mod billing;
 pub mod handlers;
 pub mod openapi;
-pub mod paywall;
 pub mod telegram;
 
 use axum::Router;
@@ -127,10 +125,6 @@ pub struct AppState {
     pub cors_patterns: Option<Arc<Vec<String>>>,
     pub limits: Arc<Limits>,
     pub started: std::time::Instant,
-    /// Present when the paywall is on. Absent means every route is free, as it always was.
-    pub paywall: Option<paywall::Paywall>,
-    /// Stripe's webhook signing secret. Absent means card payments are refused, not guessed at.
-    pub stripe_webhook_secret: Option<Arc<str>>,
     pub telegram: Option<Arc<kittiwake_config::TelegramSettings>>,
 }
 
@@ -165,16 +159,6 @@ impl AppState {
 
     pub fn with_telegram(mut self, t: Option<kittiwake_config::TelegramSettings>) -> Self {
         self.telegram = t.map(Arc::new);
-        self
-    }
-
-    pub fn with_stripe(mut self, webhook_secret: Option<String>) -> Self {
-        self.stripe_webhook_secret = webhook_secret.map(|s| Arc::from(s.as_str()));
-        self
-    }
-
-    pub fn with_paywall(mut self, enabled: bool, service_tokens: Vec<String>) -> Self {
-        self.paywall = enabled.then(|| paywall::Paywall::with_service_tokens(service_tokens));
         self
     }
 }
@@ -1074,7 +1058,6 @@ fn cors_layer(origins: &[String], patterns: &[String]) -> Option<tower_http::cor
             .expose_headers([
                 axum::http::HeaderName::from_static("x-kittiwake-source"),
                 axum::http::HeaderName::from_static("x-kittiwake-age"),
-                axum::http::HeaderName::from_static(paywall::REFUSAL_HEADER),
             ])
             .max_age(std::time::Duration::from_secs(600)),
     )
@@ -1082,10 +1065,7 @@ fn cors_layer(origins: &[String], patterns: &[String]) -> Option<tower_http::cor
 
 pub fn router(state: AppState) -> Router {
     use axum::routing::post;
-    // Everything below answers only a signed-in wallet with a current subscription, once
-    // `paywall_enabled` is set. Anything not listed here is free, so a new route is free until
-    // somebody decides otherwise.
-    let paid = Router::new()
+    let directory = Router::new()
         // The directory
         .route("/api/indexers", get(handlers::indexers))
         .route("/api/indexer/{address}", get(handlers::indexer))
@@ -1209,11 +1189,7 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/subgraph-deployment/{hash}/graft-children",
             get(handlers::graft_children),
-        )
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            paywall::require_subscription,
-        ));
+        );
 
     let routes = Router::new()
         .route("/whoami", get(get_whoami))
@@ -1290,9 +1266,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/subgraph-fees-30d", get(handlers::subgraph_fees_30d))
         .route("/api/delegation-flows", get(handlers::delegation_flows))
         .route("/api/developer-activity", get(handlers::developer_activity))
-        .route("/api/account", get(handlers::account))
-        .route("/api/billing/stripe", post(billing::stripe_webhook))
-        .merge(paid)
+        .merge(directory)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(tower_http::catch_panic::CatchPanicLayer::new());
 
@@ -1352,8 +1326,6 @@ pub fn state(
         pool,
         limits: Arc::new(limits),
         started: std::time::Instant::now(),
-        paywall: None,
-        stripe_webhook_secret: None,
         telegram: None,
     }
 }

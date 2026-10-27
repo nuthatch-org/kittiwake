@@ -235,8 +235,6 @@ async fn main() -> anyhow::Result<()> {
         cfg.cors.as_ref().map(|c| c.allowed_origins.clone()),
         cfg.cors.as_ref().map(|c| c.allowed_origin_patterns.clone()),
     )
-    .with_paywall(cfg.paywall_enabled, cfg.paywall_service_tokens.clone())
-    .with_stripe(cfg.stripe.as_ref().map(|s| s.webhook_secret.clone()))
     .with_telegram(cfg.telegram.clone())
     .with_qos_oracle(cfg.qos_oracle.clone())
     .with_github_token(cfg.github_token.clone());
@@ -284,9 +282,6 @@ async fn main() -> anyhow::Result<()> {
             kittiwake_db::ensure_graph_support_table(p)
                 .await
                 .context("creating the graph-support mirror table")?;
-            kittiwake_db::ensure_subscriptions_table(p)
-                .await
-                .context("creating the subscriptions table")?;
         }
         if let Some(path) = &cfg.backup_mark_path {
             jobs.push(backup_watch::job(path.clone(), cfg.telegram.clone()));

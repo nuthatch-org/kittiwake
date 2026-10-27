@@ -194,15 +194,11 @@ impl std::fmt::Debug for ReceiptSettings {
     }
 }
 
-/// The Telegram bot and the chat it writes to: new subscribers, and reports sent from the support
-/// page.
+/// The Telegram bot and the chat it writes to: reports sent from the support page, and alerts.
 #[derive(Clone, Deserialize)]
 pub struct TelegramSettings {
     pub bot_token: String,
     pub chat_id: String,
-    /// Wallets whose subscriptions are not news, such as the owner's own test purchase.
-    #[serde(default)]
-    pub ignore_addresses: Vec<String>,
 }
 
 impl std::fmt::Debug for TelegramSettings {
@@ -210,20 +206,6 @@ impl std::fmt::Debug for TelegramSettings {
         f.debug_struct("TelegramSettings")
             .field("bot_token", &"<redacted>")
             .field("chat_id", &self.chat_id)
-            .finish()
-    }
-}
-
-/// Stripe's webhook signing secret (`whsec_...`), from the endpoint's page in the dashboard.
-#[derive(Clone, Deserialize)]
-pub struct StripeSettings {
-    pub webhook_secret: String,
-}
-
-impl std::fmt::Debug for StripeSettings {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StripeSettings")
-            .field("webhook_secret", &"<redacted>")
             .finish()
     }
 }
@@ -326,10 +308,7 @@ pub struct Config {
     #[serde(default)]
     pub receipt: Option<ReceiptSettings>,
     pub tap: Option<TapSettings>,
-    /// Absent means `/api/billing/stripe` refuses every event, so card payments extend nothing.
-    pub stripe: Option<StripeSettings>,
-    /// Absent means new subscribers are recorded and nobody is told, and the support page cannot
-    /// send a report.
+    /// Absent means the support page cannot send a report.
     pub telegram: Option<TelegramSettings>,
     /// A fine-grained token with read access to nuthatch-org/graph-support's issues and contents.
     /// Absent means the support archive is not refreshed, because the repository is private.
@@ -346,14 +325,6 @@ pub struct Config {
     /// Turns the warmer on. Off by default for the same reason.
     #[serde(default)]
     pub warmer_enabled: bool,
-    /// Puts the paid routes behind a signed-in wallet with a current subscription. Off by default,
-    /// so a deploy cannot lock every visitor out before there is a way to pay.
-    #[serde(default)]
-    pub paywall_enabled: bool,
-    /// Bearer tokens our own services send to read paid routes, such as Foghorn's hourly roster
-    /// read. A token rather than an address: a container's bridge address changes on restart.
-    #[serde(default)]
-    pub paywall_service_tokens: Vec<String>,
 }
 
 fn default_bind() -> String {
@@ -379,13 +350,6 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.paywall_enabled && (self.studio.is_none() || self.database_url.is_none()) {
-            return Err(ConfigError::Invalid(
-                "paywall_enabled needs [studio] for sign-in and database_url for subscriptions; \
-                 without either every paid route would refuse everyone"
-                    .into(),
-            ));
-        }
         if self.nest.origin.trim().is_empty() {
             return Err(ConfigError::Invalid(
                 "nest.origin is required: every protocol route reads a nest and there is no fallback".into(),
@@ -681,24 +645,12 @@ mod tests {
             database_max_connections: 16,
             cache: None,
             limits: None,
-            stripe: None,
             telegram: None,
             github_token: None,
             backup_mark_path: None,
             scheduler_enabled: false,
             warmer_enabled: false,
-            paywall_enabled: false,
-            paywall_service_tokens: Vec::new(),
         }
-    }
-
-    #[test]
-    fn a_paywall_with_no_way_to_sign_in_is_a_startup_failure() {
-        let mut c = settings("https://nest.example");
-        c.paywall_enabled = true;
-        assert!(c.validate().is_err());
-        c.database_url = Some("postgresql://x".into());
-        assert!(c.validate().is_err(), "still no [studio]");
     }
 
     #[test]
