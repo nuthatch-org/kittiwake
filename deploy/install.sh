@@ -27,6 +27,7 @@ install -d -m 0750 -o kittiwake -g kittiwake /var/lib/kittiwake
 # Replace the binary by rename, never by writing over it: a running process holds the inode and a
 # straight copy fails with "Text file busy". The rename is atomic and leaves the old inode open
 # for the process still using it.
+[ -x "$OPT/bin/kittiwake" ] && cp -p "$OPT/bin/kittiwake" "$OPT/bin/kittiwake.prev"
 install -m 0755 "$BIN" "$OPT/bin/kittiwake.new"
 mv -f "$OPT/bin/kittiwake.new" "$OPT/bin/kittiwake"
 
@@ -73,14 +74,14 @@ user = "$NEST_USER"
 password = "$NEST_PASS"
 
 [nest.permits]
-# Two, because that is what the nest admits: `NUTHATCH_SQL_MAX_CONCURRENCY=2` on the allocations
+# Two, because that is what the nest admits: 'NUTHATCH_SQL_MAX_CONCURRENCY=2' on the allocations
 # nest since its Burrmill switch on 2026-10-01 (it was 4 before). The rule above is not advice - a
 # pool wider than the nest means the surplus is sent anyway
-# and shed, and `nest_busy` climbs while every page shows a console error for work the backend was
+# and shed, and 'nest_busy' climbs while every page shows a console error for work the backend was
 # never able to take.
 #
 # It was briefly eight, as a mitigation for a fold that starved itself by needing more permits than
-# existed. That is fixed properly in `many()`, which admits at most `lane_width - 1` at a time, so
+# existed. That is fixed properly in 'many()', which admits at most 'lane_width - 1' at a time, so
 # a six-part fold fits inside any pool of two or more and the mitigation is no longer needed. Raising this
 # again only moves the shedding from kittiwake's gate to the nest's.
 alloc = 2
@@ -116,6 +117,14 @@ systemctl enable kittiwake
 # the old binary serving after a perfectly successful-looking install. Learned the obvious way.
 systemctl restart kittiwake
 sleep 3
+if ! curl -fsS --max-time 5 http://127.0.0.1:8080/health >/dev/null && [ -x "$OPT/bin/kittiwake.prev" ]; then
+  echo "new binary is not healthy; restoring the previous one" >&2
+  mv -f "$OPT/bin/kittiwake.prev" "$OPT/bin/kittiwake"
+  systemctl restart kittiwake
+  sleep 3
+  curl -fsS --max-time 5 http://127.0.0.1:8080/health >/dev/null && echo "previous binary restored and healthy" >&2
+  exit 1
+fi
 systemctl --no-pager --lines=0 status kittiwake | head -5
 echo
 echo "running: $(readlink -f /proc/$(systemctl show kittiwake -p MainPID --value)/exe 2>/dev/null || echo unknown)"

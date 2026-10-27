@@ -7,10 +7,12 @@
 # compatible and not backward.
 set -euo pipefail
 IMAGE=${IMAGE:-rust:1-bookworm}
-docker run --rm -v "$PWD":/src -w /src -e CARGO_TERM_COLOR=never "$IMAGE" \
+# The primary is x86_64; on an Apple Silicon Mac Docker would otherwise build arm64.
+PLATFORM=${PLATFORM:-linux/amd64}
+docker run --rm --platform "$PLATFORM" -v "$PWD":/src -w /src -e CARGO_TERM_COLOR=never "$IMAGE" \
   bash -c "cargo build --release --bin kittiwake"
 ls -la target/release/kittiwake
 echo
 echo "glibc it needs (must be <= the target's):"
-docker run --rm -v "$PWD":/src -w /src "$IMAGE" \
+docker run --rm --platform "$PLATFORM" -v "$PWD":/src -w /src "$IMAGE" \
   bash -c "objdump -T target/release/kittiwake | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -3"
