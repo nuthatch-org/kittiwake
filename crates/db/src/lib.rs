@@ -409,6 +409,27 @@ impl From<QosAllocationDayRow> for QosAllocationDay {
     }
 }
 
+/// One stored QoS day summed over every indexer, or `None` when the day has not been computed.
+#[derive(Debug, Clone, Copy, sqlx::FromRow)]
+pub struct QosNetworkDay {
+    pub indexers: i64,
+    pub query_count: f64,
+    pub total_query_fees: f64,
+    pub settled: bool,
+}
+
+pub async fn qos_network_day(pool: &Pool, day: i64) -> Result<Option<QosNetworkDay>, DbError> {
+    Ok(sqlx::query_as::<_, QosNetworkDay>(
+        "SELECT (SELECT count(*) FROM qos_indexer_day i WHERE i.day = d.day) AS indexers, \
+         (SELECT coalesce(sum(query_count), 0) FROM qos_indexer_day i WHERE i.day = d.day) AS query_count, \
+         (SELECT coalesce(sum(total_query_fees), 0) FROM qos_indexer_day i WHERE i.day = d.day) AS total_query_fees, \
+         d.settled FROM qos_day d WHERE d.day = $1",
+    )
+    .bind(qos_date(day))
+    .fetch_optional(pool)
+    .await?)
+}
+
 /// The stored state of every QoS day from `from` to `to` inclusive (unix day numbers).
 pub async fn qos_day_states(pool: &Pool, from: i64, to: i64) -> Result<Vec<QosDayState>, DbError> {
     let rows = sqlx::query_as::<_, QosDayStateRow>(

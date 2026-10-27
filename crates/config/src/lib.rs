@@ -231,6 +231,22 @@ impl std::fmt::Debug for StripeSettings {
 /// The key that pays for a serving probe. Absent means probes go out unpaid, which is a weaker
 /// question rather than a broken one: an indexer that wants a receipt answers "pay me", and the
 /// probe reports that it could not tell whether the deployment serves.
+/// A GraphQL endpoint serving Edge & Node's QoS oracle subgraph, and the key it wants as a bearer.
+#[derive(Clone, Deserialize)]
+pub struct QosOracleSettings {
+    pub url: String,
+    pub api_key: String,
+}
+
+impl std::fmt::Debug for QosOracleSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QosOracleSettings")
+            .field("url", &self.url)
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Clone, Deserialize)]
 pub struct TapSettings {
     /// A 32-byte secp256k1 private key, hex, with or without `0x`. It must be the address that
@@ -302,6 +318,9 @@ pub struct Config {
     /// Foghorn's API, which `/api/foghorn/{*path}` proxies. Absent means that route answers 503
     /// rather than guessing at a host.
     pub foghorn_api_url: Option<String>,
+    /// Edge & Node's QoS oracle subgraph, for `/api/qos/oracle`. Absent means that route answers 503.
+    #[serde(default)]
+    pub qos_oracle: Option<QosOracleSettings>,
     #[serde(default)]
     pub indexer_agent: Option<IndexerAgentSettings>,
     #[serde(default)]
@@ -651,6 +670,7 @@ mod tests {
             edge_secret: None,
             studio: None,
             foghorn_api_url: None,
+            qos_oracle: None,
             indexer_agent: None,
             receipt: None,
             tap: None,

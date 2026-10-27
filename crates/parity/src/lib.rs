@@ -434,6 +434,11 @@ pub mod coverage {
              deployed build",
         ),
         (
+            "/api/qos/oracle",
+            Excused::Entirely,
+            "new on 2026-10-27 with no incumbent; it carries its own check against qos-reo-nest",
+        ),
+        (
             "/api/disassembly/diff",
             Excused::Entirely,
             "a diff of two reports, so it inherits every difference above twice over",
