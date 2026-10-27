@@ -15,6 +15,7 @@ pub mod manifest;
 pub mod naming;
 pub mod preflight;
 pub mod qos;
+pub mod qos_oracle;
 pub mod recommend;
 pub mod sql;
 pub mod status_probe;

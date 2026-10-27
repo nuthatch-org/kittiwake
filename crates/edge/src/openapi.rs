@@ -329,6 +329,10 @@ const SUMMARIES: &[Operation] = &[
         "How allocated stake sits across quality bands. Unscored means not measured, which is most of it.",
     ),
     op(
+        "/api/qos/oracle",
+        "Edge & Node's QoS oracle for the last whole day, as they published it, checked against our own decoding of the same postings.",
+    ),
+    op(
         "/api/delegate/recommend",
         "Which indexer to delegate to, ranked against four preference sliders, with the reasoning.",
     ),
