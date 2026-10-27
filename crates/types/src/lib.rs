@@ -186,8 +186,6 @@ pub enum ApiError {
     NotFound,
     #[error("unauthorized")]
     Unauthorized,
-    #[error("a subscription is required")]
-    PaymentRequired,
     #[error("dependency unavailable: {0}")]
     Unavailable(String),
     #[error("internal error")]
@@ -206,7 +204,6 @@ impl ApiError {
             ApiError::BadRequest(_) => 400,
             ApiError::NotFound => 404,
             ApiError::Unauthorized => 401,
-            ApiError::PaymentRequired => 402,
             ApiError::Unavailable(_) => 503,
             ApiError::Internal(_) => 500,
         }
@@ -224,7 +221,6 @@ impl ApiError {
             ApiError::BadRequest(_) => "bad_request",
             ApiError::NotFound => "not_found",
             ApiError::Unauthorized => "unauthorized",
-            ApiError::PaymentRequired => "payment_required",
             ApiError::Unavailable(_) => "unavailable",
             ApiError::Internal(_) => "internal",
         }

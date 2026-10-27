@@ -55,10 +55,6 @@ fn db_err(e: kittiwake_db::DbError) -> ErrorResponse {
     kittiwake_db::unavailable(e).into()
 }
 
-pub(crate) fn unix_now() -> i64 {
-    now()
-}
-
 /// Seconds since the epoch, for the "since" windows.
 fn now() -> i64 {
     SystemTime::now()
@@ -1266,33 +1262,6 @@ pub async fn studio_auth_get(State(st): State<AppState>, headers: HeaderMap) -> 
     let mut r = axum::Json(body).into_response();
     crate::no_store(r.headers_mut());
     r
-}
-
-/// The signed-in wallet's subscription, for the frontend to read once. Free, and answers a visitor
-/// who has not signed in rather than refusing them, like `studio_auth_get`.
-pub async fn account(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Response, ErrorResponse> {
-    let address = st
-        .studio
-        .as_ref()
-        .and_then(|s| session_address(&s.secret, &headers, now()));
-    let paid_until = match (&address, &st.pool) {
-        (Some(a), Some(p)) => kittiwake_db::subscription_paid_until(p, a)
-            .await
-            .map_err(db_err)?,
-        _ => None,
-    };
-    let mut r = axum::Json(serde_json::json!({
-        "address": address,
-        "paidUntil": paid_until,
-        "active": paid_until.is_some_and(|t| t > now()),
-        "paywall": st.paywall.is_some(),
-    }))
-    .into_response();
-    crate::no_store(r.headers_mut());
-    Ok(r)
 }
 
 pub async fn studio_auth_post(

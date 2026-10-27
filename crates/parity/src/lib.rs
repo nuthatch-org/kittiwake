@@ -272,16 +272,6 @@ pub mod coverage {
             "reports on the deployment answering it, so the two can only ever disagree: the incumbent describes a Vercel function and its Redis, this describes a box and its scheduler. The parity run itself would be comparing two different machines' weather",
         ),
         (
-            "/api/billing/stripe",
-            Excused::Entirely,
-            "new with the paywall; takes Stripe-signed events, covered by the billing tests",
-        ),
-        (
-            "/api/account",
-            Excused::Entirely,
-            "new with the paywall and absent from the frozen incumbent; answers per session, covered by the paywall tests",
-        ),
-        (
             "/api/studio/auth",
             Excused::Entirely,
             "session cookies and wallet signatures make the frozen public incumbent unsuitable as a fixture; covered by Dock compatibility tests",
