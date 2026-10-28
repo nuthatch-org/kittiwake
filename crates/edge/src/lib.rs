@@ -104,7 +104,7 @@ pub struct AppState {
     /// Foghorn's API base, for the QoS proxy. Absent means that route answers 503.
     pub foghorn_api_url: Option<Arc<str>>,
     /// Edge & Node's QoS oracle subgraph. Absent means `/api/qos/oracle` answers 503.
-    pub qos_oracle: Option<Arc<kittiwake_config::QosOracleSettings>>,
+    pub network_subgraph: Option<Arc<kittiwake_config::SubgraphSettings>>,
     pub substreams_mainnet: Option<kittiwake_ext::substreams::Substreams>,
     pub indexer_agent: Option<kittiwake_config::IndexerAgentSettings>,
     /// The key SQL receipts are signed with. Absent means this deployment issues none.
@@ -148,8 +148,8 @@ impl AppState {
         self
     }
 
-    pub fn with_qos_oracle(mut self, oracle: Option<kittiwake_config::QosOracleSettings>) -> Self {
-        self.qos_oracle = oracle.map(Arc::new);
+    pub fn with_network_subgraph(mut self, s: Option<kittiwake_config::SubgraphSettings>) -> Self {
+        self.network_subgraph = s.map(Arc::new);
         self
     }
 
@@ -1182,7 +1182,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/disassembly/diff", get(handlers::disassembly_diff))
         .route("/api/delegate/recommend", get(handlers::delegate_recommend))
         .route("/api/qos/capture", get(handlers::qos_capture))
-        .route("/api/qos/oracle", get(handlers::qos_oracle))
+        .route(
+            "/api/network-stats/subgraph-check",
+            get(handlers::network_subgraph_check),
+        )
         .route(
             "/api/grt-flow/substreams",
             get(handlers::grt_flow_substreams),
@@ -1332,7 +1335,7 @@ pub fn state(
         ipfs,
         studio,
         foghorn_api_url: foghorn_api_url.map(|u| Arc::from(u.as_str())),
-        qos_oracle: None,
+        network_subgraph: None,
         substreams_mainnet: None,
         indexer_agent,
         receipt_key,

@@ -320,8 +320,8 @@ const SUMMARIES: &[Operation] = &[
         "How allocated stake sits across quality bands. Unscored means not measured, which is most of it.",
     ),
     op(
-        "/api/qos/oracle",
-        "Edge & Node's QoS oracle for the last whole day, as they published it, checked against our own decoding of the same postings.",
+        "/api/network-stats/subgraph-check",
+        "The protocol totals on /api/network-stats beside the Graph Network subgraph's own, field by field.",
     ),
     op(
         "/api/grt-flow/substreams",

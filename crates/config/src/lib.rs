@@ -210,16 +210,16 @@ impl std::fmt::Debug for TelegramSettings {
     }
 }
 
-/// A GraphQL endpoint serving Edge & Node's QoS oracle subgraph, and the key it wants as a bearer.
+/// A subgraph's GraphQL endpoint and the key it wants as a bearer.
 #[derive(Clone, Deserialize)]
-pub struct QosOracleSettings {
+pub struct SubgraphSettings {
     pub url: String,
     pub api_key: String,
 }
 
-impl std::fmt::Debug for QosOracleSettings {
+impl std::fmt::Debug for SubgraphSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("QosOracleSettings")
+        f.debug_struct("SubgraphSettings")
             .field("url", &self.url)
             .field("api_key", &"<redacted>")
             .finish()
@@ -316,9 +316,10 @@ pub struct Config {
     /// Foghorn's API, which `/api/foghorn/{*path}` proxies. Absent means that route answers 503
     /// rather than guessing at a host.
     pub foghorn_api_url: Option<String>,
-    /// Edge & Node's QoS oracle subgraph, for `/api/qos/oracle`. Absent means that route answers 503.
+    /// The Graph Network subgraph on Arbitrum, for `/api/network-stats/subgraph-check`. Absent
+    /// means that route answers 503.
     #[serde(default)]
-    pub qos_oracle: Option<QosOracleSettings>,
+    pub network_subgraph: Option<SubgraphSettings>,
     /// GraphOps Substreams on Ethereum, for `/api/grt-flow/substreams`. Absent means that route
     /// answers 503.
     #[serde(default)]
@@ -654,7 +655,7 @@ mod tests {
             edge_secret: None,
             studio: None,
             foghorn_api_url: None,
-            qos_oracle: None,
+            network_subgraph: None,
             substreams_mainnet: None,
             indexer_agent: None,
             receipt: None,

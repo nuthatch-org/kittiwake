@@ -236,7 +236,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.cors.as_ref().map(|c| c.allowed_origin_patterns.clone()),
     )
     .with_telegram(cfg.telegram.clone())
-    .with_qos_oracle(cfg.qos_oracle.clone())
+    .with_network_subgraph(cfg.network_subgraph.clone())
     .with_substreams_mainnet(cfg.substreams_mainnet.as_ref())
     .with_github_token(cfg.github_token.clone());
     let limits_handle = state.limits.clone();
