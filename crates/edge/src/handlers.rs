@@ -3482,8 +3482,112 @@ async fn subgraph_graphql(
         .ok_or_else(|| unavailable("no data in the answer".into()))
 }
 
-/// `/api/network-stats/subgraph-check`: `/api/network-stats` beside the Graph Network subgraph's
-/// own `graphNetwork`, field by field.
+/// The subgraph's answer to `query(block)`, read at `block` where it has reached it and at its head
+/// otherwise. The flag says which.
+async fn subgraph_pinned(
+    client: &reqwest::Client,
+    subgraph: &kittiwake_config::SubgraphSettings,
+    block: Option<i64>,
+    query: impl Fn(Option<i64>) -> String,
+) -> Result<(serde_json::Value, bool), ApiError> {
+    use kittiwake_read::network_subgraph as ns;
+    if block.is_some() {
+        match subgraph_graphql(client, subgraph, &query(block)).await {
+            Ok(d) => return Ok((d, true)),
+            Err(ApiError::Unavailable(r)) if ns::not_yet_indexed(&r) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok((
+        subgraph_graphql(client, subgraph, &query(None)).await?,
+        false,
+    ))
+}
+
+/// One kind of entity from the allocations nest and from the subgraph at the nest's block.
+async fn entity_check(
+    ctx: &kittiwake_read::ReadCtx,
+    client: &reqwest::Client,
+    subgraph: &kittiwake_config::SubgraphSettings,
+    e: &kittiwake_read::network_subgraph::Entity,
+) -> Result<
+    (
+        kittiwake_read::network_subgraph::EntityCheck,
+        Vec<serde_json::Value>,
+    ),
+    ApiError,
+> {
+    use kittiwake_read::network_subgraph as ns;
+    const PAGE: usize = 1000;
+    /// About 9,000 deployments carry signal; this is well clear of it.
+    const MAX_PAGES: usize = 40;
+
+    let ours = ctx
+        .gate
+        .query(
+            &kittiwake_nest::QuerySpec::read(kittiwake_types::NestId::Alloc, ns::nest_sql(e))
+                .with_timeout(std::time::Duration::from_secs(90)),
+        )
+        .await?;
+    if ours.provenance.truncated {
+        return Err(ApiError::Unavailable(format!(
+            "the nest truncated the {}; there are more than its row cap",
+            e.name
+        )));
+    }
+    let block = ours.provenance.as_of;
+
+    let mut pinned = block.is_some();
+    let mut theirs: Vec<serde_json::Value> = Vec::new();
+    let mut after = String::new();
+    for _ in 0..MAX_PAGES {
+        let at = if pinned { block } else { None };
+        let data =
+            match subgraph_graphql(client, subgraph, &ns::page_query(e, at, &after, PAGE)).await {
+                Ok(d) => d,
+                // Only the first page may fall back: a mix of pinned and unpinned pages would be neither.
+                Err(ApiError::Unavailable(r))
+                    if pinned && theirs.is_empty() && ns::not_yet_indexed(&r) =>
+                {
+                    pinned = false;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+        let page = data
+            .get("rows")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let n = page.len();
+        if let Some(id) = page
+            .last()
+            .and_then(|r| r.get("id"))
+            .and_then(|i| i.as_str())
+        {
+            after = id.to_string();
+        }
+        theirs.extend(page);
+        if n < PAGE {
+            let check = ns::compare_entities(
+                e,
+                &ours.rows,
+                &theirs,
+                block,
+                pinned.then_some(block).flatten(),
+                pinned,
+            );
+            return Ok((check, theirs));
+        }
+    }
+    Err(ApiError::Unavailable(format!(
+        "the subgraph's {} ran past {MAX_PAGES} pages",
+        e.name
+    )))
+}
+
+/// `/api/network-stats/subgraph-check`: Lodestar's protocol figures beside the Graph Network
+/// subgraph's, read at the same block: the totals, every indexer and every deployment with signal.
 pub async fn network_subgraph_check(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -3502,25 +3606,16 @@ pub async fn network_subgraph_check(
         .read
         .cached_external(
             "network-subgraph-check",
-            std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(3600),
             kittiwake_types::ServedFrom::Nest,
             std::sync::Arc::new(move || {
                 let subgraph = subgraph.clone();
                 let ctx = ctx.clone();
                 Box::pin(async move {
                     let client = reqwest::Client::new();
-                    let query = ns::query();
-                    let (ours, theirs) = tokio::join!(
-                        routes::network_stats(&ctx),
-                        subgraph_graphql(&client, &subgraph, &query),
-                    );
-                    let ours = ours?;
-                    let theirs = theirs?;
+                    let ours = routes::network_stats(&ctx).await?;
                     let ours_net = ours.entry.value.get("graphNetwork").ok_or_else(|| {
                         ApiError::Unavailable("network-stats has no graphNetwork".into())
-                    })?;
-                    let theirs_net = theirs.get("graphNetwork").ok_or_else(|| {
-                        ApiError::Unavailable("the subgraph returned no graphNetwork".into())
                     })?;
                     let ours_block = ours
                         .entry
@@ -3528,6 +3623,18 @@ pub async fn network_subgraph_check(
                         .pointer("/_meta/block/number")
                         .and_then(|b| b.as_i64())
                         .or(ours.entry.provenance.as_of);
+
+                    let (totals, indexers, deployments) = tokio::join!(
+                        subgraph_pinned(&client, &subgraph, ours_block, ns::totals_query),
+                        entity_check(&ctx, &client, &subgraph, &ns::INDEXERS),
+                        entity_check(&ctx, &client, &subgraph, &ns::DEPLOYMENTS),
+                    );
+                    let (theirs, pinned) = totals?;
+                    let (indexers, indexer_rows) = indexers?;
+                    let (deployments, _) = deployments?;
+                    let theirs_net = theirs.get("graphNetwork").ok_or_else(|| {
+                        ApiError::Unavailable("the subgraph returned no graphNetwork".into())
+                    })?;
                     let theirs_block = theirs
                         .pointer("/_meta/block/number")
                         .and_then(|b| b.as_i64());
@@ -3541,7 +3648,11 @@ pub async fn network_subgraph_check(
                         "ours_block": ours_block,
                         "theirs_block": theirs_block,
                         "block_gap": ours_block.zip(theirs_block).map(|(a, b)| b - a),
-                        "check": ns::compare(ours_net, theirs_net),
+                        "pinned": pinned,
+                        "check": ns::compare(ours_net, theirs_net, pinned),
+                        "subgraph_staked_indexers": ns::staked_indexers(&indexer_rows),
+                        "indexers": indexers,
+                        "deployments": deployments,
                     }))
                 })
             }),
