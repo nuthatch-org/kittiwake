@@ -105,6 +105,7 @@ pub struct AppState {
     pub foghorn_api_url: Option<Arc<str>>,
     /// Edge & Node's QoS oracle subgraph. Absent means `/api/qos/oracle` answers 503.
     pub qos_oracle: Option<Arc<kittiwake_config::QosOracleSettings>>,
+    pub substreams_mainnet: Option<kittiwake_ext::substreams::Substreams>,
     pub indexer_agent: Option<kittiwake_config::IndexerAgentSettings>,
     /// The key SQL receipts are signed with. Absent means this deployment issues none.
     pub receipt_key: Option<Arc<ed25519_dalek::SigningKey>>,
@@ -149,6 +150,15 @@ impl AppState {
 
     pub fn with_qos_oracle(mut self, oracle: Option<kittiwake_config::QosOracleSettings>) -> Self {
         self.qos_oracle = oracle.map(Arc::new);
+        self
+    }
+
+    pub fn with_substreams_mainnet(
+        mut self,
+        settings: Option<&kittiwake_config::SubstreamsSettings>,
+    ) -> Self {
+        self.substreams_mainnet =
+            settings.map(|s| kittiwake_ext::substreams::Substreams::new(&s.url, &s.api_key));
         self
     }
 
@@ -1174,6 +1184,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/qos/capture", get(handlers::qos_capture))
         .route("/api/qos/oracle", get(handlers::qos_oracle))
         .route(
+            "/api/grt-flow/substreams",
+            get(handlers::grt_flow_substreams),
+        )
+        .route(
             "/api/data-services/query",
             post(handlers::data_service_query),
         )
@@ -1319,6 +1333,7 @@ pub fn state(
         studio,
         foghorn_api_url: foghorn_api_url.map(|u| Arc::from(u.as_str())),
         qos_oracle: None,
+        substreams_mainnet: None,
         indexer_agent,
         receipt_key,
         tap_payer,

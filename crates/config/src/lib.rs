@@ -210,9 +210,6 @@ impl std::fmt::Debug for TelegramSettings {
     }
 }
 
-/// The key that pays for a serving probe. Absent means probes go out unpaid, which is a weaker
-/// question rather than a broken one: an indexer that wants a receipt answers "pay me", and the
-/// probe reports that it could not tell whether the deployment serves.
 /// A GraphQL endpoint serving Edge & Node's QoS oracle subgraph, and the key it wants as a bearer.
 #[derive(Clone, Deserialize)]
 pub struct QosOracleSettings {
@@ -229,6 +226,25 @@ impl std::fmt::Debug for QosOracleSettings {
     }
 }
 
+/// A Substreams endpoint and its key, sent as `x-api-key`.
+#[derive(Clone, Deserialize)]
+pub struct SubstreamsSettings {
+    pub url: String,
+    pub api_key: String,
+}
+
+impl std::fmt::Debug for SubstreamsSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubstreamsSettings")
+            .field("url", &self.url)
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The key that pays for a serving probe. Absent means probes go out unpaid, which is a weaker
+/// question rather than a broken one: an indexer that wants a receipt answers "pay me", and the
+/// probe reports that it could not tell whether the deployment serves.
 #[derive(Clone, Deserialize)]
 pub struct TapSettings {
     /// A 32-byte secp256k1 private key, hex, with or without `0x`. It must be the address that
@@ -303,6 +319,10 @@ pub struct Config {
     /// Edge & Node's QoS oracle subgraph, for `/api/qos/oracle`. Absent means that route answers 503.
     #[serde(default)]
     pub qos_oracle: Option<QosOracleSettings>,
+    /// GraphOps Substreams on Ethereum, for `/api/grt-flow/substreams`. Absent means that route
+    /// answers 503.
+    #[serde(default)]
+    pub substreams_mainnet: Option<SubstreamsSettings>,
     #[serde(default)]
     pub indexer_agent: Option<IndexerAgentSettings>,
     #[serde(default)]
@@ -635,6 +655,7 @@ mod tests {
             studio: None,
             foghorn_api_url: None,
             qos_oracle: None,
+            substreams_mainnet: None,
             indexer_agent: None,
             receipt: None,
             tap: None,
