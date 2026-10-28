@@ -429,6 +429,11 @@ pub mod coverage {
             "new on 2026-10-27 with no incumbent; it carries its own check against qos-reo-nest",
         ),
         (
+            "/api/grt-flow/substreams",
+            Excused::Entirely,
+            "new on 2026-10-28 with no incumbent; it is itself a check of supply-mainnet",
+        ),
+        (
             "/api/disassembly/diff",
             Excused::Entirely,
             "a diff of two reports, so it inherits every difference above twice over",

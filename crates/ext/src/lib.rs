@@ -5,6 +5,7 @@
 //! must not, on failure, quietly serve yesterday's price as today's. It reports the failure and the
 //! panel shows a gap, exactly as a nest route would.
 
+pub mod substreams;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 

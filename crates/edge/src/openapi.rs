@@ -324,6 +324,10 @@ const SUMMARIES: &[Operation] = &[
         "Edge & Node's QoS oracle for the last whole day, as they published it, checked against our own decoding of the same postings.",
     ),
     op(
+        "/api/grt-flow/substreams",
+        "About a day of Ethereum GRT transfers, read from GraphOps Substreams and from our own nest, compared transfer by transfer.",
+    ),
+    op(
         "/api/delegate/recommend",
         "Which indexer to delegate to, ranked against four preference sliders, with the reasoning.",
     ),

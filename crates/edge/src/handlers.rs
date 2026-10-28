@@ -3644,6 +3644,120 @@ pub async fn qos_oracle(
     Ok(envelope(read))
 }
 
+/// `/api/grt-flow/substreams`: about a day of Ethereum GRT transfers, read from GraphOps
+/// Substreams and from our `supply-mainnet` nest, compared transfer by transfer.
+pub async fn grt_flow_substreams(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    use kittiwake_read::grt_substreams as gs;
+    budget!(st, peer, headers);
+    let substreams = st.substreams_mainnet.clone().ok_or_else(|| {
+        ErrorResponse::from(ApiError::Unavailable(
+            "Substreams on Ethereum is not configured".into(),
+        ))
+    })?;
+    let gate = st.read.gate.clone();
+
+    let read = st
+        .read
+        .cached_external(
+            "grt-flow-substreams",
+            std::time::Duration::from_secs(6 * 3600),
+            kittiwake_types::ServedFrom::Nest,
+            std::sync::Arc::new(move || {
+                let substreams = substreams.clone();
+                let gate = gate.clone();
+                Box::pin(async move {
+                    let tip = gate
+                        .query(&kittiwake_nest::QuerySpec::read(
+                            kittiwake_types::NestId::SupplyMainnet,
+                            "SELECT max(block_number) AS head FROM graph_token__transfer",
+                        ))
+                        .await?;
+                    let tip = tip
+                        .provenance
+                        .as_of
+                        .and_then(|b| u64::try_from(b).ok())
+                        .ok_or_else(|| {
+                            ApiError::Unavailable("supply-mainnet nest reported no tip".into())
+                        })?;
+                    let (from, to) = gs::window(tip);
+
+                    let started = std::time::Instant::now();
+                    let events = substreams
+                        .filtered_events(
+                            &gs::query(),
+                            from,
+                            to,
+                            std::time::Duration::from_secs(120),
+                        )
+                        .await?;
+                    let streamed_ms = started.elapsed().as_millis() as u64;
+                    let ss: Vec<gs::Transfer> = events
+                        .iter()
+                        .filter_map(|e| {
+                            gs::Transfer::from_log(
+                                e.block,
+                                &e.block_hash,
+                                &e.tx_hash,
+                                e.log_index,
+                                &e.topics,
+                                &e.data,
+                            )
+                        })
+                        .collect();
+                    let first_timestamp = events.first().map(|e| e.timestamp);
+                    let last_timestamp = events.last().map(|e| e.timestamp);
+
+                    let rows = gate
+                        .query(&kittiwake_nest::QuerySpec::read(
+                            kittiwake_types::NestId::SupplyMainnet,
+                            gs::nest_sql(from, to),
+                        ))
+                        .await?;
+                    if rows.provenance.truncated {
+                        return Err(ApiError::Unavailable(
+                            "the nest truncated the window; it is wider than the row cap".into(),
+                        ));
+                    }
+                    let nest: Vec<gs::Transfer> = rows
+                        .rows
+                        .iter()
+                        .filter_map(gs::Transfer::from_row)
+                        .collect();
+                    if nest.len() != rows.rows.len() || ss.len() != events.len() {
+                        return Err(ApiError::NestDecode(format!(
+                            "{} of {} nest rows and {} of {} Substreams logs decoded as transfers",
+                            nest.len(),
+                            rows.rows.len(),
+                            ss.len(),
+                            events.len()
+                        )));
+                    }
+
+                    let check = gs::reconcile(from, to, &ss, &nest);
+                    Ok(serde_json::json!({
+                        "source": {
+                            "substreams": substreams.endpoint(),
+                            "package": "ethereum-common v0.4.0, filtered_events",
+                            "query": gs::query(),
+                            "nest": "supply-mainnet",
+                            "nest_tip": tip,
+                            "streamed_ms": streamed_ms,
+                        },
+                        "first_timestamp": first_timestamp,
+                        "last_timestamp": last_timestamp,
+                        "check": check,
+                    }))
+                })
+            }),
+        )
+        .await?;
+    Ok(envelope(read))
+}
+
 // ── The service census ───────────────────────────────────────────────────────
 
 use kittiwake_read::census;
