@@ -3451,33 +3451,26 @@ pub async fn qos_capture(
     Ok(envelope(read))
 }
 
-// ── Edge & Node's QoS oracle, as published ───────────────────────────────────
+// ── The Graph Network subgraph, as a second reading of the protocol totals ──
 
-use kittiwake_read::qos_oracle;
-
-const ORACLE_PAGE: usize = 1000;
-/// The query topic carries about 2,500 deployments a day; this is well clear of it.
-const ORACLE_MAX_PAGES: usize = 20;
-
-async fn oracle_graphql(
+/// One GraphQL query against a subgraph endpoint, with the key as a bearer.
+async fn subgraph_graphql(
     client: &reqwest::Client,
-    oracle: &kittiwake_config::QosOracleSettings,
+    subgraph: &kittiwake_config::SubgraphSettings,
     query: &str,
-    variables: serde_json::Value,
 ) -> Result<serde_json::Value, ApiError> {
-    let unavailable = |e: String| ApiError::Unavailable(format!("QoS oracle subgraph: {e}"));
+    let unavailable = |e: String| ApiError::Unavailable(format!("network subgraph: {e}"));
     let resp = client
-        .post(&oracle.url)
-        .bearer_auth(&oracle.api_key)
-        .json(&serde_json::json!({ "query": query, "variables": variables }))
+        .post(&subgraph.url)
+        .bearer_auth(&subgraph.api_key)
+        .json(&serde_json::json!({ "query": query }))
         .timeout(std::time::Duration::from_secs(20))
         .send()
         .await
         .map_err(|e| unavailable(e.to_string()))?;
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.map_err(|e| unavailable(e.to_string()))?;
-    // A GraphQL error arrives with 200, and its `data` can be a partial answer that reads as a
-    // quiet day. It is refused whole.
+    // A GraphQL error arrives with 200, and its `data` can be a partial answer. It is refused whole.
     if let Some(errors) = body.get("errors") {
         return Err(unavailable(errors.to_string()));
     }
@@ -3489,153 +3482,66 @@ async fn oracle_graphql(
         .ok_or_else(|| unavailable("no data in the answer".into()))
 }
 
-/// Every row of `entity` for one oracle day, paged by id.
-async fn oracle_day_rows<T: serde::de::DeserializeOwned>(
-    client: &reqwest::Client,
-    oracle: &kittiwake_config::QosOracleSettings,
-    entity: &str,
-    fields: &str,
-    day: i64,
-) -> Result<Vec<T>, ApiError> {
-    let query = format!(
-        "query($day: Int!, $last: String!) {{ rows: {entity}(first: {ORACLE_PAGE}, orderBy: id, \
-         where: {{ dayNumber: $day, id_gt: $last }}) {{ id {fields} }} }}"
-    );
-    let mut out = Vec::new();
-    let mut last = String::new();
-    for _ in 0..ORACLE_MAX_PAGES {
-        let data = oracle_graphql(
-            client,
-            oracle,
-            &query,
-            serde_json::json!({ "day": day, "last": last }),
-        )
-        .await?;
-        let rows = data
-            .get("rows")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let n = rows.len();
-        if let Some(id) = rows
-            .last()
-            .and_then(|r| r.get("id"))
-            .and_then(|v| v.as_str())
-        {
-            last = id.to_string();
-        }
-        for r in rows {
-            out.push(serde_json::from_value(r).map_err(|e| {
-                ApiError::Unavailable(format!("QoS oracle subgraph: {entity}: {e}"))
-            })?);
-        }
-        if n < ORACLE_PAGE {
-            return Ok(out);
-        }
-    }
-    Err(ApiError::Unavailable(format!(
-        "QoS oracle subgraph: {entity} for day {day} ran past {ORACLE_MAX_PAGES} pages"
-    )))
-}
-
-/// `GET /api/qos/oracle`: Edge & Node's QoS oracle for the last whole day, as they published it,
-/// checked against qos-reo-nest's independent reading of the same postings.
-pub async fn qos_oracle(
+/// `/api/network-stats/subgraph-check`: `/api/network-stats` beside the Graph Network subgraph's
+/// own `graphNetwork`, field by field.
+pub async fn network_subgraph_check(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Response, ErrorResponse> {
+    use kittiwake_read::network_subgraph as ns;
     budget!(st, peer, headers);
-    let oracle = st.qos_oracle.clone().ok_or_else(|| {
+    let subgraph = st.network_subgraph.clone().ok_or_else(|| {
         ErrorResponse::from(ApiError::Unavailable(
-            "the QoS oracle subgraph is not configured".into(),
+            "the network subgraph is not configured".into(),
         ))
     })?;
-    let pool = st.pool.clone();
+    let ctx = st.read.clone();
 
     let read = st
         .read
         .cached_external(
-            "qos-oracle",
-            std::time::Duration::from_secs(900),
-            kittiwake_types::ServedFrom::Postgres,
+            "network-subgraph-check",
+            std::time::Duration::from_secs(600),
+            kittiwake_types::ServedFrom::Nest,
             std::sync::Arc::new(move || {
-                let oracle = oracle.clone();
-                let pool = pool.clone();
+                let subgraph = subgraph.clone();
+                let ctx = ctx.clone();
                 Box::pin(async move {
                     let client = reqwest::Client::new();
-                    let head = oracle_graphql(
-                        &client,
-                        &oracle,
-                        "{ _meta { block { number timestamp } deployment hasIndexingErrors } \
-                         latest: indexerDailyDataPoints(first: 1, orderBy: dayNumber, \
-                         orderDirection: desc) { dayNumber } }",
-                        serde_json::json!({}),
-                    )
-                    .await?;
-                    let latest = head
-                        .pointer("/latest/0/dayNumber")
-                        .and_then(serde_json::Value::as_i64)
-                        .ok_or_else(|| {
-                            ApiError::Unavailable("QoS oracle subgraph has no days".into())
-                        })?;
-
-                    // Yesterday, because today is still being posted. When the feed has stopped,
-                    // the newest day it has is shown and called stale, not passed off as yesterday.
-                    let wanted = now().div_euclid(86_400) - 1;
-                    let unix_day = wanted.min(qos_oracle::unix_day(latest));
-                    let day = qos_oracle::oracle_day(unix_day);
-
-                    let indexers: Vec<qos_oracle::IndexerDay> = oracle_day_rows(
-                        &client,
-                        &oracle,
-                        "indexerDailyDataPoints",
-                        "indexer_wallet indexer_url query_count total_query_fees \
-                         avg_indexer_latency_ms proportion_indexer_200_responses",
-                        day,
-                    )
-                    .await?;
-                    let queries: Vec<qos_oracle::QueryDay> = oracle_day_rows(
-                        &client,
-                        &oracle,
-                        "queryDailyDataPoints",
-                        "subgraphDeployment { id } chain_id query_count total_query_fees \
-                         gateway_query_success_rate avg_gateway_latency_ms \
-                         user_attributed_error_rate",
-                        day,
-                    )
-                    .await?;
-                    let nest = match &pool {
-                        Some(p) => kittiwake_db::qos_network_day(p, unix_day)
-                            .await
-                            .map_err(kittiwake_db::unavailable)?
-                            .map(|d| qos_oracle::NestDay {
-                                indexers: d.indexers,
-                                query_count: d.query_count,
-                                total_query_fees: d.total_query_fees,
-                                settled: d.settled,
-                            }),
-                        None => None,
-                    };
-
-                    let mut summary =
-                        qos_oracle::summarise(unix_day, &indexers, &queries, nest, 25);
-                    if pool.is_none() {
-                        summary.reconciliation.reason =
-                            Some("no database is configured, so our decoding was not read".into());
-                    }
+                    let query = ns::query();
+                    let (ours, theirs) = tokio::join!(
+                        routes::network_stats(&ctx),
+                        subgraph_graphql(&client, &subgraph, &query),
+                    );
+                    let ours = ours?;
+                    let theirs = theirs?;
+                    let ours_net = ours.entry.value.get("graphNetwork").ok_or_else(|| {
+                        ApiError::Unavailable("network-stats has no graphNetwork".into())
+                    })?;
+                    let theirs_net = theirs.get("graphNetwork").ok_or_else(|| {
+                        ApiError::Unavailable("the subgraph returned no graphNetwork".into())
+                    })?;
+                    let ours_block = ours
+                        .entry
+                        .value
+                        .pointer("/_meta/block/number")
+                        .and_then(|b| b.as_i64())
+                        .or(ours.entry.provenance.as_of);
+                    let theirs_block = theirs
+                        .pointer("/_meta/block/number")
+                        .and_then(|b| b.as_i64());
                     Ok(serde_json::json!({
                         "source": {
-                            "publisher": "Edge & Node QoS oracle",
-                            "served_by": oracle.url,
-                            "deployment": head.pointer("/_meta/deployment"),
-                            "block": head.pointer("/_meta/block/number"),
-                            "block_timestamp": head.pointer("/_meta/block/timestamp"),
-                            "has_indexing_errors": head.pointer("/_meta/hasIndexingErrors"),
+                            "subgraph": "Graph Network (Arbitrum)",
+                            "served_by": subgraph.url,
+                            "deployment": theirs.pointer("/_meta/deployment"),
+                            "has_indexing_errors": theirs.pointer("/_meta/hasIndexingErrors"),
                         },
-                        "latest_published_day": latest,
-                        "stale": unix_day < wanted,
-                        "summary": summary,
+                        "ours_block": ours_block,
+                        "theirs_block": theirs_block,
+                        "block_gap": ours_block.zip(theirs_block).map(|(a, b)| b - a),
+                        "check": ns::compare(ours_net, theirs_net),
                     }))
                 })
             }),
@@ -5161,170 +5067,49 @@ mod list_query_tests {
 }
 
 #[cfg(test)]
-mod qos_oracle_tests {
+mod subgraph_graphql_tests {
     use super::*;
-    use serde_json::{Value, json};
-    use wiremock::matchers::any;
-    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+    use serde_json::json;
+    use wiremock::matchers::{header, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// The oracle subgraph: `latest` names its newest day, and every day has one indexer row
-    /// through two gateways and two deployments.
-    struct Oracle {
-        latest: i64,
-        errors: bool,
-    }
-
-    impl Respond for Oracle {
-        fn respond(&self, req: &Request) -> ResponseTemplate {
-            let body: Value = serde_json::from_slice(&req.body).unwrap();
-            let q = body["query"].as_str().unwrap();
-            if self.errors {
-                return ResponseTemplate::new(200)
-                    .set_body_json(json!({"data": {"rows": []}, "errors": [{"message": "boom"}]}));
-            }
-            if q.contains("_meta") {
-                return ResponseTemplate::new(200).set_body_json(json!({"data": {
-                    "_meta": {"block": {"number": 1, "timestamp": 2}, "deployment": "QmOracle",
-                              "hasIndexingErrors": false},
-                    "latest": [{"dayNumber": self.latest}]
-                }}));
-            }
-            // Second pages are empty: the first is short of a full page anyway.
-            if body["variables"]["last"] != "" {
-                return ResponseTemplate::new(200).set_body_json(json!({"data": {"rows": []}}));
-            }
-            let rows = if q.contains("indexerDailyDataPoints") {
-                json!([
-                    {"id": "a-g1", "indexer_wallet": "0xA", "indexer_url": "https://a/",
-                     "query_count": "300", "total_query_fees": "3", "avg_indexer_latency_ms": "100",
-                     "proportion_indexer_200_responses": "1"},
-                    {"id": "a-g2", "indexer_wallet": "0xa", "indexer_url": "https://a/",
-                     "query_count": "100", "total_query_fees": "1", "avg_indexer_latency_ms": "500",
-                     "proportion_indexer_200_responses": "0"}
-                ])
-            } else {
-                json!([
-                    {"id": "q1", "subgraphDeployment": {"id": "Qm1"}, "chain_id": "base",
-                     "query_count": "10", "total_query_fees": "1", "gateway_query_success_rate": "1",
-                     "avg_gateway_latency_ms": "50", "user_attributed_error_rate": "0"},
-                    {"id": "q2", "subgraphDeployment": {"id": "Qm2"}, "chain_id": "mainnet",
-                     "query_count": "30", "total_query_fees": "2", "gateway_query_success_rate": "0.5",
-                     "avg_gateway_latency_ms": "150", "user_attributed_error_rate": "0.1"},
-                    // The live oracle carries one of these a day.
-                    {"id": "-g-1", "subgraphDeployment": null, "chain_id": null,
-                     "query_count": "5", "total_query_fees": "0", "gateway_query_success_rate": "0",
-                     "avg_gateway_latency_ms": "0", "user_attributed_error_rate": "0"}
-                ])
-            };
-            ResponseTemplate::new(200).set_body_json(json!({"data": {"rows": rows}}))
-        }
-    }
-
-    async fn stand_in(oracle: Option<Oracle>) -> (AppState, MockServer) {
-        let server = MockServer::start().await;
-        let configured = oracle.is_some();
-        if let Some(o) = oracle {
-            Mock::given(any()).respond_with(o).mount(&server).await;
-        }
-        let read = kittiwake_read::ReadCtx::new(
-            kittiwake_nest::NestGate::new(kittiwake_nest::NestConfig::new(server.uri())).unwrap(),
-            kittiwake_cache::Store::new(64),
-            1,
-        );
-        let st = crate::state(
-            crate::Limits::new(1000, 1000, 1000, Vec::new()),
-            None,
-            read,
-            None,
-            None,
-            kittiwake_ext::Ipfs::new(&server.uri()),
-            None,
-            None,
-            None,
-            None,
-        )
-        .with_qos_oracle(configured.then(|| kittiwake_config::QosOracleSettings {
+    fn settings(server: &MockServer) -> kittiwake_config::SubgraphSettings {
+        kittiwake_config::SubgraphSettings {
             url: server.uri(),
             api_key: "k".into(),
-        }));
-        (st, server)
+        }
     }
 
-    async fn ask(st: &AppState) -> Result<Response, ErrorResponse> {
-        qos_oracle(
-            State(st.clone()),
-            ConnectInfo(([127, 0, 0, 1], 1).into()),
-            HeaderMap::new(),
-        )
-        .await
-    }
-
-    async fn data(st: &AppState) -> Value {
-        let resp = ask(st)
-            .await
-            .unwrap_or_else(|e| panic!("refused: {}", e.0.status()));
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+    #[tokio::test]
+    async fn sends_the_bearer_and_returns_data() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(header("authorization", "Bearer k"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"data": {"graphNetwork": {"indexerCount": 3}}})),
+            )
+            .mount(&server)
+            .await;
+        let d = subgraph_graphql(&reqwest::Client::new(), &settings(&server), "{ x }")
             .await
             .unwrap();
-        serde_json::from_slice::<Value>(&bytes).unwrap()["data"].clone()
+        assert_eq!(d["graphNetwork"]["indexerCount"], 3);
     }
 
-    fn today() -> i64 {
-        qos_oracle::oracle_day(now().div_euclid(86_400))
-    }
-
+    /// A partial answer with errors would compare as a field gone missing; it is refused.
     #[tokio::test]
-    async fn yesterday_is_summarised_and_sent_with_its_bearer() {
-        let (st, server) = stand_in(Some(Oracle {
-            latest: today(),
-            errors: false,
-        }))
-        .await;
-        let d = data(&st).await;
-        assert_eq!(d["stale"], false);
-        assert_eq!(d["summary"]["day"], today() - 1);
-        assert_eq!(d["source"]["deployment"], "QmOracle");
-        assert_eq!(d["summary"]["network"]["query_count"], 45.0);
-        assert_eq!(d["summary"]["unattributed_query_count"], 5.0);
-        assert_eq!(d["summary"]["deployments"], 2);
-        assert_eq!(d["summary"]["top_deployments"][0]["deployment"], "Qm2");
-        assert_eq!(d["summary"]["top_indexers"][0]["gateways"], 2);
-        assert_eq!(d["summary"]["reconciliation"]["verdict"], "not_compared");
-        let reqs = server.received_requests().await.unwrap();
-        assert!(
-            reqs.iter()
-                .all(|r| r.headers.get("authorization").unwrap() == "Bearer k")
-        );
-    }
-
-    /// A stopped feed answers queries like a live one. The newest day it has is shown as stale.
-    #[tokio::test]
-    async fn a_stopped_feed_is_called_stale_not_passed_off_as_yesterday() {
-        let (st, _server) = stand_in(Some(Oracle {
-            latest: today() - 5,
-            errors: false,
-        }))
-        .await;
-        let d = data(&st).await;
-        assert_eq!(d["stale"], true);
-        assert_eq!(d["summary"]["day"], today() - 5);
-    }
-
-    #[tokio::test]
-    async fn a_graphql_error_is_refused_not_read_as_a_quiet_day() {
-        let (st, _server) = stand_in(Some(Oracle {
-            latest: today(),
-            errors: true,
-        }))
-        .await;
-        let e = ask(&st).await.expect_err("refused");
-        assert_eq!(e.0.status(), 503);
-    }
-
-    #[tokio::test]
-    async fn unconfigured_answers_unavailable() {
-        let (st, _server) = stand_in(None).await;
-        let e = ask(&st).await.expect_err("refused");
-        assert_eq!(e.0.status(), 503);
+    async fn refuses_an_answer_carrying_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"data": {"graphNetwork": null}, "errors": [{"message": "boom"}]}),
+            ))
+            .mount(&server)
+            .await;
+        let e = subgraph_graphql(&reqwest::Client::new(), &settings(&server), "{ x }")
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("boom"), "{e}");
     }
 }

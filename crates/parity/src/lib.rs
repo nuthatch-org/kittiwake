@@ -424,9 +424,9 @@ pub mod coverage {
              deployed build",
         ),
         (
-            "/api/qos/oracle",
+            "/api/network-stats/subgraph-check",
             Excused::Entirely,
-            "new on 2026-10-27 with no incumbent; it carries its own check against qos-reo-nest",
+            "new on 2026-10-28 with no incumbent; it is itself a check of network-stats",
         ),
         (
             "/api/grt-flow/substreams",
