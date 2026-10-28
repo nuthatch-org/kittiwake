@@ -54,6 +54,18 @@ pub fn note(field: &str) -> Option<&'static str> {
             "The subgraph's counter has drifted from its own indexers: count those with stake \
              above zero and it agrees with ours.",
         ),
+        "totalSupply" => Some(
+            "Ours is the token contract's own totalSupply(), sampled every few minutes rather than \
+             at this block; the subgraph sums mints and burns.",
+        ),
+        "curatorCount" => Some(
+            "The subgraph also counts an account that never signalled; ours counts accounts that \
+             have.",
+        ),
+        "subgraphCount" | "activeSubgraphCount" => Some(
+            "Lodestar misses the five subgraphs transferred from L1 and never published on L2: the \
+             allocations nest does not index SubgraphReceivedFromL1.",
+        ),
         _ => None,
     }
 }
@@ -79,6 +91,9 @@ pub struct Entity {
     pub filter: &'static str,
     /// (our column, the subgraph's field).
     pub fields: &'static [(&'static str, &'static str)],
+    /// A subgraph field that, when zero on an entity only the subgraph has, explains its absence
+    /// from ours, with the reason.
+    pub explains_absence: Option<(&'static str, &'static str)>,
 }
 
 /// Delegation cuts are left out on purpose: for indexers that never opened a Horizon provision the
@@ -96,6 +111,11 @@ pub const INDEXERS: Entity = Entity {
         ("query_fees_collected", "queryFeesCollected"),
         ("delegator_shares", "delegatorShares"),
     ],
+    explains_absence: Some((
+        "stakedTokens",
+        "addresses that set a URL or delegation parameters and never staked, which the subgraph \
+         counts as indexers",
+    )),
 };
 
 pub const DEPLOYMENTS: Entity = Entity {
@@ -107,6 +127,7 @@ pub const DEPLOYMENTS: Entity = Entity {
         ("staked_tokens", "stakedTokens"),
         ("query_fees_amount", "queryFeesAmount"),
     ],
+    explains_absence: None,
 };
 
 /// Every row, with every field cast to text so wei survives the trip.
@@ -248,6 +269,9 @@ pub struct EntityCheck {
     pub compared: usize,
     pub only_ours: usize,
     pub only_theirs: usize,
+    /// Only in the subgraph, for a reason already understood; not counted against `agree`.
+    pub only_theirs_explained: usize,
+    pub only_theirs_reason: Option<&'static str>,
     pub only_ours_examples: Vec<String>,
     pub only_theirs_examples: Vec<String>,
     pub fields: Vec<EntityField>,
@@ -269,7 +293,23 @@ pub fn compare_entities(
     let b: BTreeMap<String, &serde_json::Value> =
         theirs.iter().filter_map(|v| Some((key(v)?, v))).collect();
     let only_ours: Vec<String> = a.keys().filter(|k| !b.contains_key(*k)).cloned().collect();
-    let only_theirs: Vec<String> = b.keys().filter(|k| !a.contains_key(*k)).cloned().collect();
+    let explained = |v: &serde_json::Value| {
+        e.explains_absence.is_some_and(|(field, _)| {
+            text(v.get(field)).and_then(|t| t.parse::<u128>().ok()) == Some(0)
+        })
+    };
+    let mut only_theirs = Vec::new();
+    let mut theirs_explained = 0;
+    for (k, v) in &b {
+        if a.contains_key(k) {
+            continue;
+        }
+        if explained(v) {
+            theirs_explained += 1;
+        } else {
+            only_theirs.push(k.clone());
+        }
+    }
 
     let fields: Vec<EntityField> = e
         .fields
@@ -315,6 +355,8 @@ pub fn compare_entities(
         compared: a.keys().filter(|k| b.contains_key(*k)).count(),
         only_ours: only_ours.len(),
         only_theirs: only_theirs.len(),
+        only_theirs_explained: theirs_explained,
+        only_theirs_reason: e.explains_absence.map(|(_, why)| why),
         only_ours_examples: only_ours.into_iter().take(EXAMPLES).collect(),
         only_theirs_examples: only_theirs.into_iter().take(EXAMPLES).collect(),
         fields,
@@ -417,6 +459,20 @@ mod tests {
             .unwrap();
         assert_eq!(sig.differing, 1);
         assert_eq!(sig.examples[0].id, "0xb");
+        assert!(!c.agree);
+    }
+
+    #[test]
+    fn never_staked_indexers_only_in_the_subgraph_are_explained() {
+        let ours = vec![json!({"id": "0xa", "staked_tokens": "1"})];
+        let theirs = vec![
+            json!({"id": "0xa", "stakedTokens": "1"}),
+            json!({"id": "0xb", "stakedTokens": "0"}),
+            json!({"id": "0xc", "stakedTokens": "7"}),
+        ];
+        let c = compare_entities(&INDEXERS, &ours, &theirs, None, None, false);
+        assert_eq!((c.only_theirs, c.only_theirs_explained), (1, 1));
+        assert_eq!(c.only_theirs_examples, vec!["0xc"]);
         assert!(!c.agree);
     }
 
