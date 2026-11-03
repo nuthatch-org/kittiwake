@@ -44,6 +44,7 @@ grep -q 'kittiwake_db' "$work/sql.rs" && { echo "collect-queries: sql.rs still n
 {
   awk '/^pub const DEFAULT_NAMES_SQL: &str =/{p=1} p{print} p&&/;$/{exit}' "$names"
   awk '/^pub const LIST_TABLES: &str =/{p=1} p{print} p&&/;$/{exit}' "$sqlplay"
+  awk '/^pub const STAKING_SAMPLE: &str =/{p=1} p{print} p&&/;$/{exit}' "$sqlplay"
   # From the Probe enum through registry_sql: plain data and one format!, no serde.
   awk '/^pub enum Probe \{/{p=1} p{print} /^pub fn registry_sql/{f=1} f&&/^}$/{exit}' "$census"
   # The Stage enum, STAGES and Stage::table; the rest of the impl needs the fold's types.

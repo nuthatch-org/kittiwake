@@ -38,6 +38,10 @@ pub struct Dataset {
 pub const LIST_TABLES: &str =
     "SELECT table_name\nFROM information_schema.tables\nORDER BY table_name\nLIMIT 50";
 
+/// The staking dataset's sample. `log_index` breaks `block_number` ties, so the 20 rows are the same
+/// on every run; the release gate compares this answer exactly.
+pub const STAKING_SAMPLE: &str = "SELECT block_number, serviceProvider, delegator, tokens\nFROM staking__tokens_delegated\nORDER BY block_number DESC, log_index DESC\nLIMIT 20";
+
 pub const DATASETS: &[Dataset] = &[
     Dataset {
         id: "staking",
@@ -46,7 +50,7 @@ pub const DATASETS: &[Dataset] = &[
         chain: "Arbitrum One",
         description: "The delegation events from HorizonStaking, on the nest that indexes the whole protocol. The source behind the delegation feed on this dashboard.",
         archival: false,
-        sample: "SELECT block_number, serviceProvider, delegator, tokens\nFROM staking__tokens_delegated\nORDER BY block_number DESC\nLIMIT 20",
+        sample: STAKING_SAMPLE,
     },
     Dataset {
         id: "dips",
