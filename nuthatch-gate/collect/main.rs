@@ -196,9 +196,7 @@ fn alloc(q: &mut Set) {
 
     // The public SQL page: the staking dataset's sample and its named queries (inline in sqlplay).
     let sqlplay = "kittiwake crates/sqlplay/src";
-    q.add("sqlplay.sample", l, &format!("{sqlplay}/lib.rs DATASETS staking sample (/sql page)"), s(
-        "SELECT block_number, serviceProvider, delegator, tokens FROM staking__tokens_delegated \
-         ORDER BY block_number DESC LIMIT 20"));
+    q.add("sqlplay.sample", l, &format!("{sqlplay}/lib.rs DATASETS staking sample (/sql page)"), s(extract::STAKING_SAMPLE));
     q.add("sqlplay.delegations_to_indexer", l, &format!("{sqlplay}/named.rs delegations_to_indexer (inline)"), s(&format!(
         "SELECT block_number, block_timestamp, delegator, tokens, shares, tx_hash FROM staking__tokens_delegated \
          WHERE serviceProvider = '{IX}' AND block_number <= {BEFORE_BLOCK} ORDER BY block_number DESC LIMIT 500")));
