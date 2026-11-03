@@ -46,7 +46,7 @@ pub const DATASETS: &[Dataset] = &[
         chain: "Arbitrum One",
         description: "The delegation events from HorizonStaking, on the nest that indexes the whole protocol. The source behind the delegation feed on this dashboard.",
         archival: false,
-        sample: "SELECT block_number, serviceProvider, delegator, tokens\nFROM staking__tokens_delegated\nORDER BY block_number DESC\nLIMIT 20",
+        sample: "SELECT block_number, serviceProvider, delegator, tokens\nFROM staking__tokens_delegated\nORDER BY block_number DESC, log_index DESC\nLIMIT 20",
     },
     Dataset {
         id: "dips",
