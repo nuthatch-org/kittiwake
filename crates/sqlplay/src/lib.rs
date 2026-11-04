@@ -10,7 +10,7 @@ pub mod named;
 
 use kittiwake_types::NestId;
 use sqlparser::ast::Statement;
-use sqlparser::dialect::GenericDialect;
+use sqlparser::dialect::DuckDbDialect;
 use sqlparser::parser::Parser;
 
 /// One dataset a stranger may query. An explicit allowlist, not a passthrough: the origin fronts
@@ -97,7 +97,7 @@ pub enum ScreenError {
 
 /// Accept exactly one read-only statement. A `SELECT`, with or without CTEs, and nothing else.
 pub fn screen(sql: &str) -> Result<(), ScreenError> {
-    let statements = Parser::parse_sql(&GenericDialect {}, sql)
+    let statements = Parser::parse_sql(&DuckDbDialect {}, sql)
         .map_err(|e| ScreenError::Unparseable(e.to_string()))?;
 
     if statements.len() != 1 {
@@ -140,6 +140,16 @@ mod tests {
             screen("WITH recent AS (SELECT * FROM staking__tokens_delegated LIMIT 5) SELECT * FROM recent")
                 .is_ok()
         );
+    }
+
+    /// The portfolio statements fold positions with a DuckDB lambda; the generic dialect refused them,
+    /// so a client checking Lodestar's answers (nuthatch's `verify`) could not ask for them.
+    #[test]
+    fn a_duckdb_lambda_is_a_select_too() {
+        let sql = "SELECT list_reduce(list_prepend({'shares': 0.0::DOUBLE}, list({'shares': CAST(sh AS DOUBLE)})), \
+                   lambda acc, e: {'shares': acc.shares + e.shares}) AS folded \
+                   FROM (SELECT 1 AS sh)";
+        assert_eq!(screen(sql), Ok(()));
     }
 
     #[test]
