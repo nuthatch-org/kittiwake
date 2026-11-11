@@ -1263,6 +1263,7 @@ pub fn router(state: AppState) -> Router {
             get(handlers::studio_deploy_key_get).post(handlers::studio_deploy_key_post),
         )
         .route("/api/studio/metadata", post(handlers::studio_metadata_post))
+        .route("/api/studio/image", post(handlers::studio_image_post))
         .route("/api/studio/node", post(handlers::studio_node_post))
         .route(
             "/api/studio/ipfs/{*path}",

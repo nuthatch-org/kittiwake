@@ -1474,11 +1474,25 @@ fn subgraph_metadata_docs(body: &serde_json::Value) -> (serde_json::Value, serde
         l if l.is_empty() => "v0.0.1".to_string(),
         l => l,
     };
+    // Studio writes the image twice: `image` as an ipfs:// URI and `subgraphImage` as a URL a
+    // browser can load. Explorer reads the second.
+    const CAT: &str = "https://api.thegraph.com/ipfs/api/v0/cat?arg=";
+    let image = link("image");
+    let cid = image
+        .strip_prefix("ipfs://")
+        .or_else(|| image.strip_prefix(CAT));
+    let (image, subgraph_image) = match cid {
+        Some(cid) => (format!("ipfs://{cid}"), format!("{CAT}{cid}")),
+        None => (image.clone(), image),
+    };
+    let display = text("displayName", 200);
     (
         serde_json::json!({
             "description": text("description", 2000),
-            "displayName": text("displayName", 200),
-            "image": link("image"),
+            "displayName": display,
+            "name": display,
+            "image": image,
+            "subgraphImage": subgraph_image,
             "codeRepository": link("codeRepository"),
             "website": link("website"),
             "categories": categories,
@@ -1504,6 +1518,43 @@ pub async fn studio_metadata_post(
     let version_bytes = kittiwake_read::shape::ipfs_hash_to_bytes32(&version)
         .ok_or_else(|| ApiError::Internal("IPFS returned an invalid CID".into()))?;
     Ok(axum::Json(serde_json::json!({"subgraphMetaHash":sub,"versionMetaHash":version,"subgraphMetaBytes32":sub_bytes,"versionMetaBytes32":version_bytes})).into_response())
+}
+
+/// PNG or JPEG by its leading bytes, which is what Explorer accepts for a subgraph image. The
+/// declared content type is the client's opinion and is not consulted.
+fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else {
+        None
+    }
+}
+
+const SUBGRAPH_IMAGE_MAX: usize = 1024 * 1024;
+
+pub async fn studio_image_post(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+) -> Result<Response, ErrorResponse> {
+    session(&st, &headers)?;
+    if body.len() > SUBGRAPH_IMAGE_MAX {
+        return Err(ApiError::BadRequest("The image is over 1 MB".into()).into());
+    }
+    let mime = image_mime(&body)
+        .ok_or_else(|| ApiError::BadRequest("The image must be a PNG or a JPEG".into()))?;
+    let hash = st
+        .ipfs
+        .add_bytes(body.to_vec(), mime, "image")
+        .await
+        .map_err(|e| ApiError::Unavailable(format!("IPFS upload: {e}")))?;
+    Ok(axum::Json(serde_json::json!({
+        "hash": hash,
+        "url": format!("https://api.thegraph.com/ipfs/api/v0/cat?arg={hash}"),
+    }))
+    .into_response())
 }
 
 fn bearer(headers: &HeaderMap) -> Result<&str, ErrorResponse> {
@@ -5272,6 +5323,11 @@ mod subgraph_metadata_tests {
         }));
         assert_eq!(sub["displayName"], "Uniswap");
         assert_eq!(sub["image"], "ipfs://Qm");
+        assert_eq!(
+            sub["subgraphImage"],
+            "https://api.thegraph.com/ipfs/api/v0/cat?arg=Qm"
+        );
+        assert_eq!(sub["name"], "Uniswap");
         assert_eq!(sub["website"], "https://x.org");
         assert_eq!(sub["codeRepository"], "https://github.com/a/b");
         assert_eq!(sub["categories"], json!(["DeFi", "DEX"]));
@@ -5283,9 +5339,18 @@ mod subgraph_metadata_tests {
         let (sub, ver) = subgraph_metadata_docs(&json!({"displayName": "n"}));
         assert_eq!(
             sub,
-            json!({"description":"","displayName":"n","image":"","codeRepository":"","website":"","categories":[]})
+            json!({"description":"","displayName":"n","name":"n","image":"","subgraphImage":"","codeRepository":"","website":"","categories":[]})
         );
         assert_eq!(ver["label"], "v0.0.1");
+    }
+
+    #[test]
+    fn an_image_is_known_by_its_bytes() {
+        use super::image_mime;
+        assert_eq!(image_mime(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
+        assert_eq!(image_mime(&[0xff, 0xd8, 0xff, 0xe0]), Some("image/jpeg"));
+        assert_eq!(image_mime(b"<svg onload=alert(1)>"), None);
+        assert_eq!(image_mime(b""), None);
     }
 
     #[test]
