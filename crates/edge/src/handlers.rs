@@ -1441,26 +1441,73 @@ pub async fn studio_deploy_key_post(
     Ok(axum::Json(serde_json::json!({"key":key})).into_response())
 }
 
+/// The two documents a publish pins: the subgraph's, in the shape Explorer reads, and the version's.
+/// A link that is not http(s) or ipfs is dropped rather than refused, since Explorer renders it.
+fn subgraph_metadata_docs(body: &serde_json::Value) -> (serde_json::Value, serde_json::Value) {
+    let text = |k: &str, max: usize| -> String {
+        body.get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().chars().take(max).collect())
+            .unwrap_or_default()
+    };
+    let link = |k: &str| -> String {
+        let s = text(k, 512);
+        if s.starts_with("https://") || s.starts_with("http://") || s.starts_with("ipfs://") {
+            s
+        } else {
+            String::new()
+        }
+    };
+    let categories: Vec<String> = body
+        .get("categories")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c.as_str())
+                .map(|c| c.trim().chars().take(40).collect::<String>())
+                .filter(|c| !c.is_empty())
+                .take(10)
+                .collect()
+        })
+        .unwrap_or_default();
+    let label = match text("versionLabel", 64) {
+        l if l.is_empty() => "v0.0.1".to_string(),
+        l => l,
+    };
+    // Studio writes the image twice: `image` as an ipfs:// URI and `subgraphImage` as a URL a
+    // browser can load. Explorer reads the second.
+    const CAT: &str = "https://api.thegraph.com/ipfs/api/v0/cat?arg=";
+    let image = link("image");
+    let cid = image
+        .strip_prefix("ipfs://")
+        .or_else(|| image.strip_prefix(CAT));
+    let (image, subgraph_image) = match cid {
+        Some(cid) => (format!("ipfs://{cid}"), format!("{CAT}{cid}")),
+        None => (image.clone(), image),
+    };
+    let display = text("displayName", 200);
+    (
+        serde_json::json!({
+            "description": text("description", 2000),
+            "displayName": display,
+            "name": display,
+            "image": image,
+            "subgraphImage": subgraph_image,
+            "codeRepository": link("codeRepository"),
+            "website": link("website"),
+            "categories": categories,
+        }),
+        serde_json::json!({"label": label, "description": ""}),
+    )
+}
+
 pub async fn studio_metadata_post(
     State(st): State<AppState>,
     headers: HeaderMap,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
     session(&st, &headers)?;
-    let display = body
-        .get("displayName")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let description = body
-        .get("description")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let label = body
-        .get("versionLabel")
-        .and_then(|v| v.as_str())
-        .unwrap_or("v0.0.1");
-    let subgraph_doc = serde_json::json!({"description":description,"displayName":display,"image":"","codeRepository":"","website":""});
-    let version_doc = serde_json::json!({"label":label,"description":""});
+    let (subgraph_doc, version_doc) = subgraph_metadata_docs(&body);
     let (sub, version) = tokio::try_join!(
         st.ipfs.add_json(&subgraph_doc),
         st.ipfs.add_json(&version_doc)
@@ -1471,6 +1518,43 @@ pub async fn studio_metadata_post(
     let version_bytes = kittiwake_read::shape::ipfs_hash_to_bytes32(&version)
         .ok_or_else(|| ApiError::Internal("IPFS returned an invalid CID".into()))?;
     Ok(axum::Json(serde_json::json!({"subgraphMetaHash":sub,"versionMetaHash":version,"subgraphMetaBytes32":sub_bytes,"versionMetaBytes32":version_bytes})).into_response())
+}
+
+/// PNG or JPEG by its leading bytes, which is what Explorer accepts for a subgraph image. The
+/// declared content type is the client's opinion and is not consulted.
+fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else {
+        None
+    }
+}
+
+const SUBGRAPH_IMAGE_MAX: usize = 1024 * 1024;
+
+pub async fn studio_image_post(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+) -> Result<Response, ErrorResponse> {
+    session(&st, &headers)?;
+    if body.len() > SUBGRAPH_IMAGE_MAX {
+        return Err(ApiError::BadRequest("The image is over 1 MB".into()).into());
+    }
+    let mime = image_mime(&body)
+        .ok_or_else(|| ApiError::BadRequest("The image must be a PNG or a JPEG".into()))?;
+    let hash = st
+        .ipfs
+        .add_bytes(body.to_vec(), mime, "image")
+        .await
+        .map_err(|e| ApiError::Unavailable(format!("IPFS upload: {e}")))?;
+    Ok(axum::Json(serde_json::json!({
+        "hash": hash,
+        "url": format!("https://api.thegraph.com/ipfs/api/v0/cat?arg={hash}"),
+    }))
+    .into_response())
 }
 
 fn bearer(headers: &HeaderMap) -> Result<&str, ErrorResponse> {
@@ -5222,5 +5306,58 @@ mod subgraph_graphql_tests {
             .await
             .unwrap_err();
         assert!(e.to_string().contains("boom"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod subgraph_metadata_tests {
+    use super::subgraph_metadata_docs;
+    use serde_json::json;
+
+    #[test]
+    fn carries_every_field_explorer_shows() {
+        let (sub, ver) = subgraph_metadata_docs(&json!({
+            "displayName": " Uniswap ", "description": "d", "versionLabel": "v1.2.0",
+            "image": "ipfs://Qm", "website": "https://x.org", "codeRepository": "https://github.com/a/b",
+            "categories": ["DeFi", " ", "DEX"]
+        }));
+        assert_eq!(sub["displayName"], "Uniswap");
+        assert_eq!(sub["image"], "ipfs://Qm");
+        assert_eq!(
+            sub["subgraphImage"],
+            "https://api.thegraph.com/ipfs/api/v0/cat?arg=Qm"
+        );
+        assert_eq!(sub["name"], "Uniswap");
+        assert_eq!(sub["website"], "https://x.org");
+        assert_eq!(sub["codeRepository"], "https://github.com/a/b");
+        assert_eq!(sub["categories"], json!(["DeFi", "DEX"]));
+        assert_eq!(ver["label"], "v1.2.0");
+    }
+
+    #[test]
+    fn old_clients_get_what_they_got_before() {
+        let (sub, ver) = subgraph_metadata_docs(&json!({"displayName": "n"}));
+        assert_eq!(
+            sub,
+            json!({"description":"","displayName":"n","name":"n","image":"","subgraphImage":"","codeRepository":"","website":"","categories":[]})
+        );
+        assert_eq!(ver["label"], "v0.0.1");
+    }
+
+    #[test]
+    fn an_image_is_known_by_its_bytes() {
+        use super::image_mime;
+        assert_eq!(image_mime(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
+        assert_eq!(image_mime(&[0xff, 0xd8, 0xff, 0xe0]), Some("image/jpeg"));
+        assert_eq!(image_mime(b"<svg onload=alert(1)>"), None);
+        assert_eq!(image_mime(b""), None);
+    }
+
+    #[test]
+    fn drops_links_that_are_not_links() {
+        let (sub, _) =
+            subgraph_metadata_docs(&json!({"website": "javascript:alert(1)", "image": "data:x"}));
+        assert_eq!(sub["website"], "");
+        assert_eq!(sub["image"], "");
     }
 }

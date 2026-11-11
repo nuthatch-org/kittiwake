@@ -1168,10 +1168,25 @@ impl Ipfs {
     /// Metadata is content-addressed, so accepting an upstream response without a CID would be
     /// reporting a publication that nobody can subsequently resolve.
     pub async fn add_json(&self, value: &serde_json::Value) -> Result<String, String> {
-        let part = reqwest::multipart::Part::text(value.to_string())
-            .mime_str("application/json")
+        self.add_bytes(
+            value.to_string().into_bytes(),
+            "application/json",
+            "metadata.json",
+        )
+        .await
+    }
+
+    /// The same, for bytes the caller has already vetted.
+    pub async fn add_bytes(
+        &self,
+        bytes: Vec<u8>,
+        mime: &str,
+        file_name: &'static str,
+    ) -> Result<String, String> {
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .mime_str(mime)
             .map_err(|e| e.to_string())?
-            .file_name("metadata.json");
+            .file_name(file_name);
         let form = reqwest::multipart::Form::new().part("file", part);
         let response: serde_json::Value = self
             .http

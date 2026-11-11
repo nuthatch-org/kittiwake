@@ -65,6 +65,10 @@ pub const WITHHELD: &[(&str, &str)] = &[
         "mints an account secret and must not be advertised as anonymous API access",
     ),
     (
+        "/api/studio/image",
+        "uploads a subgraph image to IPFS for a signed-in Studio user",
+    ),
+    (
         "/api/studio/ipfs/{*path}",
         "a deploy-key-authenticated IPFS proxy, not a public IPFS gateway",
     ),
