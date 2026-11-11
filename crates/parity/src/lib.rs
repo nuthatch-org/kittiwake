@@ -292,6 +292,11 @@ pub mod coverage {
             "returns a secret exactly once and cannot be compared against a frozen deployment",
         ),
         (
+            "/api/studio/image",
+            Excused::Entirely,
+            "has no Next counterpart to compare with, and an authenticated IPFS write creates live state",
+        ),
+        (
             "/api/studio/metadata",
             Excused::Entirely,
             "authenticated IPFS writes create content-addressed live state and require the Dock integration fixture",
