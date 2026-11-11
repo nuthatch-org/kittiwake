@@ -1828,7 +1828,9 @@ pub async fn subgraph_versions(ctx: &ReadCtx, dep: &str) -> Result<Read, ApiErro
         "subgraph-versions",
         NestId::Gns,
         serde_json::json!({ "deployment": dep }),
-        CachePolicy::from_poll_interval(cadence::ARCHIVAL),
+        // Not archival: "no subgraph" stops being true the moment somebody publishes, and
+        // lodestar's /move offered a second publish for ten minutes on the strength of it.
+        CachePolicy::from_poll_interval(cadence::LIVE),
         subgraph_versions_fetcher(dep.to_string()),
     )
     .await
