@@ -1441,26 +1441,59 @@ pub async fn studio_deploy_key_post(
     Ok(axum::Json(serde_json::json!({"key":key})).into_response())
 }
 
+/// The two documents a publish pins: the subgraph's, in the shape Explorer reads, and the version's.
+/// A link that is not http(s) or ipfs is dropped rather than refused, since Explorer renders it.
+fn subgraph_metadata_docs(body: &serde_json::Value) -> (serde_json::Value, serde_json::Value) {
+    let text = |k: &str, max: usize| -> String {
+        body.get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().chars().take(max).collect())
+            .unwrap_or_default()
+    };
+    let link = |k: &str| -> String {
+        let s = text(k, 512);
+        if s.starts_with("https://") || s.starts_with("http://") || s.starts_with("ipfs://") {
+            s
+        } else {
+            String::new()
+        }
+    };
+    let categories: Vec<String> = body
+        .get("categories")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c.as_str())
+                .map(|c| c.trim().chars().take(40).collect::<String>())
+                .filter(|c| !c.is_empty())
+                .take(10)
+                .collect()
+        })
+        .unwrap_or_default();
+    let label = match text("versionLabel", 64) {
+        l if l.is_empty() => "v0.0.1".to_string(),
+        l => l,
+    };
+    (
+        serde_json::json!({
+            "description": text("description", 2000),
+            "displayName": text("displayName", 200),
+            "image": link("image"),
+            "codeRepository": link("codeRepository"),
+            "website": link("website"),
+            "categories": categories,
+        }),
+        serde_json::json!({"label": label, "description": ""}),
+    )
+}
+
 pub async fn studio_metadata_post(
     State(st): State<AppState>,
     headers: HeaderMap,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
     session(&st, &headers)?;
-    let display = body
-        .get("displayName")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let description = body
-        .get("description")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let label = body
-        .get("versionLabel")
-        .and_then(|v| v.as_str())
-        .unwrap_or("v0.0.1");
-    let subgraph_doc = serde_json::json!({"description":description,"displayName":display,"image":"","codeRepository":"","website":""});
-    let version_doc = serde_json::json!({"label":label,"description":""});
+    let (subgraph_doc, version_doc) = subgraph_metadata_docs(&body);
     let (sub, version) = tokio::try_join!(
         st.ipfs.add_json(&subgraph_doc),
         st.ipfs.add_json(&version_doc)
@@ -5222,5 +5255,44 @@ mod subgraph_graphql_tests {
             .await
             .unwrap_err();
         assert!(e.to_string().contains("boom"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod subgraph_metadata_tests {
+    use super::subgraph_metadata_docs;
+    use serde_json::json;
+
+    #[test]
+    fn carries_every_field_explorer_shows() {
+        let (sub, ver) = subgraph_metadata_docs(&json!({
+            "displayName": " Uniswap ", "description": "d", "versionLabel": "v1.2.0",
+            "image": "ipfs://Qm", "website": "https://x.org", "codeRepository": "https://github.com/a/b",
+            "categories": ["DeFi", " ", "DEX"]
+        }));
+        assert_eq!(sub["displayName"], "Uniswap");
+        assert_eq!(sub["image"], "ipfs://Qm");
+        assert_eq!(sub["website"], "https://x.org");
+        assert_eq!(sub["codeRepository"], "https://github.com/a/b");
+        assert_eq!(sub["categories"], json!(["DeFi", "DEX"]));
+        assert_eq!(ver["label"], "v1.2.0");
+    }
+
+    #[test]
+    fn old_clients_get_what_they_got_before() {
+        let (sub, ver) = subgraph_metadata_docs(&json!({"displayName": "n"}));
+        assert_eq!(
+            sub,
+            json!({"description":"","displayName":"n","image":"","codeRepository":"","website":"","categories":[]})
+        );
+        assert_eq!(ver["label"], "v0.0.1");
+    }
+
+    #[test]
+    fn drops_links_that_are_not_links() {
+        let (sub, _) =
+            subgraph_metadata_docs(&json!({"website": "javascript:alert(1)", "image": "data:x"}));
+        assert_eq!(sub["website"], "");
+        assert_eq!(sub["image"], "");
     }
 }
