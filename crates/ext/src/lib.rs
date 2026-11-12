@@ -1044,6 +1044,10 @@ const FAILURE_TTL: Duration = Duration::from_secs(3600);
 /// A manifest or metadata document. The largest real manifests are a few hundred kilobytes.
 const MAX_DOCUMENT_BYTES: usize = 4 * 1024 * 1024;
 
+/// What the deploy-key IPFS proxy will hold of one upstream answer. graph-cli uploads through it,
+/// and an add answers with a line of JSON per file.
+const MAX_PROXY_BYTES: usize = 4 * 1024 * 1024;
+
 /// Takes `n` from `budget` if that much is left. Not `fetch_update`, deprecated on current stable,
 /// nor `try_update`, which older toolchains lack.
 fn take_from(budget: &AtomicUsize, n: usize) -> bool {
@@ -1239,8 +1243,8 @@ impl Ipfs {
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-        Ok((status, bytes, ct))
+        let bytes = read_capped(response, path, MAX_PROXY_BYTES, None).await?;
+        Ok((status, bytes.into(), ct))
     }
 }
 
@@ -1485,6 +1489,24 @@ mod ipfs_tests {
         let r = tokio::time::timeout(Duration::from_secs(5), ipfs.cat("QmAbc"))
             .await
             .expect("refused before the body ended");
+        assert!(r.unwrap_err().contains("cap"));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_proxied_answer_is_refused_while_it_streams() {
+        let ipfs = Ipfs::new(&chunked_then_stall(MAX_PROXY_BYTES + 1).await);
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            ipfs.proxy(
+                reqwest::Method::POST,
+                "api/v0/cat",
+                Some("arg=QmAbc"),
+                bytes::Bytes::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("refused before the body ended");
         assert!(r.unwrap_err().contains("cap"));
     }
 
