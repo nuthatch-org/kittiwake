@@ -1309,10 +1309,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/token-metrics", get(handlers::token_metrics))
         .route("/api/subgraph-search", get(handlers::subgraph_search))
         .route("/api/subgraph-names", post(handlers::subgraph_names))
-        .route(
-            "/api/analytics/clickthrough",
-            post(handlers::analytics_clickthrough),
-        )
         .route("/api/chain-lag", get(handlers::chain_lag))
         .route("/api/dropped-chains", get(handlers::dropped_chains))
         .route("/api/reo", get(handlers::reo))
@@ -1551,6 +1547,39 @@ mod tests {
                 "{method} {path} is not budgeted"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_unused_clickthrough_write_is_not_served() {
+        use tower::ServiceExt;
+        let gate =
+            kittiwake_nest::NestGate::new(kittiwake_nest::NestConfig::new("http://127.0.0.1:9"))
+                .unwrap();
+        let read = kittiwake_read::ReadCtx::new(gate, kittiwake_cache::Store::new(64), 1);
+        let app = router(state(
+            Limits::new(1000, 1000, 1000, Vec::new()),
+            None,
+            read,
+            None,
+            None,
+            kittiwake_ext::Ipfs::default(),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let mut req = axum::http::Request::post("/api/analytics/clickthrough")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                r#"{"event_type":"trade_click","venue":"x","session_id":"x"}"#,
+            ))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([203, 0, 113, 1], 1))));
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test]
