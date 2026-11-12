@@ -2374,9 +2374,18 @@ pub async fn silent_jobs(
         .map(|(name, _)| format!("{CRON_RUN_PREFIX}{name}"))
         .collect();
 
-    // Every run ever, not a recent window: a job silent for a week has nothing inside one.
+    // Every run ever, not a recent window: a job silent for a week has nothing inside one. One
+    // index probe per step on `(step, started_at DESC)`, rather than a MAX over all of its rows.
     let rows = sqlx::query_as::<_, (String, Option<i64>)>(
-        "SELECT step,                 (EXTRACT(EPOCH FROM (NOW() - MAX(started_at))) / 60)::bigint AS quiet_minutes            FROM cron_runs           WHERE step = ANY($1)           GROUP BY step",
+        "SELECT s.step, \
+                (EXTRACT(EPOCH FROM (NOW() - last.started_at)) / 60)::bigint AS quiet_minutes \
+           FROM unnest($1::text[]) AS s(step) \
+          CROSS JOIN LATERAL ( \
+                SELECT c.started_at FROM cron_runs c \
+                 WHERE c.step = s.step \
+                 ORDER BY c.started_at DESC \
+                 LIMIT 1 \
+          ) last",
     )
     .bind(&steps)
     .fetch_all(pool)
@@ -2692,6 +2701,52 @@ mod postgres_tests {
         let url =
             std::env::var("KITTIWAKE_TEST_DATABASE_URL").expect("KITTIWAKE_TEST_DATABASE_URL");
         connect(&url, 2).await.unwrap()
+    }
+
+    fn unique(prefix: &str) -> String {
+        format!(
+            "{prefix}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    async fn runs(pool: &Pool, step: &str, minutes_ago: &[i64]) {
+        sqlx::query(
+            "INSERT INTO cron_runs (step, started_at, duration_ms, success) \
+             SELECT $1, NOW() - make_interval(mins => m::int), 1, true FROM unnest($2::bigint[]) m",
+        )
+        .bind(format!("{CRON_RUN_PREFIX}{step}"))
+        .bind(minutes_ago)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Postgres"]
+    async fn pg_a_silent_job_is_judged_by_its_latest_run_alone() {
+        let pool = test_pool().await;
+        let (quiet, busy, never) = (unique("quiet"), unique("busy"), unique("never"));
+        runs(&pool, &quiet, &[600, 300, 120]).await;
+        runs(&pool, &busy, &[600, 300, 2]).await;
+        let jobs = [(quiet.clone(), 600), (busy, 600), (never.clone(), 600)];
+        let silent = silent_jobs(&pool, &jobs, Duration::from_secs(10 * 3600))
+            .await
+            .unwrap();
+        let named: Vec<(&str, i64, bool)> = silent
+            .iter()
+            .map(|s| (s.step.as_str(), s.silent_for_minutes, s.never_ran))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                (format!("{CRON_RUN_PREFIX}{never}").as_str(), 600, true),
+                (format!("{CRON_RUN_PREFIX}{quiet}").as_str(), 120, false),
+            ]
+        );
     }
 
     #[tokio::test]

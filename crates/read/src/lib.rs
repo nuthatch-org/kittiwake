@@ -84,9 +84,11 @@ impl ExternalFlights {
 }
 
 /// A source that is not a nest: it has no provenance of its own, so the age of the cache entry is
-/// the whole of what we can say about how current it is.
+/// the whole of what we can say about how current it is. A fetch that also asks a nest runs its
+/// queries on the lane it is handed: `Read` while a reader waits on a miss, `Cron` behind a stale
+/// answer, as the nest path does.
 pub type ExternalFetcher =
-    Arc<dyn Fn() -> BoxFuture<'static, Result<serde_json::Value, ApiError>> + Send + Sync>;
+    Arc<dyn Fn(Lane) -> BoxFuture<'static, Result<serde_json::Value, ApiError>> + Send + Sync>;
 
 /// A cached answer and the record of how it was delivered.
 pub struct Read {
@@ -227,7 +229,7 @@ impl ReadCtx {
                 }
                 Freshness::Stale => {
                     if self.external.failed.get(&key).await.is_none() {
-                        drop(self.external_flight(key, fetch).await);
+                        drop(self.external_flight(key, fetch, Lane::Cron).await);
                     }
                     let meta = entry.meta(ServedFrom::Cache, true);
                     return Ok(Read { entry, meta });
@@ -239,14 +241,19 @@ impl ReadCtx {
         if let Some(e) = self.external.failed.get(&key).await {
             return Err(e);
         }
-        let entry = self.external_flight(key, fetch).await.await?;
+        let entry = self.external_flight(key, fetch, Lane::Read).await.await?;
         let meta = entry.meta(fresh_from, false);
         Ok(Read { entry, meta })
     }
 
     /// The one fetch in flight for `key`, started if there is none. Spawned, so it finishes and
     /// stores its answer whether or not anyone is still waiting for it.
-    async fn external_flight(&self, key: String, fetch: ExternalFetcher) -> ExternalFlight {
+    async fn external_flight(
+        &self,
+        key: String,
+        fetch: ExternalFetcher,
+        lane: Lane,
+    ) -> ExternalFlight {
         let mut map = self.external.inflight.lock().await;
         if let Some((_, flight)) = map.get(&key) {
             return flight.clone();
@@ -259,7 +266,7 @@ impl ReadCtx {
         let k = key.clone();
         // Its own task, so a panicking fetch becomes an error here rather than a dead flight.
         let handle = tokio::spawn(async move {
-            let v = fetch().await?;
+            let v = fetch(lane).await?;
             Ok(store.insert(k, Entry::new(v, Provenance::default())).await)
         });
         let ctx = self.clone();
@@ -433,7 +440,7 @@ mod tests {
         ctx.external = Arc::new(ExternalFlights::new(Duration::from_millis(200)));
         let starts = Arc::new(AtomicUsize::new(0));
         let s = starts.clone();
-        let fetch: ExternalFetcher = Arc::new(move || {
+        let fetch: ExternalFetcher = Arc::new(move |_| {
             let first = s.fetch_add(1, Ordering::SeqCst) == 0;
             Box::pin(async move {
                 assert!(!first, "the first fetch panics");
@@ -466,7 +473,7 @@ mod tests {
         fail: Arc<std::sync::atomic::AtomicBool>,
     ) -> ExternalFetcher {
         use std::sync::atomic::Ordering;
-        Arc::new(move || {
+        Arc::new(move |_| {
             starts.fetch_add(1, Ordering::SeqCst);
             let fail = fail.load(Ordering::SeqCst);
             Box::pin(async move {
@@ -478,6 +485,38 @@ mod tests {
                 }
             })
         })
+    }
+
+    #[tokio::test]
+    async fn an_external_refresh_behind_a_stale_answer_runs_on_the_cron_lane() {
+        let (ctx, _server) = ctx().await;
+        let lanes = Arc::new(Mutex::new(Vec::new()));
+        let seen = lanes.clone();
+        let fetch: ExternalFetcher = Arc::new(move |lane| {
+            seen.lock().unwrap().push(lane);
+            Box::pin(async { Ok(serde_json::json!({})) })
+        });
+        let ask = || {
+            ctx.cached_external_keyed(
+                "r",
+                "s",
+                Duration::from_secs(30),
+                ServedFrom::Nest,
+                fetch.clone(),
+            )
+        };
+
+        ask().await.unwrap();
+        let key = kittiwake_cache::key(1, "ext", "r", &serde_json::json!({ "subject": "s" }));
+        let entry = ctx.store.get(&key).await.unwrap();
+        let stale = Entry {
+            fetched_at: Instant::now() - Duration::from_secs(60),
+            ..(*entry).clone()
+        };
+        ctx.store.insert(key, stale).await;
+        assert!(ask().await.unwrap().meta.stale);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(*lanes.lock().unwrap(), [Lane::Read, Lane::Cron]);
     }
 
     #[tokio::test]

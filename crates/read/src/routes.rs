@@ -1358,27 +1358,29 @@ pub async fn delegation_flows(ctx: &ReadCtx, since: i64) -> Result<Read, ApiErro
 // Subgraphs: the GNS nest and the deployment views
 // ---------------------------------------------------------------------------------------------
 
-/// `/api/developer-activity`: subgraphs published per week over the window.
-pub async fn developer_activity(ctx: &ReadCtx, cutoff: i64) -> Result<Read, ApiError> {
+/// `/api/developer-activity`: subgraphs published per week in the `days` from `cutoff`, whose end
+/// is the current week.
+pub async fn developer_activity(ctx: &ReadCtx, cutoff: i64, days: i64) -> Result<Read, ApiError> {
     let inner = rows_only(
         NestId::Gns,
         sql::subgraphs_published_since_sql(cutoff),
         T_FOLD,
     );
-    let now = cutoff + 12 * 30 * 86_400;
+    let now = cutoff + days * 86_400;
+    let months = ((days + 15) / 30).max(1);
     let fetch: Fetcher = Arc::new(move |gate, lane| {
         let inner = inner.clone();
         Box::pin(async move {
             let (v, p) = inner(gate, lane).await?;
             let rows = v.as_array().cloned().unwrap_or_default();
-            Ok((crate::shape::developer_activity(&rows, 12, now), p))
+            Ok((crate::shape::developer_activity(&rows, months, now), p))
         })
     });
 
     ctx.cached(
         "developer-activity",
         NestId::Gns,
-        serde_json::json!({ "cutoff": cutoff }),
+        serde_json::json!({ "cutoff": cutoff, "days": days }),
         CachePolicy::from_poll_interval(cadence::ARCHIVAL),
         fetch,
     )
