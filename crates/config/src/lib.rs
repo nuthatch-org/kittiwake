@@ -366,19 +366,13 @@ fn default_db_max_conns() -> u32 {
 /// Keys an older build read and this one does not. A config written then still carries them, and
 /// the box's file is never overwritten, so they warn rather than stop the service starting.
 const RETIRED_KEYS: &[&str] = &[
-    "scuttle",
-    "stripe",
-    "support",
     "qos_oracle",
     "paywall_enabled",
     "paywall_service_tokens",
-    "ignore_addresses",
-    "webhook_secret",
-    "admin_secret",
-    "session_secret",
-    "trip_salt",
-    "ip_pepper",
-    "issue_token",
+    "stripe",
+    "support",
+    "scuttle",
+    "telegram.ignore_addresses",
     "nest.username",
 ];
 
@@ -394,24 +388,56 @@ fn is_retired(path: &str) -> bool {
 impl Config {
     /// Load from `path` if it exists, then overlay `KITTIWAKE_*` environment variables.
     pub fn load(path: &str) -> Result<Self, ConfigError> {
+        let (cfg, warnings) = Self::load_with_warnings(path)?;
+        for w in warnings {
+            tracing::warn!("{w}");
+        }
+        Ok(cfg)
+    }
+
+    /// As `load`, returning the warnings instead of logging them, for `--check-config`.
+    pub fn load_with_warnings(path: &str) -> Result<(Self, Vec<String>), ConfigError> {
         // `KITTIWAKE_CONFIG` names this file and is not a setting.
         Self::from_figment(
+            figment::Figment::new().merge(Toml::file(path)),
             figment::Figment::new()
-                .merge(Toml::file(path))
                 .merge(Env::prefixed("KITTIWAKE_").ignore(&["config"]).split("__")),
         )
     }
 
-    fn from_figment(figment: figment::Figment) -> Result<Self, ConfigError> {
-        let value: figment::value::Value = figment
+    /// A key in the file that nothing reads is refused: it is a mistake the operator can fix, and
+    /// ignoring it silently is the fault. One that arrives by environment only warns, because the
+    /// environment is ambient and the `KITTIWAKE_` prefix is shared with other binaries.
+    fn from_figment(
+        file: figment::Figment,
+        env: figment::Figment,
+    ) -> Result<(Self, Vec<String>), ConfigError> {
+        let value: figment::value::Value = file
+            .clone()
+            .merge(env)
             .extract()
             .map_err(|e| ConfigError::Load(e.to_string()))?;
-        let mut unknown = Vec::new();
+        let mut ignored = Vec::new();
         let cfg: Config = serde_ignored::deserialize(&value, |path| {
-            unknown.push(path.to_string().replace(".?", ""))
+            ignored.push(path.to_string().replace(".?", ""))
         })
         .map_err(|e: figment::Error| ConfigError::Load(e.to_string()))?;
-        let (retired, unknown): (Vec<_>, Vec<_>) = unknown.into_iter().partition(|p| is_retired(p));
+
+        let (mut unknown, mut warnings) = (Vec::new(), Vec::new());
+        for path in ignored {
+            if is_retired(&path) {
+                warnings.push(format!(
+                    "configuration key `{path}` was removed and is ignored; delete it"
+                ));
+            } else if file.contains(&path) {
+                unknown.push(path);
+            } else {
+                let var = format!("KITTIWAKE_{}", path.to_uppercase().replace('.', "__"));
+                warnings.push(format!(
+                    "environment variable {var} sets `{path}`, which nothing reads; it is ignored"
+                ));
+            }
+        }
         if !unknown.is_empty() {
             return Err(ConfigError::Invalid(format!(
                 "unknown configuration key{} {}: nothing reads {}, so it would be ignored silently. \
@@ -426,14 +452,8 @@ impl Config {
                 if unknown.len() == 1 { "it" } else { "them" },
             )));
         }
-        for key in retired {
-            tracing::warn!(
-                key,
-                "this configuration key was removed and is ignored; delete it"
-            );
-        }
         cfg.validate()?;
-        Ok(cfg)
+        Ok((cfg, warnings))
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -797,8 +817,12 @@ mod unknown_keys {
     use super::*;
     use figment::providers::Toml;
 
+    fn load_with(toml: &str, env: figment::Figment) -> Result<(Config, Vec<String>), ConfigError> {
+        Config::from_figment(figment::Figment::new().merge(Toml::string(toml)), env)
+    }
+
     fn load(toml: &str) -> Result<Config, ConfigError> {
-        Config::from_figment(figment::Figment::new().merge(Toml::string(toml)))
+        load_with(toml, figment::Figment::new()).map(|(c, _)| c)
     }
 
     const BASE: &str = "[nest]\norigin = \"https://nest.example\"\n";
@@ -854,5 +878,58 @@ mod unknown_keys {
         let text = include_str!("../../../deploy/config.example.toml")
             .replace("# foghorn_api_url", "foghorn_api_url");
         assert!(load(&text).unwrap().foghorn_api_url.is_some());
+    }
+
+    #[test]
+    fn every_key_ever_removed_from_a_settings_struct_warns_at_its_real_path() {
+        let toml = format!(
+            "paywall_enabled = true\npaywall_service_tokens = [\"t\"]\n{BASE}\
+             [nest.permits]\nalloc = 2\n\
+             [telegram]\nbot_token = \"b\"\nchat_id = \"c\"\nignore_addresses = [\"0x1\"]\n\
+             [stripe]\nwebhook_secret = \"w\"\n\
+             [support]\nissue_token = \"i\"\n\
+             [qos_oracle]\nurl = \"u\"\napi_key = \"k\"\n\
+             [scuttle]\nadmin_secret = \"a\"\nip_pepper = \"p\"\nsession_secret = \"s\"\ntrip_salt = \"t\"\n"
+        );
+        let (_, warnings) = load_with(&toml, figment::Figment::new()).expect("must start");
+        for key in [
+            "paywall_enabled",
+            "paywall_service_tokens",
+            "telegram.ignore_addresses",
+            "stripe",
+            "support",
+            "qos_oracle",
+            "scuttle",
+        ] {
+            assert!(
+                warnings.iter().any(|w| w.contains(&format!("`{key}`"))),
+                "{key}: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unmapped_environment_variable_warns_and_names_the_variable() {
+        let env = figment::Figment::new().merge(figment::providers::Serialized::default(
+            "api_url",
+            "https://x",
+        ));
+        let (_, warnings) =
+            load_with(BASE, env).expect("the MCP binary's variable must not stop startup");
+        assert!(
+            warnings.iter().any(|w| w.contains("KITTIWAKE_API_URL")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_mapped_environment_variable_overrides_and_does_not_warn() {
+        let env = figment::Figment::new().merge(figment::providers::Serialized::default(
+            "bind",
+            "127.0.0.1:9",
+        ));
+        let (cfg, warnings) = load_with(BASE, env).unwrap();
+        assert_eq!(cfg.bind, "127.0.0.1:9");
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 }

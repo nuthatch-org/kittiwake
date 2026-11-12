@@ -46,8 +46,25 @@ impl RunRecorder for PgRecorder {
     }
 }
 
+/// `kittiwake --check-config`: load and validate the configuration exactly as startup does, say what
+/// it would refuse or ignore, and exit without binding or connecting to anything.
+fn check_config() -> anyhow::Result<()> {
+    let config_path =
+        std::env::var("KITTIWAKE_CONFIG").unwrap_or_else(|_| "/etc/kittiwake/config.toml".into());
+    let (cfg, warnings) = Config::load_with_warnings(&config_path)
+        .with_context(|| format!("refused: configuration from {config_path}"))?;
+    for w in warnings {
+        eprintln!("warning: {w}");
+    }
+    println!("configuration ok: {config_path} (nest {})", cfg.nest.origin);
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--check-config") {
+        return check_config();
+    }
     kittiwake_obs::init_tracing();
     let metrics = kittiwake_obs::init_metrics().ok();
 
