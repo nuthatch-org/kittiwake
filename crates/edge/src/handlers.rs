@@ -935,8 +935,13 @@ pub async fn delegation_flows(
     Query(q): Query<DaysQuery>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
-    let since = now() - q.days.clamp(1, 3650) * 86_400;
+    let since = days_back(now(), q.days.clamp(1, 3650));
     Ok(envelope(routes::delegation_flows(&st.read, since).await?))
+}
+
+/// Floored to the hour, as [`thirty_days_back`] is: the window is part of the cache key.
+fn days_back(now: i64, days: i64) -> i64 {
+    now - now.rem_euclid(3600) - days * 86_400
 }
 
 pub async fn developer_activity(
@@ -946,7 +951,7 @@ pub async fn developer_activity(
     Query(q): Query<DaysQuery>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
-    let cutoff = now() - q.days.clamp(7, 3650) * 86_400;
+    let cutoff = days_back(now(), q.days.clamp(7, 3650));
     Ok(envelope(
         routes::developer_activity(&st.read, cutoff).await?,
     ))
@@ -1317,16 +1322,14 @@ pub async fn studio_auth_post(
     Ok(r)
 }
 
-pub async fn studio_auth_delete(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Response, ErrorResponse> {
-    if let Some(studio) = &st.studio
+pub async fn studio_auth_delete(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    // The cookie is cleared whatever happens here: a sign-out the browser cannot complete is worse
+    // than one the server could not record.
+    if let (Some(studio), Some(pool)) = (&st.studio, &st.pool)
         && let Some((address, _)) = session_claim(&studio.secret, &headers, now())
+        && let Err(e) = kittiwake_db::record_sign_out(pool, &address, now()).await
     {
-        kittiwake_db::record_sign_out(pool(&st)?, &address, now())
-            .await
-            .map_err(db_err)?;
+        tracing::error!(error = %e, "a Dock sign-out could not be recorded; the session stays valid until it expires");
     }
     let mut r = axum::Json(serde_json::json!({"ok": true})).into_response();
     r.headers_mut().insert(
@@ -1336,7 +1339,7 @@ pub async fn studio_auth_delete(
         ),
     );
     crate::no_store(r.headers_mut());
-    Ok(r)
+    r
 }
 
 pub async fn studio_subgraphs_get(
@@ -1689,18 +1692,44 @@ fn rpc_error(code: i32, message: &str) -> Response {
         .into_response()
 }
 
+/// The deploy key's hash, once it is known to be a real key. Anything short of that spends the
+/// caller's address budget, so the route cannot be used to try keys for free.
+async fn deploy_key_budget(
+    st: &AppState,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+) -> Result<(), ErrorResponse> {
+    let known = async {
+        let hash = kittiwake_dock::hash_key(bearer(headers)?);
+        kittiwake_db::deploy_key_owner(pool(st)?, &hash)
+            .await
+            .map_err(db_err)?
+            .ok_or(ApiError::Unauthorized)?;
+        Ok::<_, ErrorResponse>(hash)
+    }
+    .await;
+    match known {
+        Ok(hash) => Ok(st.limits.check_deploy_key(&hash)?),
+        Err(e) => {
+            st.limits.check(
+                &st.limits.read,
+                client_ip(peer, headers, st.edge_secret.as_deref()),
+            )?;
+            Err(e)
+        }
+    }
+}
+
 pub async fn studio_ipfs_proxy(
     State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(path): Path<String>,
     OriginalUri(uri): OriginalUri,
     method: Method,
     body: bytes::Bytes,
 ) -> Result<Response, ErrorResponse> {
-    kittiwake_db::deploy_key_owner(pool(&st)?, &kittiwake_dock::hash_key(bearer(&headers)?))
-        .await
-        .map_err(db_err)?
-        .ok_or(ApiError::Unauthorized)?;
+    deploy_key_budget(&st, peer, &headers).await?;
     let (status, bytes, content_type) = st
         .ipfs
         .proxy(
@@ -5285,6 +5314,17 @@ mod indexer_page_tests {
         let hour = t - t.rem_euclid(3600);
         assert_eq!(thirty_days_back(hour), thirty_days_back(hour + 3599));
         assert_eq!(thirty_days_back(hour + 3600) - thirty_days_back(hour), 3600);
+    }
+
+    /// The flows and developer-activity windows are cache keys, so a page load a minute later
+    /// must ask for the same one.
+    #[test]
+    fn the_day_windows_move_by_the_hour_not_the_second() {
+        let t: i64 = 1_790_000_000;
+        let hour = t - t.rem_euclid(3600);
+        assert_eq!(days_back(hour + 60, 90), days_back(hour + 120, 90));
+        assert_eq!(days_back(hour, 90), days_back(hour + 3599, 90));
+        assert_eq!(days_back(hour, 90), hour - 90 * 86_400);
     }
 }
 

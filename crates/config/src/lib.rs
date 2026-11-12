@@ -387,6 +387,11 @@ impl Config {
                 self.nest.origin
             )));
         }
+        if let Some((nest, _)) = self.nest.permits.iter().find(|(_, n)| **n == 0) {
+            return Err(ConfigError::Invalid(format!(
+                "nest.permits.{nest} is 0, which admits no query at all"
+            )));
+        }
         if let Some(receipt) = &self.receipt {
             // Checked here so a deployment that means to issue receipts finds out at boot rather
             // than the first time somebody asks for one.
@@ -683,6 +688,16 @@ mod tests {
     #[test]
     fn a_missing_nest_origin_is_a_startup_failure() {
         assert!(settings("").validate().is_err());
+    }
+
+    /// Zero permits admits nothing, so every read would wait out its queue timeout and fail.
+    #[test]
+    fn a_nest_with_no_permits_is_a_startup_failure() {
+        let mut c = settings("https://nest.example");
+        c.nest.permits.insert("alloc".into(), 0);
+        assert!(c.validate().is_err());
+        c.nest.permits.insert("alloc".into(), 2);
+        assert!(c.validate().is_ok());
     }
 
     #[test]
