@@ -340,6 +340,7 @@ async fn main() -> anyhow::Result<()> {
             store.clone(),
             pool.clone(),
             kittiwake_ext::Ext::default().with_github_token(cfg.github_token.clone()),
+            cfg.cron_runs_retention_days,
         ));
 
         if cfg.warmer_enabled {

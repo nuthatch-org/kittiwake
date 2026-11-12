@@ -35,8 +35,14 @@ fn mins(n: u64) -> Duration {
 /// Safe to run whenever the service is up, because nothing outside this process can see what they
 /// write. The distinction that matters is not "is it a cron" but "does it write to a store the
 /// other system also writes to" - and these do not.
-pub fn live_jobs(store: kittiwake_cache::Store, pool: Option<Pool>, ext: Ext) -> Vec<JobDef> {
+pub fn live_jobs(
+    store: kittiwake_cache::Store,
+    pool: Option<Pool>,
+    ext: Ext,
+    cron_runs_retention_days: u32,
+) -> Vec<JobDef> {
     let mut jobs = Vec::new();
+    let pool_for_prune = pool.clone();
     let pool_for_warm = pool.clone();
     let pool_for_support = pool.clone();
     let ext_for_support = ext.clone();
@@ -164,6 +170,28 @@ pub fn live_jobs(store: kittiwake_cache::Store, pool: Option<Pool>, ext: Ext) ->
                 }),
             )
             .staggered(mins(8)),
+        );
+    }
+
+    // `cron_runs` grows by every run of every job and nothing else deletes from it. Hourly, in
+    // batches, so a first run against months of history spreads over a few hours instead of one
+    // long transaction. Only this service's rows, which are ours alone to prune.
+    if let Some(pool) = pool_for_prune {
+        jobs.push(
+            JobDef::every(
+                "prune-cron-runs",
+                mins(60),
+                Arc::new(move |_ctx| {
+                    let pool = pool.clone();
+                    Box::pin(async move {
+                        kittiwake_db::prune_cron_runs(&pool, cron_runs_retention_days, 5_000, 20)
+                            .await
+                            .map(|n| JobOutcome { rows_written: n })
+                            .map_err(|e| e.to_string())
+                    })
+                }),
+            )
+            .staggered(mins(41)),
         );
     }
 
@@ -541,6 +569,7 @@ mod tests {
             ("refresh-chain-health", 30, 6),
             ("reconcile-bounties", 10, 9),
             ("ingest-graph-support", 720, 8),
+            ("prune-cron-runs", 60, 41),
         ];
         let fires = |period: u64, offset: u64| -> Vec<u64> {
             (0..60)
@@ -584,6 +613,7 @@ mod tests {
             ("refresh-chain-health", mins(30), mins(6)),
             ("reconcile-bounties", mins(10), mins(9)),
             ("ingest-graph-support", mins(720), mins(8)),
+            ("prune-cron-runs", mins(60), mins(41)),
         ];
         for (i, a) in names_and_offsets.iter().enumerate() {
             for b in names_and_offsets.iter().skip(i + 1) {

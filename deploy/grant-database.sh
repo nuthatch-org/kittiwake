@@ -24,7 +24,8 @@
 #     GRANT_DOCK lifts it, because the Dock is here now.
 #   INSERT and UPDATE on ipfs_metadata, because warm-ipfs fills it and both systems write the same
 #     document under the same CID, so they race to the same answer.
-#   INSERT on cron_runs, because every job records its run there under a `kittiwake:` prefix.
+#   INSERT on cron_runs, because every job records its run there under a `kittiwake:` prefix, and
+#     DELETE, because `prune-cron-runs` deletes its own old rows (that prefix only, never a job's last).
 #   CREATE on the schema, because this service creates three tables of its own.
 #   ALL on those three tables.
 #
@@ -118,7 +119,7 @@ GRANT SELECT ON ingestion_state, epochs, delegation_events, disputes, network_sn
   rav_redemptions, indexer_snapshots, cron_runs, parameter_changes TO $ROLE;
 
 GRANT INSERT, UPDATE ON ipfs_metadata TO $ROLE;
-GRANT INSERT ON cron_runs TO $ROLE;
+GRANT INSERT, DELETE ON cron_runs TO $ROLE;
 -- The probe-round store behind "effectively dead". Not gated on GRANT_WRITER: this is written by
 -- a read route on every request rather than by the scheduler, and without INSERT here the history
 -- never accumulates, so the verdict is stuck on `rechecking` for ever. It fails as a logged warning

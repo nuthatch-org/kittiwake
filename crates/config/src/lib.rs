@@ -351,6 +351,10 @@ pub struct Config {
     /// Turns the warmer on. Off by default for the same reason.
     #[serde(default)]
     pub warmer_enabled: bool,
+    /// How many days of this service's `cron_runs` rows to keep. Each step's latest run is kept
+    /// whatever its age.
+    #[serde(default = "default_cron_runs_retention_days")]
+    pub cron_runs_retention_days: u32,
 }
 
 fn default_bind() -> String {
@@ -361,6 +365,9 @@ fn default_metrics_bind() -> String {
 }
 fn default_db_max_conns() -> u32 {
     16
+}
+fn default_cron_runs_retention_days() -> u32 {
+    90
 }
 
 /// Keys an older build read and this one does not. A config written then still carries them, and
@@ -476,6 +483,12 @@ impl Config {
                     )));
                 }
             }
+        }
+        if self.cron_runs_retention_days == 0 {
+            return Err(ConfigError::Invalid(
+                "cron_runs_retention_days is 0, which would delete every run but each job's last"
+                    .into(),
+            ));
         }
         if let Some((nest, _)) = self.nest.permits.iter().find(|(_, n)| **n == 0) {
             return Err(ConfigError::Invalid(format!(
@@ -772,6 +785,7 @@ mod tests {
             backup_mark_path: None,
             scheduler_enabled: false,
             warmer_enabled: false,
+            cron_runs_retention_days: 90,
         }
     }
 
@@ -880,6 +894,24 @@ mod unknown_keys {
             ))
             .is_ok()
         );
+    }
+
+    #[test]
+    fn cron_runs_are_kept_ninety_days_unless_configured() {
+        assert_eq!(load(BASE).unwrap().cron_runs_retention_days, 90);
+        let kept = load(&format!(
+            "cron_runs_retention_days = 30
+{BASE}"
+        ))
+        .unwrap();
+        assert_eq!(kept.cron_runs_retention_days, 30);
+        let err = load(&format!(
+            "cron_runs_retention_days = 0
+{BASE}"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cron_runs_retention_days"), "{err}");
     }
 
     #[test]
