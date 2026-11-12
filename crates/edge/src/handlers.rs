@@ -2188,6 +2188,12 @@ async fn live_or(
     Ok(resp)
 }
 
+/// Not case-folded: whether a query is a `Qm…` or `0x…` search, and what a hash prefix matches,
+/// both depend on its case.
+fn search_key(query: &str) -> String {
+    query.trim().to_string()
+}
+
 /// `/api/subgraph-search`: one box, three questions.
 ///
 /// A `0x…` address searches deployment manifests, a `Qm…` prefix searches deployment hashes, and
@@ -2208,11 +2214,10 @@ pub async fn subgraph_search(
         .clone();
 
     // A name search costs ten nest queries across two nests to return ten rows, and a search box
-    // asks the same question on every keystroke and every back-button. The key is the trimmed,
-    // lowercased query, so it is caller-controlled; the store is a bounded LRU and the read budget
-    // already caps how fast anyone can mint keys.
+    // asks the same question on every keystroke and every back-button. The key is caller-controlled;
+    // the store is a bounded LRU and the read budget already caps how fast anyone can mint keys.
     let query = q.q.unwrap_or_default();
-    let key = query.trim().to_lowercase();
+    let key = search_key(&query);
     let (ipfs, gate, figures) = (
         st.ipfs.clone(),
         st.read.gate.clone(),
@@ -5274,6 +5279,26 @@ mod indexer_page_tests {
         let hour = t - t.rem_euclid(3600);
         assert_eq!(thirty_days_back(hour), thirty_days_back(hour + 3599));
         assert_eq!(thirty_days_back(hour + 3600) - thirty_days_back(hour), 3600);
+    }
+}
+
+#[cfg(test)]
+mod search_key_tests {
+    /// `qm…` is a name search and `Qm…` a hash search, so they must not share a cached answer.
+    #[test]
+    fn queries_that_search_differently_do_not_share_a_key() {
+        assert_ne!(
+            super::search_key("QmXyZ12345"),
+            super::search_key("qmxyz12345")
+        );
+        assert_ne!(
+            super::search_key("QmXyZ12345"),
+            super::search_key("QmxYz12345")
+        );
+        assert_eq!(
+            super::search_key("  uniswap "),
+            super::search_key("uniswap")
+        );
     }
 }
 

@@ -142,7 +142,7 @@ pub async fn signal(gate: &NestGate, deployment_id: &str) -> Option<SignalContex
     let sql = deployment_signals_sql(&hex)?;
     let answer = gate
         .query_coalesced(
-            "alloc:deployment-signal",
+            &format!("alloc:deployment-signal:{hex}"),
             QuerySpec::read(NestId::Alloc, sql),
         )
         .await
@@ -316,6 +316,45 @@ mod tests {
         assert_eq!(wei_to_grt("1000000000000000000"), 1.0);
         assert_eq!(wei_to_grt("0"), 0.0);
         assert_eq!(wei_to_grt("not a number"), 0.0);
+    }
+
+    /// The diff page looks both deployments up at once, so each must get its own signal.
+    #[tokio::test]
+    async fn two_deployments_looked_up_together_keep_their_own_signal() {
+        use wiremock::matchers::{method, path, query_param_contains};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let a = "QmZsgJLiLQKpb8hxTmQ5LWyrFVvfWzVaL4WK8dfFBn7EeK";
+        let b = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
+        let server = MockServer::start().await;
+        for (id, grt) in [(a, "1000"), (b, "9000000")] {
+            let hex = crate::shape::ipfs_hash_to_bytes32(id)
+                .unwrap()
+                .to_lowercase();
+            let rows = serde_json::json!({"count": 1, "rows": [{
+                "deployment_signalled_tokens": format!("{grt}000000000000000000"),
+                "deployment_query_fees_amount": "0",
+            }]});
+            Mock::given(method("GET"))
+                .and(path("/sql"))
+                .and(query_param_contains("q", hex.as_str()))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(rows)
+                        .set_delay(std::time::Duration::from_millis(100)),
+                )
+                .mount(&server)
+                .await;
+        }
+        let mut cfg = kittiwake_nest::NestConfig::new(server.uri());
+        for n in NestId::ALL {
+            cfg.base_paths.insert(n, String::new());
+        }
+        let gate = NestGate::new(cfg).unwrap();
+
+        let (sa, sb) = tokio::join!(signal(&gate, a), signal(&gate, b));
+        assert_eq!(sa.unwrap().signalled_grt, 1_000.0);
+        assert_eq!(sb.unwrap().signalled_grt, 9_000_000.0);
     }
 }
 
