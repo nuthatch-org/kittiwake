@@ -648,9 +648,12 @@ pub fn derived_indexer_metrics(r: &Value, delegation_ratio: f64) -> Value {
     let locked = g("locked_tokens");
     let delegated = g("delegated_tokens");
 
+    // Thawing delegation stays in the pool's tokens until withdrawn and earns nothing.
+    let earning = delegated - g("delegated_thawing_tokens");
+
     let usable_own = staked - locked;
     let max_usable = usable_own + usable_own * delegation_ratio;
-    let total_usable = max_usable.min(usable_own + delegated);
+    let total_usable = max_usable.min(usable_own + earning);
 
     let own_stake_ratio = if total_usable == 0.0 {
         0.0
@@ -669,8 +672,7 @@ pub fn derived_indexer_metrics(r: &Value, delegation_ratio: f64) -> Value {
         _ => 0.0,
     };
     let effective_cut =
-        kittiwake_rewards::effective_cut(cut, usable_own, delegated, delegation_ratio)
-            .unwrap_or(0.0);
+        kittiwake_rewards::effective_cut(cut, usable_own, earning, delegation_ratio).unwrap_or(0.0);
 
     let max_delegated = staked * delegation_ratio;
     let dilution_denom = max_delegated.max(delegated);
@@ -1776,6 +1778,22 @@ mod tests {
         );
         // Capacity is measured on the headline stake, which is what the contracts do.
         assert_eq!(a["tokenCapacity"], b["tokenCapacity"]);
+    }
+
+    /// 0x38f4…27c0 on 2026-11-12: 36,201 GRT of 1.447M delegated was thawing, and counting it
+    /// showed 11.81% where the delegation still earning gives 9.80%.
+    #[test]
+    fn thawing_delegation_does_not_count_towards_the_effective_cut() {
+        let row = json!({"staked_tokens": "11314362556599108089915647", "locked_tokens": "0",
+                         "delegated_tokens": "1447017276239013243647185",
+                         "delegated_thawing_tokens": "36201414160625143519936",
+                         "indexing_reward_cut": 900000});
+        let d = derived_indexer_metrics(&row, 16.0);
+        let f = |k: &str| d[k].as_str().unwrap().parse::<f64>().unwrap();
+        assert!((f("indexingRewardEffectiveCut") - 0.098_026_981).abs() < 1e-6);
+        assert!(
+            (f("delegatedStakeRatio") * (1.0 - f("indexingRewardEffectiveCut")) - 0.1).abs() < 1e-9
+        );
     }
 
     /// Delegating past capacity cannot improve the ratios; it dilutes.
