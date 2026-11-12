@@ -197,7 +197,7 @@ async fn a_replayed_nonce_is_refused() {
 }
 
 #[tokio::test]
-async fn an_expired_nonce_is_refused_and_spent() {
+async fn an_expired_nonce_is_refused() {
     let a = auth();
     let k = key(INDEXER_KEY);
     let ch = a.challenge(k.address(), 1_000).unwrap();
@@ -210,7 +210,43 @@ async fn an_expired_nonce_is_refused_and_spent() {
         Err(AuthError::Expired)
     );
     assert_eq!(
-        a.verify(&ch.nonce, &sig, 1_010).await,
+        a.verify(&ch.nonce, &sig, 1_301).await,
+        Err(AuthError::Expired)
+    );
+}
+
+#[tokio::test]
+async fn a_flood_of_challenges_does_not_keep_the_indexer_out() {
+    let a = auth();
+    for i in 0..5_000u32 {
+        let mut stranger = [0u8; 20];
+        stranger[..4].copy_from_slice(&i.to_be_bytes());
+        assert!(a.challenge(Address::from(stranger), 1_000).is_ok());
+    }
+    let k = key(INDEXER_KEY);
+    let ch = a.challenge(k.address(), 1_000).unwrap();
+    let sig = k
+        .sign_message_sync(ch.message.as_bytes())
+        .unwrap()
+        .to_string();
+    assert!(a.verify(&ch.nonce, &sig, 1_010).await.is_ok());
+}
+
+#[tokio::test]
+async fn a_nonce_edited_to_name_another_signer_is_unknown() {
+    let a = auth();
+    let ch = a.challenge(key(STRANGER_KEY).address(), 1_000).unwrap();
+    let mut sealed =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &ch.nonce)
+            .unwrap();
+    sealed[..20].copy_from_slice(key(INDEXER_KEY).address().as_slice());
+    let forged = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, sealed);
+    let sig = key(STRANGER_KEY)
+        .sign_message_sync(ch.message.as_bytes())
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        a.verify(&forged, &sig, 1_010).await,
         Err(AuthError::UnknownNonce)
     );
 }

@@ -362,7 +362,7 @@ impl NestGate {
             // Keep sockets warm: the nest origin is one host and we talk to it constantly.
             .pool_idle_timeout(Duration::from_secs(90))
             .build()
-            .map_err(|e| NestError::Transport(e.to_string()))?;
+            .map_err(|e| NestError::Transport(e.without_url().to_string()))?;
 
         let mut permits = HashMap::new();
         let mut cron_permits = HashMap::new();
@@ -476,7 +476,7 @@ impl NestGate {
         let resp = tokio::time::timeout(Duration::from_secs(15), req.send())
             .await
             .map_err(|_| NestError::Timeout)?
-            .map_err(|e| NestError::Transport(e.to_string()))?;
+            .map_err(|e| NestError::Transport(e.without_url().to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let reason = nest_reason(&resp.text().await.unwrap_or_default());
@@ -485,7 +485,7 @@ impl NestGate {
         let body: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| NestError::Decode(e.to_string()))?;
+            .map_err(|e| NestError::Decode(e.without_url().to_string()))?;
         Ok(body
             .get("tables")
             .and_then(|t| t.as_array())
@@ -498,7 +498,7 @@ impl NestGate {
         let resp = tokio::time::timeout(Duration::from_secs(5), req.send())
             .await
             .map_err(|_| NestError::Timeout)?
-            .map_err(|e| NestError::Transport(e.to_string()))?;
+            .map_err(|e| NestError::Transport(e.without_url().to_string()))?;
 
         let status = resp.status();
         let body: ReadyBody = resp.json().await.unwrap_or_default();
@@ -601,7 +601,7 @@ impl NestGate {
                 if e.is_timeout() {
                     NestError::Timeout
                 } else {
-                    NestError::Transport(e.to_string())
+                    NestError::Transport(e.without_url().to_string())
                 }
             })?;
 
@@ -626,7 +626,7 @@ impl NestGate {
         let env: SqlEnvelope = resp
             .json()
             .await
-            .map_err(|e| NestError::Decode(e.to_string()))?;
+            .map_err(|e| NestError::Decode(e.without_url().to_string()))?;
         let raw = env.provenance.unwrap_or(RawProvenance {
             as_of: None,
             sealed_through: None,
@@ -1350,5 +1350,32 @@ mod metric_tests {
             rendered.contains("nest_permits{nest=\"alloc\"} 2"),
             "{rendered}"
         );
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_unreachable_nest_is_reported_without_its_origin() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let gate = NestGate::new(NestConfig::new(&origin)).unwrap();
+        let nest = NestId::ALL[0];
+
+        let errors = [
+            gate.tables(nest).await.unwrap_err(),
+            gate.ready(nest).await.unwrap_err(),
+            gate.query(&QuerySpec::read(nest, "SELECT secret FROM t"))
+                .await
+                .unwrap_err(),
+        ];
+        for e in errors {
+            let told = ApiError::from(e).to_string();
+            assert!(!told.contains("127.0.0.1"), "{told}");
+            assert!(!told.contains("secret"), "{told}");
+        }
     }
 }
