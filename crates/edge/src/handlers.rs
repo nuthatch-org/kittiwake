@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{ConnectInfo, OriginalUri, State};
-use axum::http::{HeaderMap, HeaderValue, Method, header};
+use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use kittiwake_read::routes;
 use kittiwake_types::ApiError;
@@ -1721,21 +1721,30 @@ async fn deploy_key_budget(
     }
 }
 
+/// What graph-cli calls through `--ipfs`: `add` and `pin/add` to deploy, and `cat` to read a
+/// manifest back for `deploy --ipfs-hash`. Its client sends every one as a POST.
+const IPFS_PROXY_ROUTES: [&str; 3] = ["api/v0/add", "api/v0/pin/add", "api/v0/cat"];
+
 pub async fn studio_ipfs_proxy(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(path): Path<String>,
     OriginalUri(uri): OriginalUri,
-    method: Method,
     body: bytes::Bytes,
 ) -> Result<Response, ErrorResponse> {
+    if !IPFS_PROXY_ROUTES.contains(&path.as_str()) {
+        st.limits.check(
+            &st.limits.read,
+            client_ip(peer, &headers, st.edge_secret.as_deref()),
+        )?;
+        return Err(ApiError::NotFound.into());
+    }
     deploy_key_budget(&st, peer, &headers).await?;
     let (status, bytes, content_type) = st
         .ipfs
         .proxy(
-            reqwest::Method::from_bytes(method.as_str().as_bytes())
-                .map_err(|_| ApiError::BadRequest("unsupported IPFS method".into()))?,
+            reqwest::Method::POST,
             &path,
             uri.query(),
             body,
