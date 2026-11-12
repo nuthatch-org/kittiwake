@@ -18,7 +18,7 @@ use std::time::Duration;
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use kittiwake_types::{ApiError, NestId, Provenance};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 /// Which lane a query is admitted through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +27,9 @@ pub enum Lane {
     Read,
     /// A cron or the warmer. Bounded below the nest's permit count so a user read can always get in.
     Cron,
+    /// The public SQL surface. Bounded like the cron lane, so anonymous queries cannot hold every
+    /// permit the dashboard reads need.
+    Public,
 }
 
 /// Everything that can go wrong between us and a nest.
@@ -200,6 +203,10 @@ pub struct NestConfig {
     pub read_queue_timeout: Duration,
     /// How long a cron will queue. Long: nothing is waiting on it.
     pub cron_queue_timeout: Duration,
+    /// How long the nest runs a `/sql` query before it gives up itself (nuthatch's `SQL_TIMEOUT`).
+    /// A query we stop waiting for sooner keeps its permit until then, because the nest has not
+    /// stopped running it.
+    pub nest_query_budget: Duration,
 }
 
 impl NestConfig {
@@ -222,6 +229,7 @@ impl NestConfig {
             // than a cold fold, which stops the cache ever filling. Keep the two in step.
             read_queue_timeout: Duration::from_secs(20),
             cron_queue_timeout: Duration::from_secs(120),
+            nest_query_budget: Duration::from_secs(30),
         }
     }
 
@@ -249,8 +257,8 @@ pub struct QuerySpec {
     pub nest: NestId,
     pub sql: String,
     pub lane: Lane,
-    /// Wall-clock ceiling on the nest's answer. The public SQL surface uses six seconds to match
-    /// the nest's own; the protocol folds legitimately take longer and get more.
+    /// How long we wait for the nest's answer. Shorter than the nest's own budget stops the wait,
+    /// not the query; see [`NestConfig::nest_query_budget`].
     pub timeout: Duration,
 }
 
@@ -295,9 +303,43 @@ struct GateInner {
     /// An inner, smaller budget that only crons and the warmer take. Sized one below the real
     /// count, so a background job can never hold every permit while a user waits.
     cron_permits: HashMap<NestId, Arc<Semaphore>>,
+    /// The same width again, for the public SQL surface.
+    public_permits: HashMap<NestId, Arc<Semaphore>>,
     inflight: Mutex<HashMap<String, InFlight>>,
     neg_cache: moka::future::Cache<String, NestError>,
     ready_cache: moka::future::Cache<NestId, Result<ReadyBody, NestError>>,
+}
+
+/// A query's permits, kept until the nest has stopped running it. Dropped before the nest
+/// answered, by our timeout or by the caller going away, they are returned only at `nest_done`.
+struct Held {
+    permits: Option<(OwnedSemaphorePermit, Option<OwnedSemaphorePermit>)>,
+    nest_done: tokio::time::Instant,
+}
+
+impl Held {
+    /// The nest has answered, so it holds nothing for this query any more.
+    fn release(mut self) {
+        self.permits = None;
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let Some(permits) = self.permits.take() else {
+            return;
+        };
+        if tokio::time::Instant::now() >= self.nest_done {
+            return;
+        }
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let nest_done = self.nest_done;
+            rt.spawn(async move {
+                tokio::time::sleep_until(nest_done).await;
+                drop(permits);
+            });
+        }
+    }
 }
 
 /// The inner lane: one permit narrower than the nest admits, so a background job can never take
@@ -324,6 +366,7 @@ impl NestGate {
 
         let mut permits = HashMap::new();
         let mut cron_permits = HashMap::new();
+        let mut public_permits = HashMap::new();
         for n in NestId::ALL {
             let p = cfg.permits_for(n);
             // Registered here rather than on first use. A counter that springs into existence only
@@ -339,6 +382,7 @@ impl NestGate {
             metrics::gauge!("nest_permits", "nest" => n.as_str()).set(p as f64);
             permits.insert(n, Arc::new(Semaphore::new(p)));
             cron_permits.insert(n, Arc::new(Semaphore::new(cron_width(p))));
+            public_permits.insert(n, Arc::new(Semaphore::new(cron_width(p))));
         }
 
         Ok(Self {
@@ -346,6 +390,7 @@ impl NestGate {
                 http,
                 permits,
                 cron_permits,
+                public_permits,
                 inflight: Mutex::new(HashMap::new()),
                 neg_cache: moka::future::Cache::builder()
                     .max_capacity(4096)
@@ -381,7 +426,7 @@ impl NestGate {
         let p = self.inner.cfg.permits_for(nest);
         match lane {
             Lane::Read => p.max(1),
-            Lane::Cron => cron_width(p),
+            Lane::Cron | Lane::Public => cron_width(p),
         }
     }
 
@@ -491,21 +536,26 @@ impl NestGate {
         spec: &QuerySpec,
         admitted: Option<&AtomicBool>,
     ) -> Result<SqlAnswer, NestError> {
-        let (queue_timeout, _lane_permit) = match spec.lane {
-            Lane::Read => (self.inner.cfg.read_queue_timeout, None),
-            Lane::Cron => {
-                let sem = self
-                    .inner
-                    .cron_permits
+        let inner_lane = match spec.lane {
+            Lane::Read => None,
+            Lane::Cron => Some((&self.inner.cron_permits, self.inner.cfg.cron_queue_timeout)),
+            Lane::Public => Some((
+                &self.inner.public_permits,
+                self.inner.cfg.read_queue_timeout,
+            )),
+        };
+        let (queue_timeout, lane_permit) = match inner_lane {
+            None => (self.inner.cfg.read_queue_timeout, None),
+            Some((sems, wait)) => {
+                let sem = sems
                     .get(&spec.nest)
                     .cloned()
                     .ok_or(NestError::GateTimeout)?;
-                let p =
-                    tokio::time::timeout(self.inner.cfg.cron_queue_timeout, sem.acquire_owned())
-                        .await
-                        .map_err(|_| NestError::GateTimeout)?
-                        .map_err(|_| NestError::GateTimeout)?;
-                (self.inner.cfg.cron_queue_timeout, Some(p))
+                let p = tokio::time::timeout(wait, sem.acquire_owned())
+                    .await
+                    .map_err(|_| NestError::GateTimeout)?
+                    .map_err(|_| NestError::GateTimeout)?;
+                (wait, Some(p))
             }
         };
 
@@ -515,7 +565,7 @@ impl NestGate {
             .get(&spec.nest)
             .cloned()
             .ok_or(NestError::GateTimeout)?;
-        let _permit = tokio::time::timeout(queue_timeout, sem.acquire_owned())
+        let permit = tokio::time::timeout(queue_timeout, sem.acquire_owned())
             .await
             .map_err(|_| {
                 metrics::counter!("nest_gate_timeout_total", "nest" => spec.nest.as_str())
@@ -528,7 +578,15 @@ impl NestGate {
             a.store(true, Ordering::Release);
         }
         metrics::counter!("nest_query_total", "nest" => spec.nest.as_str()).increment(1);
-        self.execute(spec).await
+        let held = Held {
+            permits: Some((permit, lane_permit)),
+            nest_done: tokio::time::Instant::now() + self.inner.cfg.nest_query_budget,
+        };
+        let result = self.execute(spec).await;
+        if !matches!(result, Err(NestError::Timeout)) {
+            held.release();
+        }
+        result
     }
 
     async fn execute(&self, spec: &QuerySpec) -> Result<SqlAnswer, NestError> {
@@ -612,6 +670,7 @@ impl NestGate {
         let slot = |lane: Lane| match lane {
             Lane::Read => format!("{base}:read"),
             Lane::Cron => format!("{base}:cron"),
+            Lane::Public => format!("{base}:public"),
         };
         let own = slot(spec.lane);
         if let Some(err) = self.inner.neg_cache.get(&own).await {
@@ -1049,6 +1108,62 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "waited {:?}",
             started.elapsed()
+        );
+    }
+
+    /// The nest keeps running a query we stopped waiting for, so its permit stays taken until the
+    /// nest's own budget is spent.
+    #[tokio::test]
+    async fn an_abandoned_query_holds_its_permit_until_the_nest_gives_up() {
+        let server = MockServer::start().await;
+        slow_and_quick(&server, Arc::new(AtomicUsize::new(0))).await;
+        let mut cfg = NestConfig::new(server.uri());
+        for n in NestId::ALL {
+            cfg.base_paths.insert(n, String::new());
+        }
+        cfg.nest_query_budget = Duration::from_millis(600);
+        let gate = NestGate::new(cfg).unwrap();
+
+        let spec = QuerySpec::read(NestId::Alloc, "slow").with_timeout(Duration::from_millis(100));
+        assert_eq!(gate.query(&spec).await.unwrap_err(), NestError::Timeout);
+        assert_eq!(gate.available_permits(NestId::Alloc), 1);
+
+        // A caller that goes away mid-query leaves the nest running it just the same.
+        let gone = tokio::time::timeout(
+            Duration::from_millis(100),
+            gate.query(&QuerySpec::read(NestId::Alloc, "slow")),
+        )
+        .await;
+        assert!(gone.is_err());
+        assert_eq!(gate.available_permits(NestId::Alloc), 0);
+
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(gate.available_permits(NestId::Alloc), 2);
+    }
+
+    /// The public SQL surface may never hold every permit a dashboard read needs.
+    #[tokio::test]
+    async fn public_sql_leaves_a_permit_for_readers() {
+        let server = MockServer::start().await;
+        slow_and_quick(&server, Arc::new(AtomicUsize::new(0))).await;
+        let gate = gate_for(&server, 2).await;
+        let public = |sql: &'static str| {
+            let mut spec = QuerySpec::read(NestId::Alloc, sql);
+            spec.lane = Lane::Public;
+            spec
+        };
+
+        let g = gate.clone();
+        tokio::spawn(async move { g.query(&public("slow")).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            gate.query(&public("SELECT 2")).await.unwrap_err(),
+            NestError::GateTimeout
+        );
+        assert!(
+            gate.query(&QuerySpec::read(NestId::Alloc, "SELECT 3"))
+                .await
+                .is_ok()
         );
     }
 
