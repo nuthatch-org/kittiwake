@@ -266,7 +266,7 @@ async fn with_pending_rewards(
         format!("{address}:{:016x}", h.finish())
     };
     let ctx = st.read.clone();
-    let fetch: kittiwake_read::ExternalFetcher = std::sync::Arc::new(move || {
+    let fetch: kittiwake_read::ExternalFetcher = std::sync::Arc::new(move |_| {
         let chain = chain.clone();
         let ids = ids.clone();
         Box::pin(async move {
@@ -965,16 +965,27 @@ fn days_back(now: i64, days: i64) -> i64 {
     now - now.rem_euclid(3600) - days * 86_400
 }
 
+#[derive(serde::Deserialize)]
+pub struct ActivityQuery {
+    /// How far back, in days. Twelve months of thirty, as the chart has always shown.
+    #[serde(default = "d_activity_days")]
+    pub days: i64,
+}
+fn d_activity_days() -> i64 {
+    360
+}
+
 pub async fn developer_activity(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Query(q): Query<DaysQuery>,
+    Query(q): Query<ActivityQuery>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
-    let cutoff = days_back(now(), q.days.clamp(7, 3650));
+    let days = q.days.clamp(7, 3650);
+    let cutoff = days_back(now(), days);
     Ok(envelope(
-        routes::developer_activity(&st.read, cutoff).await?,
+        routes::developer_activity(&st.read, cutoff, days).await?,
     ))
 }
 
@@ -2041,7 +2052,7 @@ pub async fn price(
             kittiwake_types::ServedFrom::Chain,
             {
                 let ext = st.ext.clone();
-                std::sync::Arc::new(move || {
+                std::sync::Arc::new(move |_| {
                     let ext = ext.clone();
                     Box::pin(async move {
                         let (usd, change) = ext.grt_price().await?;
@@ -2070,7 +2081,7 @@ pub async fn tvl(
             kittiwake_types::ServedFrom::Chain,
             {
                 let ext = st.ext.clone();
-                std::sync::Arc::new(move || {
+                std::sync::Arc::new(move |_| {
                     let ext = ext.clone();
                     Box::pin(async move {
                         let tvl = ext.arbitrum_tvl().await?;
@@ -2117,7 +2128,7 @@ pub async fn reo(
             std::time::Duration::from_secs(300),
             kittiwake_types::ServedFrom::Chain,
             {
-                std::sync::Arc::new(move || {
+                std::sync::Arc::new(move |_| {
                     let chain = chain.clone();
                     let address = address.clone();
                     Box::pin(async move {
@@ -2365,7 +2376,7 @@ pub async fn subgraph_search(
             &key,
             std::time::Duration::from_secs(60),
             kittiwake_types::ServedFrom::Nest,
-            std::sync::Arc::new(move || {
+            std::sync::Arc::new(move |lane: kittiwake_nest::Lane| {
                 let (pool, ipfs, gate, figures, query) = (
                     pool.clone(),
                     ipfs.clone(),
@@ -2374,15 +2385,9 @@ pub async fn subgraph_search(
                     query.clone(),
                 );
                 Box::pin(async move {
-                    let hits = kittiwake_read::search::search(
-                        &pool,
-                        &ipfs,
-                        &gate,
-                        &figures,
-                        kittiwake_nest::Lane::Read,
-                        &query,
-                    )
-                    .await?;
+                    let hits =
+                        kittiwake_read::search::search(&pool, &ipfs, &gate, &figures, lane, &query)
+                            .await?;
                     Ok(serde_json::json!(hits))
                 })
             }),
@@ -2984,20 +2989,13 @@ pub async fn graft_children(
             &subject,
             std::time::Duration::from_secs(300),
             kittiwake_types::ServedFrom::Postgres,
-            std::sync::Arc::new(move || {
+            std::sync::Arc::new(move |lane: kittiwake_nest::Lane| {
                 let pool = pool.clone();
                 let ipfs = ipfs.clone();
                 let gate = gate.clone();
                 let base = base.clone();
                 Box::pin(async move {
-                    kittiwake_read::graft::children(
-                        &pool,
-                        &ipfs,
-                        &gate,
-                        kittiwake_nest::Lane::Read,
-                        &base,
-                    )
-                    .await
+                    kittiwake_read::graft::children(&pool, &ipfs, &gate, lane, &base).await
                 })
             }),
         )
@@ -3090,7 +3088,7 @@ pub async fn ens(
             kittiwake_types::ServedFrom::Chain,
             {
                 let address = address.clone();
-                std::sync::Arc::new(move || {
+                std::sync::Arc::new(move |_| {
                     let chain = chain.clone();
                     let address = address.clone();
                     Box::pin(async move {
@@ -3126,7 +3124,7 @@ async fn ens_forward(st: &AppState, raw: &str) -> Result<Response, ErrorResponse
             kittiwake_types::ServedFrom::Chain,
             {
                 let name = name.clone();
-                std::sync::Arc::new(move || {
+                std::sync::Arc::new(move |_| {
                     let (chain, name) = (chain.clone(), name.clone());
                     Box::pin(async move {
                         Ok(serde_json::json!({ "address": chain.ens_address(&name).await? }))
@@ -3727,7 +3725,7 @@ pub async fn qos_capture(
             "qos-capture",
             std::time::Duration::from_secs(900),
             kittiwake_types::ServedFrom::Postgres,
-            std::sync::Arc::new(move || {
+            std::sync::Arc::new(move |_| {
                 let pool = pool.clone();
                 let base = base.clone();
                 Box::pin(async move {
@@ -3852,6 +3850,7 @@ async fn subgraph_pinned(
 /// One kind of entity from the allocations nest and from the subgraph at the nest's block.
 async fn entity_check(
     ctx: &kittiwake_read::ReadCtx,
+    lane: kittiwake_nest::Lane,
     client: &reqwest::Client,
     subgraph: &kittiwake_config::SubgraphSettings,
     e: &kittiwake_read::network_subgraph::Entity,
@@ -3869,10 +3868,11 @@ async fn entity_check(
 
     let ours = ctx
         .gate
-        .query(
-            &kittiwake_nest::QuerySpec::read(kittiwake_types::NestId::Alloc, ns::nest_sql(e))
-                .with_timeout(std::time::Duration::from_secs(90)),
-        )
+        .query(&kittiwake_nest::QuerySpec {
+            lane,
+            ..kittiwake_nest::QuerySpec::read(kittiwake_types::NestId::Alloc, ns::nest_sql(e))
+                .with_timeout(std::time::Duration::from_secs(90))
+        })
         .await?;
     if ours.provenance.truncated {
         return Err(ApiError::Unavailable(format!(
@@ -3953,9 +3953,14 @@ pub async fn network_subgraph_check(
             "network-subgraph-check",
             std::time::Duration::from_secs(3600),
             kittiwake_types::ServedFrom::Nest,
-            std::sync::Arc::new(move || {
+            std::sync::Arc::new(move |lane: kittiwake_nest::Lane| {
                 let subgraph = subgraph.clone();
-                let ctx = ctx.clone();
+                // Behind a stale answer the figures it compares against are refreshed on the cron
+                // lane too, and an unexpired copy is used as it stands.
+                let ctx = match lane {
+                    kittiwake_nest::Lane::Cron => ctx.warming(std::time::Duration::ZERO),
+                    _ => ctx.clone(),
+                };
                 Box::pin(async move {
                     let client = reqwest::Client::new();
                     let ours = routes::network_stats(&ctx).await?;
@@ -3971,8 +3976,8 @@ pub async fn network_subgraph_check(
 
                     let (totals, indexers, deployments) = tokio::join!(
                         subgraph_pinned(&client, &subgraph, ours_block, ns::totals_query),
-                        entity_check(&ctx, &client, &subgraph, &ns::INDEXERS),
-                        entity_check(&ctx, &client, &subgraph, &ns::DEPLOYMENTS),
+                        entity_check(&ctx, lane, &client, &subgraph, &ns::INDEXERS),
+                        entity_check(&ctx, lane, &client, &subgraph, &ns::DEPLOYMENTS),
                     );
                     let (theirs, pinned) = totals?;
                     let (indexers, indexer_rows) = indexers?;
@@ -4028,15 +4033,18 @@ pub async fn grt_flow_substreams(
             "grt-flow-substreams",
             std::time::Duration::from_secs(6 * 3600),
             kittiwake_types::ServedFrom::Nest,
-            std::sync::Arc::new(move || {
+            std::sync::Arc::new(move |lane: kittiwake_nest::Lane| {
                 let substreams = substreams.clone();
                 let gate = gate.clone();
                 Box::pin(async move {
                     let tip = gate
-                        .query(&kittiwake_nest::QuerySpec::read(
-                            kittiwake_types::NestId::SupplyMainnet,
-                            "SELECT max(block_number) AS head FROM graph_token__transfer",
-                        ))
+                        .query(&kittiwake_nest::QuerySpec {
+                            lane,
+                            ..kittiwake_nest::QuerySpec::read(
+                                kittiwake_types::NestId::SupplyMainnet,
+                                "SELECT max(block_number) AS head FROM graph_token__transfer",
+                            )
+                        })
                         .await?;
                     let tip = tip
                         .provenance
@@ -4074,10 +4082,13 @@ pub async fn grt_flow_substreams(
                     let last_timestamp = events.last().map(|e| e.timestamp);
 
                     let rows = gate
-                        .query(&kittiwake_nest::QuerySpec::read(
-                            kittiwake_types::NestId::SupplyMainnet,
-                            gs::nest_sql(from, to),
-                        ))
+                        .query(&kittiwake_nest::QuerySpec {
+                            lane,
+                            ..kittiwake_nest::QuerySpec::read(
+                                kittiwake_types::NestId::SupplyMainnet,
+                                gs::nest_sql(from, to),
+                            )
+                        })
                         .await?;
                     if rows.provenance.truncated {
                         return Err(ApiError::Unavailable(
@@ -4179,12 +4190,16 @@ async fn probe_provider(provider: &census::Provider, kind: census::Probe) -> cen
 
 async fn registry_events(
     gate: &kittiwake_nest::NestGate,
+    lane: kittiwake_nest::Lane,
     service: &census::Service,
 ) -> Result<Vec<census::RegistryEvent>, String> {
-    let spec = kittiwake_nest::QuerySpec::read(
-        kittiwake_types::NestId::Services,
-        census::registry_sql(service),
-    );
+    let spec = kittiwake_nest::QuerySpec {
+        lane,
+        ..kittiwake_nest::QuerySpec::read(
+            kittiwake_types::NestId::Services,
+            census::registry_sql(service),
+        )
+    };
     let answer = gate.query(&spec).await.map_err(|e| e.to_string())?;
     census::registry_events(&answer.rows)
 }
@@ -4212,13 +4227,13 @@ pub async fn service_census(
             "service-census",
             std::time::Duration::from_secs(300),
             kittiwake_types::ServedFrom::Chain,
-            std::sync::Arc::new(move || {
+            std::sync::Arc::new(move |lane: kittiwake_nest::Lane| {
                 let chain = chain.clone();
                 let gate = gate.clone();
                 Box::pin(async move {
                     let mut services = Vec::new();
                     for service in census::SERVICES {
-                        services.push(match registry_events(&gate, service).await {
+                        services.push(match registry_events(&gate, lane, service).await {
                             Ok(events) => {
                                 let mut probes = Vec::new();
                                 for provider in census::current_providers(&events) {
@@ -4334,7 +4349,8 @@ pub async fn operator_preflight(
     });
     // Whether the registry lists this address. Read here rather than taken from the census cache,
     // so a preflight is never answered from a picture of the registry that has since moved.
-    let registered = match registry_events(&st.read.gate, service).await {
+    let registered = match registry_events(&st.read.gate, kittiwake_nest::Lane::Read, service).await
+    {
         Ok(events) => census::current_providers(&events)
             .iter()
             .any(|p| p.address == address),

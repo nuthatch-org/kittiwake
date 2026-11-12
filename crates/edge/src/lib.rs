@@ -3137,6 +3137,86 @@ mod envelope_tests {
         }
     }
 
+    /// The chart reads the last week as the one in progress and labels its window in months.
+    #[tokio::test]
+    async fn developer_activity_ends_on_the_current_week_of_its_own_window() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let nest = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(move |req: &wiremock::Request| {
+                if req.url.path().ends_with("/ready") {
+                    return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "ready": true, "lag_blocks": 0, "tip": 1, "last_block": 1,
+                        "sealed_through": 1, "stalled": false
+                    }));
+                }
+                let rows: Vec<_> = [200, 20, 0]
+                    .into_iter()
+                    .map(|d| serde_json::json!({ "createdAt": now - d * 86_400 }))
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "count": rows.len(), "rows": rows,
+                    "provenance": {"as_of": 1, "sealed_through": 1, "source": "mock"}
+                }))
+            })
+            .mount(&nest)
+            .await;
+        let mut cfg = kittiwake_nest::NestConfig::new(nest.uri());
+        for n in NestId::ALL {
+            cfg.base_paths.insert(n, format!("/{}", n.as_str()));
+        }
+        let read = kittiwake_read::ReadCtx::new(
+            kittiwake_nest::NestGate::new(cfg).unwrap(),
+            kittiwake_cache::Store::new(64),
+            1,
+        );
+        let st = state(
+            Limits::new(1000, 1000, 1000, Vec::new()),
+            None,
+            read,
+            None,
+            None,
+            kittiwake_ext::Ipfs::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let app = router(st).layer(axum::extract::connect_info::MockConnectInfo(
+            SocketAddr::from(([203, 0, 113, 9], 1)),
+        ));
+        let data = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                let resp = send(app, req("GET", uri, None, "")).await;
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["data"].clone()
+            }
+        };
+
+        for (uri, months) in [
+            ("/api/developer-activity", 12),
+            ("/api/developer-activity?days=30", 1),
+        ] {
+            let d = data(uri).await;
+            assert_eq!(d["windowMonths"], months, "{uri}");
+            let weeks = d["weeks"].as_array().unwrap();
+            assert_eq!(weeks.last().unwrap()["partial"], true, "{uri}: {d}");
+            assert_eq!(
+                weeks.iter().filter(|w| w["partial"] == true).count(),
+                1,
+                "{uri}"
+            );
+        }
+    }
+
     /// Declared query structs must still take what the free-form maps took.
     #[tokio::test]
     async fn the_directory_and_pnl_still_read_their_query_strings() {
