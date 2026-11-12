@@ -207,7 +207,7 @@ impl Substreams {
             match response.chunk().await {
                 Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
                 Ok(None) => return Err(unavailable("stream ended without an end-of-stream frame")),
-                Err(e) => return Err(unavailable(&format!("stream broke: {e}"))),
+                Err(e) => return Err(unavailable(&format!("stream broke: {}", e.without_url()))),
             }
         }
     }

@@ -48,6 +48,26 @@ pub(crate) fn ended_by_sign_out(issued_at: i64, signed_out_at: i64) -> bool {
     issued_at <= signed_out_at
 }
 
+/// When a new session for this address is dated. Tokens carry whole seconds, so one issued in the
+/// same second as a sign-out is dated the second after, or it would be ended on arrival.
+async fn new_session_cookie(st: &AppState, address: &str) -> Result<HeaderValue, ErrorResponse> {
+    let studio = dock(st)?;
+    let mut issued_at = now();
+    if let Some(pool) = st.pool.as_ref()
+        && let Some(at) = kittiwake_db::signed_out_at(pool, address)
+            .await
+            .map_err(db_err)?
+    {
+        issued_at = issued_at.max(at + 1);
+    }
+    let token = kittiwake_dock::create_session(&studio.secret, address, issued_at);
+    Ok(HeaderValue::from_str(&format!(
+        "studio_session={token}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Lax",
+        kittiwake_dock::SESSION_TTL_SECS
+    ))
+    .expect("a session token is ASCII"))
+}
+
 /// Without a database nothing can have signed out, so there is nothing to consult.
 async fn session(st: &AppState, headers: &HeaderMap) -> Result<String, ErrorResponse> {
     let (address, issued_at) = session_claim(&dock(st)?.secret, headers, now())
@@ -74,7 +94,7 @@ fn db_err(e: kittiwake_db::DbError) -> ErrorResponse {
 }
 
 /// Seconds since the epoch, for the "since" windows.
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1306,19 +1326,12 @@ pub async fn studio_auth_post(
     let studio = dock(&st)?;
     let signed = kittiwake_dock::verify_sign_in(&studio.secret, address, message, signature, now())
         .map_err(|_| ApiError::Unauthorized)?;
+    let cookie = new_session_cookie(&st, &address.to_lowercase()).await?;
     if !studio.spent_nonces.spend(&signed, now()) {
         return Err(ApiError::Unauthorized.into());
     }
-    let token = kittiwake_dock::create_session(&studio.secret, address, now());
     let mut r = axum::Json(serde_json::json!({"address": address.to_lowercase()})).into_response();
-    r.headers_mut().insert(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&format!(
-            "studio_session={token}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Lax",
-            kittiwake_dock::SESSION_TTL_SECS
-        ))
-        .unwrap(),
-    );
+    r.headers_mut().insert(header::SET_COOKIE, cookie);
     crate::no_store(r.headers_mut());
     Ok(r)
 }
@@ -1492,11 +1505,31 @@ pub async fn studio_deploy_key_post(
     headers: HeaderMap,
 ) -> Result<Response, ErrorResponse> {
     let owner = session(&st, &headers).await?;
-    let key = kittiwake_dock::generate_deploy_key();
-    kittiwake_db::replace_deploy_key(pool(&st)?, &owner, &kittiwake_dock::hash_key(&key))
+    let pool = pool(&st)?;
+    // A rotation is what someone does when a key may have leaked, and the wallet's other sessions
+    // could have read it. They end; this one is reissued so the caller stays signed in.
+    let mut cookie = None;
+    if kittiwake_db::deploy_key(pool, &owner)
         .await
-        .map_err(db_err)?;
-    Ok(axum::Json(serde_json::json!({"key":key})).into_response())
+        .map_err(db_err)?
+        .is_some()
+    {
+        kittiwake_db::record_sign_out(pool, &owner, now())
+            .await
+            .map_err(db_err)?;
+        cookie = Some(new_session_cookie(&st, &owner).await?);
+    }
+    let key = kittiwake_dock::generate_deploy_key();
+    let mut r =
+        match kittiwake_db::replace_deploy_key(pool, &owner, &kittiwake_dock::hash_key(&key)).await
+        {
+            Ok(()) => axum::Json(serde_json::json!({"key":key})).into_response(),
+            Err(e) => db_err(e).into_response(),
+        };
+    if let Some(cookie) = cookie {
+        r.headers_mut().insert(header::SET_COOKIE, cookie);
+    }
+    Ok(r)
 }
 
 /// The two documents a publish pins: the subgraph's, in the shape Explorer reads, and the version's.
@@ -1842,6 +1875,13 @@ pub async fn studio_bounties_post(
     )
     .await
     .map_err(db_err)?;
+    let Some(b) = b else {
+        let b = kittiwake_db::bounty_by_chain_id(pool(&st)?, &chain_id)
+            .await
+            .map_err(db_err)?
+            .ok_or_else(|| ApiError::Internal("a recorded bounty vanished".into()))?;
+        return Ok(axum::Json(serde_json::json!({"bounty":b})).into_response());
+    };
     Ok((
         axum::http::StatusCode::CREATED,
         axum::Json(serde_json::json!({"bounty":b})),
@@ -1867,10 +1907,14 @@ fn bounty_status(state: &kittiwake_chain::ChainBounty, now: u64) -> (&'static st
         ("open", None)
     }
 }
+/// Any signed-in wallet may ask for a reconcile, since the claimer is not the poster; the row is
+/// then rewritten from the chain, never from the request.
 pub async fn studio_bounty_patch(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Response, ErrorResponse> {
+    session(&st, &headers).await?;
     let id = id
         .parse::<i32>()
         .map_err(|_| ApiError::BadRequest("Invalid id".into()))?;

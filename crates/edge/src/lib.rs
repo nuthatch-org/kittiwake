@@ -40,6 +40,9 @@ pub struct Limits {
     /// graph-cli's IPFS uploads, per deploy key: one `add` per file, sent at once and never retried,
     /// so the burst holds a few hundred files and a runaway client then gets five a second.
     pub deploy: RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>,
+    /// The Dock's mutation budget again, keyed by the session's address, so one wallet's budget
+    /// does not grow with the addresses it calls from.
+    pub session_mutation: RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>,
     pub exempt: Vec<IpAddr>,
 }
 
@@ -62,6 +65,7 @@ impl Limits {
             sql: RateLimiter::keyed(q(sql_per_min, 5)),
             read: RateLimiter::keyed(q(read_per_min, 40)),
             mutation: RateLimiter::keyed(q(mutation_per_min, 10)),
+            session_mutation: RateLimiter::keyed(q(mutation_per_min, 10)),
             report: RateLimiter::keyed(
                 Quota::per_hour(NonZeroU32::new(6).unwrap())
                     .allow_burst(NonZeroU32::new(3).unwrap()),
@@ -105,6 +109,13 @@ impl Limits {
             .map_err(|n| refused(n, "deploy"))
     }
 
+    /// Spend from a signed-in address's mutation budget.
+    pub(crate) fn check_session(&self, address: &str) -> Result<(), ApiError> {
+        self.session_mutation
+            .check_key(&address.to_string())
+            .map_err(|n| refused(n, "session"))
+    }
+
     /// Drop the state of callers who have not been seen recently, so a long uptime against a wide
     /// range of source addresses cannot grow the keyed state without bound.
     pub fn sweep(&self) {
@@ -113,6 +124,7 @@ impl Limits {
         self.mutation.retain_recent();
         self.report.retain_recent();
         self.deploy.retain_recent();
+        self.session_mutation.retain_recent();
     }
 }
 
@@ -130,14 +142,28 @@ fn refused(
 }
 
 /// The key a caller is budgeted under. An IPv6 host is routinely handed a whole /64, so each of its
-/// addresses is the same caller; an IPv4-mapped address is the IPv4 one.
+/// addresses is the same caller. An address that carries an IPv4 one (mapped, 6to4, Teredo, NAT64)
+/// is that IPv4 caller, since a single IPv4 address owns the whole of its 6to4 /48.
 fn bucket(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V4(_) => ip,
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None => IpAddr::V6((u128::from(v6) & !u128::from(u64::MAX)).into()),
-        },
+    let IpAddr::V6(v6) = ip else {
+        return ip;
+    };
+    let bits = u128::from(v6);
+    let embedded = if let Some(v4) = v6.to_ipv4_mapped() {
+        Some(v4)
+    } else if bits >> 112 == 0x2002 {
+        Some(Ipv4Addr::from((bits >> 80) as u32))
+    } else if bits >> 96 == 0x2001_0000 {
+        // Teredo carries the client's public address inverted in its last 32 bits.
+        Some(Ipv4Addr::from(!(bits as u32)))
+    } else if bits >> 32 == 0x0064_ff9b_0000_0000_0000_0000 {
+        Some(Ipv4Addr::from(bits as u32))
+    } else {
+        None
+    };
+    match embedded {
+        Some(v4) => IpAddr::V4(v4),
+        None => IpAddr::V6((bits & !u128::from(u64::MAX)).into()),
     }
 }
 
@@ -1265,15 +1291,23 @@ async fn dock_budget(
     if req.uri().path().starts_with("/api/studio/ipfs/") {
         return Ok(next.run(req).await);
     }
-    let limiter = if req.method() == axum::http::Method::GET {
-        &st.limits.read
-    } else {
+    let mutation = req.method() != axum::http::Method::GET;
+    let limiter = if mutation {
         &st.limits.mutation
+    } else {
+        &st.limits.read
     };
     st.limits.check(
         limiter,
         client_ip(peer, req.headers(), st.edge_secret.as_deref()),
     )?;
+    if mutation
+        && let Some(studio) = &st.studio
+        && let Some((address, _)) =
+            handlers::session_claim(&studio.secret, req.headers(), handlers::now())
+    {
+        st.limits.check_session(&address)?;
+    }
     Ok(next.run(req).await)
 }
 
@@ -1784,6 +1818,50 @@ mod tests {
             limits.check(&limits.report, mapped).is_err(),
             "an IPv4-mapped address is the IPv4 caller"
         );
+    }
+
+    #[test]
+    fn an_ipv6_address_carrying_an_ipv4_one_is_that_caller() {
+        let v6 = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let cases = [
+            // 6to4: every subnet and host under 2002:cb00:7109::/48 is 203.0.113.9.
+            (
+                "203.0.113.9",
+                [
+                    "2002:cb00:7109::1",
+                    "2002:cb00:7109:ffff::2",
+                    "2002:cb00:7109:1:2:3:4:5",
+                ],
+            ),
+            // Teredo: the client's address is the last 32 bits, inverted. The server and port vary.
+            (
+                "198.51.100.7",
+                [
+                    "2001:0:4136:e378:8000:63bf:39cc:9bf8",
+                    "2001:0:5ef5:79fd:0:ffff:39cc:9bf8",
+                    "2001::1:2:39cc:9bf8",
+                ],
+            ),
+            // NAT64's well-known prefix.
+            (
+                "192.0.2.33",
+                [
+                    "64:ff9b::c000:221",
+                    "64:ff9b::192.0.2.33",
+                    "::ffff:192.0.2.33",
+                ],
+            ),
+        ];
+        for (v4, forms) in cases {
+            let limits = Limits::new(1000, 1000, 1000, Vec::new());
+            for form in forms {
+                assert!(limits.check(&limits.report, v6(form)).is_ok(), "{form}");
+            }
+            assert!(
+                limits.check(&limits.report, v4.parse().unwrap()).is_err(),
+                "{v4} had its own budget beside {forms:?}"
+            );
+        }
     }
 
     // ── Presenting a proof of indexing ───────────────────────────────────────
@@ -3195,5 +3273,269 @@ mod health_memo_tests {
 
         probe(Duration::ZERO).await;
         assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[cfg(test)]
+mod dock_session_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    fn secret() -> kittiwake_dock::Secret {
+        kittiwake_dock::Secret::new("a-studio-session-secret-of-adequate-length").unwrap()
+    }
+
+    fn dock_state(limits: Limits, pool: Option<kittiwake_db::Pool>) -> AppState {
+        let gate =
+            kittiwake_nest::NestGate::new(kittiwake_nest::NestConfig::new("http://127.0.0.1:9"))
+                .unwrap();
+        let read = kittiwake_read::ReadCtx::new(gate, kittiwake_cache::Store::new(64), 1);
+        state(
+            limits,
+            pool,
+            read,
+            None,
+            Some(Studio {
+                secret: secret(),
+                bounty_board_address: Some("0x0000000000000000000000000000000000000001".into()),
+                spent_nonces: Default::default(),
+            }),
+            kittiwake_ext::Ipfs::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn call(
+        method: &str,
+        uri: &str,
+        from: [u8; 4],
+        cookie: Option<&str>,
+        body: &str,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut b = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(c) = cookie {
+            b = b.header(header::COOKIE, c);
+        }
+        let mut req = b.body(axum::body::Body::from(body.to_string())).unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from((from, 1))));
+        req
+    }
+
+    fn cookie_for(address: &str, issued_at: i64) -> String {
+        format!(
+            "studio_session={}",
+            kittiwake_dock::create_session(&secret(), address, issued_at)
+        )
+    }
+
+    /// The cookie a response sets, as a request would send it back.
+    fn set_cookie(resp: &Response) -> Option<String> {
+        let v = resp.headers().get(header::SET_COOKIE)?.to_str().ok()?;
+        Some(v.split(';').next()?.to_string())
+    }
+
+    #[tokio::test]
+    async fn one_session_spends_one_mutation_budget_from_any_address() {
+        let app = router(dock_state(Limits::new(1000, 1000, 1, Vec::new()), None));
+        let cookie = cookie_for(
+            "0x00000000000000000000000000000000000000aa",
+            handlers::now(),
+        );
+        let first = app
+            .clone()
+            .oneshot(call(
+                "DELETE",
+                "/api/studio/subgraphs/1",
+                [203, 0, 113, 1],
+                Some(&cookie),
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_ne!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+        let elsewhere = app
+            .clone()
+            .oneshot(call(
+                "DELETE",
+                "/api/studio/subgraphs/1",
+                [198, 51, 100, 7],
+                Some(&cookie),
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(elsewhere.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Without a session the second address still has its own budget.
+        let anonymous = app
+            .oneshot(call(
+                "DELETE",
+                "/api/studio/subgraphs/1",
+                [192, 0, 2, 9],
+                None,
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_ne!(anonymous.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn reconciling_a_bounty_needs_a_session() {
+        let app = router(dock_state(Limits::new(1000, 1000, 1000, Vec::new()), None));
+        let resp = app
+            .oneshot(call(
+                "PATCH",
+                "/api/studio/bounties/1",
+                [203, 0, 113, 1],
+                None,
+                "{}",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn test_pool() -> kittiwake_db::Pool {
+        let url =
+            std::env::var("KITTIWAKE_TEST_DATABASE_URL").expect("KITTIWAKE_TEST_DATABASE_URL");
+        let pool = kittiwake_db::connect(&url, 2).await.unwrap();
+        kittiwake_db::ensure_studio_sign_outs_table(&pool)
+            .await
+            .unwrap();
+        pool
+    }
+
+    async fn status_of(app: &Router, cookie: &str) -> StatusCode {
+        app.clone()
+            .oneshot(call(
+                "GET",
+                "/api/studio/deploy-key",
+                [203, 0, 113, 1],
+                Some(cookie),
+                "",
+            ))
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// `KITTIWAKE_TEST_DATABASE_URL=postgres://… cargo test -p kittiwake-edge -- --ignored dock_`,
+    /// against a database with `db/schema.sql` applied.
+    #[tokio::test]
+    #[ignore = "needs a Postgres"]
+    async fn dock_rotating_a_deploy_key_ends_every_other_session_and_keeps_this_one() {
+        let pool = test_pool().await;
+        let app = router(dock_state(
+            Limits::new(1000, 1000, 1000, Vec::new()),
+            Some(pool),
+        ));
+        let address = format!("0x{:040x}", rand_suffix());
+        let now = handlers::now();
+        let this = cookie_for(&address, now - 20);
+        let other = cookie_for(&address, now - 10);
+
+        let first = app
+            .clone()
+            .oneshot(call(
+                "POST",
+                "/api/studio/deploy-key",
+                [203, 0, 113, 1],
+                Some(&this),
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert!(set_cookie(&first).is_none(), "a first key ends nothing");
+        assert_eq!(status_of(&app, &other).await, StatusCode::OK);
+
+        let rotated = app
+            .clone()
+            .oneshot(call(
+                "POST",
+                "/api/studio/deploy-key",
+                [203, 0, 113, 1],
+                Some(&this),
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rotated.status(), StatusCode::OK);
+        let reissued = set_cookie(&rotated).expect("the rotating session is reissued");
+        assert_eq!(status_of(&app, &other).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status_of(&app, &this).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status_of(&app, &reissued).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Postgres"]
+    async fn dock_a_sign_in_in_the_second_of_a_sign_out_is_a_live_session() {
+        use alloy::signers::SignerSync;
+        let pool = test_pool().await;
+        let app = router(dock_state(
+            Limits::new(1000, 1000, 1000, Vec::new()),
+            Some(pool.clone()),
+        ));
+        let wallet = alloy::signers::local::PrivateKeySigner::random();
+        let address = wallet.address().to_checksum(None);
+        // A sign-out stamped a moment ahead stands in for one in the same second, without
+        // depending on where the second boundary falls.
+        kittiwake_db::record_sign_out(&pool, &address, handlers::now() + 2)
+            .await
+            .unwrap();
+
+        let challenge = app
+            .clone()
+            .oneshot(call("GET", "/api/studio/auth", [203, 0, 113, 1], None, ""))
+            .await
+            .unwrap();
+        let challenge: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(challenge.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let message = kittiwake_dock::sign_in_message(
+            "www.lodestar-dashboard.com",
+            &address,
+            challenge["nonce"].as_str().unwrap(),
+            challenge["issuedAt"].as_i64().unwrap(),
+        )
+        .unwrap();
+        let signature = wallet.sign_message_sync(message.as_bytes()).unwrap();
+        let body = serde_json::json!({
+            "address": address,
+            "message": message,
+            "signature": format!("0x{}", alloy::hex::encode(signature.as_bytes())),
+        });
+        let signed_in = app
+            .clone()
+            .oneshot(call(
+                "POST",
+                "/api/studio/auth",
+                [203, 0, 113, 1],
+                None,
+                &body.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(signed_in.status(), StatusCode::OK);
+        let cookie = set_cookie(&signed_in).unwrap();
+        assert_eq!(status_of(&app, &cookie).await, StatusCode::OK);
+    }
+
+    fn rand_suffix() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     }
 }

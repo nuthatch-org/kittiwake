@@ -3264,6 +3264,7 @@ dependencies = [
 name = "kittiwake-edge"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "anyhow",
  "axum",
  "base64 0.23.1",
