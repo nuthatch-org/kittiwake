@@ -14,8 +14,10 @@ use sha2::Sha256;
 type HmacSha256 = Hmac<Sha256>;
 
 pub const COOKIE: &str = "lodestar_cockpit";
-/// Enough for every operator on a box to be mid sign-in; beyond it, a flood.
-const MAX_OUTSTANDING: usize = 1024;
+/// A nonce is the signer, the issue time and eight random bytes, then a tag over them, so issuing
+/// one stores nothing and only a completed sign-in is remembered.
+const NONCE_BODY: usize = 20 + 8 + 8;
+const NONCE_TAG: usize = 16;
 
 /// Whether an address may act for the indexer on the SubgraphService.
 pub trait Operators: Send + Sync {
@@ -47,7 +49,6 @@ pub enum AuthError {
     BadSignature,
     WrongSigner,
     NotAnOperator,
-    Busy,
     Chain(String),
 }
 
@@ -64,16 +65,9 @@ impl std::fmt::Display for AuthError {
                     "the signer is neither the indexer nor one of its operators"
                 )
             }
-            AuthError::Busy => write!(f, "too many sign-ins in flight"),
             AuthError::Chain(e) => write!(f, "could not read operators from the chain: {e}"),
         }
     }
-}
-
-struct Challenge {
-    signer: Address,
-    message: String,
-    expires_at: i64,
 }
 
 pub struct Issued {
@@ -88,7 +82,8 @@ pub struct Auth {
     nonce_ttl: i64,
     session_ttl: i64,
     key: [u8; 32],
-    challenges: Mutex<HashMap<String, Challenge>>,
+    /// Nonces of completed sign-ins, until they expire, so each signature signs in once.
+    spent: Mutex<HashMap<String, i64>>,
     operators: Box<dyn Operators>,
 }
 
@@ -115,7 +110,7 @@ impl Auth {
             nonce_ttl: nonce_ttl as i64,
             session_ttl: session_ttl as i64,
             key,
-            challenges: Mutex::new(HashMap::new()),
+            spent: Mutex::new(HashMap::new()),
             operators,
         }
     }
@@ -129,57 +124,67 @@ impl Auth {
     }
 
     pub fn challenge(&self, signer: Address, now: i64) -> Result<Issued, AuthError> {
-        let mut nonce = [0u8; 16];
-        getrandom::fill(&mut nonce).map_err(|e| AuthError::Chain(e.to_string()))?;
-        let nonce = hex::encode(nonce);
+        let mut body = [0u8; NONCE_BODY];
+        body[..20].copy_from_slice(signer.as_slice());
+        body[20..28].copy_from_slice(&now.to_be_bytes());
+        getrandom::fill(&mut body[28..]).map_err(|e| AuthError::Chain(e.to_string()))?;
+        let mut sealed = body.to_vec();
+        sealed.extend_from_slice(&self.nonce_mac(&body).finalize().into_bytes()[..NONCE_TAG]);
+        let nonce = URL_SAFE_NO_PAD.encode(sealed);
         let expires_at = now + self.nonce_ttl;
-        let message = format!(
+        Ok(Issued {
+            message: self.message(signer, &nonce, now, expires_at),
+            nonce,
+            expires_at,
+        })
+    }
+
+    fn nonce_mac(&self, body: &[u8]) -> HmacSha256 {
+        let mut mac = HmacSha256::new_from_slice(&self.key).expect("hmac takes any key length");
+        mac.update(b"cockpit-nonce|");
+        mac.update(body);
+        mac
+    }
+
+    fn message(&self, signer: Address, nonce: &str, issued_at: i64, expires_at: i64) -> String {
+        format!(
             "Sign in to the Lodestar Cockpit for indexer {indexer}.\n\n\
              This signature only proves you control this address. It sends no transaction.\n\n\
              Signer: {signer}\nCockpit: {origin}\nNonce: {nonce}\nIssued At: {issued}\nExpires At: {expires}",
             indexer = self.indexer,
             origin = self.origin,
-            issued = rfc3339(now),
+            issued = rfc3339(issued_at),
             expires = rfc3339(expires_at),
-        );
-        let mut map = self.challenges.lock().expect("challenge lock");
-        map.retain(|_, c| c.expires_at > now);
-        if map.len() >= MAX_OUTSTANDING {
-            return Err(AuthError::Busy);
-        }
-        map.insert(
-            nonce.clone(),
-            Challenge {
-                signer,
-                message: message.clone(),
-                expires_at,
-            },
-        );
-        Ok(Issued {
-            nonce,
-            message,
-            expires_at,
-        })
+        )
     }
 
-    /// Consumes the nonce whatever the outcome, so a signature is good for one attempt only.
+    /// A nonce signs in once: it is spent when a sign-in with it succeeds.
     pub async fn verify(
         &self,
         nonce: &str,
         signature: &str,
         now: i64,
     ) -> Result<Session, AuthError> {
-        let challenge = self
-            .challenges
-            .lock()
-            .expect("challenge lock")
-            .remove(nonce)
+        let sealed = URL_SAFE_NO_PAD
+            .decode(nonce)
+            .ok()
+            .filter(|s| s.len() == NONCE_BODY + NONCE_TAG)
             .ok_or(AuthError::UnknownNonce)?;
-        if challenge.expires_at <= now {
+        let (body, tag) = sealed.split_at(NONCE_BODY);
+        self.nonce_mac(body)
+            .verify_truncated_left(tag)
+            .map_err(|_| AuthError::UnknownNonce)?;
+        let signer = Address::from_slice(&body[..20]);
+        let issued_at = i64::from_be_bytes(body[20..28].try_into().expect("eight bytes"));
+        let expires_at = issued_at + self.nonce_ttl;
+        if expires_at <= now {
             return Err(AuthError::Expired);
         }
-        let recovered = recover(&challenge.message, signature)?;
-        if recovered != challenge.signer {
+        let recovered = recover(
+            &self.message(signer, nonce, issued_at, expires_at),
+            signature,
+        )?;
+        if recovered != signer {
             return Err(AuthError::WrongSigner);
         }
         if recovered != self.indexer
@@ -190,6 +195,11 @@ impl Auth {
                 .map_err(AuthError::Chain)?
         {
             return Err(AuthError::NotAnOperator);
+        }
+        let mut spent = self.spent.lock().expect("spent lock");
+        spent.retain(|_, until| *until > now);
+        if spent.insert(nonce.to_string(), expires_at).is_some() {
+            return Err(AuthError::UnknownNonce);
         }
         Ok(Session {
             indexer: self.indexer,

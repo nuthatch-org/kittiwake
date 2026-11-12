@@ -25,7 +25,8 @@ pub mod sync_speed;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::future::BoxFuture;
+use futures::FutureExt;
+use futures::future::{BoxFuture, Shared};
 use kittiwake_cache::{CachePolicy, Entry, Freshness, Store, classify};
 use kittiwake_nest::{Lane, NestGate, QuerySpec};
 use kittiwake_types::{ApiError, Meta, NestId, Provenance, ServedFrom};
@@ -50,6 +51,36 @@ pub struct ReadCtx {
     pub chain: Option<kittiwake_chain::Chain>,
     /// Set on the warmer's copy. See [`ReadCtx::warming`].
     warm_ahead: Option<Duration>,
+    external: Arc<ExternalFlights>,
+}
+
+type ExternalFlight = Shared<BoxFuture<'static, Result<Arc<Entry>, ApiError>>>;
+
+/// The external path's single flight and short memory of failure, as the gate keeps for a nest.
+struct ExternalFlights {
+    /// Each flight with its id, so a finished one clears only its own slot.
+    inflight: tokio::sync::Mutex<std::collections::HashMap<String, (u64, ExternalFlight)>>,
+    next_id: std::sync::atomic::AtomicU64,
+    failed: moka::future::Cache<String, ApiError>,
+}
+
+impl Default for ExternalFlights {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(5))
+    }
+}
+
+impl ExternalFlights {
+    fn new(failed_for: Duration) -> Self {
+        Self {
+            inflight: Default::default(),
+            next_id: Default::default(),
+            failed: moka::future::Cache::builder()
+                .max_capacity(4096)
+                .time_to_live(failed_for)
+                .build(),
+        }
+    }
 }
 
 /// A source that is not a nest: it has no provenance of its own, so the age of the cache entry is
@@ -72,6 +103,7 @@ impl ReadCtx {
             naming: None,
             chain: None,
             warm_ahead: None,
+            external: Default::default(),
         }
     }
 
@@ -194,16 +226,9 @@ impl ReadCtx {
                     return Ok(Read { entry, meta });
                 }
                 Freshness::Stale => {
-                    let ctx = self.clone();
-                    let key2 = key.clone();
-                    let f = fetch.clone();
-                    tokio::spawn(async move {
-                        if let Ok(v) = f().await {
-                            ctx.store
-                                .insert(key2, Entry::new(v, Provenance::default()))
-                                .await;
-                        }
-                    });
+                    if self.external.failed.get(&key).await.is_none() {
+                        drop(self.external_flight(key, fetch).await);
+                    }
                     let meta = entry.meta(ServedFrom::Cache, true);
                     return Ok(Read { entry, meta });
                 }
@@ -211,13 +236,53 @@ impl ReadCtx {
             }
         }
 
-        let value = fetch().await?;
-        let entry = self
-            .store
-            .insert(key, Entry::new(value, Provenance::default()))
-            .await;
+        if let Some(e) = self.external.failed.get(&key).await {
+            return Err(e);
+        }
+        let entry = self.external_flight(key, fetch).await.await?;
         let meta = entry.meta(fresh_from, false);
         Ok(Read { entry, meta })
+    }
+
+    /// The one fetch in flight for `key`, started if there is none. Spawned, so it finishes and
+    /// stores its answer whether or not anyone is still waiting for it.
+    async fn external_flight(&self, key: String, fetch: ExternalFetcher) -> ExternalFlight {
+        let mut map = self.external.inflight.lock().await;
+        if let Some((_, flight)) = map.get(&key) {
+            return flight.clone();
+        }
+        let id = self
+            .external
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let store = self.store.clone();
+        let k = key.clone();
+        // Its own task, so a panicking fetch becomes an error here rather than a dead flight.
+        let handle = tokio::spawn(async move {
+            let v = fetch().await?;
+            Ok(store.insert(k, Entry::new(v, Provenance::default())).await)
+        });
+        let ctx = self.clone();
+        let k = key.clone();
+        let flight = async move {
+            let result = handle
+                .await
+                .unwrap_or_else(|e| Err(ApiError::Unavailable(format!("fetch task failed: {e}"))));
+            if let Err(e) = &result {
+                ctx.external.failed.insert(k.clone(), e.clone()).await;
+            }
+            let mut map = ctx.external.inflight.lock().await;
+            if map.get(&k).is_some_and(|(slot, _)| *slot == id) {
+                map.remove(&k);
+            }
+            result
+        }
+        .boxed()
+        .shared();
+        // Driven to the end by its own task, so the slot is cleared even if every caller goes away.
+        tokio::spawn(flight.clone());
+        map.insert(key, (id, flight.clone()));
+        flight
     }
 
     /// The warmer's path. See [`ReadCtx::warming`].
@@ -358,6 +423,114 @@ mod tests {
             ..Entry::new(serde_json::json!({}), Provenance::default())
         };
         ctx.store.insert(key(), entry).await;
+    }
+
+    /// A fetch that panics is a failure like any other: remembered briefly, then asked again.
+    #[tokio::test]
+    async fn a_panicked_external_fetch_is_retried_once_its_failure_expires() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (mut ctx, _server) = ctx().await;
+        ctx.external = Arc::new(ExternalFlights::new(Duration::from_millis(200)));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let s = starts.clone();
+        let fetch: ExternalFetcher = Arc::new(move || {
+            let first = s.fetch_add(1, Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                assert!(!first, "the first fetch panics");
+                Ok(serde_json::json!({ "ok": true }))
+            })
+        });
+        let ask = || {
+            ctx.cached_external_keyed(
+                "r",
+                "s",
+                Duration::from_secs(30),
+                ServedFrom::Chain,
+                fetch.clone(),
+            )
+        };
+
+        assert!(ask().await.is_err(), "the panic is reported as a failure");
+        assert!(ask().await.is_err(), "and remembered");
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let read = ask().await.expect("asked again once the failure expired");
+        assert_eq!(*read.entry.value, serde_json::json!({ "ok": true }));
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+    }
+
+    /// A slow external fetch that counts how often it is started, failing while `fail` is set.
+    fn counting_fetch(
+        starts: Arc<std::sync::atomic::AtomicUsize>,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    ) -> ExternalFetcher {
+        use std::sync::atomic::Ordering;
+        Arc::new(move || {
+            starts.fetch_add(1, Ordering::SeqCst);
+            let fail = fail.load(Ordering::SeqCst);
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if fail {
+                    Err(ApiError::Unavailable("down".into()))
+                } else {
+                    Ok(serde_json::json!({}))
+                }
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn an_external_read_is_fetched_once_however_many_ask() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let (ctx, _server) = ctx().await;
+        let starts = Arc::new(AtomicUsize::new(0));
+        let fetch = counting_fetch(starts.clone(), Arc::new(AtomicBool::new(false)));
+        let ask = || {
+            ctx.cached_external_keyed(
+                "r",
+                "s",
+                Duration::from_secs(30),
+                ServedFrom::Chain,
+                fetch.clone(),
+            )
+        };
+
+        let cold = futures::future::join_all((0..20).map(|_| ask())).await;
+        assert!(cold.iter().all(Result::is_ok));
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "cold");
+
+        let key = kittiwake_cache::key(1, "ext", "r", &serde_json::json!({ "subject": "s" }));
+        let entry = Entry {
+            fetched_at: Instant::now() - Duration::from_secs(40),
+            ..Entry::new(serde_json::json!({}), Provenance::default())
+        };
+        ctx.store.insert(key, entry).await;
+        let stale = futures::future::join_all((0..20).map(|_| ask())).await;
+        assert!(stale.iter().all(|r| r.as_ref().is_ok_and(|r| r.meta.stale)));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(starts.load(Ordering::SeqCst), 2, "stale");
+    }
+
+    #[tokio::test]
+    async fn a_failed_external_read_is_not_asked_again_at_once() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let (ctx, _server) = ctx().await;
+        let starts = Arc::new(AtomicUsize::new(0));
+        let fetch = counting_fetch(starts.clone(), Arc::new(AtomicBool::new(true)));
+        for _ in 0..3 {
+            let r = ctx
+                .cached_external_keyed(
+                    "r",
+                    "s",
+                    Duration::from_secs(30),
+                    ServedFrom::Chain,
+                    fetch.clone(),
+                )
+                .await;
+            assert!(r.is_err());
+        }
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

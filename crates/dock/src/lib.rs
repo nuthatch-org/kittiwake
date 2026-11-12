@@ -94,6 +94,15 @@ pub fn create_session(secret: &Secret, address: &str, issued_at: i64) -> String 
 /// contains no colon so today the two agree, but the original chose `lastIndexOf` and a port that
 /// quietly chose differently would diverge the moment anything else did.
 pub fn parse_session(secret: &Secret, token: &str, now: i64) -> Result<String, SessionError> {
+    parse_session_issued(secret, token, now).map(|(address, _)| address)
+}
+
+/// The same, with the time the session was issued, which is what a sign-out is compared against.
+pub fn parse_session_issued(
+    secret: &Secret,
+    token: &str,
+    now: i64,
+) -> Result<(String, i64), SessionError> {
     let idx = token.rfind(':').ok_or(SessionError::Malformed)?;
     let (payload, sig) = (&token[..idx], &token[idx + 1..]);
 
@@ -118,7 +127,7 @@ pub fn parse_session(secret: &Secret, token: &str, now: i64) -> Result<String, S
     if expected.len() != sig.len() || !ok {
         return Err(SessionError::BadSignature);
     }
-    Ok(address.to_string())
+    Ok((address.to_string(), issued_at))
 }
 
 /// The origin a sign-in message may name, as its URI, or `None` for any other host. Local

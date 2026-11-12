@@ -178,7 +178,7 @@ impl Substreams {
             .body(frame(&request.encode_to_vec()))
             .send()
             .await
-            .map_err(|e| unavailable(&format!("request failed: {e}")))?;
+            .map_err(|e| unavailable(&format!("request failed: {}", e.without_url())))?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();

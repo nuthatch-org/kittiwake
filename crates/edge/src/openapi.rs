@@ -34,11 +34,6 @@ pub const WITHHELD: &[(&str, &str)] = &[
          a way to ask anything at all",
     ),
     (
-        "/api/analytics/clickthrough",
-        "records one of the dashboard's own trade clicks and is a POST; it writes to our analytics \
-         table rather than reading the protocol, so an agent has no business calling it",
-    ),
-    (
         "/api/file-issue",
         "sends a support report to the maintainers' Telegram chat. Documenting it as an anonymous \
          endpoint would be an invitation to write into our chat through us",

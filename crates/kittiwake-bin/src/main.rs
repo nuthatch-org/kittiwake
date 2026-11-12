@@ -300,6 +300,9 @@ async fn main() -> anyhow::Result<()> {
             kittiwake_db::ensure_graph_support_table(p)
                 .await
                 .context("creating the graph-support mirror table")?;
+            kittiwake_db::ensure_studio_sign_outs_table(p)
+                .await
+                .context("creating the Dock sign-out table")?;
         }
         if let Some(path) = &cfg.backup_mark_path {
             jobs.push(backup_watch::job(path.clone(), cfg.telegram.clone()));
