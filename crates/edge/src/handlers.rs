@@ -3426,13 +3426,13 @@ pub async fn foghorn_get(
     foghorn_call(&st, &path, query, None).await
 }
 
-/// The Foghorn POST surfaces: oracle-compatible GraphQL, and creating or deleting an alert
-/// subscription (lodestar#256). Forwarding arbitrary POSTs to an internal service is not a thing to
+/// The Foghorn POST surfaces: oracle-compatible GraphQL, and creating, reading or deleting an alert
+/// subscription (lodestar#256), the last two with the manage token in the body. Forwarding arbitrary POSTs to an internal service is not a thing to
 /// do by accident, so each is named.
 pub(crate) fn foghorn_post_allowed(path: &str) -> bool {
     match path.split('/').collect::<Vec<_>>().as_slice() {
         ["qos", "graphql"] | ["alerts", "subscriptions"] => true,
-        ["alerts", "subscriptions", id, "delete"] => uuid_shaped(id),
+        ["alerts", "subscriptions", id, "delete" | "read"] => uuid_shaped(id),
         _ => false,
     }
 }

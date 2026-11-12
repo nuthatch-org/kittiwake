@@ -1546,7 +1546,19 @@ pub fn router(state: AppState) -> Router {
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(axum::middleware::from_fn(observe))
-        .layer(tower_http::trace::TraceLayer::new_for_http())
+        // The default span records the whole URI, and every log line in the request carries it, so
+        // a credential in a query string would be written to the journal. The template is enough.
+        .layer(
+            tower_http::trace::TraceLayer::new_for_http().make_span_with(
+                |req: &axum::http::Request<axum::body::Body>| {
+                    let route = req
+                        .extensions()
+                        .get::<axum::extract::MatchedPath>()
+                        .map_or("unmatched", |m| m.as_str());
+                    tracing::info_span!("request", method = %req.method(), route)
+                },
+            ),
+        )
         .layer(tower_http::catch_panic::CatchPanicLayer::new());
 
     let cors = cors_layer(
@@ -2205,6 +2217,7 @@ mod tests {
             "qos/graphql",
             "alerts/subscriptions",
             "alerts/subscriptions/0f8fad5b-d9cb-469f-a165-70867728950e/delete",
+            "alerts/subscriptions/0f8fad5b-d9cb-469f-a165-70867728950e/read",
         ] {
             assert!(
                 crate::handlers::foghorn_post_allowed(good),
@@ -2216,6 +2229,8 @@ mod tests {
             "alerts",
             "alerts/subscriptions/0f8fad5b-d9cb-469f-a165-70867728950e",
             "alerts/subscriptions/not-a-uuid/delete",
+            "alerts/subscriptions/not-a-uuid/read",
+            "alerts/subscriptions/0f8fad5b-d9cb-469f-a165-70867728950e/read/x",
             "alerts/subscriptions/0f8fad5b-d9cb-469f-a165-70867728950e/delete/x",
         ] {
             assert!(
