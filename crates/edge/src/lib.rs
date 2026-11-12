@@ -1085,6 +1085,28 @@ fn cors_layer(origins: &[String], patterns: &[String]) -> Option<tower_http::cor
     )
 }
 
+/// Reads, and graph-cli's uploads, which arrive a file at a time, spend the read budget; every other
+/// Dock request is a mutation.
+async fn dock_budget(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<Response, ErrorResponse> {
+    let limiter = if req.method() == axum::http::Method::GET
+        || req.uri().path().starts_with("/api/studio/ipfs/")
+    {
+        &st.limits.read
+    } else {
+        &st.limits.mutation
+    };
+    st.limits.check(
+        limiter,
+        client_ip(peer, req.headers(), st.edge_secret.as_deref()),
+    )?;
+    Ok(next.run(req).await)
+}
+
 pub fn router(state: AppState) -> Router {
     use axum::routing::post;
     let directory = Router::new()
@@ -1220,41 +1242,10 @@ pub fn router(state: AppState) -> Router {
             get(handlers::graft_children),
         );
 
-    let routes = Router::new()
-        .route("/whoami", get(get_whoami))
-        // Also under /api, so it can be reached through the edge rewrite and the whole chain can be
-        // checked from a browser rather than only from the box.
-        .route("/api/whoami", get(get_whoami))
-        .route("/health", get(get_health))
-        // The URL anything watching this deployment already points at, answering in the shape it
-        // has always answered in. See `get_api_health`.
-        .route("/api/health", get(get_api_health))
-        .route("/ready", get(get_ready))
-        .route("/openapi.json", get(get_openapi))
-        // The network
-        .route("/api/support", get(handlers::support))
-        .route("/api/support/templates", get(handlers::support_templates))
-        .route("/api/issue-forms", get(handlers::issue_forms))
-        .route("/api/file-issue", post(handlers::file_issue))
-        .route("/api/support/{number}", get(handlers::support_issue))
-        .route("/api/epochs", get(handlers::epochs))
-        .route("/api/network-stats", get(handlers::network_stats))
-        // Same fold, different panel: one cache entry serves both.
-        .route("/api/grt-flow", get(handlers::grt_flow))
-        .route("/api/token-metrics", get(handlers::token_metrics))
-        .route("/api/subgraph-search", get(handlers::subgraph_search))
-        .route("/api/subgraph-names", post(handlers::subgraph_names))
-        .route(
-            "/api/analytics/clickthrough",
-            post(handlers::analytics_clickthrough),
-        )
-        .route("/api/chain-lag", get(handlers::chain_lag))
-        .route("/api/dropped-chains", get(handlers::dropped_chains))
-        .route("/api/reo", get(handlers::reo))
-        .route("/api/price", get(handlers::price))
-        .route("/api/tvl", get(handlers::tvl))
-        // The Dock. These are deliberately individual registrations: the parity extractor sees
-        // the real public surface, and a new route cannot wander into a rewrite unchecked.
+    // The Dock. These are deliberately individual registrations: the parity extractor sees
+    // the real public surface, and a new route cannot wander into a rewrite unchecked. Budgeted as
+    // one router, so a new Dock route cannot be added without a budget.
+    let dock = Router::new()
         .route(
             "/api/studio/auth",
             get(handlers::studio_auth_get)
@@ -1289,6 +1280,44 @@ pub fn router(state: AppState) -> Router {
             "/api/studio/bounties/{id}",
             axum::routing::patch(handlers::studio_bounty_patch),
         )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            dock_budget,
+        ));
+
+    let routes = Router::new()
+        .route("/whoami", get(get_whoami))
+        // Also under /api, so it can be reached through the edge rewrite and the whole chain can be
+        // checked from a browser rather than only from the box.
+        .route("/api/whoami", get(get_whoami))
+        .route("/health", get(get_health))
+        // The URL anything watching this deployment already points at, answering in the shape it
+        // has always answered in. See `get_api_health`.
+        .route("/api/health", get(get_api_health))
+        .route("/ready", get(get_ready))
+        .route("/openapi.json", get(get_openapi))
+        // The network
+        .route("/api/support", get(handlers::support))
+        .route("/api/support/templates", get(handlers::support_templates))
+        .route("/api/issue-forms", get(handlers::issue_forms))
+        .route("/api/file-issue", post(handlers::file_issue))
+        .route("/api/support/{number}", get(handlers::support_issue))
+        .route("/api/epochs", get(handlers::epochs))
+        .route("/api/network-stats", get(handlers::network_stats))
+        // Same fold, different panel: one cache entry serves both.
+        .route("/api/grt-flow", get(handlers::grt_flow))
+        .route("/api/token-metrics", get(handlers::token_metrics))
+        .route("/api/subgraph-search", get(handlers::subgraph_search))
+        .route("/api/subgraph-names", post(handlers::subgraph_names))
+        .route(
+            "/api/analytics/clickthrough",
+            post(handlers::analytics_clickthrough),
+        )
+        .route("/api/chain-lag", get(handlers::chain_lag))
+        .route("/api/dropped-chains", get(handlers::dropped_chains))
+        .route("/api/reo", get(handlers::reo))
+        .route("/api/price", get(handlers::price))
+        .route("/api/tvl", get(handlers::tvl))
         .route("/api/ens", get(handlers::ens))
         // Network-wide totals on the free overview.
         .route("/api/dips/agreements", get(handlers::dips_agreements))
@@ -1297,6 +1326,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/delegation-flows", get(handlers::delegation_flows))
         .route("/api/developer-activity", get(handlers::developer_activity))
         .merge(directory)
+        .merge(dock)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(tower_http::catch_panic::CatchPanicLayer::new());
 
@@ -1462,6 +1492,65 @@ mod tests {
         assert!(limits.check(&limits.report, ip).is_err());
         let other: IpAddr = [203, 0, 113, 8].into();
         assert!(limits.check(&limits.report, other).is_ok());
+    }
+
+    #[tokio::test]
+    async fn every_dock_route_spends_a_budget() {
+        use tower::ServiceExt;
+        let gate =
+            kittiwake_nest::NestGate::new(kittiwake_nest::NestConfig::new("http://127.0.0.1:9"))
+                .unwrap();
+        let read = kittiwake_read::ReadCtx::new(gate, kittiwake_cache::Store::new(64), 1);
+        let app = router(state(
+            Limits::new(1000, 1, 1, Vec::new()),
+            None,
+            read,
+            None,
+            None,
+            kittiwake_ext::Ipfs::default(),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let routes = [
+            ("GET", "/api/studio/auth"),
+            ("POST", "/api/studio/auth"),
+            ("DELETE", "/api/studio/auth"),
+            ("GET", "/api/studio/subgraphs"),
+            ("POST", "/api/studio/subgraphs"),
+            ("PATCH", "/api/studio/subgraphs/1"),
+            ("DELETE", "/api/studio/subgraphs/1"),
+            ("GET", "/api/studio/deploy-key"),
+            ("POST", "/api/studio/deploy-key"),
+            ("POST", "/api/studio/metadata"),
+            ("POST", "/api/studio/image"),
+            ("POST", "/api/studio/node"),
+            ("GET", "/api/studio/ipfs/api/v0/version"),
+            ("POST", "/api/studio/ipfs/api/v0/add"),
+            ("GET", "/api/studio/bounties"),
+            ("POST", "/api/studio/bounties"),
+            ("PATCH", "/api/studio/bounties/1"),
+        ];
+        for (i, (method, path)) in routes.into_iter().enumerate() {
+            let peer: SocketAddr = ([203, 0, 113, i as u8 + 1], 1).into();
+            let send = || {
+                let mut req = axum::http::Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap();
+                req.extensions_mut().insert(ConnectInfo(peer));
+                app.clone().oneshot(req)
+            };
+            assert_ne!(send().await.unwrap().status(), 429, "{method} {path}");
+            assert_eq!(
+                send().await.unwrap().status(),
+                429,
+                "{method} {path} is not budgeted"
+            );
+        }
     }
 
     #[test]
