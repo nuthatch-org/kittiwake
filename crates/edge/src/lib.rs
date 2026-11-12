@@ -69,7 +69,7 @@ impl Limits {
         if self.exempt.contains(&ip) {
             return Ok(());
         }
-        limiter.check_key(&ip).map_err(|not_until| {
+        limiter.check_key(&bucket(ip)).map_err(|not_until| {
             metrics::counter!("rate_limited_total").increment(1);
             ApiError::RateLimited {
                 retry_after: not_until
@@ -87,6 +87,18 @@ impl Limits {
         self.read.retain_recent();
         self.mutation.retain_recent();
         self.report.retain_recent();
+    }
+}
+
+/// The key a caller is budgeted under. An IPv6 host is routinely handed a whole /64, so each of its
+/// addresses is the same caller; an IPv4-mapped address is the IPv4 one.
+fn bucket(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6((u128::from(v6) & !u128::from(u64::MAX)).into()),
+        },
     }
 }
 
@@ -1450,6 +1462,32 @@ mod tests {
         assert!(limits.check(&limits.report, ip).is_err());
         let other: IpAddr = [203, 0, 113, 8].into();
         assert!(limits.check(&limits.report, other).is_ok());
+    }
+
+    #[test]
+    fn one_ipv6_slash_64_shares_one_budget() {
+        let limits = Limits::new(1000, 1000, 1000, Vec::new());
+        let in_one_64 = |host: u16| -> IpAddr {
+            std::net::Ipv6Addr::new(0x2001, 0xdb8, 1, 2, host, 0, 0, 1).into()
+        };
+        for host in 0..3 {
+            assert!(limits.check(&limits.report, in_one_64(host)).is_ok());
+        }
+        assert!(limits.check(&limits.report, in_one_64(99)).is_err());
+        let next_64: IpAddr = std::net::Ipv6Addr::new(0x2001, 0xdb8, 1, 3, 0, 0, 0, 1).into();
+        assert!(limits.check(&limits.report, next_64).is_ok());
+
+        let v4: IpAddr = [203, 0, 113, 9].into();
+        for _ in 0..3 {
+            assert!(limits.check(&limits.report, v4).is_ok());
+        }
+        let mapped: IpAddr = std::net::Ipv4Addr::new(203, 0, 113, 9)
+            .to_ipv6_mapped()
+            .into();
+        assert!(
+            limits.check(&limits.report, mapped).is_err(),
+            "an IPv4-mapped address is the IPv4 caller"
+        );
     }
 
     // ── Presenting a proof of indexing ───────────────────────────────────────
