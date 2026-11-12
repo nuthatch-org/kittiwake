@@ -1322,16 +1322,14 @@ pub async fn studio_auth_post(
     Ok(r)
 }
 
-pub async fn studio_auth_delete(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Response, ErrorResponse> {
-    if let Some(studio) = &st.studio
+pub async fn studio_auth_delete(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    // The cookie is cleared whatever happens here: a sign-out the browser cannot complete is worse
+    // than one the server could not record.
+    if let (Some(studio), Some(pool)) = (&st.studio, &st.pool)
         && let Some((address, _)) = session_claim(&studio.secret, &headers, now())
+        && let Err(e) = kittiwake_db::record_sign_out(pool, &address, now()).await
     {
-        kittiwake_db::record_sign_out(pool(&st)?, &address, now())
-            .await
-            .map_err(db_err)?;
+        tracing::error!(error = %e, "a Dock sign-out could not be recorded; the session stays valid until it expires");
     }
     let mut r = axum::Json(serde_json::json!({"ok": true})).into_response();
     r.headers_mut().insert(
@@ -1341,7 +1339,7 @@ pub async fn studio_auth_delete(
         ),
     );
     crate::no_store(r.headers_mut());
-    Ok(r)
+    r
 }
 
 pub async fn studio_subgraphs_get(
@@ -1694,18 +1692,44 @@ fn rpc_error(code: i32, message: &str) -> Response {
         .into_response()
 }
 
+/// The deploy key's hash, once it is known to be a real key. Anything short of that spends the
+/// caller's address budget, so the route cannot be used to try keys for free.
+async fn deploy_key_budget(
+    st: &AppState,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+) -> Result<(), ErrorResponse> {
+    let known = async {
+        let hash = kittiwake_dock::hash_key(bearer(headers)?);
+        kittiwake_db::deploy_key_owner(pool(st)?, &hash)
+            .await
+            .map_err(db_err)?
+            .ok_or(ApiError::Unauthorized)?;
+        Ok::<_, ErrorResponse>(hash)
+    }
+    .await;
+    match known {
+        Ok(hash) => Ok(st.limits.check_deploy_key(&hash)?),
+        Err(e) => {
+            st.limits.check(
+                &st.limits.read,
+                client_ip(peer, headers, st.edge_secret.as_deref()),
+            )?;
+            Err(e)
+        }
+    }
+}
+
 pub async fn studio_ipfs_proxy(
     State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(path): Path<String>,
     OriginalUri(uri): OriginalUri,
     method: Method,
     body: bytes::Bytes,
 ) -> Result<Response, ErrorResponse> {
-    kittiwake_db::deploy_key_owner(pool(&st)?, &kittiwake_dock::hash_key(bearer(&headers)?))
-        .await
-        .map_err(db_err)?
-        .ok_or(ApiError::Unauthorized)?;
+    deploy_key_budget(&st, peer, &headers).await?;
     let (status, bytes, content_type) = st
         .ipfs
         .proxy(

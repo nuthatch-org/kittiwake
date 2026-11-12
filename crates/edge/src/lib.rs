@@ -35,6 +35,9 @@ pub struct Limits {
     pub mutation: Limiter,
     /// Support reports land in a chat a person reads, so the read budget is far too generous.
     pub report: Limiter,
+    /// graph-cli's IPFS uploads, per deploy key: one `add` per file, sent at once and never retried,
+    /// so the burst holds a few hundred files and a runaway client then gets five a second.
+    pub deploy: RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>,
     pub exempt: Vec<IpAddr>,
 }
 
@@ -61,6 +64,10 @@ impl Limits {
                 Quota::per_hour(NonZeroU32::new(6).unwrap())
                     .allow_burst(NonZeroU32::new(3).unwrap()),
             ),
+            deploy: RateLimiter::keyed(
+                Quota::per_minute(NonZeroU32::new(300).unwrap())
+                    .allow_burst(NonZeroU32::new(300).unwrap()),
+            ),
             exempt,
         }
     }
@@ -69,15 +76,14 @@ impl Limits {
         if self.exempt.contains(&ip) {
             return Ok(());
         }
-        limiter.check_key(&bucket(ip)).map_err(|not_until| {
-            metrics::counter!("rate_limited_total").increment(1);
-            ApiError::RateLimited {
-                retry_after: not_until
-                    .wait_time_from(DefaultClock::default().now())
-                    .as_secs()
-                    .max(1),
-            }
-        })
+        limiter.check_key(&bucket(ip)).map_err(refused)
+    }
+
+    /// Spend from a deploy key's upload budget, keyed by the key's hash.
+    pub(crate) fn check_deploy_key(&self, key_hash: &str) -> Result<(), ApiError> {
+        self.deploy
+            .check_key(&key_hash.to_string())
+            .map_err(refused)
     }
 
     /// Drop the state of callers who have not been seen recently, so a long uptime against a wide
@@ -87,6 +93,17 @@ impl Limits {
         self.read.retain_recent();
         self.mutation.retain_recent();
         self.report.retain_recent();
+        self.deploy.retain_recent();
+    }
+}
+
+fn refused(not_until: governor::NotUntil<<DefaultClock as Clock>::Instant>) -> ApiError {
+    metrics::counter!("rate_limited_total").increment(1);
+    ApiError::RateLimited {
+        retry_after: not_until
+            .wait_time_from(DefaultClock::default().now())
+            .as_secs()
+            .max(1),
     }
 }
 
@@ -1153,17 +1170,18 @@ fn cors_layer(origins: &[String], patterns: &[String]) -> Option<tower_http::cor
     )
 }
 
-/// Reads, and graph-cli's uploads, which arrive a file at a time, spend the read budget; every other
-/// Dock request is a mutation.
+/// Reads spend the read budget and every other Dock request is a mutation. The IPFS proxy budgets
+/// itself by deploy key, because only its handler knows whether the key is real.
 async fn dock_budget(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<Response, ErrorResponse> {
-    let limiter = if req.method() == axum::http::Method::GET
-        || req.uri().path().starts_with("/api/studio/ipfs/")
-    {
+    if req.uri().path().starts_with("/api/studio/ipfs/") {
+        return Ok(next.run(req).await);
+    }
+    let limiter = if req.method() == axum::http::Method::GET {
         &st.limits.read
     } else {
         &st.limits.mutation
@@ -2220,6 +2238,74 @@ mod tests {
         for refused in ["0", "-1", "", "one", "1 GRT"] {
             assert!(!crate::handlers::positive_amount(refused), "{refused:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn signing_out_clears_the_cookie_even_when_it_cannot_be_recorded() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let unreachable = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_lazy(&format!("postgres://u:u@127.0.0.1:{port}/u"))
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for pool in [None, Some(unreachable)] {
+            let gate = kittiwake_nest::NestGate::new(kittiwake_nest::NestConfig::new(
+                "http://127.0.0.1:9",
+            ))
+            .unwrap();
+            let read = kittiwake_read::ReadCtx::new(gate, kittiwake_cache::Store::new(64), 1);
+            let st = state(
+                Limits::new(1000, 1000, 1000, Vec::new()),
+                pool,
+                read,
+                None,
+                Some(Studio {
+                    secret: dock_secret(),
+                    bounty_board_address: None,
+                    spent_nonces: Default::default(),
+                }),
+                kittiwake_ext::Ipfs::default(),
+                None,
+                None,
+                None,
+                None,
+            );
+            let r = crate::handlers::studio_auth_delete(
+                State(st),
+                dock_cookie(&format!(
+                    "studio_session={}",
+                    kittiwake_dock::create_session(&dock_secret(), "0xaa", now)
+                )),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::OK);
+            let cookie = r
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(cookie.contains("Max-Age=0"), "{cookie}");
+        }
+    }
+
+    #[test]
+    fn a_deploy_key_uploads_a_large_subgraph_in_one_go_and_no_more() {
+        let limits = Limits::new(1000, 1000, 1000, Vec::new());
+        for _ in 0..150 {
+            assert!(limits.check_deploy_key("key-a").is_ok());
+        }
+        let refused = (0..1000).any(|_| limits.check_deploy_key("key-a").is_err());
+        assert!(refused, "an unbounded stream from one key is refused");
+        assert!(
+            limits.check_deploy_key("key-b").is_ok(),
+            "another key is unaffected"
+        );
     }
 
     #[test]
