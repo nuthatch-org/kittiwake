@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::FutureExt;
@@ -280,6 +281,12 @@ impl QuerySpec {
 
 type Flight = Shared<BoxFuture<'static, Result<Arc<SqlAnswer>, NestError>>>;
 
+struct InFlight {
+    flight: Flight,
+    /// Set once the flight holds its nest permit.
+    admitted: Arc<AtomicBool>,
+}
+
 struct GateInner {
     cfg: NestConfig,
     http: reqwest::Client,
@@ -288,7 +295,7 @@ struct GateInner {
     /// An inner, smaller budget that only crons and the warmer take. Sized one below the real
     /// count, so a background job can never hold every permit while a user waits.
     cron_permits: HashMap<NestId, Arc<Semaphore>>,
-    inflight: Mutex<HashMap<String, Flight>>,
+    inflight: Mutex<HashMap<String, InFlight>>,
     neg_cache: moka::future::Cache<String, NestError>,
     ready_cache: moka::future::Cache<NestId, Result<ReadyBody, NestError>>,
 }
@@ -475,6 +482,15 @@ impl NestGate {
 
     /// Run one query, through the gate. No caching, no coalescing: this is the raw path.
     pub async fn query(&self, spec: &QuerySpec) -> Result<SqlAnswer, NestError> {
+        self.query_marking(spec, None).await
+    }
+
+    /// [`Self::query`], setting `admitted` once the nest permit is held.
+    async fn query_marking(
+        &self,
+        spec: &QuerySpec,
+        admitted: Option<&AtomicBool>,
+    ) -> Result<SqlAnswer, NestError> {
         let (queue_timeout, _lane_permit) = match spec.lane {
             Lane::Read => (self.inner.cfg.read_queue_timeout, None),
             Lane::Cron => {
@@ -508,6 +524,9 @@ impl NestGate {
             })?
             .map_err(|_| NestError::GateTimeout)?;
 
+        if let Some(a) = admitted {
+            a.store(true, Ordering::Release);
+        }
         metrics::counter!("nest_query_total", "nest" => spec.nest.as_str()).increment(1);
         self.execute(spec).await
     }
@@ -585,23 +604,42 @@ impl NestGate {
         spec: QuerySpec,
     ) -> Result<Arc<SqlAnswer>, NestError> {
         // The caller's key is a label; two statements must never share a flight under one.
-        let key = &format!(
+        let base = format!(
             "{key}:{}:{}",
             spec.nest.as_str(),
             blake3::hash(spec.sql.as_bytes()).to_hex()
         );
-        if let Some(err) = self.inner.neg_cache.get(key).await {
+        let slot = |lane: Lane| match lane {
+            Lane::Read => format!("{base}:read"),
+            Lane::Cron => format!("{base}:cron"),
+        };
+        let own = slot(spec.lane);
+        if let Some(err) = self.inner.neg_cache.get(&own).await {
             metrics::counter!("nest_negative_cache_hit_total").increment(1);
             return Err(err);
         }
 
-        let flight = {
+        let (slot_key, flight) = {
             let mut map = self.inner.inflight.lock().await;
-            if let Some(existing) = map.get(key) {
+            let joined = map
+                .get(&own)
+                .map(|f| (own.clone(), f.flight.clone()))
+                .or_else(|| {
+                    // A reader rides a background flight only once it holds its permit: before
+                    // that, joining it means waiting in the cron lane's queue and on its timeouts.
+                    let cron = (spec.lane == Lane::Read).then(|| slot(Lane::Cron))?;
+                    let f = map
+                        .get(&cron)
+                        .filter(|f| f.admitted.load(Ordering::Acquire))?;
+                    Some((cron, f.flight.clone()))
+                });
+            if let Some(joined) = joined {
                 metrics::counter!("nest_coalesced_total").increment(1);
-                existing.clone()
+                joined
             } else {
                 let gate = self.clone();
+                let admitted = Arc::new(AtomicBool::new(false));
+                let marker = admitted.clone();
                 // **Spawned, not merely shared.**
                 //
                 // A `Shared` future only advances while somebody polls it. The leader used to be
@@ -618,7 +656,9 @@ impl NestGate {
                 // A spawned task runs to completion whether or not anyone is still waiting, so the
                 // permit is always released - which is the property the gate depends on and the
                 // one `shared()` alone cannot give it.
-                let handle = tokio::spawn(async move { gate.query(&spec).await.map(Arc::new) });
+                let handle = tokio::spawn(async move {
+                    gate.query_marking(&spec, Some(&marker)).await.map(Arc::new)
+                });
                 let fut: BoxFuture<'static, Result<Arc<SqlAnswer>, NestError>> = async move {
                     match handle.await {
                         Ok(r) => r,
@@ -629,21 +669,30 @@ impl NestGate {
                 }
                 .boxed();
                 let shared = fut.shared();
-                map.insert(key.to_string(), shared.clone());
-                shared
+                map.insert(
+                    own.clone(),
+                    InFlight {
+                        flight: shared.clone(),
+                        admitted,
+                    },
+                );
+                (own, shared)
             }
         };
 
-        let result = flight.await;
+        let result = flight.clone().await;
 
         // Whoever finishes first clears the slot; a late waiter still gets the shared result.
-        self.inner.inflight.lock().await.remove(key);
+        {
+            let mut map = self.inner.inflight.lock().await;
+            if map.get(&slot_key).is_some_and(|f| f.flight.ptr_eq(&flight)) {
+                map.remove(&slot_key);
+            }
+        }
 
+        // Filed under the flight's own lane, so a cron's queue timeout is never a reader's answer.
         if let Err(ref e) = result {
-            self.inner
-                .neg_cache
-                .insert(key.to_string(), e.clone())
-                .await;
+            self.inner.neg_cache.insert(slot_key, e.clone()).await;
         }
         result
     }
@@ -722,7 +771,7 @@ mod tests {
             "dropping it is the only way it came back"
         );
     }
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
@@ -943,6 +992,111 @@ mod tests {
         );
         assert_eq!(a.unwrap().rows.len(), 1);
         assert_eq!(b.unwrap().rows.len(), 2);
+    }
+
+    /// Answers `slow` after a long wait and anything else soon, counting only the latter.
+    async fn slow_and_quick(server: &MockServer, hits: Arc<AtomicUsize>) {
+        use wiremock::matchers::query_param;
+        struct Counting(Arc<AtomicUsize>, Duration);
+        impl Respond for Counting {
+            fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .set_body_json(envelope(1))
+                    .set_delay(self.1)
+            }
+        }
+        Mock::given(method("GET"))
+            .and(path("/sql"))
+            .and(query_param("q", "slow"))
+            .respond_with(Counting(
+                Arc::new(AtomicUsize::new(0)),
+                Duration::from_secs(3),
+            ))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/sql"))
+            .respond_with(Counting(hits, Duration::from_millis(200)))
+            .mount(server)
+            .await;
+    }
+
+    /// A reader must not wait in a background job's queue while a read permit sits free.
+    #[tokio::test]
+    async fn a_reader_does_not_queue_behind_a_cron_flight_that_has_not_started() {
+        let server = MockServer::start().await;
+        slow_and_quick(&server, Arc::new(AtomicUsize::new(0))).await;
+        let gate = gate_for(&server, 2).await;
+
+        let g = gate.clone();
+        tokio::spawn(async move { g.query(&QuerySpec::cron(NestId::Alloc, "slow")).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let g = gate.clone();
+        tokio::spawn(async move {
+            g.query_coalesced("k", QuerySpec::cron(NestId::Alloc, "SELECT k"))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(gate.available_permits(NestId::Alloc), 1);
+
+        let started = std::time::Instant::now();
+        let read = gate
+            .query_coalesced("k", QuerySpec::read(NestId::Alloc, "SELECT k"))
+            .await;
+        assert!(read.is_ok(), "{read:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cron_queue_timeout_is_not_remembered_for_readers() {
+        let server = MockServer::start().await;
+        slow_and_quick(&server, Arc::new(AtomicUsize::new(0))).await;
+        let mut cfg = NestConfig::new(server.uri());
+        for n in NestId::ALL {
+            cfg.base_paths.insert(n, String::new());
+            cfg.permits.insert(n, 2);
+        }
+        cfg.cron_queue_timeout = Duration::from_millis(100);
+        let gate = NestGate::new(cfg).unwrap();
+
+        let g = gate.clone();
+        tokio::spawn(async move { g.query(&QuerySpec::cron(NestId::Alloc, "slow")).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let cron = gate
+            .query_coalesced("k", QuerySpec::cron(NestId::Alloc, "SELECT k"))
+            .await;
+        assert_eq!(cron.unwrap_err(), NestError::GateTimeout);
+
+        let read = gate
+            .query_coalesced("k", QuerySpec::read(NestId::Alloc, "SELECT k"))
+            .await;
+        assert!(read.is_ok(), "{read:?}");
+    }
+
+    /// Once a cron flight holds its permit, a reader asking the same thing rides it.
+    #[tokio::test]
+    async fn a_reader_joins_a_cron_flight_that_is_already_running() {
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        slow_and_quick(&server, hits.clone()).await;
+        let gate = gate_for(&server, 2).await;
+
+        let g = gate.clone();
+        let cron = tokio::spawn(async move {
+            g.query_coalesced("k", QuerySpec::cron(NestId::Alloc, "SELECT k"))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let read = gate
+            .query_coalesced("k", QuerySpec::read(NestId::Alloc, "SELECT k"))
+            .await;
+        assert!(read.is_ok() && cron.await.unwrap().is_ok());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
