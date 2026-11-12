@@ -441,6 +441,13 @@ CREATE TABLE IF NOT EXISTS sync_bounties (
 CREATE INDEX IF NOT EXISTS idx_sync_bounties_deployment ON sync_bounties(deployment_id);
 CREATE INDEX IF NOT EXISTS idx_sync_bounties_status     ON sync_bounties(status);
 
+-- When each address last signed out of the Dock, in Unix seconds. A session issued at or before it
+-- is refused, so signing out ends a copied cookie too. Created at startup by kittiwake.
+CREATE TABLE IF NOT EXISTS studio_sign_outs (
+  address        TEXT PRIMARY KEY,
+  signed_out_at  BIGINT NOT NULL
+);
+
 -- ── Scuttlebutt ───────────────────────────────────────────────────────────────
 --
 -- The anonymous room. From lodestar's `migrations/009_scuttlebutt.sql`, brought across with the

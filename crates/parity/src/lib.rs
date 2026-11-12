@@ -237,11 +237,6 @@ pub mod coverage {
     /// Every entry here is a thing somebody chose. Empty would be better; a long list is a smell.
     pub const UNCHECKED: &[(&str, Excused, &str)] = &[
         (
-            "/api/analytics/clickthrough",
-            Excused::Entirely,
-            "a write. Comparing it against the incumbent would mean inserting a row into the shared analytics table on every parity run, and its answer is a fixed {ok:true} that says nothing about what was stored",
-        ),
-        (
             "/api/provisions/detail",
             Excused::Entirely,
             "the incumbent has no such route. Its thaw requests and activity are nest folds checked against HorizonStaking's own thaw request lists and tokensThawing when it was written; the rest is contract reads, which parity cannot compare either",

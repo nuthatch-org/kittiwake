@@ -46,9 +46,8 @@
 # grants being unconditional for the same reason as the writer flag: until lodestar's `MIGRATED`
 # sends these paths here, the database refusing the write is the second lock on a one-way door.
 #
-# Verbs derived from the statements in crates/db, not chosen generously. `clickthrough_events` and
-# `parameter_changes` take INSERT alone because both are append-only records of a thing that
-# happened.
+# Verbs derived from the statements in crates/db, not chosen generously. `parameter_changes` takes
+# INSERT alone because it is an append-only record of a thing that happened.
 #
 #   GRANT_DOCK=1 bash deploy/grant-database.sh
 #
@@ -204,9 +203,6 @@ GRANT INSERT ON sync_bounties TO $ROLE;
 -- and the 31 messages in them are untouched: removing a board is not the same decision as
 -- destroying what people wrote on it.
 
--- Append-only. Nothing reads these back here, and a click that happened is not editable.
-GRANT INSERT ON clickthrough_events TO $ROLE;
-
 -- Sequences for the tables above. GRANT USAGE ON ALL SEQUENCES earlier in this script covers
 -- every sequence that existed when it last ran, and the default-privileges line only reaches
 -- sequences this role creates. A table owned by lodestar and created since is covered by
@@ -214,8 +210,7 @@ GRANT INSERT ON clickthrough_events TO $ROLE;
 GRANT USAGE, SELECT ON SEQUENCE
   studio_subgraphs_id_seq,
   studio_deploy_keys_id_seq,
-  sync_bounties_id_seq,
-  clickthrough_events_id_seq
+  sync_bounties_id_seq
   TO $ROLE;
 SQL
 else

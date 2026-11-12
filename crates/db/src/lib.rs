@@ -963,6 +963,56 @@ pub async fn bounty(pool: &Pool, id: i32) -> Result<Option<SyncBounty>, DbError>
         .await?)
 }
 
+pub async fn bounty_by_chain_id(
+    pool: &Pool,
+    chain_id: &str,
+) -> Result<Option<SyncBounty>, DbError> {
+    Ok(
+        sqlx::query_as(
+            "SELECT * FROM sync_bounties WHERE chain_bounty_id = $1 ORDER BY id LIMIT 1",
+        )
+        .bind(chain_id)
+        .fetch_optional(pool)
+        .await?,
+    )
+}
+
+/// Create the table Dock sign-outs are kept in. Additive and ours alone, like the others here.
+pub async fn ensure_studio_sign_outs_table(pool: &Pool) -> Result<(), DbError> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS studio_sign_outs ( \
+           address        TEXT PRIMARY KEY, \
+           signed_out_at  BIGINT NOT NULL \
+         )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// When this address last signed out of the Dock, in Unix seconds.
+pub async fn signed_out_at(pool: &Pool, address: &str) -> Result<Option<i64>, DbError> {
+    Ok(
+        sqlx::query_scalar("SELECT signed_out_at FROM studio_sign_outs WHERE address = $1")
+            .bind(address.to_lowercase())
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
+pub async fn record_sign_out(pool: &Pool, address: &str, at: i64) -> Result<(), DbError> {
+    sqlx::query(
+        "INSERT INTO studio_sign_outs (address, signed_out_at) VALUES ($1, $2) \
+         ON CONFLICT (address) DO UPDATE \
+         SET signed_out_at = GREATEST(studio_sign_outs.signed_out_at, EXCLUDED.signed_out_at)",
+    )
+    .bind(address.to_lowercase())
+    .bind(at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // Chain health: head history and per-indexer chain sets
 // ---------------------------------------------------------------------------------------------
@@ -2512,57 +2562,6 @@ pub async fn schema_gaps(pool: &Pool) -> Result<Vec<SchemaGap>, DbError> {
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect())
-}
-
-/// One trade click or protocol visit, as `/api/analytics/clickthrough` receives it.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct Clickthrough {
-    pub event_type: String,
-    pub token_address: Option<String>,
-    pub token_symbol: Option<String>,
-    pub protocol_slug: Option<String>,
-    pub venue: String,
-    pub pool_address: Option<String>,
-    pub chain: Option<String>,
-    pub destination_url: Option<String>,
-    pub wallet: Option<String>,
-    pub session_id: String,
-}
-
-/// The two the table's own CHECK constraint allows. Rejected here so a bad payload is a 400 rather
-/// than a constraint violation reported as a 500.
-pub const CLICKTHROUGH_EVENT_TYPES: &[&str] = &["trade_click", "protocol_visit"];
-
-/// Append one clickthrough.
-///
-/// `wallet` is stored only when it looks like an address, and `session_id` is truncated, both as
-/// the incumbent did: this is a public unauthenticated write, and the only thing standing between
-/// it and arbitrary strings in a shared table is what this function refuses.
-pub async fn record_clickthrough(pool: &Pool, e: &Clickthrough) -> Result<(), DbError> {
-    let wallet = e.wallet.as_deref().filter(|w| {
-        w.len() == 42 && w.starts_with("0x") && w[2..].chars().all(|c| c.is_ascii_hexdigit())
-    });
-
-    sqlx::query(
-        "INSERT INTO clickthrough_events ( \
-           event_type, token_address, token_symbol, protocol_slug, \
-           venue, pool_address, chain, destination_url, wallet, session_id \
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-    )
-    .bind(&e.event_type)
-    .bind(&e.token_address)
-    .bind(&e.token_symbol)
-    .bind(&e.protocol_slug)
-    .bind(&e.venue)
-    .bind(&e.pool_address)
-    .bind(e.chain.as_deref().unwrap_or("mainnet"))
-    .bind(&e.destination_url)
-    .bind(wallet.map(|w| w.to_ascii_lowercase()))
-    .bind(e.session_id.chars().take(64).collect::<String>())
-    .execute(pool)
-    .await?;
-
-    Ok(())
 }
 
 #[cfg(test)]

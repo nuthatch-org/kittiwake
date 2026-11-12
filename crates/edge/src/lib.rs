@@ -35,6 +35,9 @@ pub struct Limits {
     pub mutation: Limiter,
     /// Support reports land in a chat a person reads, so the read budget is far too generous.
     pub report: Limiter,
+    /// graph-cli's IPFS uploads, per deploy key: one `add` per file, sent at once and never retried,
+    /// so the burst holds a few hundred files and a runaway client then gets five a second.
+    pub deploy: RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>,
     pub exempt: Vec<IpAddr>,
 }
 
@@ -61,6 +64,10 @@ impl Limits {
                 Quota::per_hour(NonZeroU32::new(6).unwrap())
                     .allow_burst(NonZeroU32::new(3).unwrap()),
             ),
+            deploy: RateLimiter::keyed(
+                Quota::per_minute(NonZeroU32::new(300).unwrap())
+                    .allow_burst(NonZeroU32::new(300).unwrap()),
+            ),
             exempt,
         }
     }
@@ -69,15 +76,14 @@ impl Limits {
         if self.exempt.contains(&ip) {
             return Ok(());
         }
-        limiter.check_key(&ip).map_err(|not_until| {
-            metrics::counter!("rate_limited_total").increment(1);
-            ApiError::RateLimited {
-                retry_after: not_until
-                    .wait_time_from(DefaultClock::default().now())
-                    .as_secs()
-                    .max(1),
-            }
-        })
+        limiter.check_key(&bucket(ip)).map_err(refused)
+    }
+
+    /// Spend from a deploy key's upload budget, keyed by the key's hash.
+    pub(crate) fn check_deploy_key(&self, key_hash: &str) -> Result<(), ApiError> {
+        self.deploy
+            .check_key(&key_hash.to_string())
+            .map_err(refused)
     }
 
     /// Drop the state of callers who have not been seen recently, so a long uptime against a wide
@@ -87,6 +93,29 @@ impl Limits {
         self.read.retain_recent();
         self.mutation.retain_recent();
         self.report.retain_recent();
+        self.deploy.retain_recent();
+    }
+}
+
+fn refused(not_until: governor::NotUntil<<DefaultClock as Clock>::Instant>) -> ApiError {
+    metrics::counter!("rate_limited_total").increment(1);
+    ApiError::RateLimited {
+        retry_after: not_until
+            .wait_time_from(DefaultClock::default().now())
+            .as_secs()
+            .max(1),
+    }
+}
+
+/// The key a caller is budgeted under. An IPv6 host is routinely handed a whole /64, so each of its
+/// addresses is the same caller; an IPv4-mapped address is the IPv4 one.
+fn bucket(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6((u128::from(v6) & !u128::from(u64::MAX)).into()),
+        },
     }
 }
 
@@ -1141,6 +1170,29 @@ fn cors_layer(origins: &[String], patterns: &[String]) -> Option<tower_http::cor
     )
 }
 
+/// Reads spend the read budget and every other Dock request is a mutation. The IPFS proxy budgets
+/// itself by deploy key, because only its handler knows whether the key is real.
+async fn dock_budget(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<Response, ErrorResponse> {
+    if req.uri().path().starts_with("/api/studio/ipfs/") {
+        return Ok(next.run(req).await);
+    }
+    let limiter = if req.method() == axum::http::Method::GET {
+        &st.limits.read
+    } else {
+        &st.limits.mutation
+    };
+    st.limits.check(
+        limiter,
+        client_ip(peer, req.headers(), st.edge_secret.as_deref()),
+    )?;
+    Ok(next.run(req).await)
+}
+
 pub fn router(state: AppState) -> Router {
     use axum::routing::post;
     let directory = Router::new()
@@ -1276,41 +1328,10 @@ pub fn router(state: AppState) -> Router {
             get(handlers::graft_children),
         );
 
-    let routes = Router::new()
-        .route("/whoami", get(get_whoami))
-        // Also under /api, so it can be reached through the edge rewrite and the whole chain can be
-        // checked from a browser rather than only from the box.
-        .route("/api/whoami", get(get_whoami))
-        .route("/health", get(get_health))
-        // The URL anything watching this deployment already points at, answering in the shape it
-        // has always answered in. See `get_api_health`.
-        .route("/api/health", get(get_api_health))
-        .route("/ready", get(get_ready))
-        .route("/openapi.json", get(get_openapi))
-        // The network
-        .route("/api/support", get(handlers::support))
-        .route("/api/support/templates", get(handlers::support_templates))
-        .route("/api/issue-forms", get(handlers::issue_forms))
-        .route("/api/file-issue", post(handlers::file_issue))
-        .route("/api/support/{number}", get(handlers::support_issue))
-        .route("/api/epochs", get(handlers::epochs))
-        .route("/api/network-stats", get(handlers::network_stats))
-        // Same fold, different panel: one cache entry serves both.
-        .route("/api/grt-flow", get(handlers::grt_flow))
-        .route("/api/token-metrics", get(handlers::token_metrics))
-        .route("/api/subgraph-search", get(handlers::subgraph_search))
-        .route("/api/subgraph-names", post(handlers::subgraph_names))
-        .route(
-            "/api/analytics/clickthrough",
-            post(handlers::analytics_clickthrough),
-        )
-        .route("/api/chain-lag", get(handlers::chain_lag))
-        .route("/api/dropped-chains", get(handlers::dropped_chains))
-        .route("/api/reo", get(handlers::reo))
-        .route("/api/price", get(handlers::price))
-        .route("/api/tvl", get(handlers::tvl))
-        // The Dock. These are deliberately individual registrations: the parity extractor sees
-        // the real public surface, and a new route cannot wander into a rewrite unchecked.
+    // The Dock. These are deliberately individual registrations: the parity extractor sees
+    // the real public surface, and a new route cannot wander into a rewrite unchecked. Budgeted as
+    // one router, so a new Dock route cannot be added without a budget.
+    let dock = Router::new()
         .route(
             "/api/studio/auth",
             get(handlers::studio_auth_get)
@@ -1345,6 +1366,40 @@ pub fn router(state: AppState) -> Router {
             "/api/studio/bounties/{id}",
             axum::routing::patch(handlers::studio_bounty_patch),
         )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            dock_budget,
+        ));
+
+    let routes = Router::new()
+        .route("/whoami", get(get_whoami))
+        // Also under /api, so it can be reached through the edge rewrite and the whole chain can be
+        // checked from a browser rather than only from the box.
+        .route("/api/whoami", get(get_whoami))
+        .route("/health", get(get_health))
+        // The URL anything watching this deployment already points at, answering in the shape it
+        // has always answered in. See `get_api_health`.
+        .route("/api/health", get(get_api_health))
+        .route("/ready", get(get_ready))
+        .route("/openapi.json", get(get_openapi))
+        // The network
+        .route("/api/support", get(handlers::support))
+        .route("/api/support/templates", get(handlers::support_templates))
+        .route("/api/issue-forms", get(handlers::issue_forms))
+        .route("/api/file-issue", post(handlers::file_issue))
+        .route("/api/support/{number}", get(handlers::support_issue))
+        .route("/api/epochs", get(handlers::epochs))
+        .route("/api/network-stats", get(handlers::network_stats))
+        // Same fold, different panel: one cache entry serves both.
+        .route("/api/grt-flow", get(handlers::grt_flow))
+        .route("/api/token-metrics", get(handlers::token_metrics))
+        .route("/api/subgraph-search", get(handlers::subgraph_search))
+        .route("/api/subgraph-names", post(handlers::subgraph_names))
+        .route("/api/chain-lag", get(handlers::chain_lag))
+        .route("/api/dropped-chains", get(handlers::dropped_chains))
+        .route("/api/reo", get(handlers::reo))
+        .route("/api/price", get(handlers::price))
+        .route("/api/tvl", get(handlers::tvl))
         .route("/api/ens", get(handlers::ens))
         // Network-wide totals on the free overview.
         .route("/api/dips/agreements", get(handlers::dips_agreements))
@@ -1353,6 +1408,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/delegation-flows", get(handlers::delegation_flows))
         .route("/api/developer-activity", get(handlers::developer_activity))
         .merge(directory)
+        .merge(dock)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(tower_http::catch_panic::CatchPanicLayer::new());
 
@@ -1519,6 +1575,124 @@ mod tests {
         assert!(limits.check(&limits.report, ip).is_err());
         let other: IpAddr = [203, 0, 113, 8].into();
         assert!(limits.check(&limits.report, other).is_ok());
+    }
+
+    #[tokio::test]
+    async fn every_dock_route_spends_a_budget() {
+        use tower::ServiceExt;
+        let gate =
+            kittiwake_nest::NestGate::new(kittiwake_nest::NestConfig::new("http://127.0.0.1:9"))
+                .unwrap();
+        let read = kittiwake_read::ReadCtx::new(gate, kittiwake_cache::Store::new(64), 1);
+        let app = router(state(
+            Limits::new(1000, 1, 1, Vec::new()),
+            None,
+            read,
+            None,
+            None,
+            kittiwake_ext::Ipfs::default(),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let routes = [
+            ("GET", "/api/studio/auth"),
+            ("POST", "/api/studio/auth"),
+            ("DELETE", "/api/studio/auth"),
+            ("GET", "/api/studio/subgraphs"),
+            ("POST", "/api/studio/subgraphs"),
+            ("PATCH", "/api/studio/subgraphs/1"),
+            ("DELETE", "/api/studio/subgraphs/1"),
+            ("GET", "/api/studio/deploy-key"),
+            ("POST", "/api/studio/deploy-key"),
+            ("POST", "/api/studio/metadata"),
+            ("POST", "/api/studio/image"),
+            ("POST", "/api/studio/node"),
+            ("GET", "/api/studio/ipfs/api/v0/version"),
+            ("POST", "/api/studio/ipfs/api/v0/add"),
+            ("GET", "/api/studio/bounties"),
+            ("POST", "/api/studio/bounties"),
+            ("PATCH", "/api/studio/bounties/1"),
+        ];
+        for (i, (method, path)) in routes.into_iter().enumerate() {
+            let peer: SocketAddr = ([203, 0, 113, i as u8 + 1], 1).into();
+            let send = || {
+                let mut req = axum::http::Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap();
+                req.extensions_mut().insert(ConnectInfo(peer));
+                app.clone().oneshot(req)
+            };
+            assert_ne!(send().await.unwrap().status(), 429, "{method} {path}");
+            assert_eq!(
+                send().await.unwrap().status(),
+                429,
+                "{method} {path} is not budgeted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_unused_clickthrough_write_is_not_served() {
+        use tower::ServiceExt;
+        let gate =
+            kittiwake_nest::NestGate::new(kittiwake_nest::NestConfig::new("http://127.0.0.1:9"))
+                .unwrap();
+        let read = kittiwake_read::ReadCtx::new(gate, kittiwake_cache::Store::new(64), 1);
+        let app = router(state(
+            Limits::new(1000, 1000, 1000, Vec::new()),
+            None,
+            read,
+            None,
+            None,
+            kittiwake_ext::Ipfs::default(),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let mut req = axum::http::Request::post("/api/analytics/clickthrough")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                r#"{"event_type":"trade_click","venue":"x","session_id":"x"}"#,
+            ))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([203, 0, 113, 1], 1))));
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn one_ipv6_slash_64_shares_one_budget() {
+        let limits = Limits::new(1000, 1000, 1000, Vec::new());
+        let in_one_64 = |host: u16| -> IpAddr {
+            std::net::Ipv6Addr::new(0x2001, 0xdb8, 1, 2, host, 0, 0, 1).into()
+        };
+        for host in 0..3 {
+            assert!(limits.check(&limits.report, in_one_64(host)).is_ok());
+        }
+        assert!(limits.check(&limits.report, in_one_64(99)).is_err());
+        let next_64: IpAddr = std::net::Ipv6Addr::new(0x2001, 0xdb8, 1, 3, 0, 0, 0, 1).into();
+        assert!(limits.check(&limits.report, next_64).is_ok());
+
+        let v4: IpAddr = [203, 0, 113, 9].into();
+        for _ in 0..3 {
+            assert!(limits.check(&limits.report, v4).is_ok());
+        }
+        let mapped: IpAddr = std::net::Ipv4Addr::new(203, 0, 113, 9)
+            .to_ipv6_mapped()
+            .into();
+        assert!(
+            limits.check(&limits.report, mapped).is_err(),
+            "an IPv4-mapped address is the IPv4 caller"
+        );
     }
 
     // ── Presenting a proof of indexing ───────────────────────────────────────
@@ -1961,6 +2135,88 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_bounty_is_recorded_only_as_the_board_holds_it() {
+        const DEPLOYMENT: &str = "QmStfa6zwPUzKHyGrgdNMh8rgbc91sgvmskidBSujG92FR";
+        let owner = "0x00000000000000000000000000000000000000aa";
+        let posted = kittiwake_chain::PostedBounty {
+            developer: owner.into(),
+            deployment: kittiwake_read::shape::ipfs_hash_to_bytes32(DEPLOYMENT).unwrap(),
+            amount_grt: "1500".into(),
+            expires_at: 0,
+        };
+        assert!(crate::handlers::posted_by(&posted, owner, DEPLOYMENT).is_ok());
+        assert!(
+            crate::handlers::posted_by(
+                &posted,
+                "0x00000000000000000000000000000000000000bb",
+                DEPLOYMENT
+            )
+            .is_err(),
+            "another developer's bounty"
+        );
+        assert!(
+            crate::handlers::posted_by(
+                &posted,
+                owner,
+                "QmXZiV6S13ha6QXq4dmaM3TB4CHcDxBMvGexSNu9Kc28EH"
+            )
+            .is_err(),
+            "another deployment's bounty"
+        );
+        let none = kittiwake_chain::PostedBounty {
+            developer: "0x0000000000000000000000000000000000000000".into(),
+            amount_grt: "0".into(),
+            ..posted.clone()
+        };
+        assert!(crate::handlers::posted_by(&none, owner, DEPLOYMENT).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_bounty_without_an_on_chain_id_is_not_recorded() {
+        let gate =
+            kittiwake_nest::NestGate::new(kittiwake_nest::NestConfig::new("http://127.0.0.1:9"))
+                .unwrap();
+        let read = kittiwake_read::ReadCtx::new(gate, kittiwake_cache::Store::new(64), 1);
+        let st = state(
+            Limits::new(1000, 1000, 1000, Vec::new()),
+            None,
+            read,
+            None,
+            Some(Studio {
+                secret: dock_secret(),
+                bounty_board_address: None,
+                spent_nonces: Default::default(),
+            }),
+            kittiwake_ext::Ipfs::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let headers = dock_cookie(&format!(
+            "studio_session={}",
+            kittiwake_dock::create_session(&dock_secret(), "0xaa", now)
+        ));
+        let refused = crate::handlers::studio_bounties_post(
+            State(st),
+            headers,
+            axum::Json(serde_json::json!({
+                "deployment_id": "QmStfa6zwPUzKHyGrgdNMh8rgbc91sgvmskidBSujG92FR",
+                "amount_grt": "1e300",
+            })),
+        )
+        .await;
+        let Err(e) = refused else {
+            panic!("a self-declared bounty was accepted")
+        };
+        assert_eq!(e.into_response().status(), 400);
+    }
+
     /// The regression this test exists for. `amount_grt` is text in the table and the public board
     /// orders by `amount_grt::numeric`; Postgres 16 parses Infinity, so `"inf"` from one signed-in
     /// caller would sit at the top of everyone's board permanently.
@@ -1984,13 +2240,103 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn signing_out_clears_the_cookie_even_when_it_cannot_be_recorded() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let unreachable = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_lazy(&format!("postgres://u:u@127.0.0.1:{port}/u"))
+            .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for pool in [None, Some(unreachable)] {
+            let gate = kittiwake_nest::NestGate::new(kittiwake_nest::NestConfig::new(
+                "http://127.0.0.1:9",
+            ))
+            .unwrap();
+            let read = kittiwake_read::ReadCtx::new(gate, kittiwake_cache::Store::new(64), 1);
+            let st = state(
+                Limits::new(1000, 1000, 1000, Vec::new()),
+                pool,
+                read,
+                None,
+                Some(Studio {
+                    secret: dock_secret(),
+                    bounty_board_address: None,
+                    spent_nonces: Default::default(),
+                }),
+                kittiwake_ext::Ipfs::default(),
+                None,
+                None,
+                None,
+                None,
+            );
+            let r = crate::handlers::studio_auth_delete(
+                State(st),
+                dock_cookie(&format!(
+                    "studio_session={}",
+                    kittiwake_dock::create_session(&dock_secret(), "0xaa", now)
+                )),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::OK);
+            let cookie = r
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(cookie.contains("Max-Age=0"), "{cookie}");
+        }
+    }
+
+    #[test]
+    fn a_deploy_key_uploads_a_large_subgraph_in_one_go_and_no_more() {
+        let limits = Limits::new(1000, 1000, 1000, Vec::new());
+        for _ in 0..150 {
+            assert!(limits.check_deploy_key("key-a").is_ok());
+        }
+        let refused = (0..1000).any(|_| limits.check_deploy_key("key-a").is_err());
+        assert!(refused, "an unbounded stream from one key is refused");
+        assert!(
+            limits.check_deploy_key("key-b").is_ok(),
+            "another key is unaffected"
+        );
+    }
+
+    #[test]
+    fn signing_out_ends_every_session_issued_before_it() {
+        use crate::handlers::ended_by_sign_out;
+        let token = kittiwake_dock::create_session(&dock_secret(), "0xAbCd", DOCK_NOW);
+        let (address, issued_at) =
+            kittiwake_dock::parse_session_issued(&dock_secret(), &token, DOCK_NOW + 60).unwrap();
+        assert_eq!(address, "0xabcd");
+        assert_eq!(issued_at, DOCK_NOW);
+
+        assert!(ended_by_sign_out(issued_at, DOCK_NOW + 30));
+        assert!(
+            ended_by_sign_out(issued_at, DOCK_NOW),
+            "signed out in the second it was issued"
+        );
+        assert!(
+            !ended_by_sign_out(issued_at, DOCK_NOW - 1),
+            "a sign-in after the last sign-out stands"
+        );
+    }
+
     /// The session cookie is the whole of the Dock's authorisation, so every owner-scoped route is
     /// exactly as strong as this is.
     #[test]
     fn a_studio_session_names_an_address_or_nobody() {
         let token = kittiwake_dock::create_session(&dock_secret(), "0xAbCd", DOCK_NOW);
         let other = kittiwake_dock::Secret::new("a-different-secret-of-adequate-length!!").unwrap();
-        let named = |h: &HeaderMap| crate::handlers::session_address(&dock_secret(), h, DOCK_NOW);
+        let named = |h: &HeaderMap| {
+            crate::handlers::session_claim(&dock_secret(), h, DOCK_NOW).map(|(address, _)| address)
+        };
 
         // Lowercased, because that is what every owner column stores.
         assert_eq!(
@@ -2017,7 +2363,7 @@ mod tests {
             "a token signed with another secret is not a session"
         );
         assert_eq!(
-            crate::handlers::session_address(
+            crate::handlers::session_claim(
                 &dock_secret(),
                 &dock_cookie(&format!("studio_session={token}")),
                 DOCK_NOW + kittiwake_dock::SESSION_TTL_SECS + 1
