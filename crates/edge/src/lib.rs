@@ -139,6 +139,7 @@ pub struct AppState {
     pub limits: Arc<Limits>,
     pub started: std::time::Instant,
     pub telegram: Option<Arc<kittiwake_config::TelegramSettings>>,
+    health: Arc<HealthMemo<DbHealth>>,
 }
 
 #[derive(Clone)]
@@ -477,10 +478,12 @@ async fn post_sql_query(
         .ok_or_else(|| ApiError::BadRequest(format!("unknown dataset {:?}", body.dataset)))?;
     kittiwake_sqlplay::screen(&body.q).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
-    // Six seconds, below the nest's own ceiling, so a slow query fails here with a clear message
-    // rather than there. A query that cannot answer in six seconds wants a WHERE clause.
-    let spec = kittiwake_nest::QuerySpec::read(dataset.nest, body.q.clone())
+    // The caller is answered after six seconds; a query that cannot answer in six wants a WHERE
+    // clause. The nest runs it for up to its own thirty regardless, and the gate holds its permit
+    // for that long.
+    let mut spec = kittiwake_nest::QuerySpec::read(dataset.nest, body.q.clone())
         .with_timeout(Duration::from_secs(6));
+    spec.lane = kittiwake_nest::Lane::Public;
     let answer = st.read.gate.query(&spec).await.map_err(ApiError::from)?;
 
     let meta = Meta {
@@ -563,8 +566,9 @@ async fn post_sql_named(
         ApiError::Internal("this query is misconfigured".into())
     })?;
 
-    let spec = kittiwake_nest::QuerySpec::read(dataset.nest, sql.clone())
+    let mut spec = kittiwake_nest::QuerySpec::read(dataset.nest, sql.clone())
         .with_timeout(Duration::from_secs(6));
+    spec.lane = kittiwake_nest::Lane::Public;
     let answer = st.read.gate.query(&spec).await.map_err(ApiError::from)?;
 
     let meta = Meta {
@@ -646,8 +650,9 @@ async fn post_sql_receipt(
         )
     })?;
 
-    let spec = kittiwake_nest::QuerySpec::read(dataset.nest, sql.clone())
+    let mut spec = kittiwake_nest::QuerySpec::read(dataset.nest, sql.clone())
         .with_timeout(Duration::from_secs(6));
+    spec.lane = kittiwake_nest::Lane::Public;
     let answer = st.read.gate.query(&spec).await.map_err(ApiError::from)?;
 
     // A truncated or degraded answer is not the answer. Signing one puts our name on a partial
@@ -776,8 +781,14 @@ async fn get_openapi() -> Response {
 ///
 /// `ok` is false when either is present, so anything already watching this endpoint inherits both
 /// without being told about them.
-/// What both health surfaces look at. Returns `ok` and the detail behind it.
-async fn assess_health(st: &AppState) -> (bool, serde_json::Map<String, serde_json::Value>) {
+/// What both health surfaces look at. Returns `ok`, the detail behind it, and the Postgres probe.
+async fn assess_health(
+    st: &AppState,
+) -> (
+    bool,
+    serde_json::Map<String, serde_json::Value>,
+    Option<PgProbe>,
+) {
     let mut body = serde_json::Map::new();
     body.insert(
         "uptime_seconds".into(),
@@ -785,85 +796,151 @@ async fn assess_health(st: &AppState) -> (bool, serde_json::Map<String, serde_js
     );
     body.insert("cached_entries".into(), st.read.store.entry_count().into());
 
+    let Some(pool) = st.pool.as_ref() else {
+        // Read-only against the nests, with no Postgres configured. Neither check applies, and
+        // saying so is better than reporting a clean bill nothing looked for.
+        body.insert("database".into(), serde_json::json!("not configured"));
+        return (true, body, None);
+    };
+    let db = st
+        .health
+        .get_or_refresh(HEALTH_FRESH_FOR, || db_health(st, pool))
+        .await;
+    body.extend(db.detail);
+    (db.ok, body, Some(db.postgres))
+}
+
+/// How long one assessment of Postgres answers every health probe. It is several queries, and the
+/// endpoints are polled by anything that likes.
+const HEALTH_FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(15);
+
+#[derive(Clone)]
+struct PgProbe {
+    up: bool,
+    latency_ms: u64,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+struct DbHealth {
+    ok: bool,
+    detail: serde_json::Map<String, serde_json::Value>,
+    postgres: PgProbe,
+}
+
+/// The last health assessment and when it was made. Callers that arrive while one is being made
+/// wait for it rather than starting their own.
+struct HealthMemo<T>(tokio::sync::Mutex<Option<(std::time::Instant, T)>>);
+
+impl<T: Clone> HealthMemo<T> {
+    fn new() -> Self {
+        Self(tokio::sync::Mutex::new(None))
+    }
+
+    async fn get_or_refresh<F: std::future::Future<Output = T>>(
+        &self,
+        fresh_for: std::time::Duration,
+        refresh: impl FnOnce() -> F,
+    ) -> T {
+        let mut slot = self.0.lock().await;
+        if let Some((at, value)) = slot.as_ref()
+            && at.elapsed() < fresh_for
+        {
+            return value.clone();
+        }
+        let value = refresh().await;
+        *slot = Some((std::time::Instant::now(), value.clone()));
+        value
+    }
+}
+
+/// The Postgres half of [`assess_health`].
+async fn db_health(st: &AppState, pool: &kittiwake_db::Pool) -> DbHealth {
+    let mut body = serde_json::Map::new();
     let mut ok = true;
 
-    match st.pool.as_ref() {
-        None => {
-            // Read-only against the nests, with no Postgres configured. Neither check applies, and
-            // saying so is better than reporting a clean bill nothing looked for.
-            body.insert("database".into(), serde_json::json!("not configured"));
+    match kittiwake_db::schema_gaps(pool).await {
+        Ok(gaps) => {
+            if !gaps.is_empty() {
+                ok = false;
+            }
+            body.insert("schema_gaps".into(), serde_json::json!(gaps));
         }
-        Some(pool) => {
-            match kittiwake_db::schema_gaps(pool).await {
-                Ok(gaps) => {
-                    if !gaps.is_empty() {
-                        ok = false;
-                    }
-                    body.insert("schema_gaps".into(), serde_json::json!(gaps));
-                }
-                Err(e) => {
-                    ok = false;
-                    body.insert(
-                        "schema_gaps".into(),
-                        serde_json::json!({ "error": e.to_string() }),
-                    );
-                }
-            }
-
-            // A scheduled job that has stopped firing writes nothing, so `failing_jobs` cannot see
-            // it. The periods come from the scheduler that is running in this process rather than
-            // from a list kept beside it.
-            let scheduled: Vec<(String, i64)> = kittiwake_sched::scheduled_jobs()
-                .into_iter()
-                .map(|j| (j.name.to_string(), j.period.as_secs() as i64))
-                .collect();
-            // Reported alongside the verdict, because an empty `silent_jobs` has two causes and
-            // only one of them is good news: nothing is silent, or nothing is scheduled and there
-            // was nothing to ask about. A process with no scheduler is a legitimate state, so this
-            // cannot be an error - but it must not read as a clean bill of health either.
-            body.insert("scheduled_jobs".into(), scheduled.len().into());
-
-            match kittiwake_db::silent_jobs(pool, &scheduled, st.started.elapsed()).await {
-                Ok(jobs) => {
-                    if !jobs.is_empty() {
-                        ok = false;
-                    }
-                    body.insert("silent_jobs".into(), serde_json::json!(jobs));
-                }
-                Err(e) => {
-                    ok = false;
-                    body.insert(
-                        "silent_jobs".into(),
-                        serde_json::json!({ "error": e.to_string() }),
-                    );
-                }
-            }
-
-            // Three in a row rather than one: every job here is retried on a schedule, and a single
-            // failure against a nest that blinked is not news.
-            match kittiwake_db::failing_jobs(pool, 3).await {
-                Ok(jobs) => {
-                    if !jobs.is_empty() {
-                        ok = false;
-                    }
-                    body.insert("failing_jobs".into(), serde_json::json!(jobs));
-                }
-                Err(e) => {
-                    ok = false;
-                    body.insert(
-                        "failing_jobs".into(),
-                        serde_json::json!({ "error": e.to_string() }),
-                    );
-                }
-            }
+        Err(e) => {
+            ok = false;
+            body.insert(
+                "schema_gaps".into(),
+                serde_json::json!({ "error": e.to_string() }),
+            );
         }
     }
 
-    (ok, body)
+    // A scheduled job that has stopped firing writes nothing, so `failing_jobs` cannot see
+    // it. The periods come from the scheduler that is running in this process rather than
+    // from a list kept beside it.
+    let scheduled: Vec<(String, i64)> = kittiwake_sched::scheduled_jobs()
+        .into_iter()
+        .map(|j| (j.name.to_string(), j.period.as_secs() as i64))
+        .collect();
+    // Reported alongside the verdict, because an empty `silent_jobs` has two causes and
+    // only one of them is good news: nothing is silent, or nothing is scheduled and there
+    // was nothing to ask about. A process with no scheduler is a legitimate state, so this
+    // cannot be an error - but it must not read as a clean bill of health either.
+    body.insert("scheduled_jobs".into(), scheduled.len().into());
+
+    match kittiwake_db::silent_jobs(pool, &scheduled, st.started.elapsed()).await {
+        Ok(jobs) => {
+            if !jobs.is_empty() {
+                ok = false;
+            }
+            body.insert("silent_jobs".into(), serde_json::json!(jobs));
+        }
+        Err(e) => {
+            ok = false;
+            body.insert(
+                "silent_jobs".into(),
+                serde_json::json!({ "error": e.to_string() }),
+            );
+        }
+    }
+
+    // Three in a row rather than one: every job here is retried on a schedule, and a single
+    // failure against a nest that blinked is not news.
+    match kittiwake_db::failing_jobs(pool, 3).await {
+        Ok(jobs) => {
+            if !jobs.is_empty() {
+                ok = false;
+            }
+            body.insert("failing_jobs".into(), serde_json::json!(jobs));
+        }
+        Err(e) => {
+            ok = false;
+            body.insert(
+                "failing_jobs".into(),
+                serde_json::json!({ "error": e.to_string() }),
+            );
+        }
+    }
+
+    // Postgres is the one dependency whose absence is fatal rather than degrading, so it is probed
+    // separately and reported as a component rather than inferred from the checks above.
+    let t = std::time::Instant::now();
+    let error = kittiwake_db::ping(pool).await.err().map(|e| e.to_string());
+    let postgres = PgProbe {
+        up: error.is_none(),
+        latency_ms: t.elapsed().as_millis() as u64,
+        error,
+    };
+
+    DbHealth {
+        ok,
+        detail: body,
+        postgres,
+    }
 }
 
 async fn get_health(State(st): State<AppState>) -> Response {
-    let (ok, mut body) = assess_health(&st).await;
+    let (ok, mut body, _) = assess_health(&st).await;
     body.insert("ok".into(), ok.into());
     axum::Json(serde_json::Value::Object(body)).into_response()
 }
@@ -878,19 +955,10 @@ async fn get_health(State(st): State<AppState>) -> Response {
 /// question directly and from inside the scheduler that would know.
 async fn get_api_health(State(st): State<AppState>) -> Response {
     let started = std::time::Instant::now();
-    let (ok, detail) = assess_health(&st).await;
-
-    // Postgres is the one dependency whose absence is fatal rather than degrading, so it is probed
-    // separately and reported as a component rather than inferred from the checks above.
-    let (pg_up, pg_latency, pg_error) = match st.pool.as_ref() {
+    let (ok, detail, postgres) = assess_health(&st).await;
+    let (pg_up, pg_latency, pg_error) = match postgres {
         None => (false, 0u64, Some("no database configured".to_string())),
-        Some(pool) => {
-            let t = std::time::Instant::now();
-            match kittiwake_db::ping(pool).await {
-                Ok(_) => (true, t.elapsed().as_millis() as u64, None),
-                Err(e) => (false, t.elapsed().as_millis() as u64, Some(e.to_string())),
-            }
-        }
+        Some(p) => (p.up, p.latency_ms, p.error),
     };
 
     let status = if !pg_up {
@@ -1384,6 +1452,7 @@ pub fn state(
         limits: Arc::new(limits),
         started: std::time::Instant::now(),
         telegram: None,
+        health: Arc::new(HealthMemo::new()),
     }
 }
 
@@ -2545,5 +2614,38 @@ mod readiness_tests {
 
         // And the message is not what decides it: this one says 410 and is not a retirement.
         assert!(!retired(&NestError::Transport("410 blocks behind".into())));
+    }
+}
+
+#[cfg(test)]
+mod health_memo_tests {
+    use super::HealthMemo;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// A burst of health probes costs one assessment, and the next one comes only once it is old.
+    #[tokio::test]
+    async fn a_burst_of_probes_costs_one_assessment() {
+        let memo = Arc::new(HealthMemo::new());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let probe = |fresh_for: Duration| {
+            let (memo, runs) = (memo.clone(), runs.clone());
+            async move {
+                memo.get_or_refresh(fresh_for, || async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    runs.fetch_add(1, Ordering::SeqCst)
+                })
+                .await
+            }
+        };
+
+        let burst =
+            futures::future::join_all((0..50).map(|_| probe(Duration::from_secs(60)))).await;
+        assert!(burst.iter().all(|n| *n == 0));
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        probe(Duration::ZERO).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
 }

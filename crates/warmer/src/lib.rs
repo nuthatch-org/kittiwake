@@ -23,6 +23,7 @@ pub struct WarmReport {
 
 /// Warm the whole-list folds. The per-indexer pages are [`IndexerPages`].
 pub async fn warm_all(ctx: &ReadCtx) -> WarmReport {
+    let ctx = &ctx.warming(LIST_AHEAD);
     let began = Instant::now();
     let mut report = WarmReport::default();
 
@@ -75,6 +76,9 @@ fn tally(
 
 /// The rows `/api/indexers-enriched` returns: the directory Lodestar lists.
 pub const DIRECTORY_SIZE: i64 = 100;
+
+/// Each list fold is served stale for the five-minute cap, so this refreshes it as it goes stale.
+const LIST_AHEAD: Duration = Duration::from_secs(5 * 60);
 
 /// An entry is refreshed once it would expire within this. Longer than a walk of the directory
 /// takes on a healthy nest, so the walk comes round again before any entry can expire.
@@ -508,6 +512,57 @@ mod tests {
                 AHEAD < window,
                 "every visit would refresh an entry kept for {window:?}"
             );
+        }
+    }
+
+    /// The list folds are a background job's, so a full cron lane holds them back rather than
+    /// letting them take the read permits a waiting reader needs.
+    #[tokio::test]
+    async fn the_list_folds_wait_for_the_cron_lane() {
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(query_param("q", "slow"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+            .mount(&server)
+            .await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("GET"))
+            .respond_with(Nest {
+                seen: seen.clone(),
+                busy: &[],
+            })
+            .mount(&server)
+            .await;
+        let mut cfg = NestConfig::new(server.uri());
+        for n in NestId::ALL {
+            cfg.base_paths.insert(n, String::new());
+        }
+        cfg.cron_queue_timeout = Duration::from_millis(200);
+        let gate = NestGate::new(cfg).unwrap();
+        let ctx = ReadCtx::new(gate.clone(), kittiwake_cache::Store::new(64), 1);
+
+        tokio::spawn(async move {
+            gate.query(&kittiwake_nest::QuerySpec::cron(NestId::Alloc, "slow"))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let report = warm_all(&ctx).await;
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+        assert_eq!(report.warmed, 0);
+    }
+
+    #[test]
+    fn a_list_fold_is_refreshed_as_it_goes_stale() {
+        // The indexers and network-stats cadence, then epochs'.
+        for cadence in [Duration::from_secs(60), Duration::from_secs(300)] {
+            let p = kittiwake_cache::CachePolicy::from_poll_interval(cadence);
+            assert_eq!(p.hard_ttl - LIST_AHEAD, p.fresh_for, "{cadence:?}");
         }
     }
 }
