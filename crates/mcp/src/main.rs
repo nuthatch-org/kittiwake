@@ -519,6 +519,24 @@ mod tests {
             json!(["address"])
         );
 
+        let directory = schema("lodestar_subgraph_directory");
+        assert_eq!(
+            directory["properties"]["query"]["properties"]["signalMin"]["type"],
+            "string"
+        );
+        assert_eq!(
+            directory["properties"]["query"]["additionalProperties"],
+            false
+        );
+        let pnl = schema("lodestar_indexer_address_pnl");
+        assert!(
+            pnl["properties"]["query"]["properties"]["window"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("365")
+        );
+        assert_eq!(pnl["properties"]["query"]["additionalProperties"], true);
+
         let named = schema("lodestar_sql_named_post");
         assert_eq!(named["required"], json!(["body"]));
         assert_eq!(

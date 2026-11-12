@@ -1069,14 +1069,66 @@ fn thirty_days_back(now: i64) -> i64 {
     now - now.rem_euclid(3600) - 30 * 86_400
 }
 
+/// The directory's filters. Each arrives as text and is checked by `directory::Query::parse`, which
+/// says what was wrong with it; a blank value is the same as an absent one.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryQuery {
+    /// `30d` (the default) or `allTime`: which query fees `fees` and the `queryFees` sort read.
+    pub window: Option<String>,
+    /// Least signal, in GRT.
+    pub signal_min: Option<String>,
+    /// Most signal, in GRT.
+    pub signal_max: Option<String>,
+    /// Least allocated stake, in GRT.
+    pub stake_min: Option<String>,
+    /// Most allocated stake, in GRT.
+    pub stake_max: Option<String>,
+    /// Least signal-to-stake ratio.
+    pub ratio_min: Option<String>,
+    /// Most signal-to-stake ratio.
+    pub ratio_max: Option<String>,
+    /// Least query fees in the window, in GRT.
+    pub fees_min: Option<String>,
+    /// Most query fees in the window, in GRT.
+    pub fees_max: Option<String>,
+    /// Fewest indexers allocated.
+    pub indexers_min: Option<String>,
+    /// Most indexers allocated; 0 with `signalMin` finds signalled deployments nobody serves.
+    pub indexers_max: Option<String>,
+    /// The network, as a manifest names it (`mainnet`, `arbitrum-one`, `xdai`).
+    pub network: Option<String>,
+    /// A complexity class, as `facets` lists them.
+    pub complexity: Option<String>,
+    /// A category, as `facets` lists them.
+    pub category: Option<String>,
+    /// Only deployments created within this many days, 1 to 3650.
+    pub created_within_days: Option<String>,
+    /// `queryFees` (the default), `signal`, `stake`, `created`, `ratio`, `indexers` or `curators`.
+    pub sort: Option<String>,
+    /// `desc` (the default) or `asc`.
+    pub dir: Option<String>,
+    /// Rows per page, 1 to 100, default 25.
+    pub first: Option<String>,
+    /// Rows to skip, 0 to 100000.
+    pub skip: Option<String>,
+}
+
 /// `/api/subgraph-directory`: the deployments list, filtered, sorted and paged over the whole set.
 pub async fn subgraph_directory(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Query(params): Query<std::collections::HashMap<String, String>>,
+    Query(filters): Query<DirectoryQuery>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
+    let params: std::collections::HashMap<String, String> = serde_json::to_value(&filters)
+        .ok()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .map(|m: std::collections::HashMap<String, Option<String>>| {
+            m.into_iter().filter_map(|(k, v)| Some((k, v?))).collect()
+        })
+        .unwrap_or_default();
     let q = kittiwake_read::directory::Query::parse(&params).map_err(ApiError::BadRequest)?;
     let now = now();
     let read = routes::subgraph_directory(&st.read, thirty_days_back(now)).await?;
@@ -2640,6 +2692,23 @@ pub async fn indexer_revenue(
     Ok(resp)
 }
 
+/// The P&L's inputs. Anything that does not parse is treated as absent.
+#[derive(serde::Deserialize)]
+pub struct PnlQuery {
+    /// The revenue window in days: 7, 30 (the default), 90 or 365.
+    pub window: Option<String>,
+    /// GRT in USD. Without it the answer is in GRT alone.
+    #[serde(rename = "grtPrice")]
+    pub grt_price: Option<String>,
+    /// The chains served, comma-separated, each costed at its default archive-node figure.
+    pub chains: Option<String>,
+    /// Monthly overhead in USD beside the chains' costs.
+    pub overhead: Option<String>,
+    /// `cost_<chain>`: a monthly cost in USD for that chain, replacing its default.
+    #[serde(flatten)]
+    pub chain_costs: std::collections::BTreeMap<String, String>,
+}
+
 /// The cost side is request input and is never stored.
 ///
 /// There is no per-indexer configuration behind this and there deliberately is not: persisting a
@@ -2650,10 +2719,21 @@ pub async fn indexer_pnl(
     Path(address): Path<String>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Query(raw): Query<std::collections::BTreeMap<String, String>>,
+    Query(q): Query<PnlQuery>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
     let address = eth_address(&address).ok_or_else(bad_address)?;
+    let mut raw = q.chain_costs;
+    for (k, v) in [
+        ("window", q.window),
+        ("grtPrice", q.grt_price),
+        ("chains", q.chains),
+        ("overhead", q.overhead),
+    ] {
+        if let Some(v) = v {
+            raw.insert(k.to_string(), v);
+        }
+    }
     let window =
         kittiwake_rewards::pnl::revenue_window(raw.get("window").and_then(|w| w.parse().ok()));
     let cost = cost_model_from(&raw);
@@ -5326,10 +5406,13 @@ mod indexer_page_tests {
         st: &AppState,
         pairs: &[(&str, &str)],
     ) -> Result<Response, ErrorResponse> {
-        let params = pairs
+        let query = pairs
             .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let uri: axum::http::Uri = format!("/api/subgraph-directory?{query}").parse().unwrap();
+        let params = axum::extract::Query::try_from_uri(&uri).unwrap().0;
         subgraph_directory(State(st.clone()), peer(), HeaderMap::new(), Query(params)).await
     }
 

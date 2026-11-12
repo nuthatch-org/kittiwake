@@ -3137,6 +3137,33 @@ mod envelope_tests {
         }
     }
 
+    /// Declared query structs must still take what the free-form maps took.
+    #[tokio::test]
+    async fn the_directory_and_pnl_still_read_their_query_strings() {
+        let status = |uri: &str| {
+            let uri = uri.to_string();
+            async move { send(app(false), req("GET", &uri, None, "")).await.status() }
+        };
+        let pnl = "/api/indexer/0x00000000000000000000000000000000000000aa/pnl";
+        for uri in [
+            format!(
+                "{pnl}?window=7&chains=mainnet,xdai&cost_mainnet=1800&overhead=300&grtPrice=0.1"
+            ),
+            format!("{pnl}?window=nonsense&cost_xdai=lots"),
+            "/api/subgraph-directory?first=&signalMin=%205%20&sort=ratio&unknown=1".to_string(),
+        ] {
+            let got = status(&uri).await;
+            assert!(
+                got.is_server_error(),
+                "{uri} answered {got}, not the nest's absence"
+            );
+        }
+        assert_eq!(
+            status("/api/subgraph-directory?first=abc").await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
     #[tokio::test]
     async fn the_ipfs_proxy_forwards_only_what_graph_cli_calls() {
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
