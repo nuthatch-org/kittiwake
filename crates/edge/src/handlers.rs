@@ -3294,13 +3294,17 @@ pub(crate) fn agent_token<'a>(
     }
 }
 
+/// lodestar's `usePresentPoi` sends camelCase; the snake-case names are what this took before.
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PresentPoi {
-    #[serde(default)]
+    #[serde(default, alias = "deployment_id")]
     pub deployment_id: String,
-    #[serde(default)]
+    #[serde(default, alias = "allocation_id")]
     pub allocation_id: String,
+    #[serde(alias = "agent_url")]
     pub agent_url: Option<String>,
+    #[serde(alias = "agent_token")]
     pub agent_token: Option<String>,
 }
 
