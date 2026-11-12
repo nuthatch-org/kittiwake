@@ -977,6 +977,42 @@ pub async fn bounty_by_chain_id(
     )
 }
 
+/// Create the table Dock sign-outs are kept in. Additive and ours alone, like the others here.
+pub async fn ensure_studio_sign_outs_table(pool: &Pool) -> Result<(), DbError> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS studio_sign_outs ( \
+           address        TEXT PRIMARY KEY, \
+           signed_out_at  BIGINT NOT NULL \
+         )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// When this address last signed out of the Dock, in Unix seconds.
+pub async fn signed_out_at(pool: &Pool, address: &str) -> Result<Option<i64>, DbError> {
+    Ok(
+        sqlx::query_scalar("SELECT signed_out_at FROM studio_sign_outs WHERE address = $1")
+            .bind(address.to_lowercase())
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
+pub async fn record_sign_out(pool: &Pool, address: &str, at: i64) -> Result<(), DbError> {
+    sqlx::query(
+        "INSERT INTO studio_sign_outs (address, signed_out_at) VALUES ($1, $2) \
+         ON CONFLICT (address) DO UPDATE \
+         SET signed_out_at = GREATEST(studio_sign_outs.signed_out_at, EXCLUDED.signed_out_at)",
+    )
+    .bind(address.to_lowercase())
+    .bind(at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // Chain health: head history and per-indexer chain sets
 // ---------------------------------------------------------------------------------------------

@@ -21,15 +21,16 @@ fn dock(st: &AppState) -> Result<&crate::Studio, ErrorResponse> {
         .ok_or_else(|| ApiError::Unavailable("the Dock is not configured".into()).into())
 }
 
-/// The address a request's session vouches for, taking only what it decides on.
+/// The address a request's session vouches for and when it was issued, taking only what it
+/// decides on.
 ///
 /// Split out from [`session`] so the refusals are testable without an `AppState`: the Dock's whole
 /// authorisation is this cookie, and every owner-scoped route is exactly as strong as it is.
-pub(crate) fn session_address(
+pub(crate) fn session_claim(
     secret: &kittiwake_dock::Secret,
     headers: &HeaderMap,
     now: i64,
-) -> Option<String> {
+) -> Option<(String, i64)> {
     let token = headers
         .get(header::COOKIE)
         .and_then(|h| h.to_str().ok())
@@ -38,11 +39,27 @@ pub(crate) fn session_address(
                 .map(str::trim)
                 .find_map(|part| part.strip_prefix("studio_session="))
         })?;
-    kittiwake_dock::parse_session(secret, token, now).ok()
+    kittiwake_dock::parse_session_issued(secret, token, now).ok()
 }
 
-fn session(st: &AppState, headers: &HeaderMap) -> Result<String, ErrorResponse> {
-    session_address(&dock(st)?.secret, headers, now()).ok_or_else(|| ApiError::Unauthorized.into())
+/// A session issued at or before its address last signed out is over, wherever its cookie went.
+pub(crate) fn ended_by_sign_out(issued_at: i64, signed_out_at: i64) -> bool {
+    issued_at <= signed_out_at
+}
+
+/// Without a database nothing can have signed out, so there is nothing to consult.
+async fn session(st: &AppState, headers: &HeaderMap) -> Result<String, ErrorResponse> {
+    let (address, issued_at) = session_claim(&dock(st)?.secret, headers, now())
+        .ok_or_else(|| ErrorResponse::from(ApiError::Unauthorized))?;
+    if let Some(pool) = st.pool.as_ref()
+        && kittiwake_db::signed_out_at(pool, &address)
+            .await
+            .map_err(db_err)?
+            .is_some_and(|at| ended_by_sign_out(issued_at, at))
+    {
+        return Err(ApiError::Unauthorized.into());
+    }
+    Ok(address)
 }
 
 fn pool(st: &AppState) -> Result<&kittiwake_db::Pool, ErrorResponse> {
@@ -1252,7 +1269,7 @@ pub async fn indexing_status(
 // ---------------------------------------------------------------------------------------------
 
 pub async fn studio_auth_get(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let address = session(&st, &headers).ok();
+    let address = session(&st, &headers).await.ok();
     let mut body = serde_json::json!({"address": address});
     if let Some(studio) = &st.studio {
         let issued_at = now();
@@ -1300,7 +1317,17 @@ pub async fn studio_auth_post(
     Ok(r)
 }
 
-pub async fn studio_auth_delete() -> Response {
+pub async fn studio_auth_delete(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    if let Some(studio) = &st.studio
+        && let Some((address, _)) = session_claim(&studio.secret, &headers, now())
+    {
+        kittiwake_db::record_sign_out(pool(&st)?, &address, now())
+            .await
+            .map_err(db_err)?;
+    }
     let mut r = axum::Json(serde_json::json!({"ok": true})).into_response();
     r.headers_mut().insert(
         header::SET_COOKIE,
@@ -1309,14 +1336,14 @@ pub async fn studio_auth_delete() -> Response {
         ),
     );
     crate::no_store(r.headers_mut());
-    r
+    Ok(r)
 }
 
 pub async fn studio_subgraphs_get(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ErrorResponse> {
-    let owner = session(&st, &headers)?;
+    let owner = session(&st, &headers).await?;
     let rows = kittiwake_db::list_studio_subgraphs(pool(&st)?, &owner)
         .await
         .map_err(db_err)?;
@@ -1328,7 +1355,7 @@ pub async fn studio_subgraphs_post(
     headers: HeaderMap,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
-    let owner = session(&st, &headers)?;
+    let owner = session(&st, &headers).await?;
     let slug = body
         .get("slug")
         .and_then(|v| v.as_str())
@@ -1362,7 +1389,7 @@ pub async fn studio_subgraph_patch(
     Path(id): Path<String>,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
-    let owner = session(&st, &headers)?;
+    let owner = session(&st, &headers).await?;
     let id = id
         .parse::<i32>()
         .map_err(|_| ApiError::BadRequest("Invalid id".into()))?;
@@ -1389,7 +1416,7 @@ pub async fn studio_subgraph_delete(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Response, ErrorResponse> {
-    let owner = session(&st, &headers)?;
+    let owner = session(&st, &headers).await?;
     let id = id
         .parse::<i32>()
         .map_err(|_| ApiError::BadRequest("Invalid id".into()))?;
@@ -1450,7 +1477,7 @@ pub async fn studio_deploy_key_get(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ErrorResponse> {
-    let owner = session(&st, &headers)?;
+    let owner = session(&st, &headers).await?;
     let key = kittiwake_db::deploy_key(pool(&st)?, &owner)
         .await
         .map_err(db_err)?;
@@ -1460,7 +1487,7 @@ pub async fn studio_deploy_key_post(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ErrorResponse> {
-    let owner = session(&st, &headers)?;
+    let owner = session(&st, &headers).await?;
     let key = kittiwake_dock::generate_deploy_key();
     kittiwake_db::replace_deploy_key(pool(&st)?, &owner, &kittiwake_dock::hash_key(&key))
         .await
@@ -1533,7 +1560,7 @@ pub async fn studio_metadata_post(
     headers: HeaderMap,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
-    session(&st, &headers)?;
+    session(&st, &headers).await?;
     let (subgraph_doc, version_doc) = subgraph_metadata_docs(&body);
     let (sub, version) = tokio::try_join!(
         st.ipfs.add_json(&subgraph_doc),
@@ -1566,7 +1593,7 @@ pub async fn studio_image_post(
     headers: HeaderMap,
     body: bytes::Bytes,
 ) -> Result<Response, ErrorResponse> {
-    session(&st, &headers)?;
+    session(&st, &headers).await?;
     if body.len() > SUBGRAPH_IMAGE_MAX {
         return Err(ApiError::BadRequest("The image is over 1 MB".into()).into());
     }
@@ -1718,7 +1745,7 @@ pub async fn studio_bounties_post(
     headers: HeaderMap,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
-    let owner = session(&st, &headers)?;
+    let owner = session(&st, &headers).await?;
     let deployment = body
         .get("deployment_id")
         .and_then(|v| v.as_str())
@@ -3205,7 +3232,7 @@ pub async fn present_poi(
 ) -> Result<Response, ErrorResponse> {
     let caller = client_ip(peer, &headers, st.edge_secret.as_deref());
     st.limits.check(&st.limits.mutation, caller)?;
-    let address = session(&st, &headers)?;
+    let address = session(&st, &headers).await?;
 
     let (Some(deployment), Some(allocation)) = (
         cid_v0(&body.deployment_id),

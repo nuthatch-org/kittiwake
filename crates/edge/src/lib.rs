@@ -2153,13 +2153,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn signing_out_ends_every_session_issued_before_it() {
+        use crate::handlers::ended_by_sign_out;
+        let token = kittiwake_dock::create_session(&dock_secret(), "0xAbCd", DOCK_NOW);
+        let (address, issued_at) =
+            kittiwake_dock::parse_session_issued(&dock_secret(), &token, DOCK_NOW + 60).unwrap();
+        assert_eq!(address, "0xabcd");
+        assert_eq!(issued_at, DOCK_NOW);
+
+        assert!(ended_by_sign_out(issued_at, DOCK_NOW + 30));
+        assert!(
+            ended_by_sign_out(issued_at, DOCK_NOW),
+            "signed out in the second it was issued"
+        );
+        assert!(
+            !ended_by_sign_out(issued_at, DOCK_NOW - 1),
+            "a sign-in after the last sign-out stands"
+        );
+    }
+
     /// The session cookie is the whole of the Dock's authorisation, so every owner-scoped route is
     /// exactly as strong as this is.
     #[test]
     fn a_studio_session_names_an_address_or_nobody() {
         let token = kittiwake_dock::create_session(&dock_secret(), "0xAbCd", DOCK_NOW);
         let other = kittiwake_dock::Secret::new("a-different-secret-of-adequate-length!!").unwrap();
-        let named = |h: &HeaderMap| crate::handlers::session_address(&dock_secret(), h, DOCK_NOW);
+        let named = |h: &HeaderMap| {
+            crate::handlers::session_claim(&dock_secret(), h, DOCK_NOW).map(|(address, _)| address)
+        };
 
         // Lowercased, because that is what every owner column stores.
         assert_eq!(
@@ -2186,7 +2208,7 @@ mod tests {
             "a token signed with another secret is not a session"
         );
         assert_eq!(
-            crate::handlers::session_address(
+            crate::handlers::session_claim(
                 &dock_secret(),
                 &dock_cookie(&format!("studio_session={token}")),
                 DOCK_NOW + kittiwake_dock::SESSION_TTL_SECS + 1
