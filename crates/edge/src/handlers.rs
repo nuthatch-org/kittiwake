@@ -918,8 +918,13 @@ pub async fn delegation_flows(
     Query(q): Query<DaysQuery>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
-    let since = now() - q.days.clamp(1, 3650) * 86_400;
+    let since = days_back(now(), q.days.clamp(1, 3650));
     Ok(envelope(routes::delegation_flows(&st.read, since).await?))
+}
+
+/// Floored to the hour, as [`thirty_days_back`] is: the window is part of the cache key.
+fn days_back(now: i64, days: i64) -> i64 {
+    now - now.rem_euclid(3600) - days * 86_400
 }
 
 pub async fn developer_activity(
@@ -929,7 +934,7 @@ pub async fn developer_activity(
     Query(q): Query<DaysQuery>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
-    let cutoff = now() - q.days.clamp(7, 3650) * 86_400;
+    let cutoff = days_back(now(), q.days.clamp(7, 3650));
     Ok(envelope(
         routes::developer_activity(&st.read, cutoff).await?,
     ))
@@ -5238,6 +5243,17 @@ mod indexer_page_tests {
         let hour = t - t.rem_euclid(3600);
         assert_eq!(thirty_days_back(hour), thirty_days_back(hour + 3599));
         assert_eq!(thirty_days_back(hour + 3600) - thirty_days_back(hour), 3600);
+    }
+
+    /// The flows and developer-activity windows are cache keys, so a page load a minute later
+    /// must ask for the same one.
+    #[test]
+    fn the_day_windows_move_by_the_hour_not_the_second() {
+        let t: i64 = 1_790_000_000;
+        let hour = t - t.rem_euclid(3600);
+        assert_eq!(days_back(hour + 60, 90), days_back(hour + 120, 90));
+        assert_eq!(days_back(hour, 90), days_back(hour + 3599, 90));
+        assert_eq!(days_back(hour, 90), hour - 90 * 86_400);
     }
 }
 
