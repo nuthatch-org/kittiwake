@@ -535,15 +535,17 @@ fn json_type(ty: &str) -> &'static str {
     }
 }
 
-/// The fields of the named struct, read from its declaration. `None` when the type is not declared
-/// in this crate, which is the caller's cue to describe it as free-form.
-fn struct_fields(ty: &str) -> Option<Vec<Field>> {
+/// The fields of the named struct, read from its declaration, and whether a `flatten`ed map also
+/// takes keys it does not name. `None` when the type is not declared in this crate, which is the
+/// caller's cue to describe it as free-form.
+fn struct_fields(ty: &str) -> Option<(Vec<Field>, bool)> {
     let ty = ty.rsplit("::").next()?;
     let needle = format!("struct {ty} {{");
     let (src, at) = [HANDLERS, ROUTER]
         .into_iter()
         .find_map(|src| Some((src, src.find(&needle)?)))?;
     let camel_case = src[..at]
+        .trim_end_matches("pub ")
         .lines()
         .rev()
         .take_while(|l| l.trim_start().starts_with("#[") || l.trim_start().starts_with("///"))
@@ -551,6 +553,7 @@ fn struct_fields(ty: &str) -> Option<Vec<Field>> {
     let body = src[at + needle.len()..].split("\n}").next()?;
 
     let (mut fields, mut doc, mut attrs) = (Vec::new(), Vec::new(), String::new());
+    let mut flattened = false;
     for line in body.lines().map(str::trim) {
         if let Some(d) = line.strip_prefix("///") {
             doc.push(d.trim().to_string());
@@ -559,6 +562,12 @@ fn struct_fields(ty: &str) -> Option<Vec<Field>> {
         } else if let Some((name, ty)) = line.trim_start_matches("pub ").split_once(':') {
             let ty = ty.trim().trim_end_matches(',').trim();
             let name = name.trim().trim_start_matches("r#");
+            if attrs.contains("flatten") {
+                flattened = true;
+                doc.clear();
+                attrs.clear();
+                continue;
+            }
             let renamed = attrs
                 .split("rename = \"")
                 .nth(1)
@@ -582,7 +591,7 @@ fn struct_fields(ty: &str) -> Option<Vec<Field>> {
             attrs.clear();
         }
     }
-    Some(fields)
+    Some((fields, flattened))
 }
 
 /// Query parameters a route declares, and whether it also takes ones nobody declared.
@@ -594,7 +603,10 @@ fn query_fields(handler: &str) -> (Vec<Field>, bool) {
     let mut fields = Vec::new();
     for ty in extractor_types(params, "Query") {
         match struct_fields(ty) {
-            Some(f) => fields.extend(f),
+            Some((f, flattened)) => {
+                fields.extend(f);
+                free_form |= flattened;
+            }
             None => free_form = true,
         }
     }
@@ -605,7 +617,8 @@ fn query_fields(handler: &str) -> (Vec<Field>, bool) {
 fn body_schema(handler: &str) -> serde_json::Value {
     let fields = handler_params(handler)
         .and_then(|p| extractor_types(p, "Json").first().copied())
-        .and_then(struct_fields);
+        .and_then(struct_fields)
+        .map(|(fields, _)| fields);
     let Some(fields) = fields else {
         return serde_json::json!({ "type": "object" });
     };
@@ -679,6 +692,14 @@ pub fn document(version: &str) -> serde_json::Value {
             "responses": {
                 "200": { "description": "The answer, with a provenance envelope." },
                 "400": { "description": "The request was not understood; the message says why." },
+                "404": {
+                    "description": "No such path, or nothing at this one; the body is the error envelope.",
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+                },
+                "405": {
+                    "description": "The path does not take this method; `Allow` lists the ones it does.",
+                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } },
+                },
                 "429": { "description": "Rate limited." },
                 "503": { "description": "A source this route depends on is not answering." },
             },
@@ -716,6 +737,18 @@ pub fn document(version: &str) -> serde_json::Value {
         },
         "servers": [{ "url": "https://api.lodestar-dashboard.com" }],
         "paths": paths,
+        "components": {
+            "schemas": {
+                "Error": {
+                    "type": "object",
+                    "properties": {
+                        "error": { "type": "string", "description": "A stable code, such as `not_found` or `method_not_allowed`." },
+                        "message": { "type": "string" },
+                    },
+                    "required": ["error", "message"],
+                },
+            },
+        },
         // Served, deliberately undescribed, and named anyway.
         //
         // Without this the document answers "which routes exist?" with a subset, and a reader
@@ -928,6 +961,64 @@ mod tests {
         }
         non_get.sort();
         assert_eq!(non_get, ["post /api/sql/named", "post /api/subgraph-names"]);
+    }
+
+    #[test]
+    fn every_operation_declares_the_json_404_and_405() {
+        let doc = document("test");
+        let error = &doc["components"]["schemas"]["Error"];
+        assert_eq!(error["required"], serde_json::json!(["error", "message"]));
+        for (path, item) in doc["paths"].as_object().unwrap() {
+            for (method, op) in item.as_object().unwrap() {
+                for code in ["404", "405"] {
+                    assert_eq!(
+                        op["responses"][code]["content"]["application/json"]["schema"]["$ref"],
+                        "#/components/schemas/Error",
+                        "{method} {path} {code}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_directory_and_pnl_publish_their_query_parameters() {
+        let doc = document("test");
+        let names = |path: &str| -> Vec<String> {
+            doc["paths"][path]["get"]["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|p| p["in"] == "query")
+                .map(|p| p["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let directory = &doc["paths"]["/api/subgraph-directory"]["get"];
+        assert!(directory.get("x-query-free-form").is_none());
+        let filters = names("/api/subgraph-directory");
+        for want in [
+            "window",
+            "signalMin",
+            "indexersMax",
+            "createdWithinDays",
+            "sort",
+            "dir",
+            "first",
+            "skip",
+        ] {
+            assert!(filters.iter().any(|n| n == want), "{want} in {filters:?}");
+        }
+
+        // A `pub struct` under `rename_all` is published as it is spelt on the wire.
+        assert!(names("/api/indexer/{address}/delegators").contains(&"orderBy".to_string()));
+
+        // `cost_<chain>` keys are open-ended, so the route still says it takes undeclared ones.
+        let pnl = &doc["paths"]["/api/indexer/{address}/pnl"]["get"];
+        assert_eq!(pnl["x-query-free-form"], true);
+        assert_eq!(
+            names("/api/indexer/{address}/pnl"),
+            ["window", "grtPrice", "chains", "overhead"]
+        );
     }
 
     #[test]
