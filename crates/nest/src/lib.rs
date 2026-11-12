@@ -584,6 +584,12 @@ impl NestGate {
         key: &str,
         spec: QuerySpec,
     ) -> Result<Arc<SqlAnswer>, NestError> {
+        // The caller's key is a label; two statements must never share a flight under one.
+        let key = &format!(
+            "{key}:{}:{}",
+            spec.nest.as_str(),
+            blake3::hash(spec.sql.as_bytes()).to_hex()
+        );
         if let Some(err) = self.inner.neg_cache.get(key).await {
             metrics::counter!("nest_negative_cache_hit_total").increment(1);
             return Err(err);
@@ -910,6 +916,33 @@ mod tests {
             1,
             "the nest should have been asked once"
         );
+    }
+
+    /// A key that forgets a parameter must not hand one statement's rows to another.
+    #[tokio::test]
+    async fn one_key_over_two_statements_runs_both() {
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        for (q, rows) in [("SELECT 1", 1), ("SELECT 2", 2)] {
+            Mock::given(method("GET"))
+                .and(path("/sql"))
+                .and(query_param("q", q))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(envelope(rows))
+                        .set_delay(Duration::from_millis(80)),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let gate = gate_for(&server, 4).await;
+        let (a, b) = tokio::join!(
+            gate.query_coalesced("same", QuerySpec::read(NestId::Alloc, "SELECT 1")),
+            gate.query_coalesced("same", QuerySpec::read(NestId::Alloc, "SELECT 2")),
+        );
+        assert_eq!(a.unwrap().rows.len(), 1);
+        assert_eq!(b.unwrap().rows.len(), 2);
     }
 
     #[tokio::test]
