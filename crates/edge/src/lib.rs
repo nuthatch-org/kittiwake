@@ -465,10 +465,12 @@ async fn post_sql_query(
         .ok_or_else(|| ApiError::BadRequest(format!("unknown dataset {:?}", body.dataset)))?;
     kittiwake_sqlplay::screen(&body.q).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
-    // Six seconds, below the nest's own ceiling, so a slow query fails here with a clear message
-    // rather than there. A query that cannot answer in six seconds wants a WHERE clause.
-    let spec = kittiwake_nest::QuerySpec::read(dataset.nest, body.q.clone())
+    // The caller is answered after six seconds; a query that cannot answer in six wants a WHERE
+    // clause. The nest runs it for up to its own thirty regardless, and the gate holds its permit
+    // for that long.
+    let mut spec = kittiwake_nest::QuerySpec::read(dataset.nest, body.q.clone())
         .with_timeout(Duration::from_secs(6));
+    spec.lane = kittiwake_nest::Lane::Public;
     let answer = st.read.gate.query(&spec).await.map_err(ApiError::from)?;
 
     let meta = Meta {
@@ -551,8 +553,9 @@ async fn post_sql_named(
         ApiError::Internal("this query is misconfigured".into())
     })?;
 
-    let spec = kittiwake_nest::QuerySpec::read(dataset.nest, sql.clone())
+    let mut spec = kittiwake_nest::QuerySpec::read(dataset.nest, sql.clone())
         .with_timeout(Duration::from_secs(6));
+    spec.lane = kittiwake_nest::Lane::Public;
     let answer = st.read.gate.query(&spec).await.map_err(ApiError::from)?;
 
     let meta = Meta {
@@ -634,8 +637,9 @@ async fn post_sql_receipt(
         )
     })?;
 
-    let spec = kittiwake_nest::QuerySpec::read(dataset.nest, sql.clone())
+    let mut spec = kittiwake_nest::QuerySpec::read(dataset.nest, sql.clone())
         .with_timeout(Duration::from_secs(6));
+    spec.lane = kittiwake_nest::Lane::Public;
     let answer = st.read.gate.query(&spec).await.map_err(ApiError::from)?;
 
     // A truncated or degraded answer is not the answer. Signing one puts our name on a partial
