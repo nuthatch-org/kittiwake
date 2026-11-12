@@ -102,6 +102,22 @@ impl Limits {
             .map_err(|n| refused(n, self.budget_name(limiter)))
     }
 
+    /// As [`Self::check`], spending `n` from the budget at once, or nothing.
+    pub(crate) fn check_n(&self, limiter: &Limiter, ip: IpAddr, n: u32) -> Result<(), ApiError> {
+        if self.exempt.contains(&ip) {
+            return Ok(());
+        }
+        let n = NonZeroU32::new(n.max(1)).expect("at least one");
+        match limiter.check_key_n(&bucket(ip), n) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(not_until)) => Err(refused(not_until, self.budget_name(limiter))),
+            // More than the budget's burst can ever hold: no wait would make room for it.
+            Err(_) => Err(ApiError::BadRequest(
+                "the request costs more than this budget allows at once".into(),
+            )),
+        }
+    }
+
     /// Spend from a deploy key's upload budget, keyed by the key's hash.
     pub(crate) fn check_deploy_key(&self, key_hash: &str) -> Result<(), ApiError> {
         self.deploy
@@ -3135,6 +3151,133 @@ mod envelope_tests {
                 "{ct} {body}"
             );
         }
+    }
+
+    /// The two seeded addresses are answered from the cache the single form fills; the third has
+    /// to ask mainnet, which here refuses every connection.
+    #[tokio::test]
+    async fn a_batch_of_ens_lookups_answers_a_map_from_the_shared_cache() {
+        let named = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045";
+        let nameless = "0x000000000000000000000000000000000000dead";
+        let unknown = "0x00000000000000000000000000000000000000aa";
+        let store = kittiwake_cache::Store::new(64);
+        for (address, name) in [
+            (named, serde_json::json!("vitalik.eth")),
+            (nameless, serde_json::Value::Null),
+        ] {
+            let key =
+                kittiwake_cache::key(1, "ext", "ens", &serde_json::json!({ "subject": address }));
+            let entry = kittiwake_cache::Entry::new(
+                serde_json::json!({ "ensName": name }),
+                Default::default(),
+            );
+            store.insert(key, entry).await;
+        }
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mainnet = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let gate =
+            kittiwake_nest::NestGate::new(kittiwake_nest::NestConfig::new("http://127.0.0.1:9"))
+                .unwrap();
+        let read = kittiwake_read::ReadCtx::new(gate, store, 1).with_chain(Some(
+            kittiwake_chain::Chain::new("http://127.0.0.1:9", Some(mainnet)),
+        ));
+        let app = |limits: Limits| {
+            router(state(
+                limits,
+                None,
+                read.clone(),
+                None,
+                None,
+                kittiwake_ext::Ipfs::default(),
+                None,
+                None,
+                None,
+                None,
+            ))
+            .layer(axum::extract::connect_info::MockConnectInfo(
+                SocketAddr::from(([203, 0, 113, 9], 1)),
+            ))
+        };
+        let json = |resp: Response| async move {
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            )
+        };
+        let generous = || Limits::new(1000, 1000, 1000, Vec::new());
+
+        let uri = format!(
+            "/api/ens?addresses={},{nameless},%20{unknown},not-an-address",
+            named.to_uppercase().replace("0X", "0x")
+        );
+        let (status, body) = json(send(app(generous()), req("GET", &uri, None, "")).await).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["ensNames"],
+            serde_json::json!({ named: "vitalik.eth", nameless: null, "not-an-address": null })
+        );
+        assert_eq!(body["unresolved"], serde_json::json!([unknown]));
+        assert_eq!(body["provenance"]["served_from"], "cache");
+
+        // The single form reads the same entries.
+        let (_, one) = json(
+            send(
+                app(generous()),
+                req("GET", &format!("/api/ens?address={named}"), None, ""),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(one["ensName"], "vitalik.eth");
+
+        // Every lookup failing is a failure, not a map of nothing.
+        let resp = send(
+            app(generous()),
+            req("GET", &format!("/api/ens?addresses={unknown}"), None, ""),
+        )
+        .await;
+        assert_eq!(
+            envelope_of(resp).await,
+            (StatusCode::SERVICE_UNAVAILABLE, "unavailable".into())
+        );
+
+        let too_many = (0..101)
+            .map(|i| format!("0x{i:040x}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        for bad in [too_many.as_str(), "", "%20,%20"] {
+            let resp = send(
+                app(generous()),
+                req("GET", &format!("/api/ens?addresses={bad}"), None, ""),
+            )
+            .await;
+            assert_eq!(
+                envelope_of(resp).await,
+                (StatusCode::BAD_REQUEST, "bad_request".into()),
+                "{bad}"
+            );
+        }
+
+        // A hundred addresses spend ten read tokens, so fifteen admit one batch and not two.
+        let hundred = (0..100)
+            .map(|i| format!("0x{i:040x}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let tight = app(Limits::new(1000, 15, 1000, Vec::new()));
+        let batch = || req("GET", &format!("/api/ens?addresses={hundred}"), None, "");
+        assert_ne!(
+            send(tight.clone(), batch()).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            send(tight, batch()).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
 
     /// The chart reads the last week as the one in progress and labels its window in months.
