@@ -440,6 +440,10 @@ CREATE TABLE IF NOT EXISTS sync_bounties (
 
 CREATE INDEX IF NOT EXISTS idx_sync_bounties_deployment ON sync_bounties(deployment_id);
 CREATE INDEX IF NOT EXISTS idx_sync_bounties_status     ON sync_bounties(status);
+-- One row per on-chain bounty. A database that already holds duplicates needs
+-- `deploy/unique-bounty-chain-id.sh`, which resolves them before adding this.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_bounties_chain_bounty_id
+  ON sync_bounties(chain_bounty_id) WHERE chain_bounty_id IS NOT NULL;
 
 -- When each address last signed out of the Dock, in Unix seconds. A session issued at or before it
 -- is refused, so signing out ends a copied cookie too. Created at startup by kittiwake.

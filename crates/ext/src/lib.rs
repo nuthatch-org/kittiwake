@@ -139,12 +139,12 @@ impl Ext {
             .get(format!("{base}/prices/current/{GRT}"))
             .send()
             .await
-            .map_err(|e| ApiError::Unavailable(format!("price source: {e}")))?
+            .map_err(|e| ApiError::Unavailable(format!("price source: {}", e.without_url())))?
             .error_for_status()
-            .map_err(|e| ApiError::Unavailable(format!("price source: {e}")))?
+            .map_err(|e| ApiError::Unavailable(format!("price source: {}", e.without_url())))?
             .json()
             .await
-            .map_err(|e| ApiError::Unavailable(format!("price source: {e}")))?;
+            .map_err(|e| ApiError::Unavailable(format!("price source: {}", e.without_url())))?;
 
         let node = body.pointer(&format!("/coins/{GRT}")).ok_or_else(|| {
             ApiError::Unavailable("price source answered without a the-graph entry".into())
@@ -180,12 +180,12 @@ impl Ext {
             .get(&self.tvl_url)
             .send()
             .await
-            .map_err(|e| ApiError::Unavailable(format!("tvl source: {e}")))?
+            .map_err(|e| ApiError::Unavailable(format!("tvl source: {}", e.without_url())))?
             .error_for_status()
-            .map_err(|e| ApiError::Unavailable(format!("tvl source: {e}")))?
+            .map_err(|e| ApiError::Unavailable(format!("tvl source: {}", e.without_url())))?
             .json()
             .await
-            .map_err(|e| ApiError::Unavailable(format!("tvl source: {e}")))?;
+            .map_err(|e| ApiError::Unavailable(format!("tvl source: {}", e.without_url())))?;
 
         body.last()
             .and_then(|p| p.get("tvl"))
@@ -225,12 +225,18 @@ impl Ext {
             .github_get(&self.graph_support_templates_url)
             .send()
             .await
-            .map_err(|e| ApiError::Unavailable(format!("graph-support templates: {e}")))?
+            .map_err(|e| {
+                ApiError::Unavailable(format!("graph-support templates: {}", e.without_url()))
+            })?
             .error_for_status()
-            .map_err(|e| ApiError::Unavailable(format!("graph-support templates: {e}")))?
+            .map_err(|e| {
+                ApiError::Unavailable(format!("graph-support templates: {}", e.without_url()))
+            })?
             .json()
             .await
-            .map_err(|e| ApiError::Unavailable(format!("graph-support templates: {e}")))?;
+            .map_err(|e| {
+                ApiError::Unavailable(format!("graph-support templates: {}", e.without_url()))
+            })?;
 
         let mut out = Vec::new();
         for entry in listing {
@@ -244,12 +250,18 @@ impl Ext {
                 .github_get_returned(&url)
                 .send()
                 .await
-                .map_err(|e| ApiError::Unavailable(format!("graph-support template: {e}")))?
+                .map_err(|e| {
+                    ApiError::Unavailable(format!("graph-support template: {}", e.without_url()))
+                })?
                 .error_for_status()
-                .map_err(|e| ApiError::Unavailable(format!("graph-support template: {e}")))?
+                .map_err(|e| {
+                    ApiError::Unavailable(format!("graph-support template: {}", e.without_url()))
+                })?
                 .text()
                 .await
-                .map_err(|e| ApiError::Unavailable(format!("graph-support template: {e}")))?;
+                .map_err(|e| {
+                    ApiError::Unavailable(format!("graph-support template: {}", e.without_url()))
+                })?;
             out.push(GraphSupportTemplate {
                 file: entry.name,
                 yaml,
@@ -279,12 +291,18 @@ impl Ext {
                 .query(&[("page", page.to_string())])
                 .send()
                 .await
-                .map_err(|e| ApiError::Unavailable(format!("graph-support comments: {e}")))?
+                .map_err(|e| {
+                    ApiError::Unavailable(format!("graph-support comments: {}", e.without_url()))
+                })?
                 .error_for_status()
-                .map_err(|e| ApiError::Unavailable(format!("graph-support comments: {e}")))?
+                .map_err(|e| {
+                    ApiError::Unavailable(format!("graph-support comments: {}", e.without_url()))
+                })?
                 .json()
                 .await
-                .map_err(|e| ApiError::Unavailable(format!("graph-support comments: {e}")))?;
+                .map_err(|e| {
+                    ApiError::Unavailable(format!("graph-support comments: {}", e.without_url()))
+                })?;
 
             let full_page = batch.len() == 100;
             for c in batch {
@@ -331,12 +349,14 @@ impl Ext {
                 .query(&[("page", page.to_string())])
                 .send()
                 .await
-                .map_err(|e| ApiError::Unavailable(format!("graph-support: {e}")))?
+                .map_err(|e| ApiError::Unavailable(format!("graph-support: {}", e.without_url())))?
                 .error_for_status()
-                .map_err(|e| ApiError::Unavailable(format!("graph-support: {e}")))?
+                .map_err(|e| ApiError::Unavailable(format!("graph-support: {}", e.without_url())))?
                 .json()
                 .await
-                .map_err(|e| ApiError::Unavailable(format!("graph-support: {e}")))?;
+                .map_err(|e| {
+                    ApiError::Unavailable(format!("graph-support: {}", e.without_url()))
+                })?;
 
             let full_page = batch.len() == 100;
             for gh in batch {
@@ -601,6 +621,37 @@ mod tests {
 
         let ext = Ext::new("unused", format!("{}/tvl", server.uri()));
         assert_eq!(ext.arbitrum_tvl().await.unwrap(), 250.0);
+    }
+
+    /// These messages reach callers and logs; the graph-support URLs name a private repository.
+    #[tokio::test]
+    async fn a_failed_source_does_not_say_where_it_was() {
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let at = |p: &str| format!("{}/private-org/private-repo/{p}", server.uri());
+        let ext = Ext::new(at("price"), at("tvl"))
+            .with_graph_support_url(at("issues"))
+            .with_graph_support_comments_url(at("comments"))
+            .with_graph_support_templates_url(at("templates"));
+        let errors = [
+            ext.grt_price().await.unwrap_err(),
+            ext.arbitrum_tvl().await.unwrap_err(),
+            ext.graph_support_issues().await.unwrap_err(),
+            ext.graph_support_thread_comments().await.unwrap_err(),
+            ext.graph_support_templates().await.unwrap_err(),
+        ];
+        let host = server.address().to_string();
+        for e in errors {
+            let said = format!("{e:?}");
+            assert!(said.contains("403"), "{said}");
+            assert!(
+                !said.contains("private-repo") && !said.contains(&host),
+                "{said}"
+            );
+        }
     }
 }
 

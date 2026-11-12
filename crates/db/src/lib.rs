@@ -951,9 +951,18 @@ pub async fn list_bounties(
     Ok(q.fetch_all(pool).await?)
 }
 
-pub async fn create_bounty(pool: &Pool, bounty: NewBounty<'_>) -> Result<SyncBounty, DbError> {
-    Ok(sqlx::query_as("INSERT INTO sync_bounties (deployment_id, subgraph_id, developer_address, amount_grt, message, expires_at, chain_bounty_id, post_tx_hash) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *")
-        .bind(bounty.deployment).bind(bounty.subgraph_id).bind(bounty.developer.to_lowercase()).bind(bounty.amount).bind(bounty.message).bind(bounty.expires_at).bind(bounty.chain_id).bind(bounty.tx).fetch_one(pool).await?)
+/// The new row, or `None` when the bounty's on-chain id is already recorded, which a request racing
+/// this one can do between its lookup and this insert.
+pub async fn create_bounty(
+    pool: &Pool,
+    bounty: NewBounty<'_>,
+) -> Result<Option<SyncBounty>, DbError> {
+    let inserted = sqlx::query_as("INSERT INTO sync_bounties (deployment_id, subgraph_id, developer_address, amount_grt, message, expires_at, chain_bounty_id, post_tx_hash) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *")
+        .bind(bounty.deployment).bind(bounty.subgraph_id).bind(bounty.developer.to_lowercase()).bind(bounty.amount).bind(bounty.message).bind(bounty.expires_at).bind(bounty.chain_id).bind(bounty.tx).fetch_one(pool).await;
+    match inserted {
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Ok(None),
+        other => Ok(Some(other?)),
+    }
 }
 
 pub async fn bounty(pool: &Pool, id: i32) -> Result<Option<SyncBounty>, DbError> {
@@ -2670,5 +2679,50 @@ mod gaps_are_about_us {
             missing.is_empty(),
             "named by this service, absent from db/schema.sql: {missing:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod postgres_tests {
+    use super::*;
+
+    /// `KITTIWAKE_TEST_DATABASE_URL=postgres://… cargo test -p kittiwake-db -- --ignored pg_`,
+    /// against a database with `db/schema.sql` applied.
+    async fn test_pool() -> Pool {
+        let url =
+            std::env::var("KITTIWAKE_TEST_DATABASE_URL").expect("KITTIWAKE_TEST_DATABASE_URL");
+        connect(&url, 2).await.unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Postgres"]
+    async fn pg_one_on_chain_bounty_is_recorded_once() {
+        let pool = test_pool().await;
+        let chain_id = format!(
+            "{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let new = || NewBounty {
+            deployment: "QmBountyRace",
+            subgraph_id: None,
+            developer: "0x00000000000000000000000000000000000000aa",
+            amount: "1",
+            message: None,
+            expires_at: None,
+            chain_id: Some(&chain_id),
+            tx: None,
+        };
+        let (a, b) = tokio::join!(create_bounty(&pool, new()), create_bounty(&pool, new()));
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(
+            a.is_some() as u8 + b.is_some() as u8,
+            1,
+            "exactly one insert wins"
+        );
+        let kept = bounty_by_chain_id(&pool, &chain_id).await.unwrap().unwrap();
+        assert_eq!(Some(kept.id), a.or(b).map(|x| x.id));
     }
 }
