@@ -80,7 +80,7 @@ had connected. Seven were fixed the same day. What that cost and what now preven
 [`docs/decisions.md`](docs/decisions.md).
 
 Not built yet, in the migration's own order: `indexing-status`, then the product layer - the Dock,
-Scuttlebutt, the wasm disassembler, the SQL named tier and receipts - and a long tail that wants
+the wasm disassembler, the SQL named tier and receipts - and a long tail that wants
 triaging rather than porting.
 
 **Push notifications and Lodie were discontinued on 2026-09-06** and are deliberately absent.
@@ -189,8 +189,11 @@ crates/
   sqlplay/  public SQL: allowlist and screening
   sched/    the ingest scheduler
   warmer/   keeping the expensive folds hot
+  qos/      the QoS score: how well an indexer serves the queries a gateway routes to it
+  disasm/   subgraph disassembly: what a deployed mapping can do, read off the bytes
+  support/  GitHub issue forms, parsed from the YAML the repository ships
+  cockpit/  lodestar-cockpit, the self-hosted half of the Cockpit
   dock/     the Studio session scheme, pinned against the tokens the incumbent minted
-  scuttle/  the anonymous room: tripcodes, moderation, and the broadcast fan-out
   edge/     axum router, budgets, headers, error mapping
   bench/    cold and warm latency, measured apart and reported apart
   mcp/      the MCP server, a second consumer of the published API

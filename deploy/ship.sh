@@ -4,7 +4,8 @@
 #   bash deploy/ship.sh            # the newest successful main build
 #   bash deploy/ship.sh <run-id>   # a specific one, to roll back
 #
-# Artifacts are kept for thirty days, so a rollback target older than that has to be rebuilt.
+# Artifacts are kept for seven days (retention-days in ci.yml), so a rollback target older than that
+# has to be rebuilt.
 #
 # The three-step scp is what this replaces, and the step it removes is the one that goes wrong:
 # `scp target/release/kittiwake` ships whatever happens to be in the working tree, which on a Mac

@@ -9,7 +9,7 @@ which the parity harness excuses these from doing, and finding three faults in t
 
 ## The blocker almost everything shares
 
-`kittiwake` has **no privilege at all** on the tables the Dock and Scuttlebutt read and write.
+`kittiwake` has **no privilege at all** on the tables the Dock reads and writes.
 Checked against the live database, not inferred:
 
 | table | kittiwake has | kittiwake needs |
@@ -17,8 +17,6 @@ Checked against the live database, not inferred:
 | `sync_bounties` | none | SELECT, INSERT, UPDATE |
 | `studio_subgraphs` | none | SELECT, INSERT, UPDATE, DELETE |
 | `studio_deploy_keys` | none | SELECT, INSERT, UPDATE |
-| `scuttlebutt_messages` | none | SELECT, INSERT, UPDATE |
-| `scuttlebutt_bans` | none | SELECT, INSERT |
 | `clickthrough_events` | none | INSERT |
 | `parameter_changes` | SELECT | INSERT |
 
@@ -61,15 +59,15 @@ rights and nothing should: `schema_gaps` checks the schema and refuses to reshap
 
 ### The Dock — nine routes
 
-Grants above, plus `session_secret` in `/etc/kittiwake/config.toml` matching Vercel's
-`SESSION_SECRET` **exactly**, and a `[scuttle]` section for the room. Both are written by:
+Grants above, plus `session_secret` under `[studio]` in `/etc/kittiwake/config.toml`, matching
+Vercel's `SESSION_SECRET` **exactly**. It is written by:
 
 ```sh
 bash deploy/configure-dock.sh
 ```
 
-It reads the four values from the Lodestar project's production environment, writes them straight
-to the box over ssh, and echoes none of them. They travel as the first lines of the remote script's
+It reads the value from the Lodestar project's production environment, writes it straight
+to the box over ssh, and echoes it nowhere. It travels as the first lines of the remote script's
 stdin rather than as arguments, which `ps` would show to every user on the box, or through
 `SendEnv`, which silently sends nothing when the server has no matching `AcceptEnv`.
 
@@ -86,12 +84,6 @@ failure is silent.
 
 `/api/studio/auth` already answers `{"address":null}` signed out, and its shape matches lodestar's
 exactly. The other Dock GETs answer `permission denied` today, which is the table above.
-
-### Scuttlebutt — six routes
-
-Grants above, plus a Scuttlebutt config section: the route answers "Scuttlebutt is not configured"
-today. It reads the same `scuttlebutt_messages` table and the same room, so a cutover keeps the
-history rather than opening an empty one.
 
 ### The disassembler — two of three
 
