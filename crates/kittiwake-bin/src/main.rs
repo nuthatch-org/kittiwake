@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod backup_watch;
+mod envfile;
 mod jobs;
 
 use anyhow::Context;
@@ -48,7 +49,10 @@ impl RunRecorder for PgRecorder {
 
 /// `kittiwake --check-config`: load and validate the configuration exactly as startup does, say what
 /// it would refuse or ignore, and exit without binding or connecting to anything.
-fn check_config() -> anyhow::Result<()> {
+fn check_config(env_file: Option<&str>) -> anyhow::Result<()> {
+    if let Some(file) = env_file {
+        return check_config_with_env_file(file);
+    }
     let config_path =
         std::env::var("KITTIWAKE_CONFIG").unwrap_or_else(|_| "/etc/kittiwake/config.toml".into());
     let (cfg, warnings) = Config::load_with_warnings(&config_path)
@@ -60,10 +64,35 @@ fn check_config() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The check as a child of this binary with the file's variables added, so the load is the one
+/// startup does and this process's own environment is never changed.
+fn check_config_with_env_file(file: &str) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(file).with_context(|| format!("could not read {file}"))?;
+    let parsed = envfile::parse(&text);
+    for w in &parsed.warnings {
+        eprintln!("warning: {file}: {w}");
+    }
+    let status = std::process::Command::new(std::env::current_exe()?)
+        .arg("--check-config")
+        .envs(parsed.vars)
+        .status()
+        .context("could not run the check")?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("--check-config") {
-        return check_config();
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--check-config") {
+        let env_file = match args.get(2).map(String::as_str) {
+            Some("--env-file") => Some(
+                args.get(3)
+                    .map(String::as_str)
+                    .context("--env-file needs a path")?,
+            ),
+            _ => None,
+        };
+        return check_config(env_file);
     }
     kittiwake_obs::init_tracing();
     let metrics = kittiwake_obs::init_metrics().ok();
