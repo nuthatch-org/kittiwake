@@ -3042,10 +3042,15 @@ async fn label_versions(pool: &kittiwake_db::Pool, value: &mut serde_json::Value
 pub struct EnsQuery {
     pub address: Option<String>,
     pub name: Option<String>,
+    /// Up to 100 addresses, comma-separated, answered as one map.
+    pub addresses: Option<String>,
 }
 
+/// The most addresses one `?addresses=` may name.
+const ENS_BATCH_MAX: usize = 100;
+
 /// `GET /api/ens?address=0x…`: the address's primary ENS name, or null. With `?name=` instead, the
-/// address that name resolves to, or null.
+/// address that name resolves to, or null. With `?addresses=a,b,…`, a map of each to its name.
 ///
 /// Cached a day per address, which is the incumbent's key and cadence: a primary name changes
 /// rarely and a mainnet round trip on every avatar render would not be worth it.
@@ -3055,6 +3060,9 @@ pub async fn ens(
     headers: HeaderMap,
     Query(q): Query<EnsQuery>,
 ) -> Result<Response, ErrorResponse> {
+    if let Some(list) = q.addresses.as_deref() {
+        return ens_batch(&st, peer, &headers, list).await;
+    }
     budget!(st, peer, headers);
     if let Some(name) = q.name.as_deref() {
         return ens_forward(&st, name).await;
@@ -3068,26 +3076,31 @@ pub async fn ens(
     let Some(address) = eth_address(raw) else {
         return Ok(axum::Json(serde_json::json!({ "ensName": null })).into_response());
     };
-    let chain = st
-        .read
-        .chain
-        .as_ref()
-        .ok_or_else(|| {
-            ErrorResponse::from(ApiError::Unavailable(
-                "no mainnet RPC is configured, so ENS cannot be read".into(),
-            ))
-        })?
-        .clone();
+    Ok(envelope_root(ens_name(&st, mainnet(&st)?, &address).await?))
+}
 
-    let read = st
-        .read
+fn mainnet(st: &AppState) -> Result<kittiwake_chain::Chain, ErrorResponse> {
+    st.read.chain.clone().ok_or_else(|| {
+        ErrorResponse::from(ApiError::Unavailable(
+            "no mainnet RPC is configured, so ENS cannot be read".into(),
+        ))
+    })
+}
+
+/// One address's primary name, through the cache and single flight every form of the route shares.
+async fn ens_name(
+    st: &AppState,
+    chain: kittiwake_chain::Chain,
+    address: &str,
+) -> Result<kittiwake_read::Read, ApiError> {
+    st.read
         .cached_external_keyed(
             "ens",
-            &address,
+            address,
             std::time::Duration::from_secs(86_400),
             kittiwake_types::ServedFrom::Chain,
             {
-                let address = address.clone();
+                let address = address.to_string();
                 std::sync::Arc::new(move |_| {
                     let chain = chain.clone();
                     let address = address.clone();
@@ -3097,8 +3110,114 @@ pub async fn ens(
                 })
             },
         )
-        .await?;
-    Ok(envelope_root(read))
+        .await
+}
+
+/// `?addresses=`: one read token per ten addresses, so a page of rows costs a few requests' worth
+/// rather than one, and at most eight lookups in flight.
+///
+/// An address whose lookup failed is listed under `unresolved` rather than answered as null, which
+/// would read as "has no name"; only when every lookup fails is the request refused.
+async fn ens_batch(
+    st: &AppState,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    list: &str,
+) -> Result<Response, ErrorResponse> {
+    use futures::StreamExt;
+    let mut asked: Vec<&str> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .collect();
+    asked.sort_unstable();
+    asked.dedup();
+    if asked.is_empty() || asked.len() > ENS_BATCH_MAX {
+        return Err(ApiError::BadRequest(format!(
+            "addresses must name 1 to {ENS_BATCH_MAX} addresses, comma-separated"
+        ))
+        .into());
+    }
+    st.limits.check_n(
+        &st.limits.read,
+        client_ip(peer, headers, st.edge_secret.as_deref()),
+        asked.len().div_ceil(10) as u32,
+    )?;
+
+    let mut names = serde_json::Map::new();
+    let mut lookups = Vec::new();
+    for raw in asked {
+        match eth_address(raw) {
+            Some(address) => lookups.push(address),
+            // Not an address, so it has no name, as the single form says.
+            None => {
+                names.insert(raw.to_string(), serde_json::Value::Null);
+            }
+        }
+    }
+    lookups.sort_unstable();
+    lookups.dedup();
+    let chain = if lookups.is_empty() {
+        None
+    } else {
+        Some(mainnet(st)?)
+    };
+    let answers: Vec<(String, Result<kittiwake_read::Read, ApiError>)> =
+        futures::stream::iter(lookups.into_iter().map(|address| {
+            let chain = chain.clone().expect("a chain whenever there is a lookup");
+            async move {
+                let read = ens_name(st, chain, &address).await;
+                (address, read)
+            }
+        }))
+        .buffer_unordered(8)
+        .collect()
+        .await;
+
+    let (mut unresolved, mut first_error) = (Vec::new(), None);
+    let mut meta: Option<kittiwake_types::Meta> = None;
+    for (address, answer) in answers {
+        match answer {
+            Ok(read) => {
+                names.insert(
+                    address,
+                    read.entry.value.get("ensName").cloned().unwrap_or_default(),
+                );
+                // The oldest answer stands for the batch, stale if any of it is.
+                let m = meta.get_or_insert_with(|| read.meta.clone());
+                m.stale |= read.meta.stale;
+                if read.meta.age_seconds > m.age_seconds {
+                    m.age_seconds = read.meta.age_seconds;
+                    m.served_from = read.meta.served_from;
+                }
+            }
+            Err(e) => {
+                unresolved.push(address);
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    if meta.is_none()
+        && let Some(e) = first_error
+    {
+        return Err(e.into());
+    }
+    unresolved.sort_unstable();
+    let meta = meta.unwrap_or(kittiwake_types::Meta {
+        provenance: Default::default(),
+        served_from: kittiwake_types::ServedFrom::Cache,
+        stale: false,
+        age_seconds: 0,
+    });
+    let mut resp = axum::Json(serde_json::json!({
+        "ensNames": names,
+        "unresolved": unresolved,
+        "provenance": &meta,
+    }))
+    .into_response();
+    crate::provenance_headers(resp.headers_mut(), &meta);
+    crate::no_store(resp.headers_mut());
+    Ok(resp)
 }
 
 async fn ens_forward(st: &AppState, raw: &str) -> Result<Response, ErrorResponse> {
