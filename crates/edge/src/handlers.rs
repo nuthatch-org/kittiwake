@@ -3194,6 +3194,9 @@ pub struct PresentPoi {
 /// Both identifiers are interpolated into the mutation below, so both are validated to character
 /// sets that cannot contain a quote. Anything looser and a caller could close the string and queue
 /// actions of their own choosing on somebody's agent.
+///
+/// Only a signed-in caller may ask, and this box's own agent answers only the addresses its
+/// config names as operators: otherwise the route would lend the operator's credential to anyone.
 pub async fn present_poi(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -3202,6 +3205,7 @@ pub async fn present_poi(
 ) -> Result<Response, ErrorResponse> {
     let caller = client_ip(peer, &headers, st.edge_secret.as_deref());
     st.limits.check(&st.limits.mutation, caller)?;
+    let address = session(&st, &headers)?;
 
     let (Some(deployment), Some(allocation)) = (
         cid_v0(&body.deployment_id),
@@ -3215,6 +3219,11 @@ pub async fn present_poi(
     };
 
     let agent = st.indexer_agent.as_ref();
+    if body.agent_url.is_none()
+        && agent.is_some_and(|a| !a.operators.iter().any(|o| o.eq_ignore_ascii_case(&address)))
+    {
+        return Err(ApiError::Unauthorized.into());
+    }
     let (target, client) = match body.agent_url.as_deref() {
         Some(url) => {
             kittiwake_ssrf::check_resolved(url).await.map_err(|_| {

@@ -112,3 +112,5 @@ exempt_ips = []
 # [indexer_agent]
 # url = "http://127.0.0.1:18000"
 # token = "user:password"
+# The Dock addresses that may queue on this agent. Without them only a caller's own agent is reached.
+# operators = ["0x..."]
