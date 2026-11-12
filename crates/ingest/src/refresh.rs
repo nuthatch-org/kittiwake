@@ -286,7 +286,7 @@ pub async fn refresh(
         let effective_cut = rw::effective_cut(
             reward_cut_ppm,
             self_stake - locked,
-            delegated,
+            delegated - thawing,
             delegation_ratio,
         )
         .unwrap_or(reward_cut_ppm / 1_000_000.0);
