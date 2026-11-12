@@ -67,12 +67,28 @@ impl Limits {
         }
     }
 
+    /// Which of the budgets a limiter is, for the label on the refusal counter.
+    fn budget_name(&self, limiter: &Limiter) -> &'static str {
+        if std::ptr::eq(limiter, &self.sql) {
+            "sql"
+        } else if std::ptr::eq(limiter, &self.read) {
+            "read"
+        } else if std::ptr::eq(limiter, &self.mutation) {
+            "mutation"
+        } else if std::ptr::eq(limiter, &self.report) {
+            "report"
+        } else {
+            "other"
+        }
+    }
+
     pub(crate) fn check(&self, limiter: &Limiter, ip: IpAddr) -> Result<(), ApiError> {
         if self.exempt.contains(&ip) {
             return Ok(());
         }
         limiter.check_key(&ip).map_err(|not_until| {
-            metrics::counter!("rate_limited_total").increment(1);
+            metrics::counter!("rate_limited_total", "budget" => self.budget_name(limiter))
+                .increment(1);
             ApiError::RateLimited {
                 retry_after: not_until
                     .wait_time_from(DefaultClock::default().now())
@@ -281,6 +297,43 @@ impl IntoResponse for ErrorResponse {
         no_store(resp.headers_mut());
         resp
     }
+}
+
+/// One log line and one histogram sample per request.
+///
+/// Labelled by the route template (`/api/indexer/{address}`), never the path asked, so the series
+/// count is bounded by the router and no address reaches a label or a log line. A path the router
+/// did not match is `unmatched`.
+async fn observe(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let started = std::time::Instant::now();
+    let method = req.method().clone();
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map_or("unmatched", |m| m.as_str())
+        .to_string();
+    let resp = next.run(req).await;
+    let elapsed = started.elapsed();
+    let status = resp.status().as_u16();
+    metrics::histogram!(
+        "http_request_duration_seconds",
+        "route" => route.clone(),
+        "method" => method.to_string(),
+        "status" => status.to_string(),
+    )
+    .record(elapsed.as_secs_f64());
+    // The probes run every few seconds and would drown the lines worth reading.
+    if matches!(route.as_str(), "/health" | "/ready" | "/api/health") {
+        return resp;
+    }
+    tracing::info!(
+        %method,
+        route = %route,
+        status,
+        latency_ms = elapsed.as_millis() as u64,
+        "request"
+    );
+    resp
 }
 
 /// An unknown path, in the envelope every other error uses.
@@ -1314,6 +1367,7 @@ pub fn router(state: AppState) -> Router {
         .merge(directory)
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
+        .layer(axum::middleware::from_fn(observe))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(tower_http::catch_panic::CatchPanicLayer::new());
 
@@ -2326,7 +2380,7 @@ mod envelope_tests {
     use super::*;
     use tower::ServiceExt;
 
-    fn app(cors: bool) -> Router {
+    pub(super) fn app(cors: bool) -> Router {
         let gate =
             kittiwake_nest::NestGate::new(kittiwake_nest::NestConfig::new("http://127.0.0.1:9"))
                 .unwrap();
@@ -2477,6 +2531,67 @@ mod envelope_tests {
         assert!(
             !exposed.contains("x-kittiwake-source"),
             "never set: {exposed}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod observability_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    fn recorder() -> metrics_exporter_prometheus::PrometheusRecorder {
+        metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder()
+    }
+
+    #[tokio::test]
+    async fn a_request_is_timed_under_its_route_template_and_status() {
+        let rec = recorder();
+        let _guard = metrics::set_default_local_recorder(&rec);
+        let app = envelope_tests::app(false);
+        for uri in ["/api/support/abc", "/api/support/def", "/api/no-such-route"] {
+            let req = axum::http::Request::get(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            app.clone().oneshot(req).await.unwrap();
+        }
+        let text = rec.handle().render();
+        let line = |needle: &str| {
+            text.lines()
+                .any(|l| l.starts_with("http_request_duration_seconds_count") && l.contains(needle))
+        };
+        assert!(
+            line(r#"route="/api/support/{number}""#) && line(r#"status="400""#),
+            "{text}"
+        );
+        assert!(
+            line(r#"route="unmatched""#) && line(r#"status="404""#),
+            "{text}"
+        );
+        assert!(
+            !text.contains("abc") && !text.contains("def"),
+            "a raw path reached a label: {text}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_says_which_budget_refused() {
+        let rec = recorder();
+        let _guard = metrics::set_default_local_recorder(&rec);
+        let limits = Limits::new(1, 1, 1, Vec::new());
+        let ip: IpAddr = [203, 0, 113, 7].into();
+        for _ in 0..50 {
+            let _ = limits.check(&limits.sql, ip);
+            let _ = limits.check(&limits.read, ip);
+        }
+        let text = rec.handle().render();
+        assert!(
+            text.contains(r#"rate_limited_total{budget="sql"}"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"rate_limited_total{budget="read"}"#),
+            "{text}"
         );
     }
 }
