@@ -14,8 +14,8 @@
 # So this copies. It does not generate. `verify-session` at the end is what proves the copy took.
 #
 # It also REMOVES any `[scuttle]` section it finds. Scuttlebutt is gone, the binary no longer reads
-# that section, and TOML parsing here is not strict - so four unread secrets would otherwise sit in
-# the config indefinitely, looking live to anyone who opened it.
+# that section (it only warns about it) - so four unread secrets would otherwise sit in the config
+# indefinitely, looking live to anyone who opened it.
 set -euo pipefail
 
 HOST=${HOST:-root@167.235.29.213}

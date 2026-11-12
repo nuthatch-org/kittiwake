@@ -7,12 +7,13 @@
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{ConnectInfo, OriginalUri, Path, Query, State};
+use axum::extract::{ConnectInfo, OriginalUri, State};
 use axum::http::{HeaderMap, HeaderValue, Method, header};
 use axum::response::{IntoResponse, Response};
 use kittiwake_read::routes;
 use kittiwake_types::ApiError;
 
+use crate::extract::{Json, Path, Query};
 use crate::{AppState, ErrorResponse, client_ip, envelope, envelope_root};
 
 fn dock(st: &AppState) -> Result<&crate::Studio, ErrorResponse> {
@@ -1288,7 +1289,7 @@ pub async fn studio_auth_get(State(st): State<AppState>, headers: HeaderMap) -> 
 
 pub async fn studio_auth_post(
     State(st): State<AppState>,
-    axum::Json(body): axum::Json<serde_json::Value>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
     let address = body
         .get("address")
@@ -1356,7 +1357,7 @@ pub async fn studio_subgraphs_get(
 pub async fn studio_subgraphs_post(
     State(st): State<AppState>,
     headers: HeaderMap,
-    axum::Json(body): axum::Json<serde_json::Value>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
     let owner = session(&st, &headers).await?;
     let slug = body
@@ -1390,7 +1391,7 @@ pub async fn studio_subgraph_patch(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    axum::Json(body): axum::Json<serde_json::Value>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
     let owner = session(&st, &headers).await?;
     let id = id
@@ -1561,7 +1562,7 @@ fn subgraph_metadata_docs(body: &serde_json::Value) -> (serde_json::Value, serde
 pub async fn studio_metadata_post(
     State(st): State<AppState>,
     headers: HeaderMap,
-    axum::Json(body): axum::Json<serde_json::Value>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
     session(&st, &headers).await?;
     let (subgraph_doc, version_doc) = subgraph_metadata_docs(&body);
@@ -1630,7 +1631,7 @@ fn bearer(headers: &HeaderMap) -> Result<&str, ErrorResponse> {
 pub async fn studio_node_post(
     State(st): State<AppState>,
     headers: HeaderMap,
-    axum::Json(body): axum::Json<serde_json::Value>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
     let owner =
         kittiwake_db::deploy_key_owner(pool(&st)?, &kittiwake_dock::hash_key(bearer(&headers)?))
@@ -1772,7 +1773,7 @@ pub async fn studio_bounties_get(
 pub async fn studio_bounties_post(
     State(st): State<AppState>,
     headers: HeaderMap,
-    axum::Json(body): axum::Json<serde_json::Value>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
     let owner = session(&st, &headers).await?;
     let deployment = body
@@ -2324,7 +2325,7 @@ pub async fn subgraph_names(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    axum::Json(body): axum::Json<NamesBody>,
+    Json(body): Json<NamesBody>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
     let pool = st
@@ -3262,7 +3263,7 @@ pub async fn present_poi(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    axum::Json(body): axum::Json<PresentPoi>,
+    Json(body): Json<PresentPoi>,
 ) -> Result<Response, ErrorResponse> {
     let caller = client_ip(peer, &headers, st.edge_secret.as_deref());
     st.limits.check(&st.limits.mutation, caller)?;
@@ -3435,7 +3436,7 @@ pub async fn data_service_query(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    axum::Json(body): axum::Json<SampleRequest>,
+    Json(body): Json<SampleRequest>,
 ) -> Result<Response, ErrorResponse> {
     let caller = client_ip(peer, &headers, st.edge_secret.as_deref());
     st.limits.check(&st.limits.mutation, caller)?;

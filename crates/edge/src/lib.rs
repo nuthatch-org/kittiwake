@@ -10,6 +10,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod extract;
 pub mod handlers;
 pub mod openapi;
 pub mod telegram;
@@ -19,6 +20,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use extract::Json;
 use governor::clock::{Clock, DefaultClock};
 use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
@@ -72,18 +74,35 @@ impl Limits {
         }
     }
 
+    /// Which of the budgets a limiter is, for the label on the refusal counter.
+    fn budget_name(&self, limiter: &Limiter) -> &'static str {
+        if std::ptr::eq(limiter, &self.sql) {
+            "sql"
+        } else if std::ptr::eq(limiter, &self.read) {
+            "read"
+        } else if std::ptr::eq(limiter, &self.mutation) {
+            "mutation"
+        } else if std::ptr::eq(limiter, &self.report) {
+            "report"
+        } else {
+            "other"
+        }
+    }
+
     pub(crate) fn check(&self, limiter: &Limiter, ip: IpAddr) -> Result<(), ApiError> {
         if self.exempt.contains(&ip) {
             return Ok(());
         }
-        limiter.check_key(&bucket(ip)).map_err(refused)
+        limiter
+            .check_key(&bucket(ip))
+            .map_err(|n| refused(n, self.budget_name(limiter)))
     }
 
     /// Spend from a deploy key's upload budget, keyed by the key's hash.
     pub(crate) fn check_deploy_key(&self, key_hash: &str) -> Result<(), ApiError> {
         self.deploy
             .check_key(&key_hash.to_string())
-            .map_err(refused)
+            .map_err(|n| refused(n, "deploy"))
     }
 
     /// Drop the state of callers who have not been seen recently, so a long uptime against a wide
@@ -97,8 +116,11 @@ impl Limits {
     }
 }
 
-fn refused(not_until: governor::NotUntil<<DefaultClock as Clock>::Instant>) -> ApiError {
-    metrics::counter!("rate_limited_total").increment(1);
+fn refused(
+    not_until: governor::NotUntil<<DefaultClock as Clock>::Instant>,
+    budget: &'static str,
+) -> ApiError {
+    metrics::counter!("rate_limited_total", "budget" => budget).increment(1);
     ApiError::RateLimited {
         retry_after: not_until
             .wait_time_from(DefaultClock::default().now())
@@ -311,6 +333,62 @@ impl IntoResponse for ErrorResponse {
     }
 }
 
+/// One log line and one histogram sample per request.
+///
+/// Labelled by the route template (`/api/indexer/{address}`), never the path asked, so the series
+/// count is bounded by the router and no address reaches a label or a log line. A path the router
+/// did not match is `unmatched`.
+async fn observe(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let started = std::time::Instant::now();
+    let method = req.method().clone();
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map_or("unmatched", |m| m.as_str())
+        .to_string();
+    let resp = next.run(req).await;
+    let elapsed = started.elapsed();
+    let status = resp.status().as_u16();
+    metrics::histogram!(
+        "http_request_duration_seconds",
+        "route" => route.clone(),
+        "method" => method.to_string(),
+        "status" => status.to_string(),
+    )
+    .record(elapsed.as_secs_f64());
+    // The probes run every few seconds and would drown the lines worth reading.
+    if matches!(route.as_str(), "/health" | "/ready" | "/api/health") {
+        return resp;
+    }
+    tracing::info!(
+        %method,
+        route = %route,
+        status,
+        latency_ms = elapsed.as_millis() as u64,
+        "request"
+    );
+    resp
+}
+
+/// An unknown path, in the envelope every other error uses.
+async fn not_found() -> ErrorResponse {
+    ApiError::NotFound.into()
+}
+
+/// A known path asked with a method it does not bind. `Allow` is added by the router itself.
+async fn method_not_allowed() -> Response {
+    let mut resp = (
+        StatusCode::METHOD_NOT_ALLOWED,
+        axum::Json(serde_json::json!({
+            "error": "method_not_allowed",
+            "message": "method not allowed",
+        })),
+    )
+        .into_response();
+    no_store(resp.headers_mut());
+    resp
+}
+
 /// Wrapper so `ApiError` can implement `IntoResponse` without owning an axum dependency in types.
 pub struct ErrorResponse(pub ApiError);
 
@@ -484,7 +562,7 @@ async fn post_sql_query(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    axum::Json(body): axum::Json<SqlQuery>,
+    Json(body): Json<SqlQuery>,
 ) -> Result<Response, ErrorResponse> {
     st.limits.check(
         &st.limits.sql,
@@ -547,7 +625,7 @@ async fn post_sql_named(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    axum::Json(body): axum::Json<NamedCall>,
+    Json(body): Json<NamedCall>,
 ) -> Result<Response, ErrorResponse> {
     st.limits.check(
         &st.limits.sql,
@@ -619,7 +697,7 @@ async fn post_sql_receipt(
     State(st): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    axum::Json(body): axum::Json<NamedCall>,
+    Json(body): Json<NamedCall>,
 ) -> Result<Response, ErrorResponse> {
     st.limits.check(
         &st.limits.sql,
@@ -1163,8 +1241,14 @@ fn cors_layer(origins: &[String], patterns: &[String]) -> Option<tower_http::cor
             // Provenance is the point of this API: a caller that cannot read the envelope's
             // headers cannot tell a sealed answer from a stale one.
             .expose_headers([
-                axum::http::HeaderName::from_static("x-kittiwake-source"),
+                axum::http::HeaderName::from_static("x-kittiwake-served-from"),
+                axum::http::HeaderName::from_static("x-kittiwake-stale"),
                 axum::http::HeaderName::from_static("x-kittiwake-age"),
+                axum::http::HeaderName::from_static("x-kittiwake-as-of"),
+                axum::http::HeaderName::from_static("x-kittiwake-sealed-through"),
+                axum::http::HeaderName::from_static("x-kittiwake-degraded"),
+                // Not CORS-safelisted, and the only way a browser learns how long to back off.
+                header::RETRY_AFTER,
             ])
             .max_age(std::time::Duration::from_secs(600)),
     )
@@ -1409,6 +1493,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/developer-activity", get(handlers::developer_activity))
         .merge(directory)
         .merge(dock)
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
+        .layer(axum::middleware::from_fn(observe))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(tower_http::catch_panic::CatchPanicLayer::new());
 
@@ -1553,7 +1640,11 @@ mod tests {
         let body = axum::body::to_bytes(public.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert!(body.is_empty(), "{body:?}");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("not_found") && !text.contains("# TYPE"),
+            "{text}"
+        );
 
         let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
             .build_recorder()
@@ -1802,7 +1893,7 @@ mod tests {
                 State(st.clone()),
                 ConnectInfo(([127, 0, 0, 1], 1).into()),
                 headers,
-                axum::Json(crate::handlers::PresentPoi {
+                crate::extract::Json(crate::handlers::PresentPoi {
                     deployment_id: "QmStfa6zwPUzKHyGrgdNMh8rgbc91sgvmskidBSujG92FR".into(),
                     allocation_id: "0xb43b2cccceada5292732a8c58ae134adefce09bb".into(),
                     agent_url: None,
@@ -1871,7 +1962,7 @@ mod tests {
                 "studio_session={}",
                 kittiwake_dock::create_session(&dock_secret(), operator, now)
             )),
-            axum::Json(crate::handlers::PresentPoi {
+            crate::extract::Json(crate::handlers::PresentPoi {
                 deployment_id: "QmStfa6zwPUzKHyGrgdNMh8rgbc91sgvmskidBSujG92FR".into(),
                 allocation_id: "0xb43b2cccceada5292732a8c58ae134adefce09bb".into(),
                 agent_url: None,
@@ -2265,7 +2356,7 @@ mod tests {
         let refused = crate::handlers::studio_bounties_post(
             State(st),
             headers,
-            axum::Json(serde_json::json!({
+            crate::extract::Json(serde_json::json!({
                 "deployment_id": "QmStfa6zwPUzKHyGrgdNMh8rgbc91sgvmskidBSujG92FR",
                 "amount_grt": "1e300",
             })),
@@ -2760,6 +2851,227 @@ mod readiness_tests {
 
         // And the message is not what decides it: this one says 410 and is not a retirement.
         assert!(!retired(&NestError::Transport("410 blocks behind".into())));
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    pub(super) fn app(cors: bool) -> Router {
+        let gate =
+            kittiwake_nest::NestGate::new(kittiwake_nest::NestConfig::new("http://127.0.0.1:9"))
+                .unwrap();
+        let read = kittiwake_read::ReadCtx::new(gate, kittiwake_cache::Store::new(64), 1);
+        let st = state(
+            Limits::new(1000, 1000, 1000, Vec::new()),
+            None,
+            read,
+            None,
+            None,
+            kittiwake_ext::Ipfs::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let st = if cors {
+            st.with_cors(
+                Some(vec!["https://www.lodestar-dashboard.com".into()]),
+                None,
+            )
+        } else {
+            st
+        };
+        let peer: SocketAddr = "203.0.113.9:4000".parse().unwrap();
+        router(st).layer(axum::extract::connect_info::MockConnectInfo(peer))
+    }
+
+    async fn send(app: Router, req: axum::http::Request<axum::body::Body>) -> Response {
+        app.oneshot(req).await.unwrap()
+    }
+
+    /// Status, and the `error` code of a body that must be the JSON envelope.
+    async fn envelope_of(resp: Response) -> (StatusCode, String) {
+        let status = resp.status();
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(ct.starts_with("application/json"), "{status} had {ct:?}");
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("a JSON body");
+        assert!(body["message"].is_string(), "{body}");
+        (status, body["error"].as_str().unwrap().to_string())
+    }
+
+    fn req(
+        method: &str,
+        uri: &str,
+        ct: Option<&str>,
+        body: &str,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut b = axum::http::Request::builder().method(method).uri(uri);
+        if let Some(ct) = ct {
+            b = b.header(header::CONTENT_TYPE, ct);
+        }
+        b.body(axum::body::Body::from(body.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_malformed_query_string_is_a_json_bad_request() {
+        let resp = send(app(false), req("GET", "/api/indexers?first=abc", None, "")).await;
+        assert_eq!(
+            envelope_of(resp).await,
+            (StatusCode::BAD_REQUEST, "bad_request".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_path_parameter_is_a_json_bad_request() {
+        let resp = send(app(false), req("GET", "/api/support/abc", None, "")).await;
+        assert_eq!(
+            envelope_of(resp).await,
+            (StatusCode::BAD_REQUEST, "bad_request".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_of_the_wrong_type_or_shape_is_a_json_bad_request() {
+        for (ct, body) in [
+            ("text/plain", "hello"),
+            ("application/json", r#"{"dataset":1}"#),
+        ] {
+            let resp = send(app(false), req("POST", "/api/sql/query", Some(ct), body)).await;
+            assert_eq!(
+                envelope_of(resp).await,
+                (StatusCode::BAD_REQUEST, "bad_request".into()),
+                "{ct} {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_route_is_a_json_not_found() {
+        let resp = send(app(false), req("GET", "/api/no-such-route", None, "")).await;
+        assert_eq!(
+            envelope_of(resp).await,
+            (StatusCode::NOT_FOUND, "not_found".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_wrong_method_is_a_json_405_that_still_says_what_is_allowed() {
+        let resp = send(app(false), req("GET", "/api/subgraph-names", None, "")).await;
+        assert!(
+            resp.headers().contains_key(header::ALLOW),
+            "{:?}",
+            resp.headers()
+        );
+        assert_eq!(
+            envelope_of(resp).await,
+            (StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed".into())
+        );
+    }
+
+    /// A browser hides every response header outside this list from the page's script.
+    #[tokio::test]
+    async fn cors_exposes_the_headers_the_service_actually_sets() {
+        let request = axum::http::Request::builder()
+            .uri("/api/no-such-route")
+            .header(header::ORIGIN, "https://www.lodestar-dashboard.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = send(app(true), request).await;
+        let exposed = resp.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS]
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        for name in [
+            "x-kittiwake-served-from",
+            "x-kittiwake-stale",
+            "x-kittiwake-age",
+            "x-kittiwake-as-of",
+            "x-kittiwake-sealed-through",
+            "x-kittiwake-degraded",
+            "retry-after",
+        ] {
+            assert!(
+                exposed.split(',').any(|h| h.trim() == name),
+                "{name} in {exposed}"
+            );
+        }
+        assert!(
+            !exposed.contains("x-kittiwake-source"),
+            "never set: {exposed}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod observability_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    fn recorder() -> metrics_exporter_prometheus::PrometheusRecorder {
+        metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder()
+    }
+
+    #[tokio::test]
+    async fn a_request_is_timed_under_its_route_template_and_status() {
+        let rec = recorder();
+        let _guard = metrics::set_default_local_recorder(&rec);
+        let app = envelope_tests::app(false);
+        for uri in ["/api/support/abc", "/api/support/def", "/api/no-such-route"] {
+            let req = axum::http::Request::get(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            app.clone().oneshot(req).await.unwrap();
+        }
+        let text = rec.handle().render();
+        let line = |needle: &str| {
+            text.lines()
+                .any(|l| l.starts_with("http_request_duration_seconds_count") && l.contains(needle))
+        };
+        assert!(
+            line(r#"route="/api/support/{number}""#) && line(r#"status="400""#),
+            "{text}"
+        );
+        assert!(
+            line(r#"route="unmatched""#) && line(r#"status="404""#),
+            "{text}"
+        );
+        assert!(
+            !text.contains("abc") && !text.contains("def"),
+            "a raw path reached a label: {text}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_says_which_budget_refused() {
+        let rec = recorder();
+        let _guard = metrics::set_default_local_recorder(&rec);
+        let limits = Limits::new(1, 1, 1, Vec::new());
+        let ip: IpAddr = [203, 0, 113, 7].into();
+        for _ in 0..50 {
+            let _ = limits.check(&limits.sql, ip);
+            let _ = limits.check(&limits.read, ip);
+        }
+        let text = rec.handle().render();
+        assert!(
+            text.contains(r#"rate_limited_total{budget="sql"}"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"rate_limited_total{budget="read"}"#),
+            "{text}"
+        );
     }
 }
 
