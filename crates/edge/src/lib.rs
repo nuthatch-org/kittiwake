@@ -1087,8 +1087,14 @@ fn cors_layer(origins: &[String], patterns: &[String]) -> Option<tower_http::cor
             // Provenance is the point of this API: a caller that cannot read the envelope's
             // headers cannot tell a sealed answer from a stale one.
             .expose_headers([
-                axum::http::HeaderName::from_static("x-kittiwake-source"),
+                axum::http::HeaderName::from_static("x-kittiwake-served-from"),
+                axum::http::HeaderName::from_static("x-kittiwake-stale"),
                 axum::http::HeaderName::from_static("x-kittiwake-age"),
+                axum::http::HeaderName::from_static("x-kittiwake-as-of"),
+                axum::http::HeaderName::from_static("x-kittiwake-sealed-through"),
+                axum::http::HeaderName::from_static("x-kittiwake-degraded"),
+                // Not CORS-safelisted, and the only way a browser learns how long to back off.
+                header::RETRY_AFTER,
             ])
             .max_age(std::time::Duration::from_secs(600)),
     )
@@ -2438,6 +2444,39 @@ mod envelope_tests {
         assert_eq!(
             envelope_of(resp).await,
             (StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed".into())
+        );
+    }
+
+    /// A browser hides every response header outside this list from the page's script.
+    #[tokio::test]
+    async fn cors_exposes_the_headers_the_service_actually_sets() {
+        let request = axum::http::Request::builder()
+            .uri("/api/no-such-route")
+            .header(header::ORIGIN, "https://www.lodestar-dashboard.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = send(app(true), request).await;
+        let exposed = resp.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS]
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        for name in [
+            "x-kittiwake-served-from",
+            "x-kittiwake-stale",
+            "x-kittiwake-age",
+            "x-kittiwake-as-of",
+            "x-kittiwake-sealed-through",
+            "x-kittiwake-degraded",
+            "retry-after",
+        ] {
+            assert!(
+                exposed.split(',').any(|h| h.trim() == name),
+                "{name} in {exposed}"
+            );
+        }
+        assert!(
+            !exposed.contains("x-kittiwake-source"),
+            "never set: {exposed}"
         );
     }
 }
