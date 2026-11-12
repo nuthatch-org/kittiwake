@@ -208,9 +208,9 @@ impl NestConfig {
         let mut permits = HashMap::new();
         for n in NestId::ALL {
             base_paths.insert(n, n.default_base_path().to_string());
-            // The protocol nest runs with NUTHATCH_SQL_MAX_CONCURRENCY=4 by drop-in; the rest
-            // admit two. Raising these is a change to the nest, never to us.
-            permits.insert(n, if n == NestId::Alloc { 4 } else { 2 });
+            // Every nest admits two, the allocations nest included since its Burrmill switch.
+            // Raising these is a change to the nest, never to us.
+            permits.insert(n, 2);
         }
         Self {
             origin: origin.into().trim_end_matches('/').to_string(),
@@ -1232,7 +1232,7 @@ mod metric_tests {
         }
         // The cap the gate was built with, visible without reading the box's config.
         assert!(
-            rendered.contains("nest_permits{nest=\"alloc\"} 4"),
+            rendered.contains("nest_permits{nest=\"alloc\"} 2"),
             "{rendered}"
         );
     }
