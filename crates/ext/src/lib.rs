@@ -1076,7 +1076,7 @@ async fn read_capped(
         return Err(format!("Artifact {cid} is {len} bytes (>{cap} cap)"));
     }
     let mut out = Vec::new();
-    while let Some(chunk) = res.chunk().await.map_err(|e| e.to_string())? {
+    while let Some(chunk) = res.chunk().await.map_err(|e| e.without_url().to_string())? {
         if out.len() + chunk.len() > cap {
             return Err(format!("Artifact {cid} is over the {cap}-byte cap"));
         }
@@ -1125,7 +1125,7 @@ impl Ipfs {
                 if e.is_timeout() {
                     "timed out".to_string()
                 } else {
-                    e.to_string()
+                    e.without_url().to_string()
                 }
             })?;
         if !res.status().is_success() {
@@ -1159,7 +1159,7 @@ impl Ipfs {
                 if e.is_timeout() {
                     "timed out".to_string()
                 } else {
-                    e.to_string()
+                    e.without_url().to_string()
                 }
             })?;
         if !res.status().is_success() {
@@ -1189,7 +1189,7 @@ impl Ipfs {
     ) -> Result<String, String> {
         let part = reqwest::multipart::Part::bytes(bytes)
             .mime_str(mime)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.without_url().to_string())?
             .file_name(file_name);
         let form = reqwest::multipart::Form::new().part("file", part);
         let response: serde_json::Value = self
@@ -1199,12 +1199,12 @@ impl Ipfs {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.without_url().to_string())?
             .error_for_status()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.without_url().to_string())?
             .json()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.without_url().to_string())?;
         response
             .get("Hash")
             .and_then(|v| v.as_str())
@@ -1233,7 +1233,10 @@ impl Ipfs {
         if let Some(ct) = content_type {
             request = request.header("content-type", ct);
         }
-        let response = request.send().await.map_err(|e| e.to_string())?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| e.without_url().to_string())?;
         let status = response.status().as_u16();
         let ct = response
             .headers()

@@ -21,15 +21,16 @@ fn dock(st: &AppState) -> Result<&crate::Studio, ErrorResponse> {
         .ok_or_else(|| ApiError::Unavailable("the Dock is not configured".into()).into())
 }
 
-/// The address a request's session vouches for, taking only what it decides on.
+/// The address a request's session vouches for and when it was issued, taking only what it
+/// decides on.
 ///
 /// Split out from [`session`] so the refusals are testable without an `AppState`: the Dock's whole
 /// authorisation is this cookie, and every owner-scoped route is exactly as strong as it is.
-pub(crate) fn session_address(
+pub(crate) fn session_claim(
     secret: &kittiwake_dock::Secret,
     headers: &HeaderMap,
     now: i64,
-) -> Option<String> {
+) -> Option<(String, i64)> {
     let token = headers
         .get(header::COOKIE)
         .and_then(|h| h.to_str().ok())
@@ -38,11 +39,27 @@ pub(crate) fn session_address(
                 .map(str::trim)
                 .find_map(|part| part.strip_prefix("studio_session="))
         })?;
-    kittiwake_dock::parse_session(secret, token, now).ok()
+    kittiwake_dock::parse_session_issued(secret, token, now).ok()
 }
 
-fn session(st: &AppState, headers: &HeaderMap) -> Result<String, ErrorResponse> {
-    session_address(&dock(st)?.secret, headers, now()).ok_or_else(|| ApiError::Unauthorized.into())
+/// A session issued at or before its address last signed out is over, wherever its cookie went.
+pub(crate) fn ended_by_sign_out(issued_at: i64, signed_out_at: i64) -> bool {
+    issued_at <= signed_out_at
+}
+
+/// Without a database nothing can have signed out, so there is nothing to consult.
+async fn session(st: &AppState, headers: &HeaderMap) -> Result<String, ErrorResponse> {
+    let (address, issued_at) = session_claim(&dock(st)?.secret, headers, now())
+        .ok_or_else(|| ErrorResponse::from(ApiError::Unauthorized))?;
+    if let Some(pool) = st.pool.as_ref()
+        && kittiwake_db::signed_out_at(pool, &address)
+            .await
+            .map_err(db_err)?
+            .is_some_and(|at| ended_by_sign_out(issued_at, at))
+    {
+        return Err(ApiError::Unauthorized.into());
+    }
+    Ok(address)
 }
 
 fn pool(st: &AppState) -> Result<&kittiwake_db::Pool, ErrorResponse> {
@@ -918,8 +935,13 @@ pub async fn delegation_flows(
     Query(q): Query<DaysQuery>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
-    let since = now() - q.days.clamp(1, 3650) * 86_400;
+    let since = days_back(now(), q.days.clamp(1, 3650));
     Ok(envelope(routes::delegation_flows(&st.read, since).await?))
+}
+
+/// Floored to the hour, as [`thirty_days_back`] is: the window is part of the cache key.
+fn days_back(now: i64, days: i64) -> i64 {
+    now - now.rem_euclid(3600) - days * 86_400
 }
 
 pub async fn developer_activity(
@@ -929,7 +951,7 @@ pub async fn developer_activity(
     Query(q): Query<DaysQuery>,
 ) -> Result<Response, ErrorResponse> {
     budget!(st, peer, headers);
-    let cutoff = now() - q.days.clamp(7, 3650) * 86_400;
+    let cutoff = days_back(now(), q.days.clamp(7, 3650));
     Ok(envelope(
         routes::developer_activity(&st.read, cutoff).await?,
     ))
@@ -1252,7 +1274,7 @@ pub async fn indexing_status(
 // ---------------------------------------------------------------------------------------------
 
 pub async fn studio_auth_get(State(st): State<AppState>, headers: HeaderMap) -> Response {
-    let address = session(&st, &headers).ok();
+    let address = session(&st, &headers).await.ok();
     let mut body = serde_json::json!({"address": address});
     if let Some(studio) = &st.studio {
         let issued_at = now();
@@ -1300,7 +1322,15 @@ pub async fn studio_auth_post(
     Ok(r)
 }
 
-pub async fn studio_auth_delete() -> Response {
+pub async fn studio_auth_delete(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    // The cookie is cleared whatever happens here: a sign-out the browser cannot complete is worse
+    // than one the server could not record.
+    if let (Some(studio), Some(pool)) = (&st.studio, &st.pool)
+        && let Some((address, _)) = session_claim(&studio.secret, &headers, now())
+        && let Err(e) = kittiwake_db::record_sign_out(pool, &address, now()).await
+    {
+        tracing::error!(error = %e, "a Dock sign-out could not be recorded; the session stays valid until it expires");
+    }
     let mut r = axum::Json(serde_json::json!({"ok": true})).into_response();
     r.headers_mut().insert(
         header::SET_COOKIE,
@@ -1316,7 +1346,7 @@ pub async fn studio_subgraphs_get(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ErrorResponse> {
-    let owner = session(&st, &headers)?;
+    let owner = session(&st, &headers).await?;
     let rows = kittiwake_db::list_studio_subgraphs(pool(&st)?, &owner)
         .await
         .map_err(db_err)?;
@@ -1328,7 +1358,7 @@ pub async fn studio_subgraphs_post(
     headers: HeaderMap,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
-    let owner = session(&st, &headers)?;
+    let owner = session(&st, &headers).await?;
     let slug = body
         .get("slug")
         .and_then(|v| v.as_str())
@@ -1362,7 +1392,7 @@ pub async fn studio_subgraph_patch(
     Path(id): Path<String>,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
-    let owner = session(&st, &headers)?;
+    let owner = session(&st, &headers).await?;
     let id = id
         .parse::<i32>()
         .map_err(|_| ApiError::BadRequest("Invalid id".into()))?;
@@ -1389,7 +1419,7 @@ pub async fn studio_subgraph_delete(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Response, ErrorResponse> {
-    let owner = session(&st, &headers)?;
+    let owner = session(&st, &headers).await?;
     let id = id
         .parse::<i32>()
         .map_err(|_| ApiError::BadRequest("Invalid id".into()))?;
@@ -1409,6 +1439,33 @@ pub(crate) fn positive_amount(s: &str) -> bool {
     s.parse::<f64>().is_ok_and(|n| n.is_finite() && n > 0.0)
 }
 
+/// Whether the board holds this bounty as `owner` posted it, for `deployment`.
+pub(crate) fn posted_by(
+    posted: &kittiwake_chain::PostedBounty,
+    owner: &str,
+    deployment: &str,
+) -> Result<(), ApiError> {
+    if posted.developer == "0x0000000000000000000000000000000000000000"
+        || !positive_amount(&posted.amount_grt)
+    {
+        return Err(ApiError::BadRequest(
+            "No bounty has that id on the BountyBoard".into(),
+        ));
+    }
+    if !posted.developer.eq_ignore_ascii_case(owner) {
+        return Err(ApiError::BadRequest(
+            "That bounty was posted by another address".into(),
+        ));
+    }
+    let named = kittiwake_read::shape::ipfs_hash_to_bytes32(deployment);
+    if !named.is_some_and(|d| d.eq_ignore_ascii_case(&posted.deployment)) {
+        return Err(ApiError::BadRequest(
+            "That bounty is for another deployment".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn valid_slug(s: &str) -> bool {
     let mut p = s.split('/');
     let ok = |x: &str| {
@@ -1423,7 +1480,7 @@ pub async fn studio_deploy_key_get(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ErrorResponse> {
-    let owner = session(&st, &headers)?;
+    let owner = session(&st, &headers).await?;
     let key = kittiwake_db::deploy_key(pool(&st)?, &owner)
         .await
         .map_err(db_err)?;
@@ -1433,7 +1490,7 @@ pub async fn studio_deploy_key_post(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ErrorResponse> {
-    let owner = session(&st, &headers)?;
+    let owner = session(&st, &headers).await?;
     let key = kittiwake_dock::generate_deploy_key();
     kittiwake_db::replace_deploy_key(pool(&st)?, &owner, &kittiwake_dock::hash_key(&key))
         .await
@@ -1506,7 +1563,7 @@ pub async fn studio_metadata_post(
     headers: HeaderMap,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
-    session(&st, &headers)?;
+    session(&st, &headers).await?;
     let (subgraph_doc, version_doc) = subgraph_metadata_docs(&body);
     let (sub, version) = tokio::try_join!(
         st.ipfs.add_json(&subgraph_doc),
@@ -1539,7 +1596,7 @@ pub async fn studio_image_post(
     headers: HeaderMap,
     body: bytes::Bytes,
 ) -> Result<Response, ErrorResponse> {
-    session(&st, &headers)?;
+    session(&st, &headers).await?;
     if body.len() > SUBGRAPH_IMAGE_MAX {
         return Err(ApiError::BadRequest("The image is over 1 MB".into()).into());
     }
@@ -1635,18 +1692,44 @@ fn rpc_error(code: i32, message: &str) -> Response {
         .into_response()
 }
 
+/// The deploy key's hash, once it is known to be a real key. Anything short of that spends the
+/// caller's address budget, so the route cannot be used to try keys for free.
+async fn deploy_key_budget(
+    st: &AppState,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+) -> Result<(), ErrorResponse> {
+    let known = async {
+        let hash = kittiwake_dock::hash_key(bearer(headers)?);
+        kittiwake_db::deploy_key_owner(pool(st)?, &hash)
+            .await
+            .map_err(db_err)?
+            .ok_or(ApiError::Unauthorized)?;
+        Ok::<_, ErrorResponse>(hash)
+    }
+    .await;
+    match known {
+        Ok(hash) => Ok(st.limits.check_deploy_key(&hash)?),
+        Err(e) => {
+            st.limits.check(
+                &st.limits.read,
+                client_ip(peer, headers, st.edge_secret.as_deref()),
+            )?;
+            Err(e)
+        }
+    }
+}
+
 pub async fn studio_ipfs_proxy(
     State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(path): Path<String>,
     OriginalUri(uri): OriginalUri,
     method: Method,
     body: bytes::Bytes,
 ) -> Result<Response, ErrorResponse> {
-    kittiwake_db::deploy_key_owner(pool(&st)?, &kittiwake_dock::hash_key(bearer(&headers)?))
-        .await
-        .map_err(db_err)?
-        .ok_or(ApiError::Unauthorized)?;
+    deploy_key_budget(&st, peer, &headers).await?;
     let (status, bytes, content_type) = st
         .ipfs
         .proxy(
@@ -1691,17 +1774,38 @@ pub async fn studio_bounties_post(
     headers: HeaderMap,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Result<Response, ErrorResponse> {
-    let owner = session(&st, &headers)?;
+    let owner = session(&st, &headers).await?;
     let deployment = body
         .get("deployment_id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| ApiError::BadRequest("deployment_id and amount_grt are required".into()))?;
-    let amount = body
-        .get("amount_grt")
+        .ok_or_else(|| {
+            ApiError::BadRequest("deployment_id and chain_bounty_id are required".into())
+        })?;
+    let chain_id: u64 = body
+        .get("chain_bounty_id")
         .and_then(|v| v.as_str())
-        .filter(|s| positive_amount(s))
-        .ok_or_else(|| ApiError::BadRequest("amount_grt must be a positive number".into()))?;
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| {
+            ApiError::BadRequest("chain_bounty_id must name a bounty on the BountyBoard".into())
+        })?;
+    let chain = st
+        .chain
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("no Arbitrum RPC is configured".into()))?;
+    let board = dock(&st)?
+        .bounty_board_address
+        .as_deref()
+        .ok_or_else(|| ApiError::Unavailable("BountyBoard is not configured".into()))?;
+    let posted = chain.posted_bounty(board, chain_id).await?;
+    posted_by(&posted, &owner, deployment)?;
+    let chain_id = chain_id.to_string();
+    if let Some(b) = kittiwake_db::bounty_by_chain_id(pool(&st)?, &chain_id)
+        .await
+        .map_err(db_err)?
+    {
+        return Ok(axum::Json(serde_json::json!({"bounty":b})).into_response());
+    }
     let subgraph_id = match body.get("slug").and_then(|v| v.as_str()) {
         Some(s) => kittiwake_db::studio_subgraph_by_slug(pool(&st)?, s)
             .await
@@ -1710,20 +1814,19 @@ pub async fn studio_bounties_post(
             .map(|x| x.id),
         None => None,
     };
-    let expires = body
-        .get("expires_at")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse().ok());
+    let expires = (posted.expires_at > 0)
+        .then(|| chrono::DateTime::from_timestamp(posted.expires_at as i64, 0))
+        .flatten();
     let b = kittiwake_db::create_bounty(
         pool(&st)?,
         kittiwake_db::NewBounty {
             deployment,
             subgraph_id,
             developer: &owner,
-            amount,
+            amount: &posted.amount_grt,
             message: body.get("message").and_then(|v| v.as_str()),
             expires_at: expires,
-            chain_id: body.get("chain_bounty_id").and_then(|v| v.as_str()),
+            chain_id: Some(&chain_id),
             tx: body.get("post_tx_hash").and_then(|v| v.as_str()),
         },
     )
@@ -3163,7 +3266,7 @@ pub async fn present_poi(
 ) -> Result<Response, ErrorResponse> {
     let caller = client_ip(peer, &headers, st.edge_secret.as_deref());
     st.limits.check(&st.limits.mutation, caller)?;
-    let address = session(&st, &headers)?;
+    let address = session(&st, &headers).await?;
 
     let (Some(deployment), Some(allocation)) = (
         cid_v0(&body.deployment_id),
@@ -3244,12 +3347,14 @@ pub async fn present_poi(
 
     let upstream = request.send().await.map_err(|e| {
         ErrorResponse::from(ApiError::Unavailable(format!(
-            "could not reach the indexer agent: {e}"
+            "could not reach the indexer agent: {}",
+            e.without_url()
         )))
     })?;
     let answer: serde_json::Value = upstream.json().await.map_err(|e| {
         ErrorResponse::from(ApiError::Unavailable(format!(
-            "the indexer agent answered unreadably: {e}"
+            "the indexer agent answered unreadably: {}",
+            e.without_url()
         )))
     })?;
     let mut response = axum::Json(answer).into_response();
@@ -3385,7 +3490,7 @@ pub async fn data_service_query(
         Err(e) => {
             let mut response = axum::Json(serde_json::json!({
                 "ok": false,
-                "error": if e.is_timeout() { "request timed out".to_string() } else { e.to_string() },
+                "error": if e.is_timeout() { "request timed out".to_string() } else { e.without_url().to_string() },
                 "durationMs": duration_ms,
             }))
             .into_response();
@@ -3494,17 +3599,18 @@ pub async fn qos_capture(
                         .timeout(std::time::Duration::from_secs(15))
                         .send()
                         .await
-                        .map_err(|e| ApiError::Unavailable(format!("Foghorn: {e}")))?;
+                        .map_err(|e| {
+                            ApiError::Unavailable(format!("Foghorn: {}", e.without_url()))
+                        })?;
                     if !scores.status().is_success() {
                         return Err(ApiError::Unavailable(format!(
                             "Foghorn returned {}",
                             scores.status()
                         )));
                     }
-                    let scores: FoghornIndexers = scores
-                        .json()
-                        .await
-                        .map_err(|e| ApiError::Unavailable(format!("Foghorn: {e}")))?;
+                    let scores: FoghornIndexers = scores.json().await.map_err(|e| {
+                        ApiError::Unavailable(format!("Foghorn: {}", e.without_url()))
+                    })?;
                     let allocations = kittiwake_db::allocating_indexers(&pool)
                         .await
                         .map_err(|e| ApiError::Unavailable(e.to_string()))?;
@@ -3565,9 +3671,12 @@ async fn subgraph_graphql(
         .timeout(std::time::Duration::from_secs(20))
         .send()
         .await
-        .map_err(|e| unavailable(e.to_string()))?;
+        .map_err(|e| unavailable(e.without_url().to_string()))?;
     let status = resp.status();
-    let body: serde_json::Value = resp.json().await.map_err(|e| unavailable(e.to_string()))?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| unavailable(e.without_url().to_string()))?;
     // A GraphQL error arrives with 200, and its `data` can be a partial answer. It is refused whole.
     if let Some(errors) = body.get("errors") {
         return Err(unavailable(errors.to_string()));
@@ -4376,39 +4485,6 @@ fn deployment_cid(raw: Option<&str>) -> Result<String, ErrorResponse> {
     raw.and_then(cid_v0).map(str::to_string).ok_or_else(|| {
         ApiError::BadRequest("Invalid deployment ID. Expected a CIDv0 hash (Qm…)".into()).into()
     })
-}
-
-/// `POST /api/analytics/clickthrough` — one trade click or protocol visit.
-///
-/// Unauthenticated and fire-and-forget: the caller ignores the answer, and a reader must never see
-/// anything because a click could not be counted. What that buys is a public write into a shared
-/// table, so the validation here is the whole of the door: the event type is checked against the
-/// two the column's CHECK allows, `venue` and `session_id` are required, and the wallet is stored
-/// only when it is shaped like an address.
-pub async fn analytics_clickthrough(
-    State(st): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    axum::Json(body): axum::Json<kittiwake_db::Clickthrough>,
-) -> Result<Response, ErrorResponse> {
-    budget!(st, peer, headers);
-    let pool = st
-        .pool
-        .as_ref()
-        .ok_or_else(|| ApiError::Unavailable("no database is configured".into()))?;
-
-    if !kittiwake_db::CLICKTHROUGH_EVENT_TYPES.contains(&body.event_type.as_str())
-        || body.venue.is_empty()
-        || body.session_id.is_empty()
-    {
-        return Err(ApiError::BadRequest("invalid payload".into()).into());
-    }
-
-    kittiwake_db::record_clickthrough(pool, &body)
-        .await
-        .map_err(kittiwake_db::unavailable)?;
-
-    Ok(axum::Json(serde_json::json!({ "ok": true })).into_response())
 }
 
 #[cfg(test)]
@@ -5238,6 +5314,17 @@ mod indexer_page_tests {
         let hour = t - t.rem_euclid(3600);
         assert_eq!(thirty_days_back(hour), thirty_days_back(hour + 3599));
         assert_eq!(thirty_days_back(hour + 3600) - thirty_days_back(hour), 3600);
+    }
+
+    /// The flows and developer-activity windows are cache keys, so a page load a minute later
+    /// must ask for the same one.
+    #[test]
+    fn the_day_windows_move_by_the_hour_not_the_second() {
+        let t: i64 = 1_790_000_000;
+        let hour = t - t.rem_euclid(3600);
+        assert_eq!(days_back(hour + 60, 90), days_back(hour + 120, 90));
+        assert_eq!(days_back(hour, 90), days_back(hour + 3599, 90));
+        assert_eq!(days_back(hour, 90), hour - 90 * 86_400);
     }
 }
 

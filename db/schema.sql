@@ -296,6 +296,8 @@ CREATE TABLE IF NOT EXISTS cron_runs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_cron_runs_step_started ON cron_runs (step, started_at DESC);
+-- `failing_jobs` windows on started_at alone, which the index above cannot serve.
+CREATE INDEX IF NOT EXISTS idx_cron_runs_started ON cron_runs (started_at);
 
 -- One row per probe round of /api/indexing-status/[hash] (RFC-006 D5). "Effectively dead" is
 -- derived from the last K rows per deployment, never from one round (lodestar#59).
@@ -438,6 +440,13 @@ CREATE TABLE IF NOT EXISTS sync_bounties (
 
 CREATE INDEX IF NOT EXISTS idx_sync_bounties_deployment ON sync_bounties(deployment_id);
 CREATE INDEX IF NOT EXISTS idx_sync_bounties_status     ON sync_bounties(status);
+
+-- When each address last signed out of the Dock, in Unix seconds. A session issued at or before it
+-- is refused, so signing out ends a copied cookie too. Created at startup by kittiwake.
+CREATE TABLE IF NOT EXISTS studio_sign_outs (
+  address        TEXT PRIMARY KEY,
+  signed_out_at  BIGINT NOT NULL
+);
 
 -- ── Scuttlebutt ───────────────────────────────────────────────────────────────
 --

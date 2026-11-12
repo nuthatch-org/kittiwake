@@ -658,6 +658,24 @@ impl Chain {
         })
     }
 
+    /// What a bounty was posted as, which is what the Dock records rather than a caller's account
+    /// of it.
+    pub async fn posted_bounty(&self, board: &str, id: u64) -> Result<PostedBounty, ApiError> {
+        let addr = Address::from_str(board.trim())
+            .map_err(|_| ApiError::Internal(format!("bad bounty board address: {board}")))?;
+        let c = IBountyBoard::new(addr, self.arb("bounty")?);
+        let b = tokio::time::timeout(Duration::from_secs(8), c.getBounty(U256::from(id)).call())
+            .await
+            .map_err(|_| ApiError::Unavailable("arbitrum rpc timed out".into()))?
+            .map_err(|e| ApiError::Unavailable(format!("getBounty({id}): {e}")))?;
+        Ok(PostedBounty {
+            developer: format!("{:#x}", b.developer),
+            deployment: format!("{:#x}", b.deploymentId),
+            amount_grt: grt_decimal(b.amount),
+            expires_at: b.expiresAt.to::<u64>(),
+        })
+    }
+
     /// What each open allocation would collect if a POI were presented now, before cuts, in wei.
     ///
     /// Every batch is pinned to one block so the rows add up. A row whose call reverts is `None`
@@ -855,6 +873,30 @@ pub struct ChainBounty {
     pub expires_at: u64,
 }
 
+/// The fields of a bounty written once, when it was posted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostedBounty {
+    /// Lowercase `0x…`. The zero address means no bounty has this id.
+    pub developer: String,
+    /// `0x…` bytes32, the form `ipfs_hash_to_bytes32` gives.
+    pub deployment: String,
+    /// GRT as a decimal, without trailing zeros.
+    pub amount_grt: String,
+    /// Unix seconds, or 0 for no expiry.
+    pub expires_at: u64,
+}
+
+/// Wei to a GRT decimal, exactly: `1500000000000000000` is `1.5`.
+pub fn grt_decimal(wei: U256) -> String {
+    let unit = U256::from(10u64).pow(U256::from(18u64));
+    let (whole, frac) = (wei / unit, wei % unit);
+    if frac.is_zero() {
+        return whole.to_string();
+    }
+    let frac = format!("{:0>18}", frac.to_string());
+    format!("{whole}.{}", frac.trim_end_matches('0'))
+}
+
 /// `wei[i]` answers `allocations[i]` as passed to [`Chain::pending_rewards`], as a decimal string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingRewards {
@@ -962,6 +1004,15 @@ fn now_secs() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_bounty_amount_is_its_wei_in_grt_exactly() {
+        let wei = |s: &str| alloy::primitives::U256::from_str_radix(s, 10).unwrap();
+        assert_eq!(super::grt_decimal(wei("1500000000000000000")), "1.5");
+        assert_eq!(super::grt_decimal(wei("2000000000000000000000")), "2000");
+        assert_eq!(super::grt_decimal(wei("1")), "0.000000000000000001");
+        assert_eq!(super::grt_decimal(wei("0")), "0");
+    }
+
     /// Only names whose normalisation is lowercasing reach the chain; anything else would be hashed
     /// into a node that is not the one its owner registered.
     #[test]
