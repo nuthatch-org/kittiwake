@@ -392,7 +392,10 @@ pub mod coverage {
         (
             "/api/indexer/present-poi",
             Excused::Entirely,
-            "POST that queues an action on a live indexer agent; the harness must not present proofs against production",
+            "POST that queues an action on a live indexer agent; the harness must not present proofs \
+             against production, and the incumbent route is gone. The body lodestar's \
+             `usePresentPoi` sends is pinned instead by kittiwake-edge's \
+             `present_poi_reads_the_body_the_frontend_sends`",
         ),
         (
             "/api/foghorn/{*path}",

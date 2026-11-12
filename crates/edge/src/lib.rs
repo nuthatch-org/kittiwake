@@ -1921,6 +1921,108 @@ mod tests {
         );
     }
 
+    /// The bodies below are what lodestar's `usePresentPoi` sends, field for field.
+    #[tokio::test]
+    async fn present_poi_reads_the_body_the_frontend_sends() {
+        use tower::ServiceExt;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
+        let agent = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "queueActions": [{ "id": 1 }] }
+            })))
+            .mount(&agent)
+            .await;
+        let gate =
+            kittiwake_nest::NestGate::new(kittiwake_nest::NestConfig::new("http://127.0.0.1:9"))
+                .unwrap();
+        let read = kittiwake_read::ReadCtx::new(gate, kittiwake_cache::Store::new(64), 1);
+        let operator = "0x00000000000000000000000000000000000000aa";
+        let app = router(state(
+            Limits::new(1000, 1000, 1000, Vec::new()),
+            None,
+            read,
+            None,
+            Some(Studio {
+                secret: dock_secret(),
+                bounty_board_address: None,
+                spent_nonces: Default::default(),
+            }),
+            kittiwake_ext::Ipfs::default(),
+            None,
+            Some(kittiwake_config::IndexerAgentSettings {
+                url: agent.uri(),
+                token: None,
+                operators: vec![operator.into()],
+            }),
+            None,
+            None,
+        ))
+        .layer(axum::extract::connect_info::MockConnectInfo(
+            SocketAddr::from(([203, 0, 113, 1], 1)),
+        ));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let cookie = format!(
+            "studio_session={}",
+            kittiwake_dock::create_session(&dock_secret(), operator, now)
+        );
+        let post = |body: serde_json::Value| {
+            axum::http::Request::post("/api/indexer/present-poi")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, cookie.as_str())
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap()
+        };
+        let deployment = "QmStfa6zwPUzKHyGrgdNMh8rgbc91sgvmskidBSujG92FR";
+        let allocation = "0xb43b2cccceada5292732a8c58ae134adefce09bb";
+
+        let camel = app
+            .clone()
+            .oneshot(post(serde_json::json!({
+                "deploymentId": deployment,
+                "allocationId": allocation,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(camel.status(), StatusCode::OK);
+        let sent = agent.received_requests().await.unwrap();
+        let query = String::from_utf8_lossy(&sent[0].body);
+        assert!(
+            query.contains(deployment) && query.contains(allocation),
+            "{query}"
+        );
+
+        // `agentUrl` is read too: a private one is refused rather than ignored for this box's agent.
+        let own_agent = app
+            .clone()
+            .oneshot(post(serde_json::json!({
+                "deploymentId": deployment,
+                "allocationId": allocation,
+                "agentUrl": "http://127.0.0.1:18000/",
+                "agentToken": "me:secret",
+            })))
+            .await
+            .unwrap();
+        assert_eq!(own_agent.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(agent.received_requests().await.unwrap().len(), 1);
+
+        let snake = app
+            .oneshot(post(serde_json::json!({
+                "deployment_id": deployment,
+                "allocation_id": allocation,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            snake.status(),
+            StatusCode::OK,
+            "the old spelling still works"
+        );
+    }
+
     #[tokio::test]
     async fn this_boxs_agent_queues_only_for_a_signed_in_operator() {
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
