@@ -10,6 +10,9 @@ metrics_bind = "127.0.0.1:9184"
 scheduler_enabled = false
 warmer_enabled = false
 
+# Days of this service's cron_runs rows to keep; each job's latest run is kept whatever its age.
+cron_runs_retention_days = 90
+
 # Absent means the Postgres-backed routes report unavailable rather than pretending.
 # database_url = "postgresql://lodestar:...@127.0.0.1:5433/lodestar?sslmode=require"
 database_max_connections = 16

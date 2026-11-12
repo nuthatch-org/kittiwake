@@ -2349,6 +2349,41 @@ fn judge_silence(
     })
 }
 
+/// Delete this service's `cron_runs` rows older than `days`, at most `batch` at a time and `batches`
+/// times, keeping each step's latest run whatever its age: `silent_jobs` dates a job by it. Returns
+/// the rows deleted. The platform's unprefixed rows are left alone.
+pub async fn prune_cron_runs(
+    pool: &Pool,
+    days: u32,
+    batch: i64,
+    batches: u32,
+) -> Result<u64, DbError> {
+    let mut deleted = 0;
+    for _ in 0..batches {
+        let n = sqlx::query(
+            "DELETE FROM cron_runs WHERE id = ANY(ARRAY( \
+               SELECT c.id FROM cron_runs c \
+                WHERE c.step LIKE $1 \
+                  AND c.started_at < NOW() - make_interval(days => $2) \
+                  AND c.started_at < ( \
+                        SELECT l.started_at FROM cron_runs l \
+                         WHERE l.step = c.step ORDER BY l.started_at DESC LIMIT 1) \
+                LIMIT $3))",
+        )
+        .bind(format!("{CRON_RUN_PREFIX}%"))
+        .bind(days as i32)
+        .bind(batch)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        deleted += n;
+        if n < batch as u64 {
+            break;
+        }
+    }
+    Ok(deleted)
+}
+
 /// Scheduled jobs that have not run for far longer than their own period.
 ///
 /// `failing_jobs` sees a job that runs and errors. It cannot see one that has stopped running,
@@ -2723,6 +2758,57 @@ mod postgres_tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Postgres"]
+    async fn pg_pruning_keeps_the_window_and_every_steps_latest_run() {
+        let pool = test_pool().await;
+        let (busy, gone_quiet) = (unique("prune-busy"), unique("prune-quiet"));
+        runs(
+            &pool,
+            &busy,
+            &[5, 60 * 24 * 10, 60 * 24 * 100, 60 * 24 * 200, 60 * 24 * 300],
+        )
+        .await;
+        runs(&pool, &gone_quiet, &[60 * 24 * 200, 60 * 24 * 400]).await;
+        let platform = unique("platform-step");
+        sqlx::query(
+            "INSERT INTO cron_runs (step, started_at, duration_ms, success) \
+             VALUES ($1, NOW() - interval '500 days', 1, true), ($1, NOW(), 1, true)",
+        )
+        .bind(&platform)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Small batches, so the loop and its bound are exercised too; other tests' rows may share
+        // the table, so it runs until there is nothing left to prune.
+        let mut deleted = 0;
+        for _ in 0..1000 {
+            match prune_cron_runs(&pool, 90, 2, 3).await.unwrap() {
+                0 => break,
+                n => deleted += n,
+            }
+        }
+        assert!(deleted >= 3, "{deleted}");
+
+        let ages = |step: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT (EXTRACT(EPOCH FROM (NOW() - started_at)) / 86400)::bigint \
+                       FROM cron_runs WHERE step = $1 ORDER BY started_at DESC",
+                )
+                .bind(step)
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(ages(format!("{CRON_RUN_PREFIX}{busy}")).await, [0, 10]);
+        assert_eq!(ages(format!("{CRON_RUN_PREFIX}{gone_quiet}")).await, [200]);
+        assert_eq!(ages(platform).await, [0, 500]);
     }
 
     #[tokio::test]
