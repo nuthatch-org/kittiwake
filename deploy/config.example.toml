@@ -8,11 +8,16 @@ metrics_bind = "127.0.0.1:9184"
 # Off by default. Two instances both scheduling against one Postgres is a data problem, so turning
 # these on is a deliberate act on exactly one box.
 scheduler_enabled = false
-warmer_enabled = true
+warmer_enabled = false
 
 # Absent means the Postgres-backed routes report unavailable rather than pretending.
 # database_url = "postgresql://lodestar:...@127.0.0.1:5433/lodestar?sslmode=require"
 database_max_connections = 16
+
+# Foghorn's API, which `/api/foghorn/{*path}` proxies. Leave it out and that route answers 503
+# rather than guessing at a host. Both services sit on this box, so this is normally loopback.
+# A top-level key, so it must sit above the first [table].
+# foghorn_api_url = "http://127.0.0.1:8081"
 
 # Read access to nuthatch-org/graph-support, which is private. Without it the support archive is
 # never refreshed. A top-level key, so it must sit above the first [table].
@@ -100,10 +105,6 @@ exempt_ips = []
 # already issued is signed by a public key nobody can look up any more.
 # [receipt]
 # issuer_key = "..."
-
-# Foghorn's API, which `/api/foghorn/{*path}` proxies. Leave it out and that route answers 503
-# rather than guessing at a host. Both services sit on this box, so this is normally loopback.
-# foghorn_api_url = "http://127.0.0.1:8081"
 
 # The indexer-agent management API that `/api/indexer/present-poi` queues actions against. The
 # token belongs to this URL and travels only here: a caller who nominates their own agent brings
