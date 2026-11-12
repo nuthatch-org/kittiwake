@@ -24,6 +24,22 @@ install -d -m 0755 "$OPT/bin"
 install -d -m 0750 -o root -g kittiwake "$ETC"
 install -d -m 0750 -o kittiwake -g kittiwake /var/lib/kittiwake
 
+# Read the existing config with the NEW binary, as startup will, before anything is replaced. A
+# config the new build refuses would otherwise be found by the restart below, with the service down.
+# The unit's EnvironmentFile is loaded first so an ambient KITTIWAKE_* variable is seen too.
+if [ -f "$ETC/config.toml" ]; then
+  ENVFILE=$(sed -n 's/^EnvironmentFile=-\{0,1\}//p' "$UNIT" | head -n1)
+  if ! (
+    set -a
+    if [ -n "$ENVFILE" ] && [ -r "$ENVFILE" ]; then . "$ENVFILE"; fi
+    set +a
+    KITTIWAKE_CONFIG="$ETC/config.toml" "$BIN" --check-config
+  ); then
+    echo "the new binary refuses $ETC/config.toml; nothing was installed and the old one is still running" >&2
+    exit 1
+  fi
+fi
+
 # Replace the binary by rename, never by writing over it: a running process holds the inode and a
 # straight copy fails with "Text file busy". The rename is atomic and leaves the old inode open
 # for the process still using it.
