@@ -1513,6 +1513,84 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn this_boxs_agent_queues_only_for_a_signed_in_operator() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
+        let agent = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "queueActions": [{ "id": 1 }] }
+            })))
+            .mount(&agent)
+            .await;
+
+        let gate =
+            kittiwake_nest::NestGate::new(kittiwake_nest::NestConfig::new("http://127.0.0.1:9"))
+                .unwrap();
+        let read = kittiwake_read::ReadCtx::new(gate, kittiwake_cache::Store::new(64), 1);
+        let st = state(
+            Limits::new(1000, 1000, 1000, Vec::new()),
+            None,
+            read,
+            None,
+            Some(Studio {
+                secret: dock_secret(),
+                bounty_board_address: None,
+                spent_nonces: Default::default(),
+            }),
+            kittiwake_ext::Ipfs::default(),
+            None,
+            Some(kittiwake_config::IndexerAgentSettings {
+                url: agent.uri(),
+                token: Some("operator:hunter2".into()),
+                operators: vec!["0x00000000000000000000000000000000000000AA".into()],
+            }),
+            None,
+            None,
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let signed_in = |address: &str| {
+            dock_cookie(&format!(
+                "studio_session={}",
+                kittiwake_dock::create_session(&dock_secret(), address, now)
+            ))
+        };
+        let present = |headers: HeaderMap| {
+            crate::handlers::present_poi(
+                State(st.clone()),
+                ConnectInfo(([127, 0, 0, 1], 1).into()),
+                headers,
+                axum::Json(crate::handlers::PresentPoi {
+                    deployment_id: "QmStfa6zwPUzKHyGrgdNMh8rgbc91sgvmskidBSujG92FR".into(),
+                    allocation_id: "0xb43b2cccceada5292732a8c58ae134adefce09bb".into(),
+                    agent_url: None,
+                    agent_token: None,
+                }),
+            )
+        };
+        let status = |r: Result<Response, ErrorResponse>| match r {
+            Ok(r) => r.status(),
+            Err(e) => e.into_response().status(),
+        };
+
+        assert_eq!(status(present(HeaderMap::new()).await), 401);
+        assert_eq!(
+            status(present(signed_in("0x00000000000000000000000000000000000000bb")).await),
+            401,
+            "a session that is not an operator's does not reach this box's agent"
+        );
+        assert!(agent.received_requests().await.unwrap().is_empty());
+
+        assert_eq!(
+            status(present(signed_in("0x00000000000000000000000000000000000000aa")).await),
+            200
+        );
+        assert_eq!(agent.received_requests().await.unwrap().len(), 1);
+    }
+
     // ── Foghorn ──────────────────────────────────────────────────────────────
 
     /// The segments are pasted into an upstream URL and the client normalises `..` before sending,

@@ -165,6 +165,10 @@ pub struct IndexerAgentSettings {
     pub url: String,
     /// `user:password` for Basic auth, if the endpoint wants it.
     pub token: Option<String>,
+    /// The Dock addresses that may queue actions on this agent. Empty, the default, means nobody
+    /// may, and the route reaches only an agent the caller names with their own credential.
+    #[serde(default)]
+    pub operators: Vec<String>,
 }
 
 impl std::fmt::Debug for IndexerAgentSettings {
@@ -172,6 +176,7 @@ impl std::fmt::Debug for IndexerAgentSettings {
         f.debug_struct("IndexerAgentSettings")
             .field("url", &self.url)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("operators", &self.operators)
             .finish()
     }
 }
