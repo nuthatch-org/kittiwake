@@ -363,16 +363,97 @@ fn default_db_max_conns() -> u32 {
     16
 }
 
+/// Keys an older build read and this one does not. A config written then still carries them, and
+/// the box's file is never overwritten, so they warn rather than stop the service starting.
+const RETIRED_KEYS: &[&str] = &[
+    "qos_oracle",
+    "paywall_enabled",
+    "paywall_service_tokens",
+    "stripe",
+    "support",
+    "scuttle",
+    "telegram.ignore_addresses",
+    "nest.username",
+];
+
+fn is_retired(path: &str) -> bool {
+    RETIRED_KEYS.iter().any(|k| {
+        path == *k
+            || path
+                .strip_prefix(k)
+                .is_some_and(|rest| rest.starts_with('.'))
+    })
+}
+
 impl Config {
     /// Load from `path` if it exists, then overlay `KITTIWAKE_*` environment variables.
     pub fn load(path: &str) -> Result<Self, ConfigError> {
-        let cfg: Config = figment::Figment::new()
-            .merge(Toml::file(path))
-            .merge(Env::prefixed("KITTIWAKE_").split("__"))
+        let (cfg, warnings) = Self::load_with_warnings(path)?;
+        for w in warnings {
+            tracing::warn!("{w}");
+        }
+        Ok(cfg)
+    }
+
+    /// As `load`, returning the warnings instead of logging them, for `--check-config`.
+    pub fn load_with_warnings(path: &str) -> Result<(Self, Vec<String>), ConfigError> {
+        // `KITTIWAKE_CONFIG` names this file and is not a setting.
+        Self::from_figment(
+            figment::Figment::new().merge(Toml::file(path)),
+            figment::Figment::new()
+                .merge(Env::prefixed("KITTIWAKE_").ignore(&["config"]).split("__")),
+        )
+    }
+
+    /// A key in the file that nothing reads is refused: it is a mistake the operator can fix, and
+    /// ignoring it silently is the fault. One that arrives by environment only warns, because the
+    /// environment is ambient and the `KITTIWAKE_` prefix is shared with other binaries.
+    fn from_figment(
+        file: figment::Figment,
+        env: figment::Figment,
+    ) -> Result<(Self, Vec<String>), ConfigError> {
+        let value: figment::value::Value = file
+            .clone()
+            .merge(env)
             .extract()
             .map_err(|e| ConfigError::Load(e.to_string()))?;
+        let mut ignored = Vec::new();
+        let cfg: Config = serde_ignored::deserialize(&value, |path| {
+            ignored.push(path.to_string().replace(".?", ""))
+        })
+        .map_err(|e: figment::Error| ConfigError::Load(e.to_string()))?;
+
+        let (mut unknown, mut warnings) = (Vec::new(), Vec::new());
+        for path in ignored {
+            if is_retired(&path) {
+                warnings.push(format!(
+                    "configuration key `{path}` was removed and is ignored; delete it"
+                ));
+            } else if file.contains(&path) {
+                unknown.push(path);
+            } else {
+                let var = format!("KITTIWAKE_{}", path.to_uppercase().replace('.', "__"));
+                warnings.push(format!(
+                    "environment variable {var} sets `{path}`, which nothing reads; it is ignored"
+                ));
+            }
+        }
+        if !unknown.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "unknown configuration key{} {}: nothing reads {}, so it would be ignored silently. \
+                 Check the spelling and that it sits under the right [table]; a key placed after a \
+                 [table] header belongs to that table",
+                if unknown.len() == 1 { "" } else { "s" },
+                unknown
+                    .iter()
+                    .map(|p| format!("`{p}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if unknown.len() == 1 { "it" } else { "them" },
+            )));
+        }
         cfg.validate()?;
-        Ok(cfg)
+        Ok((cfg, warnings))
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -386,6 +467,15 @@ impl Config {
                 "nest.origin must be a URL, got {:?}",
                 self.nest.origin
             )));
+        }
+        if let Some(limits) = &self.limits {
+            for entry in &limits.exempt_ips {
+                if entry.parse::<std::net::IpAddr>().is_err() {
+                    return Err(ConfigError::Invalid(format!(
+                        "limits.exempt_ips entry {entry:?} is not an IP address; a network range is not accepted, list each address"
+                    )));
+                }
+            }
         }
         if let Some((nest, _)) = self.nest.permits.iter().find(|(_, n)| **n == 0) {
             return Err(ConfigError::Invalid(format!(
@@ -734,5 +824,127 @@ password = "p"
         let parsed = super::Config::load(path.to_str().unwrap());
         std::fs::remove_dir_all(&dir).ok();
         assert!(parsed.is_ok(), "{:?}", parsed.err());
+    }
+}
+
+#[cfg(test)]
+mod unknown_keys {
+    use super::*;
+    use figment::providers::Toml;
+
+    fn load_with(toml: &str, env: figment::Figment) -> Result<(Config, Vec<String>), ConfigError> {
+        Config::from_figment(figment::Figment::new().merge(Toml::string(toml)), env)
+    }
+
+    fn load(toml: &str) -> Result<Config, ConfigError> {
+        load_with(toml, figment::Figment::new()).map(|(c, _)| c)
+    }
+
+    const BASE: &str = "[nest]\norigin = \"https://nest.example\"\n";
+
+    #[test]
+    fn a_key_under_the_wrong_table_is_refused_and_named_with_its_table() {
+        let err = load(&format!(
+            "{BASE}[limits]\nfoghorn_api_url = \"http://127.0.0.1:8081\"\n"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("`limits.foghorn_api_url`"), "{err}");
+    }
+
+    #[test]
+    fn a_misspelt_top_level_key_is_refused() {
+        let err = load(&format!("scheduler_enable = true\n{BASE}"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`scheduler_enable`"), "{err}");
+    }
+
+    #[test]
+    fn a_key_from_a_removed_feature_is_tolerated() {
+        let cfg = load(&format!(
+            "{BASE}[scuttle]\ntrip_salt = \"x\"\n[stripe]\nsecret = \"y\"\n[nest.permits]\nalloc = 2\n"
+        ));
+        assert!(cfg.is_ok(), "{:?}", cfg.err());
+    }
+
+    #[test]
+    fn an_exempt_address_that_does_not_parse_is_refused() {
+        let err = load(&format!("{BASE}[limits]\nexempt_ips = [\"10.0.0.0/8\"]\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("10.0.0.0/8"), "{err}");
+        assert!(
+            load(&format!(
+                "{BASE}[limits]\nexempt_ips = [\"127.0.0.1\", \"::1\"]\n"
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_shipped_example_loads() {
+        let text = include_str!("../../../deploy/config.example.toml");
+        assert!(load(text).is_ok(), "{:?}", load(text).err());
+    }
+
+    #[test]
+    fn the_foghorn_url_in_the_example_reaches_the_top_level_once_uncommented() {
+        let text = include_str!("../../../deploy/config.example.toml")
+            .replace("# foghorn_api_url", "foghorn_api_url");
+        assert!(load(&text).unwrap().foghorn_api_url.is_some());
+    }
+
+    #[test]
+    fn every_key_ever_removed_from_a_settings_struct_warns_at_its_real_path() {
+        let toml = format!(
+            "paywall_enabled = true\npaywall_service_tokens = [\"t\"]\n{BASE}\
+             [nest.permits]\nalloc = 2\n\
+             [telegram]\nbot_token = \"b\"\nchat_id = \"c\"\nignore_addresses = [\"0x1\"]\n\
+             [stripe]\nwebhook_secret = \"w\"\n\
+             [support]\nissue_token = \"i\"\n\
+             [qos_oracle]\nurl = \"u\"\napi_key = \"k\"\n\
+             [scuttle]\nadmin_secret = \"a\"\nip_pepper = \"p\"\nsession_secret = \"s\"\ntrip_salt = \"t\"\n"
+        );
+        let (_, warnings) = load_with(&toml, figment::Figment::new()).expect("must start");
+        for key in [
+            "paywall_enabled",
+            "paywall_service_tokens",
+            "telegram.ignore_addresses",
+            "stripe",
+            "support",
+            "qos_oracle",
+            "scuttle",
+        ] {
+            assert!(
+                warnings.iter().any(|w| w.contains(&format!("`{key}`"))),
+                "{key}: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unmapped_environment_variable_warns_and_names_the_variable() {
+        let env = figment::Figment::new().merge(figment::providers::Serialized::default(
+            "api_url",
+            "https://x",
+        ));
+        let (_, warnings) =
+            load_with(BASE, env).expect("the MCP binary's variable must not stop startup");
+        assert!(
+            warnings.iter().any(|w| w.contains("KITTIWAKE_API_URL")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_mapped_environment_variable_overrides_and_does_not_warn() {
+        let env = figment::Figment::new().merge(figment::providers::Serialized::default(
+            "bind",
+            "127.0.0.1:9",
+        ));
+        let (cfg, warnings) = load_with(BASE, env).unwrap();
+        assert_eq!(cfg.bind, "127.0.0.1:9");
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 }

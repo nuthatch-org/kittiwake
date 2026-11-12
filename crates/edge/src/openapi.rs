@@ -110,6 +110,13 @@ pub const WITHHELD: &[(&str, &str)] = &[
     ),
 ];
 
+/// A summary for one method of a path, where the path's own line fits only the first.
+const METHOD_SUMMARIES: &[(&str, &str, &str)] = &[(
+    "/api/sql/named",
+    "post",
+    "Run one named query by name with typed arguments; the answer carries the SQL it ran.",
+)];
+
 /// One published operation.
 struct Operation {
     path: &'static str,
@@ -253,7 +260,7 @@ const SUMMARIES: &[Operation] = &[
     ),
     op(
         "/api/portfolio",
-        "One address's position as a delegator or an indexer.",
+        "One address's position as a delegator or a curator, chosen by `type`.",
     ),
     op(
         "/api/sql/catalog",
@@ -261,7 +268,7 @@ const SUMMARIES: &[Operation] = &[
     ),
     op(
         "/api/sql/named",
-        "The named-query tier: what may be asked, and asking it by name.",
+        "The named-query tier: which queries may be asked, and their arguments.",
     ),
     op(
         "/api/indexer-disputes/{address}",
@@ -393,6 +400,232 @@ fn routes_in(src: &str) -> Vec<String> {
     out
 }
 
+/// The handlers' source, read for the same reason as the router's: what a route accepts is
+/// declared by its extractors, and a hand-kept copy of it would be wrong the first time one
+/// changed.
+const HANDLERS: &str = include_str!("handlers.rs");
+
+const METHODS: [&str; 5] = ["get", "post", "put", "patch", "delete"];
+
+/// One method on a served path, and the handler function bound to it.
+pub struct Served {
+    pub path: String,
+    pub method: &'static str,
+    handler: String,
+}
+
+/// The text up to the parenthesis that closes one already opened.
+fn balanced(src: &str, open: char, close: char) -> &str {
+    let mut depth = 1;
+    for (i, c) in src.char_indices() {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return &src[..i];
+            }
+        }
+    }
+    src
+}
+
+/// Every `/api/...` path with the methods the router binds to it.
+///
+/// A document that said GET for a route bound only to POST sent every client that trusted it to a
+/// 405.
+pub fn served_routes() -> Vec<Served> {
+    let mut out = Vec::new();
+    for (i, _) in ROUTER.match_indices(".route(") {
+        let span = balanced(&ROUTER[i + ".route(".len()..], '(', ')');
+        let Some(rest) = span.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = rest.find('"') else { continue };
+        let path = &rest[..end];
+        if !path.starts_with("/api/") {
+            continue;
+        }
+        let bindings = &rest[end + 1..];
+        for method in METHODS {
+            let call = format!("{method}(");
+            for (j, _) in bindings.match_indices(&call) {
+                let before = bindings[..j].chars().next_back();
+                if before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                    continue;
+                }
+                let handler = balanced(&bindings[j + call.len()..], '(', ')')
+                    .trim()
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                out.push(Served {
+                    path: path.to_string(),
+                    method,
+                    handler,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| (&a.path, a.method).cmp(&(&b.path, b.method)));
+    out.dedup_by(|a, b| a.path == b.path && a.method == b.method);
+    out
+}
+
+/// One field of a query string or a request body.
+struct Field {
+    name: String,
+    json_type: &'static str,
+    required: bool,
+    doc: String,
+}
+
+/// The source of a function's parameter list, between its parentheses.
+fn handler_params(handler: &str) -> Option<&'static str> {
+    let needle = format!("fn {handler}(");
+    [HANDLERS, ROUTER].into_iter().find_map(|src| {
+        let at = src.find(&needle)? + needle.len();
+        Some(balanced(&src[at..], '(', ')'))
+    })
+}
+
+/// The type inside each `extractor<...>` among a handler's parameters.
+fn extractor_types<'a>(params: &'a str, extractor: &str) -> Vec<&'a str> {
+    let open = format!("{extractor}<");
+    params
+        .match_indices(&open)
+        .filter(|(i, _)| {
+            !params[..*i]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+        .map(|(i, _)| balanced(&params[i + open.len()..], '<', '>').trim())
+        .collect()
+}
+
+fn camel(snake: &str) -> String {
+    let mut out = String::new();
+    let mut up = false;
+    for c in snake.chars() {
+        if c == '_' {
+            up = true;
+        } else if up {
+            out.extend(c.to_uppercase());
+            up = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn json_type(ty: &str) -> &'static str {
+    let ty = ty
+        .strip_prefix("Option<")
+        .map_or(ty, |t| t.trim_end_matches('>'));
+    match ty {
+        t if t.starts_with(['i', 'u']) && t[1..].chars().all(|c| c.is_ascii_digit()) => "integer",
+        "f32" | "f64" => "number",
+        "bool" => "boolean",
+        t if t.starts_with("Vec<") => "array",
+        t if t.contains("Map<") || t.ends_with("Value") => "object",
+        _ => "string",
+    }
+}
+
+/// The fields of the named struct, read from its declaration. `None` when the type is not declared
+/// in this crate, which is the caller's cue to describe it as free-form.
+fn struct_fields(ty: &str) -> Option<Vec<Field>> {
+    let ty = ty.rsplit("::").next()?;
+    let needle = format!("struct {ty} {{");
+    let (src, at) = [HANDLERS, ROUTER]
+        .into_iter()
+        .find_map(|src| Some((src, src.find(&needle)?)))?;
+    let camel_case = src[..at]
+        .lines()
+        .rev()
+        .take_while(|l| l.trim_start().starts_with("#[") || l.trim_start().starts_with("///"))
+        .any(|l| l.contains("rename_all = \"camelCase\""));
+    let body = src[at + needle.len()..].split("\n}").next()?;
+
+    let (mut fields, mut doc, mut attrs) = (Vec::new(), Vec::new(), String::new());
+    for line in body.lines().map(str::trim) {
+        if let Some(d) = line.strip_prefix("///") {
+            doc.push(d.trim().to_string());
+        } else if line.starts_with("#[") {
+            attrs.push_str(line);
+        } else if let Some((name, ty)) = line.trim_start_matches("pub ").split_once(':') {
+            let ty = ty.trim().trim_end_matches(',').trim();
+            let name = name.trim().trim_start_matches("r#");
+            let renamed = attrs
+                .split("rename = \"")
+                .nth(1)
+                .and_then(|s| s.split('"').next());
+            fields.push(Field {
+                name: renamed.map_or_else(
+                    || {
+                        if camel_case {
+                            camel(name)
+                        } else {
+                            name.to_string()
+                        }
+                    },
+                    str::to_string,
+                ),
+                json_type: json_type(ty),
+                required: !ty.starts_with("Option<") && !attrs.contains("default"),
+                doc: doc.join(" "),
+            });
+            doc.clear();
+            attrs.clear();
+        }
+    }
+    Some(fields)
+}
+
+/// Query parameters a route declares, and whether it also takes ones nobody declared.
+fn query_fields(handler: &str) -> (Vec<Field>, bool) {
+    let Some(params) = handler_params(handler) else {
+        return (Vec::new(), false);
+    };
+    let mut free_form = params.contains("RawQuery");
+    let mut fields = Vec::new();
+    for ty in extractor_types(params, "Query") {
+        match struct_fields(ty) {
+            Some(f) => fields.extend(f),
+            None => free_form = true,
+        }
+    }
+    (fields, free_form)
+}
+
+/// The JSON schema of a request body, free-form when the type is not one this crate declares.
+fn body_schema(handler: &str) -> serde_json::Value {
+    let fields = handler_params(handler)
+        .and_then(|p| extractor_types(p, "Json").first().copied())
+        .and_then(struct_fields);
+    let Some(fields) = fields else {
+        return serde_json::json!({ "type": "object" });
+    };
+    let properties: serde_json::Map<String, serde_json::Value> = fields
+        .iter()
+        .map(|f| {
+            (
+                f.name.clone(),
+                serde_json::json!({ "type": f.json_type, "description": f.doc }),
+            )
+        })
+        .collect();
+    let required: Vec<&str> = fields
+        .iter()
+        .filter(|f| f.required)
+        .map(|f| f.name.as_str())
+        .collect();
+    serde_json::json!({ "type": "object", "properties": properties, "required": required })
+}
+
 /// The router's `{name}` parameters, as OpenAPI wants them declared.
 fn parameters(path: &str) -> Vec<serde_json::Value> {
     path.split('/')
@@ -416,16 +649,33 @@ fn parameters(path: &str) -> Vec<serde_json::Value> {
 /// each one is for, and which parameters are part of the path.
 pub fn document(version: &str) -> serde_json::Value {
     let mut paths = serde_json::Map::new();
-    for path in served_paths() {
-        if WITHHELD.iter().any(|(p, _)| *p == path) {
+    for served in served_routes() {
+        let path = &served.path;
+        if WITHHELD.iter().any(|(p, _)| p == path) {
             continue;
         }
-        let Some(o) = SUMMARIES.iter().find(|o| o.path == path) else {
+        let Some(o) = SUMMARIES.iter().find(|o| o.path == *path) else {
             continue; // The test below is what stops this being silent.
         };
-        let op = serde_json::json!({
-            "summary": o.summary,
-            "parameters": parameters(&path),
+        let summary = METHOD_SUMMARIES
+            .iter()
+            .find(|(p, m, _)| p == path && *m == served.method)
+            .map_or(o.summary, |(_, _, s)| s);
+
+        let mut parameters = parameters(path);
+        let (query, free_form) = query_fields(&served.handler);
+        parameters.extend(query.iter().map(|f| {
+            serde_json::json!({
+                "name": f.name,
+                "in": "query",
+                "required": f.required,
+                "description": f.doc,
+                "schema": { "type": f.json_type },
+            })
+        }));
+        let mut op = serde_json::json!({
+            "summary": summary,
+            "parameters": parameters,
             "responses": {
                 "200": { "description": "The answer, with a provenance envelope." },
                 "400": { "description": "The request was not understood; the message says why." },
@@ -433,9 +683,20 @@ pub fn document(version: &str) -> serde_json::Value {
                 "503": { "description": "A source this route depends on is not answering." },
             },
         });
-        let mut item = serde_json::Map::new();
-        item.insert("get".into(), op);
-        paths.insert(path, serde_json::Value::Object(item));
+        if free_form {
+            op["x-query-free-form"] = true.into();
+        }
+        if served.method != "get" {
+            op["requestBody"] = serde_json::json!({
+                "content": { "application/json": { "schema": body_schema(&served.handler) } },
+            });
+        }
+        paths
+            .entry(path.clone())
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .expect("a path item is an object")
+            .insert(served.method.into(), op);
     }
 
     serde_json::json!({
@@ -623,5 +884,78 @@ mod tests {
             doc["paths"].get("/api/sql/named").is_some(),
             "the named tier is"
         );
+    }
+
+    #[test]
+    fn a_post_only_route_is_published_as_a_post_and_not_a_get() {
+        let doc = document("test");
+        let names = &doc["paths"]["/api/subgraph-names"];
+        assert!(names.get("get").is_none(), "{names}");
+        assert!(names["post"]["requestBody"].is_object());
+        assert_eq!(
+            names["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]["hashes"]
+                ["type"],
+            "array"
+        );
+    }
+
+    #[test]
+    fn a_route_bound_to_two_methods_is_published_under_both() {
+        let doc = document("test");
+        let named = &doc["paths"]["/api/sql/named"];
+        assert!(
+            named["get"].is_object() && named["post"].is_object(),
+            "{named}"
+        );
+        assert_ne!(named["get"]["summary"], named["post"]["summary"]);
+        assert_eq!(
+            named["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]["name"]
+                ["type"],
+            "string"
+        );
+    }
+
+    /// Every published operation is something the MCP server will send. A new mutating route is a
+    /// decision to make here, not a thing that appears as a tool.
+    #[test]
+    fn only_the_two_read_posts_are_published_beyond_get() {
+        let doc = document("test");
+        let mut non_get = Vec::new();
+        for (path, item) in doc["paths"].as_object().unwrap() {
+            for method in item.as_object().unwrap().keys().filter(|m| *m != "get") {
+                non_get.push(format!("{method} {path}"));
+            }
+        }
+        non_get.sort();
+        assert_eq!(non_get, ["post /api/sql/named", "post /api/subgraph-names"]);
+    }
+
+    #[test]
+    fn query_parameters_come_from_the_handlers_extractors() {
+        let doc = document("test");
+        let params = doc["paths"]["/api/portfolio"]["get"]["parameters"]
+            .as_array()
+            .unwrap();
+        let address = params
+            .iter()
+            .find(|p| p["name"] == "address")
+            .expect("address");
+        assert_eq!(address["in"], "query");
+        assert_eq!(address["required"], false);
+        assert!(
+            params.iter().any(|p| p["name"] == "type"),
+            "r#type is spelt type"
+        );
+
+        let indexers = doc["paths"]["/api/indexers"]["get"]["parameters"]
+            .as_array()
+            .unwrap();
+        let first = indexers
+            .iter()
+            .find(|p| p["name"] == "first")
+            .expect("first");
+        assert_eq!(first["schema"]["type"], "integer");
+        assert_eq!(first["required"], false, "it has a default");
+        assert!(indexers.iter().any(|p| p["name"] == "order_by"));
     }
 }

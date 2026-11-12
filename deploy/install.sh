@@ -24,6 +24,35 @@ install -d -m 0755 "$OPT/bin"
 install -d -m 0750 -o root -g kittiwake "$ETC"
 install -d -m 0750 -o kittiwake -g kittiwake /var/lib/kittiwake
 
+# Read the existing config with the NEW binary, as startup will, before anything is replaced. A
+# config the new build refuses would otherwise be found by the restart below, with the service down.
+# The unit's EnvironmentFile is handed to the binary, which reads it as systemd does; it is never
+# sourced here, because its values (URLs, passwords) are not shell.
+if [ -f "$ETC/config.toml" ]; then
+  ENVFILE=$(sed -n 's/^EnvironmentFile=//p' "$UNIT" | head -n1)
+  OPTIONAL=no
+  case "$ENVFILE" in -*) OPTIONAL=yes; ENVFILE=${ENVFILE#-} ;; esac
+  ENVARGS=()
+  if [ -n "$ENVFILE" ]; then
+    if [ -r "$ENVFILE" ]; then
+      ENVARGS=(--env-file "$ENVFILE")
+    elif [ "$OPTIONAL" = no ]; then
+      echo "could not run the config check: the unit names $ENVFILE and it is not readable" >&2
+      exit 1
+    fi
+  fi
+  rc=0
+  KITTIWAKE_CONFIG="$ETC/config.toml" "$BIN" --check-config ${ENVARGS[@]+"${ENVARGS[@]}"} || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -ge 126 ]; then
+      echo "could not run the config check (exit $rc); nothing was installed and the old binary is still running" >&2
+    else
+      echo "the new binary refuses $ETC/config.toml (its message is above); nothing was installed and the old binary is still running" >&2
+    fi
+    exit 1
+  fi
+fi
+
 # Replace the binary by rename, never by writing over it: a running process holds the inode and a
 # straight copy fails with "Text file busy". The rename is atomic and leaves the old inode open
 # for the process still using it.

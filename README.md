@@ -210,3 +210,6 @@ carries every nest with the protocol nest capped at 2 GB, and has been memory-ex
 `deploy/kittiwake.service` targets 768 MB soft, 1 GB hard. `deploy/Caddyfile.fragment` terminates
 TLS and is the only thing that may set `X-Forwarded-For`, which is why the service honours that
 header only from a loopback peer.
+
+`kittiwake --check-config` loads the configuration as startup does, prints what it refuses or ignores and
+exits non-zero on a refusal without binding anything; `deploy/install.sh` runs it first (reading the unit's EnvironmentFile via `--env-file`, as systemd does) and aborts the install.
