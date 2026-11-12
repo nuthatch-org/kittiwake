@@ -1941,6 +1941,88 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_bounty_is_recorded_only_as_the_board_holds_it() {
+        const DEPLOYMENT: &str = "QmStfa6zwPUzKHyGrgdNMh8rgbc91sgvmskidBSujG92FR";
+        let owner = "0x00000000000000000000000000000000000000aa";
+        let posted = kittiwake_chain::PostedBounty {
+            developer: owner.into(),
+            deployment: kittiwake_read::shape::ipfs_hash_to_bytes32(DEPLOYMENT).unwrap(),
+            amount_grt: "1500".into(),
+            expires_at: 0,
+        };
+        assert!(crate::handlers::posted_by(&posted, owner, DEPLOYMENT).is_ok());
+        assert!(
+            crate::handlers::posted_by(
+                &posted,
+                "0x00000000000000000000000000000000000000bb",
+                DEPLOYMENT
+            )
+            .is_err(),
+            "another developer's bounty"
+        );
+        assert!(
+            crate::handlers::posted_by(
+                &posted,
+                owner,
+                "QmXZiV6S13ha6QXq4dmaM3TB4CHcDxBMvGexSNu9Kc28EH"
+            )
+            .is_err(),
+            "another deployment's bounty"
+        );
+        let none = kittiwake_chain::PostedBounty {
+            developer: "0x0000000000000000000000000000000000000000".into(),
+            amount_grt: "0".into(),
+            ..posted.clone()
+        };
+        assert!(crate::handlers::posted_by(&none, owner, DEPLOYMENT).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_bounty_without_an_on_chain_id_is_not_recorded() {
+        let gate =
+            kittiwake_nest::NestGate::new(kittiwake_nest::NestConfig::new("http://127.0.0.1:9"))
+                .unwrap();
+        let read = kittiwake_read::ReadCtx::new(gate, kittiwake_cache::Store::new(64), 1);
+        let st = state(
+            Limits::new(1000, 1000, 1000, Vec::new()),
+            None,
+            read,
+            None,
+            Some(Studio {
+                secret: dock_secret(),
+                bounty_board_address: None,
+                spent_nonces: Default::default(),
+            }),
+            kittiwake_ext::Ipfs::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let headers = dock_cookie(&format!(
+            "studio_session={}",
+            kittiwake_dock::create_session(&dock_secret(), "0xaa", now)
+        ));
+        let refused = crate::handlers::studio_bounties_post(
+            State(st),
+            headers,
+            axum::Json(serde_json::json!({
+                "deployment_id": "QmStfa6zwPUzKHyGrgdNMh8rgbc91sgvmskidBSujG92FR",
+                "amount_grt": "1e300",
+            })),
+        )
+        .await;
+        let Err(e) = refused else {
+            panic!("a self-declared bounty was accepted")
+        };
+        assert_eq!(e.into_response().status(), 400);
+    }
+
     /// The regression this test exists for. `amount_grt` is text in the table and the public board
     /// orders by `amount_grt::numeric`; Postgres 16 parses Infinity, so `"inf"` from one signed-in
     /// caller would sit at the top of everyone's board permanently.

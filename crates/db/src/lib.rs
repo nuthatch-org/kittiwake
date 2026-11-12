@@ -963,6 +963,20 @@ pub async fn bounty(pool: &Pool, id: i32) -> Result<Option<SyncBounty>, DbError>
         .await?)
 }
 
+pub async fn bounty_by_chain_id(
+    pool: &Pool,
+    chain_id: &str,
+) -> Result<Option<SyncBounty>, DbError> {
+    Ok(
+        sqlx::query_as(
+            "SELECT * FROM sync_bounties WHERE chain_bounty_id = $1 ORDER BY id LIMIT 1",
+        )
+        .bind(chain_id)
+        .fetch_optional(pool)
+        .await?,
+    )
+}
+
 // ---------------------------------------------------------------------------------------------
 // Chain health: head history and per-indexer chain sets
 // ---------------------------------------------------------------------------------------------

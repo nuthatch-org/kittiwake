@@ -1409,6 +1409,33 @@ pub(crate) fn positive_amount(s: &str) -> bool {
     s.parse::<f64>().is_ok_and(|n| n.is_finite() && n > 0.0)
 }
 
+/// Whether the board holds this bounty as `owner` posted it, for `deployment`.
+pub(crate) fn posted_by(
+    posted: &kittiwake_chain::PostedBounty,
+    owner: &str,
+    deployment: &str,
+) -> Result<(), ApiError> {
+    if posted.developer == "0x0000000000000000000000000000000000000000"
+        || !positive_amount(&posted.amount_grt)
+    {
+        return Err(ApiError::BadRequest(
+            "No bounty has that id on the BountyBoard".into(),
+        ));
+    }
+    if !posted.developer.eq_ignore_ascii_case(owner) {
+        return Err(ApiError::BadRequest(
+            "That bounty was posted by another address".into(),
+        ));
+    }
+    let named = kittiwake_read::shape::ipfs_hash_to_bytes32(deployment);
+    if !named.is_some_and(|d| d.eq_ignore_ascii_case(&posted.deployment)) {
+        return Err(ApiError::BadRequest(
+            "That bounty is for another deployment".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn valid_slug(s: &str) -> bool {
     let mut p = s.split('/');
     let ok = |x: &str| {
@@ -1696,12 +1723,33 @@ pub async fn studio_bounties_post(
         .get("deployment_id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| ApiError::BadRequest("deployment_id and amount_grt are required".into()))?;
-    let amount = body
-        .get("amount_grt")
+        .ok_or_else(|| {
+            ApiError::BadRequest("deployment_id and chain_bounty_id are required".into())
+        })?;
+    let chain_id: u64 = body
+        .get("chain_bounty_id")
         .and_then(|v| v.as_str())
-        .filter(|s| positive_amount(s))
-        .ok_or_else(|| ApiError::BadRequest("amount_grt must be a positive number".into()))?;
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| {
+            ApiError::BadRequest("chain_bounty_id must name a bounty on the BountyBoard".into())
+        })?;
+    let chain = st
+        .chain
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable("no Arbitrum RPC is configured".into()))?;
+    let board = dock(&st)?
+        .bounty_board_address
+        .as_deref()
+        .ok_or_else(|| ApiError::Unavailable("BountyBoard is not configured".into()))?;
+    let posted = chain.posted_bounty(board, chain_id).await?;
+    posted_by(&posted, &owner, deployment)?;
+    let chain_id = chain_id.to_string();
+    if let Some(b) = kittiwake_db::bounty_by_chain_id(pool(&st)?, &chain_id)
+        .await
+        .map_err(db_err)?
+    {
+        return Ok(axum::Json(serde_json::json!({"bounty":b})).into_response());
+    }
     let subgraph_id = match body.get("slug").and_then(|v| v.as_str()) {
         Some(s) => kittiwake_db::studio_subgraph_by_slug(pool(&st)?, s)
             .await
@@ -1710,20 +1758,19 @@ pub async fn studio_bounties_post(
             .map(|x| x.id),
         None => None,
     };
-    let expires = body
-        .get("expires_at")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse().ok());
+    let expires = (posted.expires_at > 0)
+        .then(|| chrono::DateTime::from_timestamp(posted.expires_at as i64, 0))
+        .flatten();
     let b = kittiwake_db::create_bounty(
         pool(&st)?,
         kittiwake_db::NewBounty {
             deployment,
             subgraph_id,
             developer: &owner,
-            amount,
+            amount: &posted.amount_grt,
             message: body.get("message").and_then(|v| v.as_str()),
             expires_at: expires,
-            chain_id: body.get("chain_bounty_id").and_then(|v| v.as_str()),
+            chain_id: Some(&chain_id),
             tx: body.get("post_tx_hash").and_then(|v| v.as_str()),
         },
     )
