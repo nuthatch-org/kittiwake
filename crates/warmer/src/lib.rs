@@ -557,12 +557,33 @@ mod tests {
         assert_eq!(report.warmed, 0);
     }
 
-    #[test]
-    fn a_list_fold_is_refreshed_as_it_goes_stale() {
-        // The indexers and network-stats cadence, then epochs'.
-        for cadence in [Duration::from_secs(60), Duration::from_secs(300)] {
-            let p = kittiwake_cache::CachePolicy::from_poll_interval(cadence);
-            assert_eq!(p.hard_ttl - LIST_AHEAD, p.fresh_for, "{cadence:?}");
-        }
+    /// A fresh list fold is left alone and a stale one is refreshed, so the warm job keeps the
+    /// cadence it had before it moved to the cron lane.
+    #[tokio::test]
+    async fn a_list_fold_is_refreshed_as_it_goes_stale() {
+        let (ctx, seen, _server) = ctx(&[]).await;
+        warm_all(&ctx).await;
+        let asked = || seen.lock().unwrap().len();
+
+        // network-stats is fresh for a minute.
+        let key = kittiwake_cache::key(
+            1,
+            NestId::Alloc.as_str(),
+            "network-stats",
+            &serde_json::json!({}),
+        );
+        let aged = |secs| kittiwake_cache::Entry {
+            fetched_at: Instant::now() - Duration::from_secs(secs),
+            ..kittiwake_cache::Entry::new(serde_json::json!({}), Default::default())
+        };
+
+        ctx.store.insert(key.clone(), aged(50)).await;
+        let before = asked();
+        warm_all(&ctx).await;
+        assert_eq!(asked(), before, "a fresh fold is left alone");
+
+        ctx.store.insert(key, aged(70)).await;
+        warm_all(&ctx).await;
+        assert!(asked() > before, "a stale fold is refreshed");
     }
 }

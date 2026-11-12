@@ -58,17 +58,26 @@ type ExternalFlight = Shared<BoxFuture<'static, Result<Arc<Entry>, ApiError>>>;
 
 /// The external path's single flight and short memory of failure, as the gate keeps for a nest.
 struct ExternalFlights {
-    inflight: tokio::sync::Mutex<std::collections::HashMap<String, ExternalFlight>>,
+    /// Each flight with its id, so a finished one clears only its own slot.
+    inflight: tokio::sync::Mutex<std::collections::HashMap<String, (u64, ExternalFlight)>>,
+    next_id: std::sync::atomic::AtomicU64,
     failed: moka::future::Cache<String, ApiError>,
 }
 
 impl Default for ExternalFlights {
     fn default() -> Self {
+        Self::new(Duration::from_secs(5))
+    }
+}
+
+impl ExternalFlights {
+    fn new(failed_for: Duration) -> Self {
         Self {
             inflight: Default::default(),
+            next_id: Default::default(),
             failed: moka::future::Cache::builder()
                 .max_capacity(4096)
-                .time_to_live(Duration::from_secs(5))
+                .time_to_live(failed_for)
                 .build(),
         }
     }
@@ -239,33 +248,40 @@ impl ReadCtx {
     /// stores its answer whether or not anyone is still waiting for it.
     async fn external_flight(&self, key: String, fetch: ExternalFetcher) -> ExternalFlight {
         let mut map = self.external.inflight.lock().await;
-        if let Some(flight) = map.get(&key) {
+        if let Some((_, flight)) = map.get(&key) {
             return flight.clone();
         }
+        let id = self
+            .external
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let store = self.store.clone();
+        let k = key.clone();
+        // Its own task, so a panicking fetch becomes an error here rather than a dead flight.
+        let handle = tokio::spawn(async move {
+            let v = fetch().await?;
+            Ok(store.insert(k, Entry::new(v, Provenance::default())).await)
+        });
         let ctx = self.clone();
         let k = key.clone();
-        let handle = tokio::spawn(async move {
-            let result = match fetch().await {
-                Ok(v) => Ok(ctx
-                    .store
-                    .insert(k.clone(), Entry::new(v, Provenance::default()))
-                    .await),
-                Err(e) => {
-                    ctx.external.failed.insert(k.clone(), e.clone()).await;
-                    Err(e)
-                }
-            };
-            ctx.external.inflight.lock().await.remove(&k);
-            result
-        });
         let flight = async move {
-            handle
+            let result = handle
                 .await
-                .unwrap_or_else(|e| Err(ApiError::Unavailable(format!("fetch task failed: {e}"))))
+                .unwrap_or_else(|e| Err(ApiError::Unavailable(format!("fetch task failed: {e}"))));
+            if let Err(e) = &result {
+                ctx.external.failed.insert(k.clone(), e.clone()).await;
+            }
+            let mut map = ctx.external.inflight.lock().await;
+            if map.get(&k).is_some_and(|(slot, _)| *slot == id) {
+                map.remove(&k);
+            }
+            result
         }
         .boxed()
         .shared();
-        map.insert(key, flight.clone());
+        // Driven to the end by its own task, so the slot is cleared even if every caller goes away.
+        tokio::spawn(flight.clone());
+        map.insert(key, (id, flight.clone()));
         flight
     }
 
@@ -407,6 +423,41 @@ mod tests {
             ..Entry::new(serde_json::json!({}), Provenance::default())
         };
         ctx.store.insert(key(), entry).await;
+    }
+
+    /// A fetch that panics is a failure like any other: remembered briefly, then asked again.
+    #[tokio::test]
+    async fn a_panicked_external_fetch_is_retried_once_its_failure_expires() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (mut ctx, _server) = ctx().await;
+        ctx.external = Arc::new(ExternalFlights::new(Duration::from_millis(200)));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let s = starts.clone();
+        let fetch: ExternalFetcher = Arc::new(move || {
+            let first = s.fetch_add(1, Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                assert!(!first, "the first fetch panics");
+                Ok(serde_json::json!({ "ok": true }))
+            })
+        });
+        let ask = || {
+            ctx.cached_external_keyed(
+                "r",
+                "s",
+                Duration::from_secs(30),
+                ServedFrom::Chain,
+                fetch.clone(),
+            )
+        };
+
+        assert!(ask().await.is_err(), "the panic is reported as a failure");
+        assert!(ask().await.is_err(), "and remembered");
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let read = ask().await.expect("asked again once the failure expired");
+        assert_eq!(*read.entry.value, serde_json::json!({ "ok": true }));
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
     }
 
     /// A slow external fetch that counts how often it is started, failing while `fail` is set.
