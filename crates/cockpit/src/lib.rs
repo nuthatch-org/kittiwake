@@ -66,7 +66,6 @@ fn err(status: StatusCode, msg: impl std::fmt::Display) -> Response {
 fn auth_err(e: AuthError) -> Response {
     let status = match e {
         AuthError::NotAnOperator => StatusCode::FORBIDDEN,
-        AuthError::Busy => StatusCode::TOO_MANY_REQUESTS,
         AuthError::Chain(_) => StatusCode::BAD_GATEWAY,
         _ => StatusCode::UNAUTHORIZED,
     };
