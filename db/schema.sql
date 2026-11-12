@@ -296,6 +296,8 @@ CREATE TABLE IF NOT EXISTS cron_runs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_cron_runs_step_started ON cron_runs (step, started_at DESC);
+-- `failing_jobs` windows on started_at alone, which the index above cannot serve.
+CREATE INDEX IF NOT EXISTS idx_cron_runs_started ON cron_runs (started_at);
 
 -- One row per probe round of /api/indexing-status/[hash] (RFC-006 D5). "Effectively dead" is
 -- derived from the last K rows per deployment, never from one round (lodestar#59).
