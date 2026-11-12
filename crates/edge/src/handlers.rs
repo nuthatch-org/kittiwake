@@ -3313,12 +3313,14 @@ pub async fn present_poi(
 
     let upstream = request.send().await.map_err(|e| {
         ErrorResponse::from(ApiError::Unavailable(format!(
-            "could not reach the indexer agent: {e}"
+            "could not reach the indexer agent: {}",
+            e.without_url()
         )))
     })?;
     let answer: serde_json::Value = upstream.json().await.map_err(|e| {
         ErrorResponse::from(ApiError::Unavailable(format!(
-            "the indexer agent answered unreadably: {e}"
+            "the indexer agent answered unreadably: {}",
+            e.without_url()
         )))
     })?;
     let mut response = axum::Json(answer).into_response();
@@ -3454,7 +3456,7 @@ pub async fn data_service_query(
         Err(e) => {
             let mut response = axum::Json(serde_json::json!({
                 "ok": false,
-                "error": if e.is_timeout() { "request timed out".to_string() } else { e.to_string() },
+                "error": if e.is_timeout() { "request timed out".to_string() } else { e.without_url().to_string() },
                 "durationMs": duration_ms,
             }))
             .into_response();
@@ -3563,17 +3565,18 @@ pub async fn qos_capture(
                         .timeout(std::time::Duration::from_secs(15))
                         .send()
                         .await
-                        .map_err(|e| ApiError::Unavailable(format!("Foghorn: {e}")))?;
+                        .map_err(|e| {
+                            ApiError::Unavailable(format!("Foghorn: {}", e.without_url()))
+                        })?;
                     if !scores.status().is_success() {
                         return Err(ApiError::Unavailable(format!(
                             "Foghorn returned {}",
                             scores.status()
                         )));
                     }
-                    let scores: FoghornIndexers = scores
-                        .json()
-                        .await
-                        .map_err(|e| ApiError::Unavailable(format!("Foghorn: {e}")))?;
+                    let scores: FoghornIndexers = scores.json().await.map_err(|e| {
+                        ApiError::Unavailable(format!("Foghorn: {}", e.without_url()))
+                    })?;
                     let allocations = kittiwake_db::allocating_indexers(&pool)
                         .await
                         .map_err(|e| ApiError::Unavailable(e.to_string()))?;
@@ -3634,9 +3637,12 @@ async fn subgraph_graphql(
         .timeout(std::time::Duration::from_secs(20))
         .send()
         .await
-        .map_err(|e| unavailable(e.to_string()))?;
+        .map_err(|e| unavailable(e.without_url().to_string()))?;
     let status = resp.status();
-    let body: serde_json::Value = resp.json().await.map_err(|e| unavailable(e.to_string()))?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| unavailable(e.without_url().to_string()))?;
     // A GraphQL error arrives with 200, and its `data` can be a partial answer. It is refused whole.
     if let Some(errors) = body.get("errors") {
         return Err(unavailable(errors.to_string()));

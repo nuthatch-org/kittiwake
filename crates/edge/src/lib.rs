@@ -1743,6 +1743,66 @@ mod tests {
         assert_eq!(agent.received_requests().await.unwrap().len(), 1);
     }
 
+    #[tokio::test]
+    async fn an_unreachable_agent_is_reported_without_its_url() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/private-path", closed.local_addr().unwrap());
+        drop(closed);
+        let gate =
+            kittiwake_nest::NestGate::new(kittiwake_nest::NestConfig::new("http://127.0.0.1:9"))
+                .unwrap();
+        let read = kittiwake_read::ReadCtx::new(gate, kittiwake_cache::Store::new(64), 1);
+        let operator = "0x00000000000000000000000000000000000000aa";
+        let st = state(
+            Limits::new(1000, 1000, 1000, Vec::new()),
+            None,
+            read,
+            None,
+            Some(Studio {
+                secret: dock_secret(),
+                bounty_board_address: None,
+                spent_nonces: Default::default(),
+            }),
+            kittiwake_ext::Ipfs::default(),
+            None,
+            Some(kittiwake_config::IndexerAgentSettings {
+                url,
+                token: None,
+                operators: vec![operator.into()],
+            }),
+            None,
+            None,
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let refused = crate::handlers::present_poi(
+            State(st),
+            ConnectInfo(([127, 0, 0, 1], 1).into()),
+            dock_cookie(&format!(
+                "studio_session={}",
+                kittiwake_dock::create_session(&dock_secret(), operator, now)
+            )),
+            axum::Json(crate::handlers::PresentPoi {
+                deployment_id: "QmStfa6zwPUzKHyGrgdNMh8rgbc91sgvmskidBSujG92FR".into(),
+                allocation_id: "0xb43b2cccceada5292732a8c58ae134adefce09bb".into(),
+                agent_url: None,
+                agent_token: None,
+            }),
+        )
+        .await;
+        let Err(e) = refused else {
+            panic!("a closed port answered")
+        };
+        let body = axum::body::to_bytes(e.into_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains("private-path"), "{body}");
+        assert!(!body.contains("127.0.0.1"), "{body}");
+    }
+
     // ── Foghorn ──────────────────────────────────────────────────────────────
 
     /// The segments are pasted into an upstream URL and the client normalises `..` before sending,
