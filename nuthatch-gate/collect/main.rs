@@ -242,7 +242,7 @@ fn alloc(q: &mut Set) {
         "SELECT d.id, d.kind, d.indexer, d.fisherman, d.allocation_id, \
          a.subgraph_deployment, d.status, d.created_at, d.resolved_at \
          FROM lodestar_disputes d LEFT JOIN lodestar_allocations a ON a.id = d.allocation_id \
-         ORDER BY d.created_at"));
+         ORDER BY d.created_at, d.id"));
     q.add("live.delegation_events", k, &format!("{ingest}/live.rs"), sql::delegation_events_sql(None, 20, 0));
     q.add("live.newest_provisions", k, &format!("{ingest}/live.rs"), s(&sql::newest_provisions_sql(10)));
     q.add("rav.collections", k, &format!("{ingest}/rav.rs build_sql (inline, cursor a day back, first page)"), s(&format!(

@@ -438,7 +438,7 @@ pub async fn disputes(pool: &Pool, gate: &NestGate, lane: Lane) -> Result<Ingest
     let sql = "SELECT d.id, d.kind, d.indexer, d.fisherman, d.allocation_id, \
                a.subgraph_deployment, d.status, d.created_at, d.resolved_at \
                FROM lodestar_disputes d LEFT JOIN lodestar_allocations a ON a.id = d.allocation_id \
-               ORDER BY d.created_at"
+               ORDER BY d.created_at, d.id"
         .to_string();
     let answer = page(gate, NestId::Alloc, sql, lane, "disputes").await?;
 
