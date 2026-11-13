@@ -1,0 +1,57 @@
+# yatr - https://github.com/cargopete/yatr
+#
+# The ci task is what the check job in .github/workflows/ci.yml gates on, and the workflow calls
+# these tasks by name. Deploys stay in deploy/ and are not tasks here.
+
+[env]
+CARGO_TERM_COLOR = "always"
+# The query! macros check against the committed .sqlx/ rather than a database. #2
+SQLX_OFFLINE = "true"
+
+[settings]
+cache = true
+
+[tasks.fmt]
+desc = "Format the tree"
+run = ["cargo fmt --all"]
+no_cache = true
+
+[tasks.fmt-check]
+desc = "Fail if the tree is unformatted"
+run = ["cargo fmt --all -- --check"]
+sources = ["crates/**/*.rs", "nuthatch-gate/**/*.rs"]
+
+# crates include_str! files from db/, deploy/ and their own fixtures.
+[tasks.lint]
+desc = "Clippy, warnings denied as CI denies them"
+run = ["cargo clippy --all-targets --all-features"]
+env = { RUSTFLAGS = "-D warnings" }
+sources = ["crates/**", "db/**", "deploy/*.toml", ".sqlx/**", "Cargo.toml", "Cargo.lock"]
+
+[tasks.test]
+desc = "The whole suite; no network or database needed"
+run = ["cargo test --all"]
+env = { RUSTFLAGS = "-D warnings" }
+sources = ["crates/**", "db/**", "deploy/*.toml", ".sqlx/**", "Cargo.toml", "Cargo.lock"]
+watch = ["crates/**"]
+
+[tasks.queries-check]
+desc = "Fail if nuthatch-gate's committed query sets are stale"
+run = ["nuthatch-gate/collect/collect-queries.sh --check"]
+sources = ["crates/**/*.rs", "nuthatch-gate/**"]
+
+[tasks.queries-write]
+desc = "Regenerate nuthatch-gate's query sets; review the diff"
+run = ["nuthatch-gate/collect/collect-queries.sh --write"]
+no_cache = true
+
+[tasks.build]
+desc = "Release build of the service and the cockpit"
+run = ["cargo build --release --bin kittiwake --bin lodestar-cockpit"]
+sources = ["crates/**", "db/**", "deploy/*.toml", ".sqlx/**", "Cargo.toml", "Cargo.lock"]
+outputs = ["target/release/kittiwake", "target/release/lodestar-cockpit"]
+
+[tasks.ci]
+desc = "What CI gates on: fmt-check, lint, test, queries-check"
+depends = ["fmt-check", "lint", "test", "queries-check"]
+run = []

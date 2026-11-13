@@ -14,6 +14,8 @@ env:
   # message about DATABASE_URL rather than a clear one about the cache. A query changed without
   # `cargo sqlx prepare` being re-run fails here, which is the point. #2
   SQLX_OFFLINE: "true"
+  # The commands the check job runs live in yatr.toml. Bump deliberately.
+  YATR_VERSION: "1.2.0"
 
 jobs:
   check:
@@ -24,12 +26,24 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --all-features
+      - name: Cache yatr
+        id: cache-yatr
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/yatr
+          key: yatr-${{ runner.os }}-${{ env.YATR_VERSION }}
+      - name: Install yatr
+        if: steps.cache-yatr.outputs.cache-hit != 'true'
+        # Not this workspace's -D warnings: yatr is another crate.
+        run: cargo install yatr --version ${{ env.YATR_VERSION }} --locked
+        env:
+          RUSTFLAGS: ""
+      - run: yatr fmt-check
+      - run: yatr lint
       # No network and no database: every test runs against an in-process mock nest.
-      - run: cargo test --all
+      - run: yatr test
       # The statements nuthatch's release gate replays; a change to sql.rs that leaves them stale fails here.
-      - run: nuthatch-gate/collect/collect-queries.sh --check
+      - run: yatr queries-check
 
   release:
     # The binary a deploy installs, so `deploy/install.sh` stops depending on whoever's laptop has
