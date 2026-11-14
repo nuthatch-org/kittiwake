@@ -51,7 +51,14 @@ run = ["cargo build --release --bin kittiwake --bin lodestar-cockpit"]
 sources = ["crates/**", "db/**", "deploy/*.toml", ".sqlx/**", "Cargo.toml", "Cargo.lock"]
 outputs = ["target/release/kittiwake", "target/release/lodestar-cockpit"]
 
+[tasks.agents-check]
+desc = "Fail if the task table in AGENTS.md has drifted from this file"
+run = ["yatr agents --check"]
+sources = ["yatr.toml", "AGENTS.md"]
+# The section's wording belongs to the yatr that wrote it.
+tool_inputs = ["yatr --version"]
+
 [tasks.ci]
-desc = "What CI gates on: fmt-check, lint, test, queries-check"
-depends = ["fmt-check", "lint", "test", "queries-check"]
+desc = "What CI gates on: fmt-check, lint, test, queries-check, agents-check"
+depends = ["fmt-check", "lint", "test", "queries-check", "agents-check"]
 run = []
