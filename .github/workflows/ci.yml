@@ -15,7 +15,7 @@ env:
   # `cargo sqlx prepare` being re-run fails here, which is the point. #2
   SQLX_OFFLINE: "true"
   # The commands the check job runs live in yatr.toml. Bump deliberately.
-  YATR_VERSION: "1.2.0"
+  YATR_VERSION: "1.3.0"
 
 jobs:
   check:
