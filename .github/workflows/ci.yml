@@ -35,7 +35,7 @@ jobs:
       - name: Install yatr
         if: steps.cache-yatr.outputs.cache-hit != 'true'
         # Not this workspace's -D warnings: yatr is another crate.
-        run: cargo install yatr --version ${{ env.YATR_VERSION }} --locked
+        run: cargo install yatr --version ${{ env.YATR_VERSION }} --locked --force
         env:
           RUSTFLAGS: ""
       - run: yatr fmt-check
