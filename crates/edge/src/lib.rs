@@ -10,6 +10,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub mod discord;
 pub mod extract;
 pub mod handlers;
 pub mod openapi;
@@ -220,6 +221,8 @@ pub struct AppState {
     pub limits: Arc<Limits>,
     pub started: std::time::Instant,
     pub telegram: Option<Arc<kittiwake_config::TelegramSettings>>,
+    /// `(name, subgraph id)` for `/api/core-subgraphs`, in the order shown.
+    pub core_subgraphs: Arc<Vec<(String, String)>>,
     health: Arc<HealthMemo<DbHealth>>,
 }
 
@@ -263,6 +266,15 @@ impl AppState {
 
     pub fn with_telegram(mut self, t: Option<kittiwake_config::TelegramSettings>) -> Self {
         self.telegram = t.map(Arc::new);
+        self
+    }
+
+    pub fn with_core_subgraphs(mut self, list: &[kittiwake_config::CoreSubgraph]) -> Self {
+        self.core_subgraphs = Arc::new(
+            list.iter()
+                .map(|c| (c.name.clone(), c.subgraph_id.clone()))
+                .collect(),
+        );
         self
     }
 }
@@ -1457,6 +1469,7 @@ pub fn router(state: AppState) -> Router {
             "/api/subgraph-versions/{hash}",
             get(handlers::subgraph_versions),
         )
+        .route("/api/core-subgraphs", get(handlers::core_subgraphs))
         .route(
             "/api/subgraph-deployment/{hash}/graft-children",
             get(handlers::graft_children),
@@ -1619,6 +1632,7 @@ pub fn state(
         limits: Arc::new(limits),
         started: std::time::Instant::now(),
         telegram: None,
+        core_subgraphs: Arc::new(Vec::new()),
         health: Arc::new(HealthMemo::new()),
     }
 }

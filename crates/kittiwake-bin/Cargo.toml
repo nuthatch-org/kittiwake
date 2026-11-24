@@ -9,6 +9,7 @@ name = "kittiwake"
 path = "src/main.rs"
 
 [dependencies]
+serde_json = "1.0.151"
 anyhow = "1.0.104"
 axum = "0.8.9"
 chrono = "0.4.45"

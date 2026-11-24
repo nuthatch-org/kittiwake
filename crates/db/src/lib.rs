@@ -1022,6 +1022,49 @@ pub async fn record_sign_out(pool: &Pool, address: &str, at: i64) -> Result<(), 
     Ok(())
 }
 
+/// The last version of each core subgraph that was announced, so a restart neither repeats an
+/// announcement nor misses one that arrived while the process was down.
+pub async fn ensure_core_subgraph_announced_table(pool: &Pool) -> Result<(), DbError> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS core_subgraph_announced ( \
+           subgraph_id    TEXT PRIMARY KEY, \
+           deployment     TEXT NOT NULL, \
+           announced_at   BIGINT NOT NULL \
+         )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// `(subgraph id, deployment)` for every core subgraph seen so far.
+pub async fn core_subgraphs_announced(pool: &Pool) -> Result<Vec<(String, String)>, DbError> {
+    Ok(
+        sqlx::query_as("SELECT subgraph_id, deployment FROM core_subgraph_announced")
+            .fetch_all(pool)
+            .await?,
+    )
+}
+
+pub async fn record_core_subgraph_announced(
+    pool: &Pool,
+    subgraph_id: &str,
+    deployment: &str,
+    at: i64,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "INSERT INTO core_subgraph_announced (subgraph_id, deployment, announced_at) \
+         VALUES ($1, $2, $3) ON CONFLICT (subgraph_id) DO UPDATE \
+         SET deployment = EXCLUDED.deployment, announced_at = EXCLUDED.announced_at",
+    )
+    .bind(subgraph_id)
+    .bind(deployment)
+    .bind(at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // Chain health: head history and per-indexer chain sets
 // ---------------------------------------------------------------------------------------------

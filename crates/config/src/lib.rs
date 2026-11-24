@@ -215,6 +215,43 @@ impl std::fmt::Debug for TelegramSettings {
     }
 }
 
+/// A subgraph indexers depend on, whose new versions are announced.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct CoreSubgraph {
+    pub name: String,
+    /// The GNS subgraph id, in decimal.
+    pub subgraph_id: String,
+}
+
+fn default_core_subgraphs() -> Vec<CoreSubgraph> {
+    vec![
+        CoreSubgraph {
+            name: "Graph Network Arbitrum".into(),
+            subgraph_id:
+                "84468279771724132628381251053479559413443101875436543530087934453580950131991"
+                    .into(),
+        },
+        CoreSubgraph {
+            name: "Graph Analytics Arbitrum".into(),
+            subgraph_id:
+                "65059848955934576494808969788666560755158813555225818204372720480641989660197"
+                    .into(),
+        },
+    ]
+}
+
+/// A Discord webhook. The URL carries its own token, so it is never printed.
+#[derive(Clone, Deserialize)]
+pub struct DiscordWebhook {
+    pub url: String,
+}
+
+impl std::fmt::Debug for DiscordWebhook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DiscordWebhook(<redacted>)")
+    }
+}
+
 /// A subgraph's GraphQL endpoint and the key it wants as a bearer.
 #[derive(Clone, Deserialize)]
 pub struct SubgraphSettings {
@@ -344,6 +381,13 @@ pub struct Config {
     /// whether the nightly backup of this database still arrives.
     #[serde(default)]
     pub backup_mark_path: Option<String>,
+    /// Subgraphs whose new versions are posted to `core_subgraphs_discord` and listed at
+    /// /api/core-subgraphs.
+    #[serde(default = "default_core_subgraphs")]
+    pub core_subgraphs: Vec<CoreSubgraph>,
+    /// Absent means new core subgraph versions are listed but not announced.
+    #[serde(default)]
+    pub core_subgraphs_discord: Option<DiscordWebhook>,
     /// Turns the in-process scheduler on. Off by default so a second instance, or a staging box,
     /// cannot start writing to the same Postgres behind your back.
     #[serde(default)]
@@ -783,6 +827,8 @@ mod tests {
             telegram: None,
             github_token: None,
             backup_mark_path: None,
+            core_subgraphs: default_core_subgraphs(),
+            core_subgraphs_discord: None,
             scheduler_enabled: false,
             warmer_enabled: false,
             cron_runs_retention_days: 90,

@@ -452,6 +452,13 @@ CREATE TABLE IF NOT EXISTS studio_sign_outs (
   signed_out_at  BIGINT NOT NULL
 );
 
+-- The last version of each core subgraph announced to Discord (kittiwake-bin/src/core_watch.rs).
+CREATE TABLE IF NOT EXISTS core_subgraph_announced (
+  subgraph_id    TEXT PRIMARY KEY,
+  deployment     TEXT NOT NULL,
+  announced_at   BIGINT NOT NULL
+);
+
 -- ── Scuttlebutt ───────────────────────────────────────────────────────────────
 --
 -- The anonymous room. From lodestar's `migrations/009_scuttlebutt.sql`, brought across with the
