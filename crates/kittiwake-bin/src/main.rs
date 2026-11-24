@@ -12,6 +12,7 @@ use std::time::Duration;
 mod backup_watch;
 mod envfile;
 mod jobs;
+mod jobs_watch;
 
 use anyhow::Context;
 use futures::future::BoxFuture;
@@ -335,6 +336,9 @@ async fn main() -> anyhow::Result<()> {
         }
         if let Some(path) = &cfg.backup_mark_path {
             jobs.push(backup_watch::job(path.clone(), cfg.telegram.clone()));
+        }
+        if let (Some(p), Some(t)) = (&pool, &cfg.telegram) {
+            jobs.push(jobs_watch::job(p.clone(), t.clone()));
         }
         jobs.extend(jobs::live_jobs(
             store.clone(),
