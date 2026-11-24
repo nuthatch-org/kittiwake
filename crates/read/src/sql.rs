@@ -1191,6 +1191,27 @@ pub fn subgraph_versions_sql(subgraph_id: &str, limit: i64) -> Option<String> {
 /// `MAX(signalled_tokens)` and a filtered `SUM` of allocations, matching the shape the single
 /// deployment view uses, so a version row and a deployment page cannot disagree about the same
 /// deployment.
+/// Every version of each listed subgraph, newest first within a subgraph. The caller keeps as
+/// many per subgraph as it shows; a core subgraph has tens of versions, not thousands.
+pub fn core_subgraph_versions_sql(subgraph_ids: &[String]) -> Option<String> {
+    if subgraph_ids.is_empty()
+        || subgraph_ids.len() > 50
+        || !subgraph_ids.iter().all(|i| is_subgraph_id(i))
+    {
+        return None;
+    }
+    let list = subgraph_ids
+        .iter()
+        .map(|i| format!("'{i}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "SELECT subgraph_id, deployment_id, version_metadata, version_number, created_at \
+         FROM subgraph_versions WHERE subgraph_id IN ({list}) \
+         ORDER BY subgraph_id, version_number DESC"
+    ))
+}
+
 pub fn deployments_signal_stake_sql(ids: &[String]) -> Option<String> {
     if ids.is_empty() || ids.len() > 200 || !ids.iter().all(|i| is_deployment_id(i)) {
         return None;

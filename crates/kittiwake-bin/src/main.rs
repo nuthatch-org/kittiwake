@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod backup_watch;
+mod core_watch;
 mod envfile;
 mod jobs;
 mod jobs_watch;
@@ -283,6 +284,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.cors.as_ref().map(|c| c.allowed_origin_patterns.clone()),
     )
     .with_telegram(cfg.telegram.clone())
+    .with_core_subgraphs(&cfg.core_subgraphs)
     .with_network_subgraph(cfg.network_subgraph.clone())
     .with_substreams_mainnet(cfg.substreams_mainnet.as_ref())
     .with_github_token(cfg.github_token.clone());
@@ -333,12 +335,22 @@ async fn main() -> anyhow::Result<()> {
             kittiwake_db::ensure_studio_sign_outs_table(p)
                 .await
                 .context("creating the Dock sign-out table")?;
+            kittiwake_db::ensure_core_subgraph_announced_table(p)
+                .await
+                .context("creating the core subgraph announcement table")?;
         }
         if let Some(path) = &cfg.backup_mark_path {
             jobs.push(backup_watch::job(path.clone(), cfg.telegram.clone()));
         }
         if let (Some(p), Some(t)) = (&pool, &cfg.telegram) {
             jobs.push(jobs_watch::job(p.clone(), t.clone()));
+        }
+        if let (Some(p), Some(h)) = (&pool, &cfg.core_subgraphs_discord) {
+            jobs.push(core_watch::job(
+                p.clone(),
+                h.clone(),
+                cfg.core_subgraphs.clone(),
+            ));
         }
         jobs.extend(jobs::live_jobs(
             store.clone(),

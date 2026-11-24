@@ -3126,6 +3126,7 @@ dependencies = [
  "kittiwake-sqlplay",
  "kittiwake-types",
  "kittiwake-warmer",
+ "serde_json",
  "tokio",
  "tracing",
 ]

@@ -2932,6 +2932,37 @@ pub async fn dips_agreements(
     Ok(envelope(read))
 }
 
+/// `GET /api/core-subgraphs`: the newest versions of the subgraphs indexers depend on, with the
+/// stake on each, labelled from the IPFS document cache like `/api/subgraph-versions`.
+pub async fn core_subgraphs(
+    State(st): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Response, ErrorResponse> {
+    budget!(st, peer, headers);
+    if st.core_subgraphs.is_empty() {
+        return Err(ApiError::Unavailable("no core subgraphs are configured".into()).into());
+    }
+    let read = routes::core_subgraphs(&st.read, (*st.core_subgraphs).clone()).await?;
+    let mut value = (*read.entry.value).clone();
+    if let Some(pool) = st.pool.as_ref()
+        && let Some(list) = value["subgraphs"].as_array_mut()
+    {
+        for s in list {
+            label_versions(pool, s).await;
+        }
+    }
+    let read = kittiwake_read::Read {
+        entry: std::sync::Arc::new(kittiwake_cache::Entry {
+            value: std::sync::Arc::new(value),
+            provenance: read.entry.provenance.clone(),
+            fetched_at: read.entry.fetched_at,
+        }),
+        meta: read.meta,
+    };
+    Ok(envelope(read))
+}
+
 /// `GET /api/subgraph-versions/{hash}`: every version of the subgraph that published a deployment.
 ///
 /// The nest half is cached; the labels are filled here from the IPFS document cache in one bulk
@@ -3008,7 +3039,7 @@ pub async fn graft_children(
 /// A document the cache has not seen leaves the label null rather than blocking the response on a
 /// fetch: the warm job is what fills that cache, and a version list is more useful with a missing
 /// label than it is late.
-async fn label_versions(pool: &kittiwake_db::Pool, value: &mut serde_json::Value) {
+pub async fn label_versions(pool: &kittiwake_db::Pool, value: &mut serde_json::Value) {
     let Some(versions) = value.get_mut("versions").and_then(|v| v.as_array_mut()) else {
         return;
     };

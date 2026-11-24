@@ -1825,6 +1825,102 @@ pub fn subgraph_versions_fetcher(dep: String) -> Fetcher {
     })
 }
 
+/// How many versions of each core subgraph `/api/core-subgraphs` carries.
+pub const CORE_VERSIONS_SHOWN: usize = 5;
+
+/// `/api/core-subgraphs`: each listed subgraph's newest versions, with the signal and stake on
+/// each, so a reader can see how far indexers have moved to the new one. `list` is
+/// `(name, subgraph id)` in the order it is shown.
+pub fn core_subgraphs_fetcher(list: Vec<(String, String)>) -> Fetcher {
+    Arc::new(move |gate: NestGate, lane: Lane| {
+        let list = list.clone();
+        Box::pin(async move {
+            let ids: Vec<String> = list.iter().map(|(_, id)| id.clone()).collect();
+            let versions_sql = sql::core_subgraph_versions_sql(&ids).ok_or_else(|| {
+                ApiError::Internal("a core subgraph id is not a subgraph id".into())
+            })?;
+            let mut spec = QuerySpec::read(NestId::Gns, versions_sql).with_timeout(T_FOLD);
+            spec.lane = lane;
+            let versions = gate.query(&spec).await.map_err(ApiError::from)?;
+            let mut provenance = versions.provenance.clone();
+
+            let mut by_id: std::collections::HashMap<&str, Vec<&serde_json::Value>> =
+                std::collections::HashMap::new();
+            for row in &versions.rows {
+                if let Some(id) = row.get("subgraph_id").and_then(|v| v.as_str()) {
+                    let kept = by_id.entry(id).or_default();
+                    if kept.len() < CORE_VERSIONS_SHOWN {
+                        kept.push(row);
+                    }
+                }
+            }
+
+            let deployments: Vec<String> = by_id
+                .values()
+                .flatten()
+                .filter_map(|r| r.get("deployment_id").and_then(|v| v.as_str()))
+                .map(str::to_lowercase)
+                .collect();
+            let mut stats = serde_json::Map::new();
+            if let Some(stats_sql) = sql::deployments_signal_stake_sql(&deployments) {
+                let mut spec = QuerySpec::read(NestId::Alloc, stats_sql).with_timeout(T_FOLD);
+                spec.lane = lane;
+                let answer = gate.query(&spec).await.map_err(ApiError::from)?;
+                provenance = older_of(&provenance, &answer.provenance);
+                for row in &answer.rows {
+                    if let Some(id) = row.get("subgraph_deployment").and_then(|v| v.as_str()) {
+                        stats.insert(id.to_string(), row.clone());
+                    }
+                }
+            }
+
+            let out: Vec<serde_json::Value> = list
+                .iter()
+                .map(|(name, id)| {
+                    let versions: Vec<serde_json::Value> = by_id
+                        .get(id.as_str())
+                        .map(|rows| rows.as_slice())
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|row| {
+                            let dep = row.get("deployment_id").and_then(|v| v.as_str()).unwrap_or_default();
+                            let stat = stats.get(&dep.to_lowercase());
+                            let token = |key: &str| {
+                                stat.and_then(|s| s.get(key))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("0")
+                                    .to_string()
+                            };
+                            serde_json::json!({
+                                "version": row.get("version_number").cloned().unwrap_or(serde_json::Value::Null),
+                                "createdAt": row.get("created_at").cloned().unwrap_or(serde_json::Value::Null),
+                                "ipfsHash": shape::ipfs_or_id(dep),
+                                "signalledTokens": token("signalled_tokens"),
+                                "stakedTokens": token("staked_tokens"),
+                                "versionMetadata": row.get("version_metadata").cloned().unwrap_or(serde_json::Value::Null),
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({ "name": name, "subgraphId": id, "versions": versions })
+                })
+                .collect();
+
+            Ok((serde_json::json!({ "subgraphs": out }), provenance))
+        })
+    })
+}
+
+pub async fn core_subgraphs(ctx: &ReadCtx, list: Vec<(String, String)>) -> Result<Read, ApiError> {
+    ctx.cached(
+        "core-subgraphs",
+        NestId::Gns,
+        serde_json::json!({ "subgraphs": list }),
+        CachePolicy::from_poll_interval(cadence::LIVE),
+        core_subgraphs_fetcher(list),
+    )
+    .await
+}
+
 pub async fn subgraph_versions(ctx: &ReadCtx, dep: &str) -> Result<Read, ApiError> {
     ctx.cached(
         "subgraph-versions",
