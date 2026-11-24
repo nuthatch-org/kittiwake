@@ -18,8 +18,6 @@ use alloy::providers::{MulticallBuilder, MulticallItem, Provider};
 use alloy::sol;
 use kittiwake_types::ApiError;
 
-/// The Rewards Eligibility Oracle (GIP-0079) on Arbitrum One.
-pub const REO_ADDRESS: &str = "0x8ec2767a9d9ba02b4e09e8ff4fac2e14a340f304";
 /// GRT on Arbitrum One.
 pub const GRT_ARBITRUM: &str = "0x9623063377ad1b27544c965ccd7342f7ea7e88c7";
 /// GRT on Ethereum mainnet, where the token was minted.
@@ -118,6 +116,7 @@ sol! {
         function getRewards(address rewardsIssuer, address allocationID)
             external view returns (uint256);
         function denylist(bytes32 subgraphDeploymentID) external view returns (uint256);
+        function getProviderEligibilityOracle() external view returns (address);
     }
 
     #[sol(rpc)]
@@ -260,12 +259,39 @@ impl Chain {
         Ok(metered::connect(url, "arbitrum", op))
     }
 
+    /// The oracle RewardsManager consults. Read from it rather than pinned: a pinned address kept
+    /// reading a retired oracle that called every indexer eligible.
+    async fn reo_address(&self, provider: impl Provider) -> Result<Address, ApiError> {
+        let rewards = IRewardsManager::new(
+            Address::from_str(REWARDS_MANAGER).expect("RewardsManager address is a constant"),
+            provider,
+        );
+        let addr = rewards
+            .getProviderEligibilityOracle()
+            .call()
+            .await
+            .map_err(|e| ApiError::Unavailable(format!("getProviderEligibilityOracle: {e}")))?;
+        if addr.is_zero() {
+            return Err(ApiError::Unavailable(
+                "RewardsManager names no eligibility oracle".into(),
+            ));
+        }
+        Ok(addr)
+    }
+
     /// The oracle's network-wide state. Read once per refresh, not once per indexer.
     pub async fn oracle_context(&self) -> Result<OracleContext, ApiError> {
-        let oracle = IRewardsEligibilityOracle::new(
-            Address::from_str(REO_ADDRESS).expect("REO address is a constant"),
-            self.arb("oracle_context")?,
-        );
+        let provider = self.arb("oracle_context")?;
+        let addr = self.reo_address(&provider).await?;
+        self.oracle_context_at(addr, provider).await
+    }
+
+    async fn oracle_context_at(
+        &self,
+        addr: Address,
+        provider: impl Provider,
+    ) -> Result<OracleContext, ApiError> {
+        let oracle = IRewardsEligibilityOracle::new(addr, provider);
         let c_period = oracle.getEligibilityPeriod();
         let c_enforced = oracle.getEligibilityValidation();
         let c_updated = oracle.getLastOracleUpdateTime();
@@ -298,10 +324,7 @@ impl Chain {
         indexers: &[String],
     ) -> Result<Vec<Option<bool>>, ApiError> {
         let provider = self.arb("eligibility_batch")?;
-        let oracle = IRewardsEligibilityOracle::new(
-            Address::from_str(REO_ADDRESS).expect("REO address is a constant"),
-            &provider,
-        );
+        let oracle = IRewardsEligibilityOracle::new(self.reo_address(&provider).await?, &provider);
         let parsed: Vec<(usize, Address)> = indexers
             .iter()
             .enumerate()
@@ -366,10 +389,9 @@ impl Chain {
     pub async fn eligibility(&self, indexer: &str) -> Result<Eligibility, ApiError> {
         let addr = Address::from_str(indexer)
             .map_err(|_| ApiError::BadRequest(format!("not an address: {indexer}")))?;
-        let oracle = IRewardsEligibilityOracle::new(
-            Address::from_str(REO_ADDRESS).expect("REO address is a constant"),
-            self.arb("eligibility")?,
-        );
+        let provider = self.arb("eligibility")?;
+        let reo = self.reo_address(&provider).await?;
+        let oracle = IRewardsEligibilityOracle::new(reo, &provider);
 
         let c_eligible = oracle.isEligible(addr);
         let c_renewed = oracle.getEligibilityRenewalTime(addr);
@@ -377,7 +399,7 @@ impl Chain {
 
         let eligible = eligible.map_err(|e| ApiError::Unavailable(format!("oracle: {e}")))?;
         let renewed_at = renewed.ok().map(u256_to_u64);
-        let ctx = self.oracle_context().await?;
+        let ctx = self.oracle_context_at(reo, &provider).await?;
 
         let expires_in = match (renewed_at, ctx.period_seconds) {
             (Some(r), Some(p)) if r > 0 => Some((r + p) as i64 - now_secs()),
@@ -1109,7 +1131,6 @@ mod tests {
     #[test]
     fn the_contract_addresses_parse() {
         for a in [
-            REO_ADDRESS,
             GRT_ARBITRUM,
             GRT_MAINNET,
             L1_BRIDGE_ESCROW,
