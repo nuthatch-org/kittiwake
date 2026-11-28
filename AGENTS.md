@@ -23,3 +23,7 @@ This project's build, test and lint commands are [yatr](https://github.com/cargo
 | `queries-write` | Regenerate nuthatch-gate's query sets; review the diff |  | always runs |
 | `test` | The whole suite; no network or database needed |  | cached on its inputs |
 <!-- yatr:end -->
+
+## Lessons
+
+Notes from finished jobs, one line each, oldest first. Agents add one line at the end of a job and never repeat an existing line. At most 15 lines: when full, merge or replace the oldest. Format: `- YYYY-MM-DD: what went wrong, what was corrected, or what was faster.`
