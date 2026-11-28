@@ -1,7 +1,6 @@
 # REVIEW.md
 
-Instructions for Claude's managed Code Review on pull requests in this repository. The local `/code-review`
-command does not read this file; it reads `CLAUDE.md`. Put rules you want in both places in `CLAUDE.md`.
+This file is the review guide for our coding workers and human reviewers: what to flag, at what severity, and what to skip. Claude's managed Code Review and Approvals are not installed (the owner's plan is Max, not Team or Enterprise), so nothing here is enforced by a GitHub check. The local `/code-review` command does not read this file; it reads `CLAUDE.md`. Put rules you want in both places in `CLAUDE.md`.
 
 ## What matters most here
 kittiwake is the Rust service and cockpit behind Lodestar. Flag these as Important:

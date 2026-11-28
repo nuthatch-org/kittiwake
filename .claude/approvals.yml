@@ -1,9 +1,14 @@
 # .claude/approvals.yml for nuthatch-org/kittiwake
-# Claude Approvals policy file. Reference: https://code.claude.com/docs/en/approvals-policy
 #
-# STATE: starts in observe mode. The Claude Approvals check only reports what this policy WOULD decide;
-# Claude approves nothing and nothing is blocked. Delete the `mode: observe` line (in a separate PR) to enforce.
-# Needs the Claude GitHub App on this repo and a Claude Team or Enterprise organisation; without them this file is inert.
+# This file is the risk policy for our coding workers and reviewers.
+# Claude Approvals, PR Steward and managed Code Review are not installed: the owner's
+# Claude plan is Max, not Team or Enterprise, so this file is not enforced by any GitHub
+# check. Workers read it, classify their change as auto-ok or Pete-sign-off, and put that
+# label in the PR body (for example `risk: low (docs)` or `risk: needs Pete (CI)`).
+# Reference for the format: https://code.claude.com/docs/en/approvals-policy
+#
+# `mode: observe` is left in place only in case a later plan includes Approvals; it does
+# nothing today.
 #
 # WHY these buckets (set by Pete's rule: Claude may approve only low-risk changes):
 #   1. Docs and tests, and dependency lockfile bumps from Dependabot/Renovate: Claude may approve when its code review passes.
