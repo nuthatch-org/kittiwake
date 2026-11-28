@@ -1,0 +1,83 @@
+# .claude/approvals.yml for nuthatch-org/kittiwake
+# Claude Approvals policy file. Reference: https://code.claude.com/docs/en/approvals-policy
+#
+# STATE: starts in observe mode. The Claude Approvals check only reports what this policy WOULD decide;
+# Claude approves nothing and nothing is blocked. Delete the `mode: observe` line (in a separate PR) to enforce.
+# Needs the Claude GitHub App on this repo and a Claude Team or Enterprise organisation; without them this file is inert.
+#
+# WHY these buckets (set by Pete's rule: Claude may approve only low-risk changes):
+#   1. Docs and tests, and dependency lockfile bumps from Dependabot/Renovate: Claude may approve when its code review passes.
+#   2. Small fixes elsewhere: Claude may approve when its review passes and the change is tiny.
+#   3. Releases and version bumps, auth and secrets, CI and build, anything public-facing, the review rules themselves:
+#      Pete signs off. Claude only comments and never approves.
+# When rules overlap, the strictest verdict wins, so a PR that touches one protected file is a protected PR.
+#
+# Caveat: PRs opened by workers go out under Pete's GitHub account (cargopete), and the author can fill a seat.
+# So a worker PR on a protected path shows as "Pete has signed off" unless GitHub itself requires a review from
+# someone other than the author. Real separation needs an extra account or a GitHub required-review rule.
+
+version: 1
+mode: observe
+rules:
+  - purpose: "Docs and tests. Claude may approve once its review passes."
+    paths:
+      - "docs/**"
+      - "tests/**"
+      - "**/tests/**"
+    verdict: { claude: comments, seats: 1 }
+    override:
+      - if: "claude/code_review = pass"
+        verdict: { claude: approves, seats: 1 }
+    advisory: [claude/code_review]
+
+  - purpose: "Dependency lockfile bumps opened only by Dependabot or Renovate. Small, and Claude's review must pass. Claude cannot tell a patch bump from a minor one here, so the size cap stands in for that."
+    paths:
+      - "Cargo.lock"
+    verdict: { claude: comments, seats: 1 }
+    override:
+      - if: "ALL pr/authors = [bot:dependabot, bot:renovate] AND claude/code_review = pass AND pr/diff_lines <= 60"
+        verdict: { claude: approves, seats: 1 }
+    advisory: [claude/code_review]
+
+  - purpose: "A small fix (at most 3 files and 40 changed lines) that Claude's review passes. Claude may approve it. Anything bigger needs a person."
+    paths:
+      - "**"
+      - "!docs/**"
+      - "!tests/**"
+      - "!**/tests/**"
+      - "!Cargo.lock"
+    verdict: { claude: comments, seats: 1 }
+    override:
+      - if: "claude/code_review = pass AND pr/files_changed <= 3 AND pr/diff_lines <= 40"
+        verdict: { claude: approves, seats: 1 }
+    advisory: [claude/code_review]
+
+  - purpose: "Releases, version bumps, auth and secrets, CI and build, and public-facing files need Pete's sign-off. Claude never approves these."
+    paths:
+      - ".github/**"
+      - "yatr.toml"
+      - "deploy/**"
+      - "db/**"
+      - "**/Cargo.toml"
+      - "README.md"
+      - "**/.env*"
+      - "**/*secret*"
+      - "**/*credential*"
+      - "**/*.pem"
+      - "**/*.key"
+      - "**/auth/**"
+      - "crates/ssrf/**"
+      - "crates/edge/**"
+    verdict: { claude: comments, seats: [{ count: 1, from: [cargopete] }] }
+    advisory: [claude/code_review]
+
+  - purpose: "A change to the review and approval rules needs Pete's sign-off, here and in any directory with its own policy file."
+    paths:
+      - "**/.claude/**"
+      - "REVIEW.md"
+      - "**/REVIEW.md"
+      - "CLAUDE.md"
+      - "AGENTS.md"
+      - ".github/CODEOWNERS"
+    nested: inherit
+    verdict: { claude: comments, seats: [{ count: 1, from: [cargopete] }] }
